@@ -1,0 +1,10 @@
+[package]
+name = "harness-provider-hook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-capability = { path = "../harness-capability" }
+serde_json = { workspace = true }

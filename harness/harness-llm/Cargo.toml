@@ -1,0 +1,23 @@
+[package]
+name = "harness-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+async-stream = "0.3"
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# 真实 HTTP Provider（DeepSeek/OpenAI/Anthropic/Local）。rustls-tls 避免对系统 OpenSSL 的依赖；
+# stream 特征启用 SSE 流式响应体（bytes_stream），实现真流式输出。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+[features]
+deepseek = []
+openai = []
+anthropic = []
+local = []

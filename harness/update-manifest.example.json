@@ -1,0 +1,8 @@
+{
+  "version": "0.2.0",
+  "channel": "stable",
+  "notes": "新增版本管理与自动升级；优化权限下拉对齐；修复会话重命名。",
+  "url": "https://your-cdn.example.com/aidops-desktop/0.2.0/aidops-desktop.exe",
+  "sha256": "可选：新 exe 的 SHA-256 十六进制（提供后下载会自动校验，不一致则拒绝安装）",
+  "mandatory": false
+}

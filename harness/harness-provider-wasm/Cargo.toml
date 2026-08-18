@@ -1,0 +1,22 @@
+[package]
+name = "harness-provider-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-capability = { path = "../harness-capability" }
+
+[dependencies.wasmtime]
+version = "21"
+optional = true
+
+[dependencies.tokio]
+workspace = true
+optional = true
+
+[features]
+# 开启后引入 wasmtime，运行期动态加载不可信用户脚本 / 工具 Provider（dsh 动态插件路径，完成文档 §11.4）。
+# tokio 供 ShellBridge 的专用线程运行时使用（异步 Shell → 同步 host 导入桥接）。
+wasm-tools = ["dep:wasmtime", "dep:tokio"]

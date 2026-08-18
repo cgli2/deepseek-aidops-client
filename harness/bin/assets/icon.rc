@@ -1,0 +1,4 @@
+// aidops-desktop 可执行文件图标（资源管理器 / 任务栏显示）。
+// 由 build.rs 经 embed-resource 在 Windows 构建时编译进 exe。
+// 要替换成自己的 logo，直接覆盖同目录的 icon.ico 即可（无需改本文件）。
+1 ICON "icon.ico"

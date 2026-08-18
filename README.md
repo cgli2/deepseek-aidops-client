@@ -2,7 +2,21 @@
 
 DeepSeek-AIOps 的原生 Rust 编码代理（移植 dsh 微内核「一切皆插件」思想），配套 **AIOPS Desktop** 桌面客户端（egui/eframe GUI）。已打通 GUI → DeepSeek → 工具调用 → 文件/命令执行 → 工具结果回传 → 继续推理的完整闭环。
 
+## 设计动机：为什么重复造轮子？
+
+市面上的主流 AI 编码代理（Codex、OpenCode、Qoder、WorkBuddy 等）多基于 Electron / WebView 或 Node / Python 技术栈：功能齐全，但 **启动慢、内存与 CPU 占用高、常驻后台代价大**，在配置一般的机器上容易拖累开发体验。
+
+本 Harness 选择 **纯 Rust 原生** 路线，不与它们比"功能堆叠"，而是比"轻、快、省"：
+
+- **零运行时、零 WebView、零 Electron**：二进制仅几 MB 到十几 MB，冷启动以秒计；egui 即时模式 GUI 直接绘制在原生窗口，不挂浏览器进程。
+- **极致性能与低占用**：无 GC 停顿、无解释器开销；长会话与大上下文下仍保持低内存、低 CPU，交互不卡顿。
+- **可裁剪的微内核**：能力以插件挂载，可按需编译 `GUI / TUI / headless` 三形态，交付物只含要用到的能力（WASM / 沙箱可默认关闭）。
+- **为常驻而生**：适合 DevOps / AIOps 后台常驻、CI 冒烟、资源受限环境——这是重型客户端难以兼顾的场景。
+
+> 一句话：**别人把 Agent 做成功能齐全的"操作系统"，我们把 Agent 做成随手即用的"瑞士军刀"**——极致高效、极低开销的用户体验，是本项目存在的唯一理由。
+
 > 系统设计见 [`docs/system-design-completion.md`](docs/system-design-completion.md)；
+> **架构图与层次图**（L0–L7 依赖方向、运行时数据流、crate 职责）见 [`docs/architecture.md`](docs/architecture.md)；
 > 功能→扩展点映射见 [`harness/extensions/EXTENSION-COOKBOOK.md`](harness/extensions/EXTENSION-COOKBOOK.md)。
 
 ## 内容说明
@@ -16,7 +30,24 @@ DeepSeek-AIOps 的原生 Rust 编码代理（移植 dsh 微内核「一切皆插
 
 ## 架构说明
 
-Cargo workspace（`harness/`，16 个 crate），微内核 + 能力接缝三角色（Definition / Provider / Consumer）：
+采 **微内核 + “一切皆插件”** 设计：`harness-core` 只提供内核原语（服务仓库、事件总线、插件组合、配置、扩展点），所有业务能力以 **Definition / Provider / Consumer** 三角色挂在能力接缝上。
+
+> 📐 完整的 **层次图（L0–L7）** 与 **运行时数据流图** 见 [`docs/architecture.md`](docs/architecture.md)（Mermaid 渲染，含每层的 crate 依赖方向、外部边界，以及本次 A/B/C/D + 图标 + 版本管理分别落在哪一层）。
+
+**分层（自上而下为依赖方向，上层依赖下层；`harness-core` 是地基，不依赖任何内部 crate）：**
+
+| 层 | Crate（角色） | 职责 |
+|----|---------------|------|
+| **L0 微内核** | `harness-core` | `AppContext`(TypeMap) · 事件总线 · `Plugin` 拓扑排序 · 配置（原子写 + 热重载）· `Workspace` · `Update` · `ui_input` |
+| **L1 领域原语** | `harness-llm`、`harness-session` | LLM 流式 I/O 与 Provider；`SessionLog`（真相源，fork/resume/replay 全派生自它） |
+| **L2 能力定义** | `harness-capability` | 纯 trait 接缝：`Shell`/`Fs`/`Editor`/`Lsp`/`Subagent`/`Compaction`/`Memory`/`Hook`/`Git`（零实现） |
+| **L3 能力实现** | `harness-provider-*`（local/sandbox/wasm/memory/hook/git） | Provider 落地：bash/fs/editor/lsp/watcher、WASM 沙箱、钩子、Git… |
+| **L4 运行时与工具** | `harness-runtime`、`harness-tool` | tokio 编排 + Agent 循环 + 多任务调度；模型可见工具（Consumer，只认 trait） |
+| **L5 协议边界** | `harness-acp`、`harness-sdk` | ACP stdio JSON-RPC 服务器（事件总线消费者）+ 宿主侧客户端 |
+| **L6 表现层** | `harness-ui` | `Ui` trait + `NullUi` / `TuiUi` / `EguiUi`（AIOPS Desktop）；设置、更新横幅、图标 |
+| **L7 组装根** | `bin` | 组合入口：Profile → `compose_plugins` → run（产物 `aidops-desktop`） |
+
+（快速 ASCII 概览见下；精确依赖箭头以 [`docs/architecture.md`](docs/architecture.md) 为准。）
 
 ```
 harness-core        微内核：AppContext(TypeMap) + 类型化事件总线 + 可逆注册 + Plugin 拓扑组合
@@ -27,11 +58,17 @@ harness-provider-*  Provider 实现：local（bash/fs/editor/lsp/watcher）、me
                     git、sandbox（landlock/seccomp/JobObject/Null）、wasm（Wasmtime 沙箱导入）
 harness-tool        模型可见工具（Consumer，仅依赖 capability trait）
 harness-runtime     tokio 编排 + Agent 循环 + 工具管线 + 多任务调度（层级取消）
-harness-ui          UI 入口（trait）+ NullUi / TuiUi / EguiUi（AIOPS Desktop）
+harness-ui          Ui 入口（trait）+ NullUi / TuiUi / EguiUi（AIOPS Desktop）
 harness-acp         ACP stdio JSON-RPC 服务器（进程外边界）
 harness-sdk         进程外 JSON-RPC 客户端（宿主侧边界）
 bin                 组合入口：Profile → compose_plugins → run（产物 aidops-desktop）
 ```
+
+**三条关键不变量**（详见架构文档 §1）：
+
+1. **会话日志是真相源**：模型可见的一切都能从 `SessionLog`（追加事件流）重建；运行时不在别处另存状态。
+2. **Consumer 永不直接依赖 Provider**：工具只依赖 `capability` 的纯 trait；换 `LocalBash` 为 `WasmShell`，工具源码零改动。
+3. **UI 是事件总线的纯消费者**：UI 只订阅 `SessionLog` / 事件总线渲染，不反向调用核心循环。
 
 **插件机制要点**（详见设计文档 §11）：
 
@@ -50,7 +87,7 @@ harness/            Cargo workspace（全部源码 + 构建脚本 + 配置）
 ├── config/         default.toml（hooks、模型等默认配置）
 ├── extensions/     EXTENSION-COOKBOOK.md（扩展开发手册，随发布包分发）
 └── dist/           打包交付物（aidops-desktop[.exe] + config + cookbook）
-docs/               系统设计 / 架构分析文档
+docs/               系统设计 / 架构文档（architecture.md 含层次图与运行时图）/ 分析文档
 ```
 
 ## 构建与打包

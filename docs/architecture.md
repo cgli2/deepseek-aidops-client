@@ -21,69 +21,35 @@
 
 ## 2. 层次图（Layered Architecture）
 
-箭头 `A --> B` 表示 **“A 依赖 B”**（上层依赖下层）。`harness-core`（L0）不依赖任何内部 crate，是全场地基。
+箭头 `A --> B` 表示 **“A 依赖 B”**（上层依赖下层）。下图按 **层级聚合** 展示：每一层是一个节点，列出该层所含的 crate；层与层之间的箭头表示「该层依赖那些层」。**精确的 crate ↔ crate 依赖矩阵见 §4。**
 
 ```mermaid
 flowchart TB
-    subgraph L7["L7 · 组装层 Composition Root"]
-        bin["harness-bin<br/>aidops-desktop.exe<br/>装配全部 crate + 启动自更新(try_apply_and_relaunch)"]
-    end
+    L7["L7 · 组装层 Composition Root<br/>harness-bin（aidops-desktop.exe）"]
+    L6["L6 · 表现层 Presentation<br/>harness-ui（EguiUi / TuiUi / NullUi）"]
+    L5["L5 · 协议边界 Integration<br/>harness-acp · harness-sdk"]
+    L4["L4 · 运行时与工具<br/>harness-runtime · harness-tool"]
+    L3["L3 · 能力实现 Providers<br/>local / sandbox / wasm / memory / hook / git"]
+    L2["L2 · 能力定义 Capability（纯 trait）<br/>harness-capability"]
+    L1["L1 · 领域原语 Domain<br/>harness-llm · harness-session"]
+    L0["L0 · 微内核 Foundation<br/>harness-core"]
 
-    subgraph L6["L6 · 表现层 Presentation"]
-        ui["harness-ui<br/>Ui trait / EguiUi(eframe) / TuiUi / NullUi<br/>SettingsDb · 更新横幅 · 图标"]
-    end
-
-    subgraph L5["L5 · 集成 / 协议边界"]
-        acp["harness-acp<br/>ACP stdio JSON-RPC 服务器(事件总线消费者)"]
-        sdk["harness-sdk<br/>宿主侧 JSON-RPC 客户端(与 acp 成对)"]
-    end
-
-    subgraph L4["L4 · 运行时与工具"]
-        runtime["harness-runtime<br/>AgentLoop · Scheduler · Subagent · SessionController"]
-        tool["harness-tool<br/>Bash / Fs / Edit / Plan / Delegate(Consumer)"]
-    end
-
-    subgraph L3["L3 · 能力实现 Providers"]
-        pl["harness-provider-local<br/>(bash/fs/editor/lsp/watcher)"]
-        ps["harness-provider-sandbox"]
-        pw["harness-provider-wasm<br/>(wasmtime 隔离脚本)"]
-        pm["harness-provider-memory"]
-        ph["harness-provider-hook"]
-        pg["harness-provider-git"]
-    end
-
-    subgraph L2["L2 · 能力定义 Capability (Definition, 零实现)"]
-        cap["harness-capability<br/>Shell / Fs / Editor / Git / Hook / Lsp / Memory / Subagent / Watcher"]
-    end
-
-    subgraph L1["L1 · 领域原语 Domain"]
-        llm["harness-llm<br/>LlmProvider · DeepSeek/OpenAI/Anthropic/Local/Replay<br/>Message/ToolCall/Usage · model_catalog"]
-        sess["harness-session<br/>SessionLog(追加日志=真相源)<br/>SessionEvent · telemetry · 标题/清理"]
-    end
-
-    subgraph L0["L0 · 微内核 Foundation"]
-        core["harness-core<br/>AppContext(TypeMap) · EventBusView · Plugin/toposort<br/>ExtensionPoint · Config(原子写+热重载) · Workspace · Update · ui_input"]
-    end
-
-    bin --> ui & runtime & llm & sess & cap & pw & core & acp
-    ui --> core & sess & llm
-    acp --> core & runtime & sess
-    sdk --> core
-    runtime --> core & llm & sess & cap
-    tool --> core & cap & llm & sess
-    cap --> core & llm & sess
-    llm --> core
-    sess --> core & llm
-    pl & pw & pm & ph & pg --> core & cap
-    ps --> core
+    L7 --> L6 & L5 & L4 & L3 & L2 & L1 & L0
+    L6 --> L1 & L0
+    L5 --> L4 & L1 & L0
+    L4 --> L2 & L1 & L0
+    L3 --> L2 & L0
+    L2 --> L1 & L0
+    L1 --> L0
 ```
 
 **读图要点**
-- `session` 依赖 `llm`（复用 `Usage` 类型），所以 L1 内 `llm` 在 `session` 之下。
-- `capability` 依赖 `llm` + `session`，是 L1 之上、L3 Provider 之下的“接口层”。
-- `tool` / `runtime` 都在 L4，但 `runtime` 是编排者，`tool` 是被它调用的 Consumer。
-- `ui` / `acp` / `sdk` 互不依赖，只通过 `core` 与下层对话，保证边界清晰。
-- `bin` 是唯一把所有人拼起来的“组装根”，不含业务。
+- 所有依赖箭头都**只向下**指向更低层，绝不反向——这是分层稳定的根本约束。
+- `harness-core`（L0）不依赖任何内部 crate，是全场地基；所有 crate 最终都依赖它。
+- `bin`（L7）是唯一组装根，扇出依赖所有层（把所有人拼起来），自身不含业务逻辑。
+- `capability`（L2）是纯接口层：`runtime`/`tool`（L4）与 `provider-*`（L3）都只认它的 trait，互相不直连。
+- L1 内 `session` 依赖 `llm`（复用 `Usage` 类型），二者同层、llm 在 session 之下。
+- 更细的 crate ↔ crate 依赖见 §4《Crate 职责一览》。
 
 ---
 
@@ -93,21 +59,21 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    U["用户"] -->|键入 / 点击发送| UI["harness-ui<br/>(事件总线消费者)"]
+    U["用户"] -->|键入或点击发送| UI["harness-ui<br/>事件总线消费者"]
 
-    UI -->|UiInputSink / LlmControl，configure_provider / reload_config| RT["harness-runtime<br/>AgentLoop"]
+    UI -->|UiInputSink / LlmControl| RT["harness-runtime<br/>AgentLoop"]
 
-    RT -->|stream Chunk（含 usage 帧）| LLM["harness-llm<br/>DeepSeek / OpenAI / Anthropic / Local"]
-    RT -->|调用 Arc(dyn Shell/Fs/Editor)| TOOL["harness-tool<br/>(Consumer, 只认 trait)"]
-    TOOL -->|经导入表落地| PROV["harness-provider-*<br/>(Provider 实现)"]
+    RT -->|流式 Chunk（含 usage 帧）| LLM["harness-llm<br/>DeepSeek / OpenAI / Anthropic / Local"]
+    RT -->|调用 trait| TOOL["harness-tool<br/>只认 capability trait"]
+    TOOL -->|经导入表落地| PROV["harness-provider-*<br/>Provider 实现"]
 
-    RT -->|追加 SessionEvent| LOG["harness-session<br/>SessionLog(追加日志=真相源)"]
+    RT -->|追加 SessionEvent| LOG["harness-session<br/>SessionLog 真相源"]
 
-    LOG -->|订阅 / 重放| UI
-    RT -.->|外部请求→内部事件| ACP["harness-acp<br/>stdio JSON-RPC"]
+    LOG -->|订阅重放| UI
+    RT -.->|外部请求转内部事件| ACP["harness-acp<br/>stdio JSON-RPC"]
 
-    LLM -->|HTTPS + SSE| EXT["LLM API<br/>(DeepSeek / OpenAI / …)"]
-    PROV -.->|本地进程 / 文件 / WASM 沙箱| OS["操作系统 / 文件系统"]
+    LLM -->|HTTPS + SSE| EXT["LLM API<br/>DeepSeek / OpenAI 等"]
+    PROV -.->|本地进程 / 文件 / WASM| OS["操作系统 / 文件系统"]
     UI -.->|检查更新 / 下载| GH["GitHub<br/>update-manifest.json"]
 ```
 

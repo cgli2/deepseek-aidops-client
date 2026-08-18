@@ -186,3 +186,11 @@ post_tool_use = "scripts/audit-tool.sh"
 - WASM 插件默认零直接宿主能力，仅经显式 capability bridge 交互。
 
 详见设计文档 §13 与 [`harness/extensions/EXTENSION-COOKBOOK.md`](harness/extensions/EXTENSION-COOKBOOK.md)。
+
+## License
+
+本项目以 **MIT 协议** 开源。完整的许可证文本见仓库根目录 [`LICENSE`](LICENSE) 文件。
+
+> Copyright (c) 2026 cgli
+>
+> 任何人可按 MIT 条款自由使用、复制、修改、合并、分发、再许可及销售本软件及其副本，详见 [`LICENSE`](LICENSE)。

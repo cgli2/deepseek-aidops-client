@@ -101,8 +101,11 @@ docs/               系统设计 / 架构文档（architecture.md 含层次图�
 ```bash
 make help                 # 查看全部命令及可覆盖变量
 make doctor               # 检查 Rust、Xcode 工具和签名证书
+make install-dev-tools    # 首次安装 cargo-watch
 make dev                  # 启动 GUI 开发版
 make dev-replay           # 离线 Replay 模型启动，不需要 API Key
+make dev-watch            # 源码变化后自动重编译并重启 GUI
+make dev-replay-watch     # Replay 离线热重启开发模式
 make check                # workspace 全功能编译检查
 make test                 # workspace 全功能测试
 make logs                 # 跟踪 macOS GUI 诊断日志
@@ -112,7 +115,12 @@ make logs                 # 跟踪 macOS GUI 诊断日志
 
 ```bash
 make dev WORKSPACE=/path/to/project
+make dev-watch WORKSPACE=/path/to/project
 ```
+
+`dev-watch` 属于自动重编译并重启模式，不是 Web 前端式的组件 HMR。修改 Rust 源码后，
+`cargo-watch` 会停止旧进程、增量编译并重新启动应用；SQLite 设置、会话日志等持久化数据
+会保留，尚未保存的输入框内容等内存状态会清空。使用 `Ctrl+C` 停止监听。
 
 构建和 macOS 发布：
 

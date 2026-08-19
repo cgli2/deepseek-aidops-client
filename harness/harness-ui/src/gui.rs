@@ -2161,6 +2161,122 @@ fn ghost_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
     resp.clicked()
 }
 
+#[derive(Clone, Copy)]
+enum SidebarActionIcon {
+    Add,
+    Archive,
+}
+
+fn sidebar_control_height() -> f32 {
+    if cfg!(target_os = "macos") { 26.0 } else { 24.0 }
+}
+
+/// 侧栏紧凑图标按钮：固定尺寸和矢量图形，避免平台字体造成基线偏移。
+fn sidebar_icon_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: SidebarActionIcon,
+    tooltip: &str,
+) -> bool {
+    let height = sidebar_control_height();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(height, height), egui::Sense::click());
+    let fill = if response.hovered() { pal.hover } else { pal.field };
+    ui.painter().rect(
+        rect,
+        egui::Rounding::same(6.0),
+        fill,
+        egui::Stroke::new(1.0, pal.border),
+    );
+    let color = if response.hovered() { pal.text } else { pal.dim };
+    let stroke = egui::Stroke::new(1.4, color);
+    let c = rect.center();
+    match icon {
+        SidebarActionIcon::Add => {
+            ui.painter().line_segment([c + egui::vec2(-4.0, 0.0), c + egui::vec2(4.0, 0.0)], stroke);
+            ui.painter().line_segment([c + egui::vec2(0.0, -4.0), c + egui::vec2(0.0, 4.0)], stroke);
+        }
+        SidebarActionIcon::Archive => {
+            let body = egui::Rect::from_center_size(c + egui::vec2(0.0, 1.5), egui::vec2(10.0, 7.0));
+            ui.painter().rect(body, egui::Rounding::same(1.5), egui::Color32::TRANSPARENT, stroke);
+            ui.painter().line_segment([c + egui::vec2(-5.5, -3.0), c + egui::vec2(5.5, -3.0)], stroke);
+            ui.painter().line_segment([c + egui::vec2(0.0, -6.0), c + egui::vec2(0.0, -1.0)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-2.0, -3.0), c + egui::vec2(0.0, -1.0)], stroke);
+            ui.painter().line_segment([c + egui::vec2(2.0, -3.0), c + egui::vec2(0.0, -1.0)], stroke);
+        }
+    }
+    response.on_hover_text(tooltip).clicked()
+}
+
+/// 侧栏文字按钮：macOS/Windows 各自使用合适高度，文字始终按按钮中心绘制。
+fn sidebar_text_button(ui: &mut egui::Ui, pal: &Palette, label: &str, tooltip: &str) -> bool {
+    let height = sidebar_control_height();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, height), egui::Sense::click());
+    let fill = if response.hovered() { pal.hover } else { pal.field };
+    ui.painter().rect(
+        rect,
+        egui::Rounding::same(6.0),
+        fill,
+        egui::Stroke::new(1.0, pal.border),
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(if cfg!(target_os = "macos") { 11.5 } else { 11.0 }),
+        if response.hovered() { pal.text } else { pal.dim },
+    );
+    response.on_hover_text(tooltip).clicked()
+}
+
+/// 带搜索图标和清除动作的侧栏搜索框。
+fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut String) {
+    let id = ui.make_persistent_id("history_search_input");
+    let focused = ui.memory(|memory| memory.has_focus(id));
+    let stroke_color = if focused { pal.accent } else { pal.border };
+    let mut clear = false;
+    egui::Frame::default()
+        .fill(pal.field)
+        .rounding(egui::Rounding::same(7.0))
+        .stroke(egui::Stroke::new(1.0, stroke_color))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .show(ui, |ui| {
+            ui.set_min_height(sidebar_control_height() - 8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                let center = icon_rect.center() + egui::vec2(-1.0, -1.0);
+                let stroke = egui::Stroke::new(1.25, pal.dim);
+                ui.painter().circle_stroke(center, 4.0, stroke);
+                ui.painter().line_segment(
+                    [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
+                    stroke,
+                );
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .id_source(id)
+                        .desired_width(f32::INFINITY)
+                        .frame(false)
+                        .margin(egui::Margin::same(0.0))
+                        .hint_text(egui::RichText::new("搜索历史…").color(pal.dim)),
+                );
+                if !value.is_empty() {
+                    let (clear_rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                    if response.hovered() {
+                        ui.painter().circle_filled(clear_rect.center(), 7.0, pal.hover);
+                    }
+                    let c = clear_rect.center();
+                    let stroke = egui::Stroke::new(1.15, pal.dim);
+                    ui.painter().line_segment([c + egui::vec2(-2.5, -2.5), c + egui::vec2(2.5, 2.5)], stroke);
+                    ui.painter().line_segment([c + egui::vec2(-2.5, 2.5), c + egui::vec2(2.5, -2.5)], stroke);
+                    clear = response.on_hover_text("清除搜索").clicked();
+                }
+            });
+        });
+    if clear {
+        value.clear();
+    }
+}
+
 /// 表单字段标签（暗色小号，上方留白）。
 fn field_label(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     ui.add_space(8.0);
@@ -2327,16 +2443,12 @@ impl eframe::App for AppState {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("项目").size(11.0).color(pal.dim));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add_sized(
-                                    [20.0, 20.0],
-                                    egui::Button::new(
-                                        egui::RichText::new("+").size(14.0).color(pal.dim),
-                                    ),
-                                )
-                                .on_hover_text("添加新项目")
-                                .clicked()
-                            {
+                            if sidebar_icon_button(
+                                ui,
+                                &pal,
+                                SidebarActionIcon::Add,
+                                "添加新项目",
+                            ) {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                     let s = path.display().to_string();
                                     let _ = self.host.settings.add_project(&path);
@@ -2403,18 +2515,27 @@ impl eframe::App for AppState {
                                     if is_active { pal.text } else { pal.dim },
                                 );
                                 if hovered {
-                                    // 悬停时右侧浮现归档按钮。
+                                    // 悬停时右侧浮现固定尺寸的矢量归档按钮。
+                                    let control_h = sidebar_control_height();
                                     let arch_rect = egui::Rect::from_min_size(
-                                        egui::pos2(rect.max.x - 42.0, rect.center().y - 10.0),
-                                        egui::vec2(38.0, 20.0),
-                                    );
-                                    let b = ui.put(
-                                        arch_rect,
-                                        egui::Button::new(
-                                            egui::RichText::new("归档").size(10.0).color(pal.dim),
+                                        egui::pos2(
+                                            rect.max.x - control_h - 3.0,
+                                            rect.center().y - control_h / 2.0,
                                         ),
+                                        egui::vec2(control_h, control_h),
                                     );
-                                    if b.clicked() {
+                                    #[allow(deprecated)]
+                                    let archive_clicked = ui
+                                        .allocate_ui_at_rect(arch_rect, |ui| {
+                                            sidebar_icon_button(
+                                                ui,
+                                                &pal,
+                                                SidebarActionIcon::Archive,
+                                                "归档项目",
+                                            )
+                                        })
+                                        .inner;
+                                    if archive_clicked {
                                         archive_now = Some(proj.path.clone());
                                     }
                                 }
@@ -2440,28 +2561,20 @@ impl eframe::App for AppState {
                                 .color(pal.dim),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add_sized(
-                                    [36.0, 18.0],
-                                    egui::Button::new(
-                                        egui::RichText::new("清空").size(10.0).color(pal.dim),
-                                    ),
-                                )
-                                .on_hover_text("删除全部历史会话（保留当前对话）")
-                                .clicked()
-                            {
+                            if sidebar_text_button(
+                                ui,
+                                &pal,
+                                "清空",
+                                "删除全部历史会话（保留当前对话）",
+                            ) {
                                 self.clear_history();
                             }
-                            if ui
-                                .add_sized(
-                                    [36.0, 18.0],
-                                    egui::Button::new(
-                                        egui::RichText::new("精简").size(10.0).color(pal.dim),
-                                    ),
-                                )
-                                .on_hover_text("仅保留最近 30 个会话（当前对话不删）")
-                                .clicked()
-                            {
+                            if sidebar_text_button(
+                                ui,
+                                &pal,
+                                "精简",
+                                "仅保留最近 30 个会话（当前对话不删）",
+                            ) {
                                 self.prune_history();
                             }
                         });
@@ -2479,11 +2592,7 @@ impl eframe::App for AppState {
                         }
                     }
                     ui.add_space(4.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.history_search)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(egui::RichText::new("搜索历史…").color(pal.dim)),
-                    );
+                    sidebar_search_field(ui, &pal, &mut self.history_search);
                     ui.add_space(4.0);
                     let history_height = (ui.available_height() - 40.0).max(90.0);
                     egui::ScrollArea::vertical()
@@ -3082,9 +3191,26 @@ impl eframe::App for AppState {
                     egui::Stroke::new(1.0_f32, pal.head_border),
                 );
                 ui.add_space(4.0);
-                // ── 版本更新横幅（非 Idle 时显示）──
-                self.draw_update_banner(ui, &pal);
-                egui::ScrollArea::vertical()
+                // 正文画布保留响应式左右 gutter：宽窗口更舒展，窄窗口不浪费空间。
+                // 顶部导航色带仍保持满宽，消息气泡按扣除 gutter 后的宽度排版。
+                let content_padding = if ui.available_width() >= 1100.0 {
+                    24.0
+                } else if ui.available_width() >= 760.0 {
+                    18.0
+                } else {
+                    12.0
+                };
+                egui::Frame::default()
+                    .inner_margin(egui::Margin {
+                        left: content_padding,
+                        right: content_padding,
+                        top: 2.0,
+                        bottom: 0.0,
+                    })
+                    .show(ui, |ui| {
+                        // ── 版本更新横幅（非 Idle 时显示）──
+                        self.draw_update_banner(ui, &pal);
+                        egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink(false)
                     .show(ui, |ui| {
@@ -3156,6 +3282,7 @@ impl eframe::App for AppState {
                             });
                             ui.add_space(6.0);
                         }
+                    });
                     });
             });
 

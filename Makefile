@@ -10,7 +10,8 @@ NOTARY_PROFILE ?= aidops-notary
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor dev dev-replay check test fmt icon build release \
+.PHONY: help doctor install-dev-tools watch-ready dev dev-replay dev-watch \
+	dev-replay-watch check test fmt icon build release \
 	package package-mac-dev package-mac-release package-mac-notarize \
 	package-mac-universal verify-mac open-mac logs
 
@@ -20,8 +21,11 @@ help: ## 显示快捷命令
 	  '' \
 	  '开发调试' \
 	  '  make doctor              检查 Rust、macOS 工具和签名证书' \
+	  '  make install-dev-tools   安装 cargo-watch 开发工具' \
 	  '  make dev                 启动 GUI 开发版' \
 	  '  make dev-replay          使用离线 Replay 模型启动 GUI' \
+	  '  make dev-watch           监听源码，自动重编译并重启 GUI' \
+	  '  make dev-replay-watch    离线 Replay 热重启开发模式' \
 	  '  make check               全 workspace 编译检查' \
 	  '  make test                运行全 workspace 测试' \
 	  '  make fmt                 仅检查 Rust 格式，不改文件' \
@@ -56,12 +60,32 @@ doctor: ## 检查本机开发和 macOS 发布环境
 	else \
 		printf 'macOS 签名检查已跳过（当前系统: %s）\n' "$$(uname -s)"; \
 	fi
+	@if command -v cargo-watch >/dev/null; then \
+		cargo watch --version; \
+	else \
+		printf '\ncargo-watch: 未安装（运行 make install-dev-tools）\n'; \
+	fi
+
+install-dev-tools: ## 安装自动重启开发工具
+	cargo install cargo-watch --locked
+
+watch-ready:
+	@command -v cargo-watch >/dev/null || { \
+		echo '错误：未安装 cargo-watch。请先运行 make install-dev-tools'; \
+		exit 1; \
+	}
 
 dev: ## 启动 GUI 开发版
 	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" cargo run -p harness-bin -- --gui
 
 dev-replay: ## 使用离线 Replay 模型启动 GUI
 	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" HARNESS_REPLAY=1 cargo run -p harness-bin -- --gui
+
+dev-watch: watch-ready ## 监听源码并自动重启真实模型 GUI
+	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" cargo watch --delay 0.3 -x 'run -p harness-bin -- --gui'
+
+dev-replay-watch: watch-ready ## 监听源码并自动重启 Replay GUI
+	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" HARNESS_REPLAY=1 cargo watch --delay 0.3 -x 'run -p harness-bin -- --gui'
 
 check: ## 全功能编译检查
 	cd "$(HARNESS)" && cargo check --workspace --all-features

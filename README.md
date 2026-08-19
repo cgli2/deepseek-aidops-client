@@ -94,6 +94,41 @@ docs/               系统设计 / 架构文档（architecture.md 含层次图�
 
 前提：安装 Rust stable（`rustup`）。打包命令统一使用 `--all-features`，确保交付物包含全部能力（GUI / TUI / WASM / 沙箱）。
 
+### 快捷命令
+
+仓库根目录提供统一 `Makefile`。日常开发只需记住：
+
+```bash
+make help                 # 查看全部命令及可覆盖变量
+make doctor               # 检查 Rust、Xcode 工具和签名证书
+make dev                  # 启动 GUI 开发版
+make dev-replay           # 离线 Replay 模型启动，不需要 API Key
+make check                # workspace 全功能编译检查
+make test                 # workspace 全功能测试
+make logs                 # 跟踪 macOS GUI 诊断日志
+```
+
+指定应用打开后的默认工作区：
+
+```bash
+make dev WORKSPACE=/path/to/project
+```
+
+构建和 macOS 发布：
+
+```bash
+make icon                 # 重新生成 Windows/macOS/运行时图标
+make package              # 当前平台默认打包
+make package-mac-dev      # Apple Development 本地测试包
+make package-mac-release  # Developer ID 正式签名，不上传 Apple
+make package-mac-notarize # 正式签名、公证、staple
+make verify-mac           # 验证签名、公证票据并输出 SHA-256
+```
+
+公证默认使用钥匙串 Profile `aidops-notary`，可通过
+`make package-mac-notarize NOTARY_PROFILE=其他名称` 覆盖。Apple ID 专用密码只应保存在
+`notarytool` 钥匙串 Profile 中，不要写入命令、Makefile 或仓库。
+
 ### Windows
 
 需要 VS Build Tools（提供 `vcvars64.bat` / link.exe）。脚本会自动初始化 MSVC 环境并切到 `x86_64-pc-windows-msvc` 目标，无需手动设置（默认 GNU 目标缺 `dlltool.exe` 会失败）。

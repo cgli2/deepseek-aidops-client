@@ -1768,6 +1768,47 @@ fn draw_paperclip_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Colo
     );
 }
 
+/// 侧栏品牌标：几何与 `bin/assets/aidops-logo.svg` 保持一致。
+/// 展开时为横向 Logo，收起时只保留脉冲结图形。
+fn draw_brand_logo(ui: &egui::Ui, rect: egui::Rect, expanded: bool, pal: &Palette) {
+    let blue = egui::Color32::from_rgb(0x60, 0xa5, 0xfa);
+    let mint = egui::Color32::from_rgb(0x5e, 0xea, 0xd4);
+    // 展开态按“图形 + 双行字标”的整体视觉宽度居中，收起态单独居中图形。
+    let logo_width = if expanded { 91.0 } else { 27.0 };
+    let logo_height = 27.0;
+    let origin = egui::pos2(
+        rect.center().x - logo_width / 2.0,
+        rect.center().y - logo_height / 2.0,
+    );
+    let point = |x: f32, y: f32| origin + egui::vec2(x, y);
+    let stroke = 2.3;
+    let left = [point(0.0, 18.0), point(7.0, 4.0), point(14.0, 15.0), point(25.0, 0.0)];
+    let right = [point(1.0, 23.0), point(11.0, 10.0), point(18.0, 20.0), point(27.0, 11.0)];
+    ui.painter().add(egui::Shape::line(left.to_vec(), egui::Stroke::new(stroke, blue)));
+    ui.painter().add(egui::Shape::line(right.to_vec(), egui::Stroke::new(stroke, mint)));
+    for (pos, color) in [(left[0], blue), (left[3], blue), (right[0], mint), (right[3], mint)] {
+        ui.painter().circle_filled(pos, 2.1, color);
+    }
+    ui.painter().circle_filled(right[1], 2.3, egui::Color32::from_rgb(0xf0, 0xf9, 0xff));
+
+    if expanded {
+        ui.painter().text(
+            egui::pos2(origin.x + 38.0, origin.y + 10.0),
+            egui::Align2::LEFT_CENTER,
+            "AIOPS",
+            egui::FontId::proportional(15.0),
+            pal.text,
+        );
+        ui.painter().text(
+            egui::pos2(origin.x + 39.0, origin.y + 23.0),
+            egui::Align2::LEFT_CENTER,
+            "DESKTOP",
+            egui::FontId::proportional(8.5),
+            pal.dim,
+        );
+    }
+}
+
 /// 侧栏扁平导航项：透明底、悬停微亮、矢量图标。返回是否点击。
 fn nav_item(
     ui: &mut egui::Ui,
@@ -2042,14 +2083,13 @@ impl eframe::App for AppState {
             .frame(egui::Frame::default().fill(pal.side).inner_margin(8.0))
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.painter().text(
-                    egui::pos2(ui.max_rect().center().x, ui.cursor().min.y + 10.0),
-                    egui::Align2::CENTER_CENTER,
-                    if self.sidebar_expanded { "AIOPS DESKTOP" } else { "AI" },
-                    egui::FontId::proportional(11.0),
-                    pal.dim,
+                let logo_height = 30.0;
+                let (logo_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), logo_height),
+                    egui::Sense::hover(),
                 );
-                ui.add_space(24.0);
+                draw_brand_logo(ui, logo_rect, self.sidebar_expanded, &pal);
+                ui.add_space(6.0);
                 if nav_item(ui, &pal, Icon::Chat, "新建对话", self.sidebar_expanded, !self.busy, true)
                 {
                     self.new_session();
@@ -3399,9 +3439,13 @@ impl eframe::App for AppState {
 
 impl Ui for EguiUi {
     fn run(self: Arc<Self>, _bus: EventBusView, log: Arc<SessionLog>) {
+        #[cfg(target_os = "macos")]
+        let window_title = "";
+        #[cfg(not(target_os = "macos"))]
+        let window_title = "AIOPS Desktop";
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title("AIOPS Desktop")
+                .with_title(window_title)
                 .with_inner_size([1280.0, 800.0])
                 .with_min_inner_size([960.0, 600.0])
                 // egui 0.30：窗口图标挂在 ViewportBuilder 上（旧版 NativeOptions.icon_data 已移除）。

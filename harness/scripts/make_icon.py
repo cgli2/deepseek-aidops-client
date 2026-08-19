@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """生成 aidops-desktop 的 Windows、macOS 和运行时图标。
 
-设计：圆角渐变底（深靛蓝 #2A3F8F -> 青色 #14B8C4）+ 白色 "ops" 字母组合。
-- 每个目标尺寸独立绘制（而非放大缩放），保证 16px 等小尺寸依旧清晰。
+设计：深色圆角底 + 原创「智能脉冲结」标记。双轨数据流围绕中心节点形成
+抽象 A，表达 AI 推理、可观测信号和运维闭环；不依赖字体，小尺寸仍清晰。
+- 每个目标尺寸以 4x 超采样独立绘制，保证 16px 图标边缘干净。
 - 输出 Windows 多尺寸 .ico、macOS 1024px PNG 源图和 egui RGBA 数据。
 
 用法：
@@ -10,84 +11,73 @@
 产物：
     harness/bin/assets/icon.ico
     harness/bin/assets/icon_1024.png
-要换字母 / 配色 / 换成自己的 logo，改下面的 BRAND_TEXT / COLORS 或直接替换 icon.ico 即可。
+横向品牌字标源文件位于 bin/assets/aidops-logo.svg。
 """
 import io
 import os
 import struct
 import sys
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 ASSETS = os.path.join(os.path.dirname(__file__), "..", "bin", "assets")
 OUT = os.path.abspath(os.path.join(ASSETS, "icon.ico"))
 MAC_SOURCE = os.path.abspath(os.path.join(ASSETS, "icon_1024.png"))
 MAC_ICNS = os.path.abspath(os.path.join(ASSETS, "AppIcon.icns"))
 
-BRAND_TEXT = "ops"         # 字母组合（ops = AIOps，规避外部品牌商标风险）
-TOP = (42, 63, 143)        # 渐变顶部：深靛蓝 #2A3F8F
-BOT = (20, 184, 196)       # 渐变底部：青色 #14B8C4
-GLYPH = (255, 255, 255)    # 字母颜色：白
+INK = (8, 17, 31)
+INK_LIGHT = (15, 31, 52)
+BLUE = (96, 165, 250)
+MINT = (94, 234, 212)
+WHITE = (240, 249, 255)
 
 SIZES = [16, 24, 32, 48, 64, 128, 256]
 
 
-def load_font(sz: int) -> ImageFont.ImageFont:
-    for p in (
-        "C:/Windows/Fonts/arialbd.ttf",
-        "C:/Windows/Fonts/segoeui.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-    ):
-        if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, sz)
-            except Exception:
-                pass
-    return ImageFont.load_default()
-
-
 def render(size: int) -> Image.Image:
-    s = size
+    scale = 4
+    s = size * scale
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
 
-    # 1) 垂直渐变底
+    # 克制的深色场，保留 macOS 图标所需的大圆角和安全边距。
     grad = Image.new("RGBA", (s, s))
     px = grad.load()
     for y in range(s):
         t = y / max(1, s - 1)
-        r = int(TOP[0] + (BOT[0] - TOP[0]) * t)
-        g = int(TOP[1] + (BOT[1] - TOP[1]) * t)
-        b = int(TOP[2] + (BOT[2] - TOP[2]) * t)
+        r = int(INK_LIGHT[0] + (INK[0] - INK_LIGHT[0]) * t)
+        g = int(INK_LIGHT[1] + (INK[1] - INK_LIGHT[1]) * t)
+        b = int(INK_LIGHT[2] + (INK[2] - INK_LIGHT[2]) * t)
         for x in range(s):
             px[x, y] = (r, g, b, 255)
 
-    # 2) 圆角遮罩（透明四角）
     mask = Image.new("L", (s, s), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
-        [0, 0, s - 1, s - 1], radius=max(2, int(s * 0.22)), fill=255
+        [int(s * 0.035), int(s * 0.035), int(s * 0.965), int(s * 0.965)],
+        radius=max(2, int(s * 0.225)),
+        fill=255,
     )
     grad.putalpha(mask)
-
     d = ImageDraw.Draw(grad)
 
-    # 3) 顶部高光（轻微光泽）
-    hl = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    ImageDraw.Draw(hl).rounded_rectangle(
-        [int(s * 0.08), int(s * 0.06), int(s * 0.92), int(s * 0.52)],
-        radius=max(2, int(s * 0.18)),
-        fill=(255, 255, 255, int(38 * (s / 256) + 14)),
-    )
-    grad = Image.alpha_composite(hl, grad)
+    # 双轨脉冲结：两条折线共享中心节点，构成抽象 A/闭环。
+    width = max(scale * 2, int(s * 0.055))
+    left = [(s * .25, s * .64), (s * .39, s * .37), (s * .53, s * .58), (s * .73, s * .30)]
+    right = [(s * .27, s * .75), (s * .47, s * .47), (s * .61, s * .69), (s * .76, s * .49)]
+    d.line(left, fill=BLUE, width=width, joint="curve")
+    d.line(right, fill=MINT, width=width, joint="curve")
 
-    # 4) 字母组合（字号按字符数自适应，避免长文本在小尺寸溢出圆角）
-    d = ImageDraw.Draw(grad)
-    font = load_font(max(int(s * 0.52 * (2.0 / max(1, len(BRAND_TEXT)))), 7))
-    bbox = d.textbbox((0, 0), BRAND_TEXT, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    tx = (s - tw) / 2 - bbox[0]
-    ty = (s - th) / 2 - bbox[1] - s * 0.02  # 视觉居中微调
-    d.text((tx, ty), BRAND_TEXT, font=font, fill=(*GLYPH, 255))
+    # 三个端点代表输入、推理和动作，中心白点强化小尺寸辨识。
+    radius = max(scale * 2, int(s * .045))
+    for x, y, color in [
+        (*left[0], BLUE),
+        (*left[-1], BLUE),
+        (*right[0], MINT),
+        (*right[-1], MINT),
+    ]:
+        d.ellipse([x-radius, y-radius, x+radius, y+radius], fill=color)
+    cx, cy = right[1]
+    d.ellipse([cx-radius, cy-radius, cx+radius, cy+radius], fill=WHITE)
 
-    return grad
+    return grad.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def save_ico(path: str, frames) -> None:

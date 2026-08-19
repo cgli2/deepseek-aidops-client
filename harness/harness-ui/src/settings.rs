@@ -42,6 +42,15 @@ impl SettingsDb {
             .and_then(|p| p.parent().map(PathBuf::from));
         let local_dir = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
 
+        #[cfg(target_os = "macos")]
+        let bases = app_data_dir().into_iter().collect::<Vec<_>>();
+        #[cfg(not(target_os = "macos"))]
+        let bases = exe_dir
+            .clone()
+            .into_iter()
+            .chain(local_dir.clone())
+            .collect::<Vec<_>>();
+
         // 旧数据一次性迁移：exe 旁无 db 而 %LOCALAPPDATA% 有时，整体拷贝（db + 密钥文件）。
         if let (Some(e), Some(l)) = (&exe_dir, &local_dir) {
             let de = e.join("DeepSeekAIOps");
@@ -59,7 +68,10 @@ impl SettingsDb {
         }
 
         let mut dir: Option<PathBuf> = None;
-        for base in exe_dir.into_iter().chain(local_dir.into_iter()) {
+        for base in bases {
+            #[cfg(target_os = "macos")]
+            let d = base;
+            #[cfg(not(target_os = "macos"))]
             let d = base.join("DeepSeekAIOps");
             if std::fs::create_dir_all(&d).is_ok() {
                 dir = Some(d);
@@ -315,6 +327,21 @@ impl SettingsDb {
     }
 }
 
+pub(crate) fn app_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library/Application Support/com.clotee.aidops"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from))
+    }
+}
+
 /// 旧版 Windows DPAPI 解密（仅用于兼容升级前的密文）。
 #[cfg(windows)]
 fn legacy_unprotect(input: &[u8]) -> Result<Vec<u8>, String> {
@@ -355,13 +382,16 @@ fn legacy_unprotect(_input: &[u8]) -> Result<Vec<u8>, String> {
 
 /// 迁移日志追加一行（与 GUI trace 同文件，无控制台环境也能排查）。
 fn trace_migrated(dir: &std::path::Path) {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            let log = d.join("harness_gui_trace.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(log) {
-                use std::io::Write;
-                let _ = writeln!(f, "[settings] migrated data dir -> {}", dir.display());
-            }
+    if let Some(d) = app_data_dir() {
+        let _ = std::fs::create_dir_all(&d);
+        let log = d.join("harness_gui_trace.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(log)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "[settings] migrated data dir -> {}", dir.display());
         }
     }
 }

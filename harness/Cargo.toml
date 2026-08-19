@@ -23,7 +23,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://example.com/deepseek-aidops-stable"
+repository = "https://github.com/cgli2/deepseek-aidops-client"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

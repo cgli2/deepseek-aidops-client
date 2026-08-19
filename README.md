@@ -128,10 +128,25 @@ sudo apt install build-essential pkg-config libxkbcommon-dev libssl-dev
 
 ```bash
 cd harness
-./scripts/build.sh package       # release 构建 → dist/aidops-desktop
+./scripts/build.sh package       # release 构建 → dist/AIOPS Desktop.app + DMG
 ```
 
-原生 Metal/OpenGL 与 AppKit 支持开箱即用，无额外依赖。首次运行如被 Gatekeeper 拦截，可用 `xattr -d com.apple.quarantine dist/aidops-desktop` 或右键打开。
+Bundle Identifier 为 `com.clotee.aidops`，Team ID 为 `VATCH8RNM8`。默认 `auto`
+模式会优先选择 `Developer ID Application`，否则使用已安装的团队开发证书，最后才回退
+ad-hoc。也可以通过 `MACOS_SIGNING_MODE=development|release|adhoc` 明确指定。
+
+正式 DMG 发布只接受 `Developer ID Application`，不会误用面向 App Store 的
+`Apple Distribution` 证书。签名并公证：
+
+```bash
+MACOS_SIGNING_MODE=release \
+MACOS_NOTARY_PROFILE="aidops-notary" \
+./scripts/build.sh package
+```
+
+`MACOS_NOTARY_PROFILE` 需提前通过 `xcrun notarytool store-credentials` 保存。
+设置 `MACOS_UNIVERSAL=1` 可同时构建 Apple Silicon 与 Intel 并合并为 Universal 2；
+默认只构建当前 Mac 的架构。可通过 `MACOS_BUILD_NUMBER` 覆盖 Bundle build number。
 
 ### iOS
 
@@ -162,10 +177,10 @@ $env:HARNESS_WORKSPACE = "D:\path\to\project"          # 可选；默认是启�
 
 ### 数据存放位置
 
-- **配置数据库**：默认存放在**可执行文件旁边** `DeepSeekAIOps\settings.db`（便携：程序拷走数据跟着走）；exe 目录不可写时回退 `%LOCALAPPDATA%\DeepSeekAIOps`（Windows），再回退当前目录。旧版本存于 `%LOCALAPPDATA%` 的数据会在首次启动时自动迁移（含密钥文件），迁移记录写入 `harness_gui_trace.log`。
+- **配置数据库**：macOS 使用 `~/Library/Application Support/com.clotee.aidops/settings.db`；Windows/Linux 默认存放在可执行文件旁边 `DeepSeekAIOps/settings.db`，不可写时回退平台目录或当前目录。旧版 Windows 数据会在首次启动时自动迁移（含密钥文件），迁移记录写入 `harness_gui_trace.log`。
 - **密钥文件**：`settings.key`（AES-256-GCM 本地密钥）与 `settings.db` 同目录，首次保存密钥时生成。
 - **会话日志**：按项目隔离，`<工作区>/.harness/sessions/*.jsonl`。
-- **启动诊断**：GUI 无控制台时的 trace 写到可执行文件旁的 `harness_gui_trace.log`。
+- **启动诊断**：macOS 写入上述 Application Support 目录；其他平台写到可执行文件旁的 `harness_gui_trace.log`。
 
 ### 钩子配置示例（借鉴 Codex Hooks）
 

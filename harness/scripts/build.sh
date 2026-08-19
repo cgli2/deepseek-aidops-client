@@ -26,6 +26,9 @@ fi
 cd "$SCRIPT_DIR/.."
 
 if [[ "${1:-}" == "package" ]]; then
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    exec "$SCRIPT_DIR/package-macos.sh"
+  fi
   echo "[build] cargo build --release --all-features"
   cargo build --release --all-features
   mkdir -p dist

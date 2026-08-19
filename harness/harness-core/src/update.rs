@@ -29,6 +29,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// exe 文件名主干（与 `bin/Cargo.toml` 的 `[[bin]] name` 一致）。
 /// 替换逻辑据此推导 `*-next.exe` / `*-old.exe`，改名不影响功能。
+#[cfg(windows)]
 const APP_EXE_STEM: &str = "aidops-desktop";
 
 /// 远端发布清单（清单 JSON 直接对应此结构）。
@@ -205,6 +206,7 @@ pub fn sha256_of(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", h.finalize()))
 }
 
+#[cfg(windows)]
 fn current_exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
@@ -256,6 +258,15 @@ pub fn spawn_check(
 
 /// 自动安装：下载新 exe 到 exe 旁 + 写 `.update-pending`，等待重启替换。
 pub fn spawn_download(status: Arc<Mutex<UpdateStatus>>, rel: Release) {
+    #[cfg(not(windows))]
+    {
+        let _ = rel;
+        if let Ok(mut g) = status.lock() {
+            *g = UpdateStatus::Error("当前平台请下载并安装新的应用包".into());
+        }
+        return;
+    }
+    #[cfg(windows)]
     std::thread::spawn(move || {
         if let Ok(mut g) = status.lock() {
             *g = UpdateStatus::Downloading;
@@ -277,7 +288,11 @@ pub fn spawn_download(status: Arc<Mutex<UpdateStatus>>, rel: Release) {
             return;
         }
         // 完整性校验（清单提供 sha256 时）。
-        if let Some(expected) = &rel.sha256 {
+        if let Some(expected) = rel
+            .sha256
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
             match sha256_of(&next) {
                 Ok(actual) if actual.eq_ignore_ascii_case(expected) => {}
                 Ok(actual) => {
@@ -314,10 +329,13 @@ pub fn open_url(url: &str) {
             .args(["/c", "start", "", url])
             .spawn();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-        let _ = url;
     }
 }
 

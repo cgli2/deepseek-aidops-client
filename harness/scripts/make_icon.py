@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""生成 aidops-desktop 的品牌化可执行文件图标 (icon.ico)。
+"""生成 aidops-desktop 的 Windows、macOS 和运行时图标。
 
 设计：圆角渐变底（深靛蓝 #2A3F8F -> 青色 #14B8C4）+ 白色 "ops" 字母组合。
 - 每个目标尺寸独立绘制（而非放大缩放），保证 16px 等小尺寸依旧清晰。
-- 输出为包含 16/24/32/48/64/128/256 多档分辨率的 Windows .ico。
+- 输出 Windows 多尺寸 .ico、macOS 1024px PNG 源图和 egui RGBA 数据。
 
 用法：
     python scripts/make_icon.py
 产物：
     harness/bin/assets/icon.ico
+    harness/bin/assets/icon_1024.png
 要换字母 / 配色 / 换成自己的 logo，改下面的 BRAND_TEXT / COLORS 或直接替换 icon.ico 即可。
 """
 import io
 import os
 import struct
+import sys
 from PIL import Image, ImageDraw, ImageFont
 
 ASSETS = os.path.join(os.path.dirname(__file__), "..", "bin", "assets")
 OUT = os.path.abspath(os.path.join(ASSETS, "icon.ico"))
+MAC_SOURCE = os.path.abspath(os.path.join(ASSETS, "icon_1024.png"))
+MAC_ICNS = os.path.abspath(os.path.join(ASSETS, "AppIcon.icns"))
 
 BRAND_TEXT = "ops"         # 字母组合（ops = AIOps，规避外部品牌商标风险）
 TOP = (42, 63, 143)        # 渐变顶部：深靛蓝 #2A3F8F
@@ -145,10 +149,22 @@ def save_rust(path: str, size: int) -> None:
 
 def main() -> None:
     os.makedirs(ASSETS, exist_ok=True)
+    if "--mac-only" in sys.argv:
+        mac_icon = render(1024)
+        mac_icon.save(MAC_SOURCE, format="PNG")
+        mac_icon.save(MAC_ICNS, format="ICNS")
+        print("wrote", os.path.normpath(MAC_SOURCE))
+        print("wrote", os.path.normpath(MAC_ICNS))
+        return
     frames = [render(s) for s in SIZES]
     save_ico(OUT, frames)
+    mac_icon = render(1024)
+    mac_icon.save(MAC_SOURCE, format="PNG")
+    mac_icon.save(MAC_ICNS, format="ICNS")
     save_rust(ICON_DATA_RS, ICON_DATA_SIZE)
     print("wrote", os.path.normpath(OUT), "sizes:", SIZES)
+    print("wrote", os.path.normpath(MAC_SOURCE))
+    print("wrote", os.path.normpath(MAC_ICNS))
     print("wrote", os.path.normpath(ICON_DATA_RS))
 
 

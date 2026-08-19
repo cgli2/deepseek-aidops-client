@@ -5,13 +5,14 @@
 //! - 深色/浅色主题切换，持久化到 SettingsDb（`ui.theme`）；
 //! - 经 `UiInputSink` 反向通道驱动后台 turn；轮询 `SessionLog` 渲染事件。
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use harness_core::event::EventBusView;
 use harness_core::ui_input::UiInputSink;
 use harness_core::Config;
 use harness_core::LlmControl;
-use harness_core::update::{Release, UpdateStatus};
+use harness_core::update::UpdateStatus;
 use harness_session::{SessionEvent, SessionLog, SessionMeta};
 
 use crate::Ui;
@@ -40,19 +41,18 @@ fn relative_time(t: &std::time::SystemTime) -> String {
     }
 }
 
-/// 诊断追踪：把关键事件追加到 exe 目录下的 `harness_gui_trace.log`。
+/// 诊断追踪：macOS 写 Application Support，其余平台写到 exe 目录。
 fn trace(line: &str) {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("harness_gui_trace.log");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&p)
-            {
-                let _ = writeln!(f, "[{}] {}", now_ms(), line);
-            }
+    if let Some(dir) = crate::settings::app_data_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("harness_gui_trace.log");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
+            let _ = writeln!(f, "[{}] {}", now_ms(), line);
         }
     }
 }
@@ -64,36 +64,113 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 加载 CJK 字体（egui 默认字体不含中文）。Windows 优先雅黑，回退黑体/宋体；
-/// 其它平台尝试常见 Noto/PingFang 路径。全部缺失时保持默认字体（仅拉丁字符）。
-fn install_cjk_fonts(ctx: &egui::Context) {
-    let candidates = [
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\simsun.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-    ];
-    let mut fonts = egui::FontDefinitions::default();
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "cjk".to_owned(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .insert(0, "cjk".to_owned());
-            }
-            trace(&format!("[fonts] loaded CJK font: {path}"));
-            break;
+#[cfg(target_os = "windows")]
+const CJK_FONT_CANDIDATES: &[&str] = &[
+    "C:\\Windows\\Fonts\\msyh.ttc",
+    "C:\\Windows\\Fonts\\simhei.ttf",
+    "C:\\Windows\\Fonts\\simsun.ttc",
+];
+
+#[cfg(target_os = "macos")]
+const CJK_FONT_CANDIDATES: &[&str] = &[
+    // 新版 macOS 的苹方位于 AssetsV2，运行时扫描；以下为离线/旧系统回退。
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
+    // 保留旧版 macOS 路径作为最后兼容项。
+    "/System/Library/Fonts/PingFang.ttc",
+];
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const CJK_FONT_CANDIDATES: &[&str] = &[
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+];
+
+#[cfg(target_os = "macos")]
+fn macos_pingfang_path() -> Option<PathBuf> {
+    let root = std::path::Path::new(
+        "/System/Library/AssetsV2/com_apple_MobileAsset_Font8",
+    );
+    std::fs::read_dir(root).ok()?.flatten().find_map(|entry| {
+        let path = entry.path().join("AssetData/PingFang.ttc");
+        path.is_file().then_some(path)
+    })
+}
+
+fn available_cjk_font() -> Option<(PathBuf, Vec<u8>)> {
+    #[cfg(target_os = "macos")]
+    if let Some(path) = macos_pingfang_path() {
+        if let Ok(bytes) = std::fs::read(&path) {
+            return Some((path, bytes));
         }
     }
+
+    CJK_FONT_CANDIDATES
+        .iter()
+        .find_map(|path| std::fs::read(path).ok().map(|bytes| (PathBuf::from(path), bytes)))
+}
+
+/// egui 默认字体不含中文，因此把操作系统 CJK 字体注册为比例和等宽族的 fallback。
+fn install_cjk_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // macOS 原生界面采用 SF Pro；中文由同一字体族中的 PingFang SC 补齐。
+    // 仅在 macOS 注入到族首，Windows 仍完整保留原有字体顺序与字形度量。
+    #[cfg(target_os = "macos")]
+    {
+        for (key, path, family) in [
+            ("mac-sf", "/System/Library/Fonts/SFNS.ttf", egui::FontFamily::Proportional),
+            ("mac-sf-mono", "/System/Library/Fonts/SFNSMono.ttf", egui::FontFamily::Monospace),
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts.font_data.insert(
+                    key.to_owned(),
+                    Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                fonts.families.entry(family).or_default().insert(0, key.to_owned());
+                trace(&format!("[fonts] loaded macOS UI font: {path}"));
+            }
+        }
+    }
+
+    if let Some((path, bytes)) = available_cjk_font() {
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let fonts_in_family = fonts.families.entry(family).or_default();
+            #[cfg(target_os = "macos")]
+            fonts_in_family.insert(1.min(fonts_in_family.len()), "cjk".to_owned());
+            #[cfg(not(target_os = "macos"))]
+            fonts_in_family.push("cjk".to_owned());
+        }
+        trace(&format!("[fonts] loaded CJK fallback: {}", path.display()));
+    } else {
+        trace(&format!(
+            "[fonts] no CJK font found; checked: {}",
+            CJK_FONT_CANDIDATES.join(", ")
+        ));
+    }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_ui_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.interact_size.y = 28.0;
+    ctx.set_style(style);
 }
 
 /// 主题调色板（深/浅两套）。
@@ -898,7 +975,7 @@ impl AppState {
     fn draw_update_banner(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let status = self.update_status.lock().map(|g| g.clone()).unwrap_or(UpdateStatus::Idle);
         // 读取升级策略：自动安装开启时，「立即升级」走下载+重启；否则打开下载页。
-        let auto_install = self
+        let auto_install = cfg!(windows) && self
             .host
             .settings
             .get("update.auto_install")
@@ -1043,10 +1120,12 @@ impl AppState {
         ui.add_space(8.0);
 
         let _ = ui.checkbox(&mut self.f_auto_check, "自动检查更新（启动后节流 24 小时）");
-        let _ = ui.checkbox(
-            &mut self.f_auto_install,
-            "自动下载并安装（发现新版本时后台下载，重启即生效）",
-        );
+        ui.add_enabled_ui(cfg!(windows), |ui| {
+            let _ = ui.checkbox(
+                &mut self.f_auto_install,
+                "自动下载并安装（当前仅 Windows 支持）",
+            );
+        });
         ui.add_space(10.0);
 
         ui.horizontal(|ui| {
@@ -1438,6 +1517,9 @@ fn nav_item(
     enabled: bool,
     accent: bool,
 ) -> bool {
+    #[cfg(target_os = "macos")]
+    let height = 38.0;
+    #[cfg(not(target_os = "macos"))]
     let height = 36.0;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
@@ -1460,11 +1542,48 @@ fn nav_item(
             egui::pos2(rect.min.x + 40.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(if cfg!(target_os = "macos") { 13.5 } else { 13.0 }),
             text_color,
         );
     }
     response.clicked() && enabled
+}
+
+#[cfg(target_os = "macos")]
+fn macos_theme_button(ui: &mut egui::Ui, pal: &Palette, dark: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(62.0, 26.0), egui::Sense::click());
+    let fill = if response.hovered() { pal.hover } else { pal.field };
+    ui.painter().rect(
+        rect,
+        egui::Rounding::same(6.0),
+        fill,
+        egui::Stroke::new(1.0, pal.border),
+    );
+
+    let icon_center = egui::pos2(rect.left() + 13.0, rect.center().y);
+    let stroke = egui::Stroke::new(1.25, if response.hovered() { pal.text } else { pal.dim });
+    if dark {
+        ui.painter().circle(icon_center, 3.5, egui::Color32::TRANSPARENT, stroke);
+        for i in 0..8 {
+            let angle = i as f32 * std::f32::consts::TAU / 8.0;
+            let direction = egui::vec2(angle.cos(), angle.sin());
+            ui.painter().line_segment(
+                [icon_center + direction * 5.5, icon_center + direction * 7.0],
+                stroke,
+            );
+        }
+    } else {
+        ui.painter().circle_filled(icon_center, 5.5, stroke.color);
+        ui.painter().circle_filled(icon_center + egui::vec2(2.5, -2.0), 5.0, fill);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 25.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        if dark { "浅色" } else { "深色" },
+        egui::FontId::proportional(12.0),
+        pal.text,
+    );
+    response.clicked()
 }
 
 /// 模态面板右上角关闭按钮（矢量 ✕，悬停微亮）。
@@ -2405,10 +2524,15 @@ impl eframe::App for AppState {
                 // 导航头色带：独立底色 + 底边主题色分隔线，与消息区拉开层次。
                 let head = egui::Frame::default()
                     .fill(pal.head_fill)
-                    .inner_margin(egui::Margin::symmetric(14.0, 5.0))
+                    .inner_margin(egui::Margin::symmetric(
+                        14.0,
+                        if cfg!(target_os = "macos") { 7.0 } else { 5.0 },
+                    ))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    #[cfg(target_os = "macos")]
+                    ui.set_min_height(26.0);
                     // 紧凑导航头：单行小标题，不再展示模型副标题。
                     ui.label(
                         egui::RichText::new("对话工作台")
@@ -2417,14 +2541,22 @@ impl eframe::App for AppState {
                             .color(pal.text),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        #[cfg(target_os = "macos")]
+                        let toggle_theme = macos_theme_button(ui, &pal, self.dark);
+                        #[cfg(not(target_os = "macos"))]
+                        let toggle_theme = {
                         let theme_label = if self.dark { "☀ 浅色" } else { "🌙 深色" };
-                        if ui.button(theme_label).clicked() {
+                            ui.button(theme_label).clicked()
+                        };
+                        if toggle_theme {
                             self.dark = !self.dark;
                             let _ = self
                                 .host
                                 .settings
                                 .set("ui.theme", if self.dark { "dark" } else { "light" });
                         }
+                        #[cfg(target_os = "macos")]
+                        ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(self.host.llm_control.status())
                                 .size(11.0)
@@ -2462,13 +2594,19 @@ impl eframe::App for AppState {
                                 let bubble = egui::Frame::default()
                                     .fill(fill)
                                     .rounding(egui::Rounding::same(10.0))
-                                    .inner_margin(egui::Margin::same(10.0))
+                                    .inner_margin(if cfg!(target_os = "macos") {
+                                        egui::Margin::symmetric(12.0, 10.0)
+                                    } else {
+                                        egui::Margin::same(10.0)
+                                    })
                                     .stroke(egui::Stroke::new(1.0_f32, pal.border));
                                 bubble.show(ui, |ui| {
                                     ui.set_max_width(max_w * 0.78);
                                     ui.label(
                                         egui::RichText::new(&msg.label).size(10.5).color(pal.dim),
                                     );
+                                    #[cfg(target_os = "macos")]
+                                    ui.add_space(2.0);
                                     // selectable(true)：正文支持鼠标拖选，选中后 Ctrl+C 复制。
                                     let resp = if msg.kind == "assistant" {
                                         // Markdown 富文本渲染：标题/加粗/列表/代码块转 LayoutJob；
@@ -2868,10 +3006,32 @@ impl Ui for EguiUi {
             options,
             Box::new(move |cc| {
                 install_cjk_fonts(&cc.egui_ctx);
+                #[cfg(target_os = "macos")]
+                install_macos_ui_style(&cc.egui_ctx);
                 Ok(Box::new(app))
             }),
         ) {
             trace(&format!("eframe::run_native ERR: {e}"));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_font_tests {
+    use super::*;
+
+    #[test]
+    fn system_cjk_font_is_loaded_and_contains_chinese_glyphs() {
+        let (path, _) = available_cjk_font().expect("macOS system CJK font is missing");
+        assert!(path.is_file());
+
+        let ctx = egui::Context::default();
+        install_cjk_fonts(&ctx);
+        ctx.begin_pass(Default::default());
+        let has_chinese = ctx.fonts(|fonts| {
+            fonts.has_glyphs(&egui::FontId::proportional(14.0), "中文界面")
+        });
+        let _ = ctx.end_pass();
+        assert!(has_chinese, "loaded font cannot render Chinese: {}", path.display());
     }
 }

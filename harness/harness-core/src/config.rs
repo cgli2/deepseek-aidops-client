@@ -188,6 +188,17 @@ fn config_candidates() -> Vec<String> {
                     .into_owned(),
             );
             v.push(dir.join("default.toml").to_string_lossy().into_owned());
+            #[cfg(target_os = "macos")]
+            if dir.file_name().is_some_and(|name| name == "MacOS") {
+                if let Some(contents) = dir.parent() {
+                    v.push(
+                        contents
+                            .join("Resources/config/default.toml")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
         }
     }
     v

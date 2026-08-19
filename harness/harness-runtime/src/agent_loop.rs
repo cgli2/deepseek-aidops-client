@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use harness_capability::assets::{ChatTurn, ConversationMemory};
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
 use harness_core::event::Waterfall;
 use harness_core::{error::Result, types::UserInput, AppContext};
@@ -48,7 +49,22 @@ impl AgentLoop {
             input: input.text.clone(),
         });
 
+        // 记忆自动沉淀（L0 工作记忆）：每个用户回合写入对话记忆（无后端则落本地文件）。
+        // 失败容忍——记忆写入不应影响正常对话流程。
+        if let Some(conv) = ctx.try_get::<dyn ConversationMemory>() {
+            let _ = conv
+                .record_turn(ChatTurn {
+                    session_id: log.id().to_string(),
+                    role: "user".into(),
+                    content: input.text.clone(),
+                    ts: String::new(),
+                })
+                .await;
+        }
+
         let mut debt: usize = 1;
+        // 跨步累积本轮助手最终文本，供回合结束时沉淀为 L0 记忆。
+        let mut last_assistant = String::new();
         messages.push(Message::user(&input.text));
         let max_steps = max_steps_limit();
         let mut steps = 0usize;
@@ -252,6 +268,7 @@ impl AgentLoop {
                     step_had_tools = true;
                 }
             }
+            last_assistant = assistant_text.clone();
             // 本步用量落盘：Usage 事件不进模型上下文、不影响多轮重建，
             // 仅用于会话级成本计量（usage_total）。
             if step_usage.total_tokens > 0 {
@@ -289,6 +306,20 @@ impl AgentLoop {
                 .await;
             if stop.will_stop {
                 break;
+            }
+        }
+
+        // 记忆自动沉淀（L0）：记录本轮助手最终回复（无后端则落本地文件）。失败容忍。
+        if !last_assistant.trim().is_empty() {
+            if let Some(conv) = ctx.try_get::<dyn ConversationMemory>() {
+                let _ = conv
+                    .record_turn(ChatTurn {
+                        session_id: log.id().to_string(),
+                        role: "assistant".into(),
+                        content: last_assistant.clone(),
+                        ts: String::new(),
+                    })
+                    .await;
             }
         }
 

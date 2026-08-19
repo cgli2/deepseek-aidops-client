@@ -8,6 +8,7 @@ members = [
   "harness-provider-sandbox",
   "harness-provider-wasm",
   "harness-provider-memory",
+  "harness-provider-aidops",
   "harness-provider-hook",
   "harness-provider-git",
   "harness-llm",

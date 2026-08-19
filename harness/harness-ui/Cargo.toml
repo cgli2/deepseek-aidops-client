@@ -15,6 +15,12 @@ rfd = "0.15"
 # 密钥加密：OS 无关的 AES-256-GCM（取代 Windows DPAPI，Linux/macOS 同样加密落盘）。
 aes-gcm = "0.10"
 rand = "0.8"
+# 记忆面板：反序列化本地原生记忆资产（facts/skills/wiki/codegraph）。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 记忆面板接后端实时查询：持有资产 Definition 服务 + 独立 tokio runtime 驱动异步查询。
+harness-capability = { path = "../harness-capability" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

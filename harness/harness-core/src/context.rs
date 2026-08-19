@@ -168,10 +168,15 @@ impl Drop for Registration {
         match &self.kind {
             RegistrationKind::Service { inner, tid } => {
                 if let Some(i) = inner.upgrade() {
-                    i.services
+                    // 退出路径防御：锁中毒（先前 panic 遗留）时恢复而非二次 panic → abort；
+                    // 且先释放写锁再 drop 被移除的服务（可能是持有 runtime 的重对象，
+                    // 持锁期间析构会放大任何析构异常的影响面）。
+                    let removed = i
+                        .services
                         .write()
-                        .expect("AppContext services RwLock poisoned")
-                        .remove(tid);
+                        .map(|mut g| g.remove(tid))
+                        .unwrap_or_else(|e| e.into_inner().remove(tid));
+                    drop(removed);
                 }
             }
             RegistrationKind::Handler {

@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use harness_capability::assets::{CodeGraph, ConversationMemory, SkillLibrary, WikiStore};
 use harness_capability::editor::Editor;
 use harness_capability::fs::Fs;
 use harness_capability::git::Git;
@@ -30,9 +31,11 @@ use harness_provider_git::GitCli;
 use harness_provider_hook::ShellHook;
 use harness_provider_local::{LocalBash, LocalEditor, LocalFs, LocalLsp, PollingFileWatcher};
 use harness_provider_memory::FileMemory;
+#[cfg(feature = "aidops")]
+use harness_provider_aidops::AidopsBackend;
 use harness_provider_sandbox::Sandbox;
 use harness_session::SessionLog;
-use harness_tool::{BashTool, DelegateTool, EditTool, FsTool, PlanTool, ToolRegistry};
+use harness_tool::{BashTool, DelegateTool, EditTool, FsTool, MemoryTool, PlanTool, ToolRegistry};
 use harness_ui::Ui;
 
 use harness_runtime::{InProcessSubagent, SessionController};
@@ -142,9 +145,8 @@ impl Plugin for HarnessPlugin {
         let sink: Arc<dyn UiInputSink> = Arc::new(controller);
         regs.push(ctx.provide(sink));
 
-        // UI（事件总线消费者；headless 用 NullUi）。
-        let ui: Arc<dyn Ui> = make_ui(self.profile, ctx, &self.config, &cwd, self.settings.clone());
-        regs.push(ctx.provide(ui.clone()));
+        // UI（事件总线消费者；headless 用 NullUi）在资产服务注册后再构建（见下方），
+        // 以便把四类记忆资产服务注入 GUI 记忆面板（后端实时查询）。
 
         // Codex 借鉴能力（记忆 / 钩子 / git）。均以"能力接缝"形式注入，Consumer 零耦合。
         let memory: Arc<dyn Memory> = FileMemory::new(cwd.clone());
@@ -153,6 +155,82 @@ impl Plugin for HarnessPlugin {
         regs.push(ctx.provide(hook.clone()));
         let git: Arc<dyn Git> = GitCli::new(cwd.clone());
         regs.push(ctx.provide(git.clone()));
+
+        // ---- 四类记忆资产（ChatMemory L0~L3 / Skill / Wiki / CodeGraph）----
+        // 原生实现始终构建（dsh 不接入 aidops 也能工作 → 约束 1）。
+        let native_conv = harness_provider_memory::NativeConversationMemory::new(cwd.clone());
+        let native_skill = harness_provider_memory::NativeSkillLibrary::new(cwd.clone());
+        let native_wiki = harness_provider_memory::NativeWikiStore::new(cwd.clone());
+        let native_code = harness_provider_memory::NativeCodeGraph::new(cwd.clone());
+
+        // 若配置了 aidops 后端（且编译期启用 `aidops` feature），用远程 Provider 包裹原生兜底；
+        // 否则直接注册原生 Provider。Consumer（MemoryTool / runtime）只见到 `Arc<dyn ...>`，零改动。
+        #[cfg(feature = "aidops")]
+        let (conv, skill, wiki, code) = {
+            let cfg = &self.config.aidops;
+            if cfg.enabled() {
+                let api_key = std::env::var(&cfg.api_key_env)
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| cfg.api_key.clone())
+                    .unwrap_or_default();
+                let backend = AidopsBackend::new(
+                    harness_provider_aidops::AidopsConfig {
+                        base_url: cfg.base_url.clone(),
+                        api_key_env: cfg.api_key_env.clone(),
+                        api_key: if api_key.is_empty() { None } else { Some(api_key) },
+                        project_id: cfg.project_id,
+                    },
+                    native_conv.clone(),
+                    native_skill.clone(),
+                    native_wiki.clone(),
+                    native_code.clone(),
+                );
+                (
+                    backend.clone() as Arc<dyn ConversationMemory>,
+                    backend.clone() as Arc<dyn SkillLibrary>,
+                    backend.clone() as Arc<dyn WikiStore>,
+                    backend as Arc<dyn CodeGraph>,
+                )
+            } else {
+                (
+                    native_conv.clone() as Arc<dyn ConversationMemory>,
+                    native_skill.clone() as Arc<dyn SkillLibrary>,
+                    native_wiki.clone() as Arc<dyn WikiStore>,
+                    native_code.clone() as Arc<dyn CodeGraph>,
+                )
+            }
+        };
+        #[cfg(not(feature = "aidops"))]
+        let (conv, skill, wiki, code) = (
+            native_conv.clone() as Arc<dyn ConversationMemory>,
+            native_skill.clone() as Arc<dyn SkillLibrary>,
+            native_wiki.clone() as Arc<dyn WikiStore>,
+            native_code.clone() as Arc<dyn CodeGraph>,
+        );
+
+        regs.push(ctx.provide(conv.clone()));
+        regs.push(ctx.provide(skill.clone()));
+        regs.push(ctx.provide(wiki.clone()));
+        regs.push(ctx.provide(code.clone()));
+
+        // UI（事件总线消费者；headless 用 NullUi）。资产服务已注册，一并注入 GUI
+        // 供记忆面板做后端实时查询（不连后端时服务即原生文件实现，面板展示本地）。
+        let ui: Arc<dyn Ui> = make_ui(
+            self.profile,
+            ctx,
+            &self.config,
+            &cwd,
+            self.settings.clone(),
+            conv.clone(),
+            skill.clone(),
+            wiki.clone(),
+            code.clone(),
+        );
+        regs.push(ctx.provide(ui.clone()));
+
+        // 记忆工具（Consumer）：让模型可显式查询/沉淀记忆与知识。
+        tools.register(MemoryTool::new(conv, skill, wiki, code));
 
         // M6：可替换的本地 LSP、文件监听与进程内子代理 Provider。
         let lsp_command =
@@ -244,6 +322,10 @@ fn make_ui(
     config: &Config,
     workspace: &std::path::Path,
     settings: Arc<harness_ui::SettingsDb>,
+    conv: Arc<dyn ConversationMemory>,
+    skill: Arc<dyn SkillLibrary>,
+    wiki: Arc<dyn WikiStore>,
+    code: Arc<dyn CodeGraph>,
 ) -> Arc<dyn Ui> {
     #[cfg(feature = "tui")]
     if profile == Profile::Tui {
@@ -265,6 +347,10 @@ fn make_ui(
             config.llm.base_url.clone(),
             config.llm.model.clone(),
             settings,
+            conv,
+            skill,
+            wiki,
+            code,
         ));
     }
     Arc::new(ConsoleUi)

@@ -2,6 +2,17 @@
 //!
 //! 存储布局：`<root>/.harness-memory/<scope>/<key>` —— 每个条目一个文件（内容为 value）。
 //! 写即落盘（追加友好、崩溃安全），并维护内存索引加速检索。可换成 SQLite / 向量库而不影响 Consumer。
+//!
+//! 另含 `assets_native`：四类记忆资产（ChatMemory / Skill / Wiki / CodeGraph）的**原生离线**实现，
+//! 是 dsh 不接入 aidops 后端时的兜底 Provider。
+
+mod assets_native;
+
+pub use assets_native::{
+    NativeCodeGraph, NativeConversationMemory, NativeSkillLibrary, NativeWikiStore,
+};
+// 索引器实现位于 Definition 层（harness-capability::index），不耦合具体 Provider；此处仅转发。
+pub use harness_capability::index::{bootstrap_assets, IndexStats};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

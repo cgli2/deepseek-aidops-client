@@ -19,6 +19,7 @@ harness-provider-local = { path = "../harness-provider-local" }
 harness-provider-sandbox = { path = "../harness-provider-sandbox" }
 harness-provider-wasm = { path = "../harness-provider-wasm" }
 harness-provider-memory = { path = "../harness-provider-memory" }
+harness-provider-aidops = { path = "../harness-provider-aidops", optional = true }
 harness-provider-hook = { path = "../harness-provider-hook" }
 harness-provider-git = { path = "../harness-provider-git" }
 harness-ui = { path = "../harness-ui" }
@@ -31,6 +32,7 @@ default = ["deepseek", "gui"]
 tui = ["harness-ui/tui"]
 gui = ["harness-ui/gui"]
 acp = ["harness-acp"]
+aidops = ["harness-provider-aidops"]
 wasm-tools = ["harness-provider-wasm/wasm-tools"]
 local-llm = ["harness-llm/local"]
 deepseek = ["harness-llm/deepseek"]

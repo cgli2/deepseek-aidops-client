@@ -1653,6 +1653,7 @@ dependencies = [
  "harness-capability",
  "harness-core",
  "harness-llm",
+ "harness-provider-aidops",
  "harness-provider-git",
  "harness-provider-hook",
  "harness-provider-local",
@@ -1712,6 +1713,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-provider-aidops"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "harness-capability",
+ "harness-core",
+ "harness-provider-memory",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "harness-provider-git"
 version = "0.1.0"
 dependencies = [
@@ -1745,8 +1760,12 @@ dependencies = [
 name = "harness-provider-memory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "harness-capability",
  "harness-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1835,6 +1854,7 @@ dependencies = [
  "crossterm",
  "eframe",
  "egui",
+ "harness-capability",
  "harness-core",
  "harness-llm",
  "harness-provider-wasm",
@@ -1844,6 +1864,9 @@ dependencies = [
  "ratatui",
  "rfd",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
  "windows-sys 0.52.0",
 ]
 
@@ -1987,7 +2010,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -3461,7 +3484,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -3575,6 +3598,7 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -4355,6 +4379,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5009,6 +5051,15 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "url",
  "web-sys",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

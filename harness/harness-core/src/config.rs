@@ -22,6 +22,51 @@ pub struct Config {
     /// 界面相关设置（见 `[ui]` 表）。
     #[serde(default)]
     pub ui: UiConfig,
+    /// 可选的后端记忆服务（智程平台 aidops）。不配置则 dsh 完全离线、使用原生文件记忆。
+    #[serde(default)]
+    pub aidops: AidopsConfig,
+}
+
+/// 可选后端（智程平台 aidops）连接配置（见 `[aidops]` 表）。
+///
+/// 仅当 `base_url` 非空时启用；启用后 dsh 把四类记忆资产同步到 aidops 后端，
+/// 后端不可达时自动回落原生文件实现（见 `harness-provider-aidops`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AidopsConfig {
+    /// 后端基址，如 `http://localhost:8000`。空串 = 不启用。
+    #[serde(default)]
+    pub base_url: String,
+    /// API key 所在环境变量名（不落盘 key 本身）。
+    #[serde(default = "default_aidops_key_env")]
+    pub api_key_env: String,
+    /// 字面量 key（可选，不推荐落盘）；优先级低于同名环境变量。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// 默认项目 id（单项目假设）；为 `None` 时所有后端调用回落原生。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i64>,
+}
+
+impl AidopsConfig {
+    /// 是否启用后端（仅当 `base_url` 非空）。空则 dsh 完全离线、使用原生文件记忆。
+    pub fn enabled(&self) -> bool {
+        !self.base_url.trim().is_empty()
+    }
+}
+
+impl Default for AidopsConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key_env: default_aidops_key_env(),
+            api_key: None,
+            project_id: None,
+        }
+    }
+}
+
+fn default_aidops_key_env() -> String {
+    "AIDOPS_API_KEY".into()
 }
 
 /// 界面设置（`[ui]` 表）。
@@ -99,6 +144,12 @@ impl Default for Config {
             permission_preset: default_preset(),
             hooks: HashMap::new(),
             ui: UiConfig { profile: None },
+            aidops: AidopsConfig {
+                base_url: String::new(),
+                api_key_env: default_aidops_key_env(),
+                api_key: None,
+                project_id: None,
+            },
         }
     }
 }

@@ -7,6 +7,7 @@ mod bash;
 mod delegate;
 mod edit;
 mod fs;
+mod memory;
 mod plan;
 pub mod registry;
 
@@ -14,5 +15,6 @@ pub use bash::BashTool;
 pub use delegate::DelegateTool;
 pub use edit::EditTool;
 pub use fs::FsTool;
+pub use memory::MemoryTool;
 pub use plan::PlanTool;
 pub use registry::{DynTool, ToolRegistry};

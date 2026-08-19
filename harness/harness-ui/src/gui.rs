@@ -13,6 +13,9 @@ use harness_core::ui_input::UiInputSink;
 use harness_core::Config;
 use harness_core::LlmControl;
 use harness_core::update::UpdateStatus;
+use harness_capability::assets::{
+    CodeGraph, ConversationMemory, FactKind, SkillLibrary, WikiStore,
+};
 use harness_session::{SessionEvent, SessionLog, SessionMeta};
 
 use crate::Ui;
@@ -278,9 +281,61 @@ pub struct EguiUi {
     base_url: String,
     model: String,
     settings: Arc<crate::SettingsDb>,
+    /// 四类记忆资产 Definition 服务（由 compose 注入；连 aidops 后端时为远程实现，
+    /// 否则为原生文件实现）。记忆面板经此查询，自动反映后端/本地。
+    conv: Arc<dyn ConversationMemory>,
+    skill: Arc<dyn SkillLibrary>,
+    wiki: Arc<dyn WikiStore>,
+    code: Arc<dyn CodeGraph>,
+    /// 独立 tokio runtime（析构安全包装）：记忆面板驱动资产服务的异步查询（原生走文件 IO、
+    /// 后端走网络）。注意 GUI 事件循环本身运行在 `#[tokio::main]` 的 runtime 主线程内，
+    /// 不可在该线程直接 `block_on` 另一 runtime（会触发 "Cannot start a runtime from
+    /// within a runtime" 硬 panic → 闪退）。因此面板改为在**独立 OS 线程**里 `block_on`，
+    /// 结果经 mpsc 通道回传，GUI 线程只做同步 `recv()`，彻底规避重入 panic。
+    rt: UiRuntime,
+}
+
+/// 独立 tokio runtime 的析构安全包装。
+///
+/// 点右上角关闭窗口时，本对象可能在主 runtime（`#[tokio::main]`）的异步上下文中被 drop；
+/// tokio 禁止在该上下文 drop runtime（blocking 池无法安全关闭），直接 panic 并经
+/// services RwLock 中毒引发二次 panic → abort，表现为点关闭后卡顿数秒才退出。
+/// 修复：drop 时把 runtime move 到专用 OS 线程做有界关闭，任何上下文都安全。
+struct UiRuntime(Option<tokio::runtime::Runtime>);
+
+impl UiRuntime {
+    fn new(thread_name: &str) -> Self {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name(thread_name)
+            .build()
+            .expect("[harness-ui] 无法创建记忆查询 runtime");
+        Self(Some(rt))
+    }
+
+    fn handle(&self) -> tokio::runtime::Handle {
+        self.0
+            .as_ref()
+            .expect("[harness-ui] 记忆查询 runtime 已关闭")
+            .handle()
+            .clone()
+    }
+}
+
+impl Drop for UiRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            // 有界关闭（2s）：查询任务均为本地文件 IO，正常瞬间完成；
+            // 移交独立线程确保不在异步上下文中 drop runtime。
+            let _ = std::thread::Builder::new()
+                .name("harness-ui-mem-shutdown".into())
+                .spawn(move || rt.shutdown_timeout(std::time::Duration::from_secs(2)));
+        }
+    }
 }
 
 impl EguiUi {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sink: Arc<dyn UiInputSink>,
         llm_control: Arc<dyn LlmControl>,
@@ -289,6 +344,10 @@ impl EguiUi {
         base_url: String,
         model: String,
         settings: Arc<crate::SettingsDb>,
+        conv: Arc<dyn ConversationMemory>,
+        skill: Arc<dyn SkillLibrary>,
+        wiki: Arc<dyn WikiStore>,
+        code: Arc<dyn CodeGraph>,
     ) -> Self {
         Self {
             sink,
@@ -298,6 +357,11 @@ impl EguiUi {
             base_url,
             model,
             settings,
+            conv,
+            skill,
+            wiki,
+            code,
+            rt: UiRuntime::new("harness-ui-mem"),
         }
     }
 }
@@ -355,6 +419,10 @@ struct AppState {
     f_key: String,
     /// 思考档位 / 努力度（对齐 cc-switch thinkingLevelMap）：发给上游的 reasoning_effort 字符串。
     f_effort: String,
+    // aidops 后端连接配置表单（对应 Config.aidops；留空则仅用本地文件记忆）
+    f_aidops_base: String,
+    f_aidops_key: String,
+    f_aidops_project: String,
     profiles: Vec<String>,
     selected_profile: String,
     attachment: String,
@@ -392,6 +460,15 @@ struct AppState {
     f_update_channel: String,
     f_auto_check: bool,
     f_auto_install: bool,
+    // 记忆面板状态（浏览本地原生记忆资产）
+    mem_tab: String,
+    mem_query: String,
+    mem_loaded: bool,
+    mem_items: Vec<MemItem>,
+    /// 是否已对当前工作区执行过资产索引（首次打开记忆面板时自动执行一次）。
+    mem_bootstrapped: bool,
+    /// 最近一次索引/操作的反馈信息。
+    mem_index_msg: String,
 }
 
 impl AppState {
@@ -428,6 +505,17 @@ impl AppState {
             f_model: host.model.clone(),
             f_key: String::new(),
             f_effort: settings.get("llm.reasoning_effort").unwrap_or_default(),
+            // aidops 后端连接：从 .harness.toml 的 [aidops] 段加载（无则空，仅用本地记忆）。
+            f_aidops_base: Config::load().map(|c| c.aidops.base_url).unwrap_or_default(),
+            f_aidops_key: Config::load()
+                .ok()
+                .and_then(|c| c.aidops.api_key)
+                .unwrap_or_default(),
+            f_aidops_project: Config::load()
+                .ok()
+                .and_then(|c| c.aidops.project_id)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             selected_profile: String::new(),
             attachment: String::new(),
             permission: settings
@@ -505,20 +593,193 @@ impl AppState {
             f_update_channel: settings
                 .get("update.channel")
                 .unwrap_or_else(|| "stable".into()),
-            f_auto_check: settings
-                .get("update.auto_check")
-                .map(|v| v == "true")
-                .unwrap_or(true),
-            f_auto_install: settings
-                .get("update.auto_install")
-                .map(|v| v == "true")
-                .unwrap_or(false),
+    f_auto_check: settings
+        .get("update.auto_check")
+        .map(|v| v == "true")
+        .unwrap_or(true),
+    f_auto_install: settings
+        .get("update.auto_install")
+        .map(|v| v == "true")
+        .unwrap_or(false),
+    // 记忆面板状态（浏览本地原生记忆资产）
+    mem_tab: String::new(),
+    mem_query: String::new(),
+    mem_loaded: false,
+    mem_items: Vec::new(),
+    mem_bootstrapped: false,
+    mem_index_msg: String::new(),
             // host/log 放最后：上方字段仍需借用 host.settings，提前移入会报 E0505。
             host,
             log,
         };
         state.refresh_history();
         state
+    }
+
+    /// 经 `host.rt` 独立 runtime 查询四类资产服务，把结果填充到 `mem_items`。
+    /// 查询为空时列出全部（list_*），否则按关键词匹配（match/query），保证面板默认可见。
+    fn refresh_mem(&mut self) {
+        let tab = self.mem_tab.clone();
+        let query = self.mem_query.clone();
+        // 会话 id 去掉 `.jsonl` 后缀：`recent_turns` 内部会自行拼接扩展名，
+        // 带后缀会拼出 `xxx.jsonl.jsonl` 永远读不到文件，对话记忆轮次恒空。
+        let session = self.current_session.trim_end_matches(".jsonl").to_string();
+        let conv = self.host.conv.clone();
+        let skill = self.host.skill.clone();
+        let wiki = self.host.wiki.clone();
+        let code = self.host.code.clone();
+        // 关键修复：GUI 线程已处于 tokio 主 runtime 内，直接 block_on 会 panic 闪退。
+        // 改在独立 OS 线程里 block_on（该线程无 runtime context，不重入），结果经 mpsc 回传。
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<MemItem>>();
+        std::thread::spawn(move || {
+            let items = handle.block_on(async move {
+            let mut out: Vec<MemItem> = Vec::new();
+            match tab.as_str() {
+                "chat" => {
+                    if let Ok(facts) = conv.list_facts().await {
+                        for f in facts {
+                            let kind_label = match f.kind {
+                                FactKind::Preference => "偏好",
+                                FactKind::Decision => "决策",
+                                _ => "事实",
+                            };
+                            out.push(MemItem {
+                                title: format!("[{}] {}", f.layer.as_str(), kind_label),
+                                meta: f.id,
+                                body: f.content,
+                            });
+                        }
+                    }
+                    if let Ok(turns) = conv.recent_turns(&session, 50).await {
+                        for t in turns {
+                            out.push(MemItem {
+                                title: format!("{} / {}", t.role, t.session_id),
+                                meta: t.ts,
+                                body: t.content,
+                            });
+                        }
+                    }
+                }
+                "skill" => {
+                    let skills = if query.trim().is_empty() {
+                        skill.list_skills().await.unwrap_or_default()
+                    } else {
+                        skill.match_skills(&query).await.unwrap_or_default()
+                    };
+                    for s in skills {
+                        out.push(MemItem {
+                            title: format!("{} ({})", s.name, s.version),
+                            meta: s.id,
+                            body: format!(
+                                "触发边界: {}\n步骤: {}",
+                                s.trigger_boundary,
+                                s.steps.join("；")
+                            ),
+                        });
+                    }
+                }
+                "wiki" => {
+                    let pages = if query.trim().is_empty() {
+                        wiki.list_pages().await.unwrap_or_default()
+                    } else {
+                        wiki.query_pages(&query).await.unwrap_or_default()
+                    };
+                    for p in pages {
+                        let body: String = p.blocks.join("\n");
+                        let body = if body.chars().count() > 400 {
+                            format!("{}…", body.chars().take(400).collect::<String>())
+                        } else {
+                            body
+                        };
+                        out.push(MemItem {
+                            title: p.title,
+                            meta: format!("{} 个链接", p.links.len()),
+                            body,
+                        });
+                    }
+                }
+                "code" => {
+                    let syms = if query.trim().is_empty() {
+                        code.list_symbols().await.unwrap_or_default()
+                    } else {
+                        code.query_symbols(&query).await.unwrap_or_default()
+                    };
+                    for x in syms {
+                        out.push(MemItem {
+                            title: format!("{} @ {}", x.name, x.file),
+                            meta: x.kind,
+                            body: format!("{} ｜ 调用: {}", x.summary, x.calls.join(", ")),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            out
+            });
+            let _ = tx.send(items);
+        });
+        if let Ok(items) = rx.recv() {
+            self.mem_items = items;
+        }
+    }
+
+    /// 对当前工作区执行一次资产索引（扫描 SKILL.md / *.md / 源码 → Skill/Wiki/CodeGraph），
+    /// 并把已有对话文件合并为事实（consolidate 入口）。
+    /// 结果通过四类资产服务落盘（原生文件实现或 aidops 后端），并刷新面板。
+    fn bootstrap_mem(&mut self) {
+        let conv = self.host.conv.clone();
+        let skill = self.host.skill.clone();
+        let wiki = self.host.wiki.clone();
+        let code = self.host.code.clone();
+        let ws = self.host.workspace_root.clone();
+        let path = std::path::Path::new(&ws).to_path_buf();
+        // 同 refresh_mem：在独立 OS 线程 block_on，避免 GUI 线程重入 runtime 导致闪退。
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<
+            harness_core::error::Result<(harness_capability::index::IndexStats, usize)>,
+        >();
+        std::thread::spawn(move || {
+            let res = handle.block_on(async move {
+                let stats =
+                    harness_capability::index::bootstrap_assets(&skill, &wiki, &code, &path)
+                        .await?;
+                // 事实合并：全链路无人调用 `consolidate`（对话记忆面板恒空），
+                // 在 bootstrap 时对全部已有对话文件补做一次合并（按 id 去重、幂等）。
+                let mut facts = 0usize;
+                let conv_dir = path.join(".harness-memory").join("conversations");
+                if let Ok(entries) = std::fs::read_dir(&conv_dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.extension().is_some_and(|x| x == "jsonl") {
+                            if let Some(sid) = p.file_stem().and_then(|s| s.to_str()) {
+                                if let Ok(f) = conv.consolidate(sid).await {
+                                    facts += f.len();
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok((stats, facts))
+            });
+            let _ = tx.send(res);
+        });
+        match rx.recv() {
+            Ok(Ok((stats, facts))) => {
+                self.mem_index_msg = format!(
+                    "已索引：{} 技能 / {} 文档 / {} 符号 / {} 事实",
+                    stats.skills, stats.pages, stats.symbols, facts
+                );
+                self.mem_bootstrapped = true;
+                self.mem_loaded = false; // 强制刷新
+            }
+            Ok(Err(e)) => {
+                self.mem_index_msg = format!("索引失败: {e}");
+            }
+            Err(_) => {
+                self.mem_index_msg = "索引失败: 后台任务未返回结果".into();
+            }
+        }
     }
 
     fn push(&mut self, kind: &str, label: &str, text: &str) {
@@ -1722,6 +1983,18 @@ fn field_label(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     ui.add_space(3.0);
 }
 
+// ── 记忆面板：浏览本地原生记忆资产（与 harness-provider-memory 落盘结构一致）──
+// 注意：本面板读取 `<cwd>/.harness-memory` 下的本地文件，反映 dsh「不接入后端时的
+// 原生记忆」。若已配置并连接 aidops 后端，后端的记忆以远端为准，此处仅展示本地副本。
+
+#[derive(Clone)]
+struct MemItem {
+    title: String,
+    meta: String,
+    body: String,
+}
+
+
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_log();
@@ -1795,6 +2068,10 @@ impl eframe::App for AppState {
                 }
                 if nav_item(ui, &pal, Icon::Gear, "系统配置", self.sidebar_expanded, true, false) {
                     self.settings_page = "系统配置".into();
+                    self.settings_open = true;
+                }
+                if nav_item(ui, &pal, Icon::Layers, "记忆中心", self.sidebar_expanded, true, false) {
+                    self.settings_page = "记忆".into();
                     self.settings_open = true;
                 }
                 if nav_item(ui, &pal, Icon::Update, "检查更新", self.sidebar_expanded, true, false) {
@@ -2546,7 +2823,7 @@ impl eframe::App for AppState {
                         #[cfg(not(target_os = "macos"))]
                         let toggle_theme = {
                         let theme_label = if self.dark { "☀ 浅色" } else { "🌙 深色" };
-                            ui.button(theme_label).clicked()
+                        ui.button(theme_label).clicked()
                         };
                         if toggle_theme {
                             self.dark = !self.dark;
@@ -2872,6 +3149,108 @@ impl eframe::App for AppState {
                                             .color(pal.dim),
                                         );
                                     }
+                                    "记忆" => {
+                                        // 标签切换：对话记忆 / 技能 / 知识库 / 代码图谱
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (t, label) in [
+                                                ("chat", "对话记忆"),
+                                                ("skill", "技能"),
+                                                ("wiki", "知识库"),
+                                                ("code", "代码图谱"),
+                                            ] {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.mem_tab,
+                                                        t.to_string(),
+                                                        label,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.mem_loaded = false;
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("搜索").size(12.0).color(pal.dim),
+                                            );
+                                            if ui
+                                                .text_edit_singleline(&mut self.mem_query)
+                                                .changed()
+                                            {
+                                                self.mem_loaded = false;
+                                            }
+                                        });
+                                        ui.add_space(6.0);
+                                        if self.mem_tab.is_empty() {
+                                            self.mem_tab = "chat".into();
+                                        }
+                                        if !self.mem_loaded {
+                                            // 首次打开：自动对当前工作区做一次资产索引
+                                            //（扫描 SKILL.md / *.md / 源码 → Skill/Wiki/CodeGraph），
+                                            // 之后记忆面板才有真实内容可见。
+                                            if !self.mem_bootstrapped {
+                                                self.bootstrap_mem();
+                                            }
+                                            self.refresh_mem();
+                                            self.mem_loaded = true;
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if ghost_button(ui, &pal, "重新索引资产") {
+                                                self.bootstrap_mem();
+                                            }
+                                            if !self.mem_index_msg.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(&self.mem_index_msg)
+                                                        .size(11.0)
+                                                        .color(pal.dim),
+                                                );
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "共 {} 条 · 本地原生记忆（若已连接 aidops 后端，以远端为准）",
+                                                self.mem_items.len()
+                                            ))
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(6.0);
+                                        egui::ScrollArea::vertical().show(ui, |ui| {
+                                            if self.mem_items.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "暂无记忆。点击「重新索引资产」扫描工作区的 SKILL.md / 文档 / 源码，自动沉淀技能、知识库与代码图谱；对话中也会逐步沉淀对话记忆（L0~L3）。",
+                                                    )
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                                );
+                                            }
+                                            for it in &self.mem_items {
+                                                ui.group(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&it.title)
+                                                            .size(13.0)
+                                                            .color(pal.text)
+                                                            .strong(),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(&it.meta)
+                                                            .size(10.5)
+                                                            .color(pal.dim),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(&it.body)
+                                                            .size(12.0)
+                                                            .color(pal.text),
+                                                    );
+                                                });
+                                                ui.add_space(6.0);
+                                            }
+                                        });
+                                    }
                                     "更新" => {
                                         self.draw_update_settings(ui, &pal);
                                     }
@@ -2890,13 +3269,46 @@ impl eframe::App for AppState {
                                             self.save_preferences();
                                         }
                                         ui.add_space(10.0);
+                                        field_label(ui, &pal, "aidops 后端连接（可选）");
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "配置后 dsh 把四类记忆资产同步到智程平台；留空则仅用本地文件记忆，桌面可独立工作。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.f_aidops_base)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("后端地址，如 http://localhost:8000"),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.f_aidops_key)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("API Key（可选；亦可用环境变量 AIDOPS_API_KEY）")
+                                                .password(true),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.f_aidops_project)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("项目 ID（可选，整数）"),
+                                        );
+                                        ui.add_space(10.0);
                                         field_label(ui, &pal, "配置文件 .harness.toml");
                                         ui.horizontal(|ui| {
                                             if ghost_button(ui, &pal, "重新加载") {
                                                 match Config::load() {
                                                     Ok(cfg) => {
                                                         let _ = self.host.llm_control.reload_config(&cfg);
-                                                        self.note = "已从 .harness.toml 重新加载并应用模型配置".into();
+                                                        self.f_aidops_base = cfg.aidops.base_url;
+                                                        self.f_aidops_key =
+                                                            cfg.aidops.api_key.unwrap_or_default();
+                                                        self.f_aidops_project = cfg
+                                                            .aidops
+                                                            .project_id
+                                                            .map(|v| v.to_string())
+                                                            .unwrap_or_default();
+                                                        self.note = "已从 .harness.toml 重新加载并应用配置".into();
                                                     }
                                                     Err(e) => self.note = format!("加载失败: {e}"),
                                                 }
@@ -2909,9 +3321,18 @@ impl eframe::App for AppState {
                                                 // 不写入 api_key：密钥经 AES-256-GCM 加密存储，明文落盘会泄露；
                                                 // 热重载（reload_config）会回退到运行时缓存的 key。
                                                 cfg.llm.reasoning_effort = self.effort();
+                                                // aidops 后端连接（可选插件入口）：留空 base_url 即不启用。
+                                                cfg.aidops.base_url = self.f_aidops_base.trim().to_string();
+                                                cfg.aidops.api_key = if self.f_aidops_key.trim().is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(self.f_aidops_key.trim().to_string())
+                                                };
+                                                cfg.aidops.project_id =
+                                                    self.f_aidops_project.trim().parse::<i64>().ok();
                                                 match cfg.save_atomic(".harness.toml") {
                                                     Ok(()) => {
-                                                        self.note = "配置已原子写入 .harness.toml（临时文件 + rename）".into()
+                                                        self.note = "配置已原子写入 .harness.toml（含 [aidops]，临时文件 + rename）".into()
                                                     }
                                                     Err(e) => self.note = format!("写入失败: {e}"),
                                                 }
@@ -3033,5 +3454,46 @@ mod macos_font_tests {
         });
         let _ = ctx.end_pass();
         assert!(has_chinese, "loaded font cannot render Chinese: {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod close_safety_tests {
+    use super::*;
+
+    /// 根因锚定：裸 tokio Runtime 在异步上下文（如 `#[tokio::main]` 的 block_on 内）
+    /// 被 drop 会硬 panic。这正是旧代码点右上角关闭后卡顿/崩溃的来源。
+    #[test]
+    #[should_panic(expected = "Cannot drop a runtime in a context where blocking is not allowed")]
+    fn raw_runtime_drop_inside_block_on_panics() {
+        let outer = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        outer.block_on(async {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            drop(rt);
+        });
+    }
+
+    /// 回归守卫：`UiRuntime` 在同样的异步上下文中析构必须安全
+    ///（移交专用 OS 线程做有界关闭），保证关窗退出路径不再 panic。
+    #[test]
+    fn ui_runtime_drop_inside_async_context_is_safe() {
+        let outer = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        outer.block_on(async {
+            let rt = UiRuntime::new("harness-ui-mem-test");
+            // 确认 runtime 可用后再析构（跨 runtime 用 spawn+await，避免嵌套 block_on）。
+            let v = rt.handle().spawn(async { 1 + 1 }).await.unwrap();
+            assert_eq!(v, 2);
+            drop(rt);
+        });
+        drop(outer);
     }
 }

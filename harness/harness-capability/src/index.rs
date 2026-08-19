@@ -41,7 +41,9 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 /// 参与代码图谱抽取的文件扩展名。
-const CODE_EXTS: &[&str] = &["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h"];
+const CODE_EXTS: &[&str] = &[
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h",
+];
 
 /// 单次索引的全局上限，避免超大仓库卡死 UI。
 const MAX_FILES: usize = 800;
@@ -131,9 +133,7 @@ pub async fn bootstrap_assets(
     // ── 2. 知识库：所有 *.md ────────────────────────────────
     let mut pages: Vec<WikiPage> = Vec::new();
     walk_files(workspace, &mut |path, rel| {
-        if rel.ends_with(".md")
-            && !rel.eq_ignore_ascii_case("README.md")
-            && pages.len() < MAX_PAGES
+        if rel.ends_with(".md") && !rel.eq_ignore_ascii_case("README.md") && pages.len() < MAX_PAGES
         {
             if let Ok(content) = std::fs::read_to_string(path) {
                 pages.push(parse_wiki(rel, &content));
@@ -144,8 +144,7 @@ pub async fn bootstrap_assets(
         wiki.upsert_page(p.clone()).await?;
     }
     // 链接图谱：跨页面链接关系（best-effort）。
-    let page_ids: std::collections::HashSet<String> =
-        pages.iter().map(|p| p.id.clone()).collect();
+    let page_ids: std::collections::HashSet<String> = pages.iter().map(|p| p.id.clone()).collect();
     for p in &pages {
         for l in &p.links {
             if page_ids.contains(&l.target) {
@@ -201,11 +200,13 @@ fn parse_skill(rel: &str, content: &str) -> Skill {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("## ") {
             let head = rest.to_lowercase();
-            section = if head.contains("触发") || head.contains("trigger") || head.contains("边界") {
+            section = if head.contains("触发") || head.contains("trigger") || head.contains("边界")
+            {
                 Some("trigger")
             } else if head.contains("步骤") || head.contains("steps") || head.contains("执行") {
                 Some("steps")
-            } else if head.contains("验证") || head.contains("verify") || head.contains("检验") {
+            } else if head.contains("验证") || head.contains("verify") || head.contains("检验")
+            {
                 Some("verify")
             } else {
                 None
@@ -364,8 +365,9 @@ fn parse_code(rel: &str, content: &str) -> Vec<CodeSymbol> {
         } else if let Some((fid, fname)) = &current_fn {
             for callee in call_targets(line) {
                 if callee != *fname && def_names.contains(&callee) {
-                    if let Some(entry) =
-                        calls_map.iter_mut().find(|(id, _)| id.as_str() == fid.as_str())
+                    if let Some(entry) = calls_map
+                        .iter_mut()
+                        .find(|(id, _)| id.as_str() == fid.as_str())
                     {
                         entry.1.insert(callee);
                     }
@@ -390,7 +392,10 @@ fn def_name_of(line: &str) -> Option<String> {
     let take = |prefix: &str| {
         l.strip_prefix(prefix)
             .map(str::trim_start)
-            .and_then(|rest| rest.split(|c: char| !c.is_alphanumeric() && c != '_').next())
+            .and_then(|rest| {
+                rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+            })
             .filter(|n| !n.is_empty())
             .map(|n| n.to_string())
     };
@@ -451,8 +456,16 @@ fn call_targets(line: &str) -> Vec<String> {
             if i < chars.len() && chars[i] == '(' {
                 if !matches!(
                     ident.as_str(),
-                    "if" | "for" | "while" | "match" | "return" | "when" | "switch" | "catch"
-                        | "await" | "sizeof" | "typeof"
+                    "if" | "for"
+                        | "while"
+                        | "match"
+                        | "return"
+                        | "when"
+                        | "switch"
+                        | "catch"
+                        | "await"
+                        | "sizeof"
+                        | "typeof"
                 ) {
                     out.push(ident);
                 }

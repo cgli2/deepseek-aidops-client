@@ -4,8 +4,10 @@
 //! guest 只能调用 host 显式导入的 `env.host_log` / `env.shell_run`，不能直接触碰
 //! 文件系统 / 网络 / 进程（完成文档 §11.4 不变量：WASM 侧零直接能力）。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use harness_capability::shell::{Shell, ShellOutput, ShellRequest};
 use harness_core::error::{Error, Result};
@@ -16,6 +18,104 @@ use wasmtime::{Caller, Engine, Instance, Linker, Module, Store};
 /// 同时接受 `.wasm` 二进制与 `.wat` 文本（`Module::new` 两者都能解析），便于测试与脚本分发。
 pub struct WasmPluginLoader {
     engine: Engine,
+}
+
+/// 已启用插件的运行时容器。
+///
+/// 插件 ABI 极小且安全：可选导出 `on_load() -> ()` 和 `on_unload() -> ()`。
+/// 宿主只提供显式导入的 `env.host_log`；未额外授权时没有 Shell、文件或网络能力。
+pub struct WasmPluginRuntime {
+    loader: WasmPluginLoader,
+    active: Mutex<HashMap<String, ActivePlugin>>,
+}
+
+struct ActivePlugin {
+    store: Store<HostState>,
+    instance: Instance,
+}
+
+impl Default for WasmPluginRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WasmPluginRuntime {
+    pub fn new() -> Self {
+        Self {
+            loader: WasmPluginLoader::new(),
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 加载并启用插件；同一 id 已启用时不重复执行 on_load。
+    pub fn activate(&self, id: &str, path: &Path) -> Result<()> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| Error::PluginLoad("wasm runtime lock poisoned".into()))?;
+        if active.contains_key(id) {
+            return Ok(());
+        }
+        let (mut store, instance) = self.loader.load(path)?;
+        if let Ok(on_load) = instance.get_typed_func::<(), ()>(&mut store, "on_load") {
+            on_load
+                .call(&mut store, ())
+                .map_err(|e| Error::PluginLoad(format!("{id} on_load failed: {e}")))?;
+        }
+        active.insert(id.to_string(), ActivePlugin { store, instance });
+        Ok(())
+    }
+
+    /// 卸载插件；可选调用 `on_unload`，随后销毁 Store/Instance。
+    pub fn deactivate(&self, id: &str) -> Result<()> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| Error::PluginLoad("wasm runtime lock poisoned".into()))?;
+        if let Some(plugin) = active.get_mut(id) {
+            if let Ok(on_unload) = plugin
+                .instance
+                .get_typed_func::<(), ()>(&mut plugin.store, "on_unload")
+            {
+                on_unload
+                    .call(&mut plugin.store, ())
+                    .map_err(|e| Error::PluginLoad(format!("{id} on_unload failed: {e}")))?;
+            }
+        }
+        active.remove(id);
+        Ok(())
+    }
+
+    pub fn is_active(&self, id: &str) -> bool {
+        self.active
+            .lock()
+            .map(|items| items.contains_key(id))
+            .unwrap_or(false)
+    }
+
+    pub fn active_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .active
+            .lock()
+            .map(|items| items.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// 读取某插件经 host_log 写出的运行日志。
+    pub fn logs(&self, id: &str) -> Vec<String> {
+        self.active
+            .lock()
+            .ok()
+            .and_then(|items| {
+                items
+                    .get(id)
+                    .and_then(|p| p.store.data().guest_log.lock().ok().map(|log| log.clone()))
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl Default for WasmPluginLoader {
@@ -239,5 +339,23 @@ mod tests {
             .get_typed_func::<(), i32>(&mut store, "try_run")
             .unwrap();
         assert_eq!(try_run.call(&mut store, ()).unwrap(), -1);
+    }
+
+    #[test]
+    fn runtime_calls_lifecycle_and_tracks_activation() {
+        let wat = r#"
+            (module
+              (import "env" "host_log" (func $log (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "loaded")
+              (func (export "on_load") (call $log (i32.const 0) (i32.const 6))))
+        "#;
+        let path = write_temp("lifecycle.wat", wat);
+        let runtime = WasmPluginRuntime::new();
+        runtime.activate("test", &path).unwrap();
+        assert!(runtime.is_active("test"));
+        assert_eq!(runtime.logs("test"), ["loaded"]);
+        runtime.deactivate("test").unwrap();
+        assert!(!runtime.is_active("test"));
     }
 }

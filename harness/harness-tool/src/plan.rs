@@ -95,7 +95,10 @@ mod tests {
         assert!(res.ok);
         assert!(res.content.contains("[doing] 读代码"));
         assert!(res.content.contains("[pending] 写总结"));
-        let has_plan = log.replay().iter().any(|ev| matches!(ev, SessionEvent::PlanUpdate { .. }));
+        let has_plan = log
+            .replay()
+            .iter()
+            .any(|ev| matches!(ev, SessionEvent::PlanUpdate { .. }));
         assert!(has_plan);
     }
 

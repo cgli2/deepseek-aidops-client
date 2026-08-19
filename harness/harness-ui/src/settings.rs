@@ -93,7 +93,8 @@ impl SettingsDb {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS model_profiles(name TEXT PRIMARY KEY,provider TEXT NOT NULL,base_url TEXT NOT NULL,model TEXT NOT NULL,api_key BLOB NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);")
             .map_err(|e| format!("初始化模型配置失败: {e}"))?;
         // 旧库迁移：projects 表补 archived 列（已存在则忽略错误）。
-        let _ = conn.execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
+        let _ = conn
+            .execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
         Ok(Self {
             conn: Mutex::new(conn),
             path,
@@ -142,9 +143,9 @@ impl SettingsDb {
         let Ok(conn) = self.conn.lock() else {
             return vec![];
         };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT name,path,archived FROM projects ORDER BY last_opened_at DESC",
-        ) else {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT name,path,archived FROM projects ORDER BY last_opened_at DESC")
+        else {
             return vec![];
         };
         let Ok(rows) = stmt.query_map([], |row| {
@@ -160,10 +161,14 @@ impl SettingsDb {
     }
     /// 归档 / 取消归档项目（归档后侧栏隐藏，记录仍保留）。
     pub fn archive_project(&self, path: &str, archived: bool) -> Result<(), String> {
-        self.conn.lock().map_err(|_| "SQLite 锁异常".to_string())?.execute(
-            "UPDATE projects SET archived=?1 WHERE path=?2",
-            params![archived as i64, path],
-        ).map_err(|e| format!("归档项目失败: {e}"))?;
+        self.conn
+            .lock()
+            .map_err(|_| "SQLite 锁异常".to_string())?
+            .execute(
+                "UPDATE projects SET archived=?1 WHERE path=?2",
+                params![archived as i64, path],
+            )
+            .map_err(|e| format!("归档项目失败: {e}"))?;
         Ok(())
     }
     /// 读取全部已登记插件（内置 + 导入的 WASM）。
@@ -171,9 +176,9 @@ impl SettingsDb {
         let Ok(conn) = self.conn.lock() else {
             return vec![];
         };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id,name,enabled,config_json FROM plugins ORDER BY id",
-        ) else {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT id,name,enabled,config_json FROM plugins ORDER BY id")
+        else {
             return vec![];
         };
         let Ok(rows) = stmt.query_map([], |row| {
@@ -296,8 +301,8 @@ impl SettingsDb {
     fn protect(&self, input: &[u8]) -> Result<Vec<u8>, String> {
         use aes_gcm::aead::{Aead, KeyInit};
         let key = self.crypto_key()?;
-        let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
-            .map_err(|e| format!("加密初始化失败: {e}"))?;
+        let cipher =
+            aes_gcm::Aes256Gcm::new_from_slice(&key).map_err(|e| format!("加密初始化失败: {e}"))?;
         let mut nonce = [0u8; 12];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
         let ct = cipher

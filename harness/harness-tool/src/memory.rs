@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_capability::assets::{
-    ConversationMemory, FactKind, LifecycleLayer, SkillLibrary, WikiStore, CodeGraph,
+    CodeGraph, ConversationMemory, FactKind, LifecycleLayer, SkillLibrary, WikiStore,
 };
 use harness_core::error::Result;
 use harness_llm::{ToolCall, ToolResult};
@@ -98,9 +98,7 @@ impl crate::registry::DynTool for MemoryTool {
                     .unwrap_or(LifecycleLayer::L2);
                 let id = format!(
                     "fact:{}",
-                    args.get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("manual")
+                    args.get("id").and_then(|v| v.as_str()).unwrap_or("manual")
                 );
                 self.conv
                     .remember(harness_capability::assets::MemoryFact {
@@ -138,19 +136,31 @@ impl crate::registry::DynTool for MemoryTool {
                 match sub {
                     "callers_of" => {
                         let r = self.code.callers_of(id).await?;
-                        Ok(Self::ok(call, serde_json::to_string_pretty(&r).unwrap_or_default()))
+                        Ok(Self::ok(
+                            call,
+                            serde_json::to_string_pretty(&r).unwrap_or_default(),
+                        ))
                     }
                     "callees_of" => {
                         let r = self.code.callees_of(id).await?;
-                        Ok(Self::ok(call, serde_json::to_string_pretty(&r).unwrap_or_default()))
+                        Ok(Self::ok(
+                            call,
+                            serde_json::to_string_pretty(&r).unwrap_or_default(),
+                        ))
                     }
                     "impact_path" => {
                         let r = self.code.impact_path(id).await?;
-                        Ok(Self::ok(call, serde_json::to_string_pretty(&r).unwrap_or_default()))
+                        Ok(Self::ok(
+                            call,
+                            serde_json::to_string_pretty(&r).unwrap_or_default(),
+                        ))
                     }
                     _ => {
                         let r = self.code.query_symbols(query).await?;
-                        Ok(Self::ok(call, serde_json::to_string_pretty(&r).unwrap_or_default()))
+                        Ok(Self::ok(
+                            call,
+                            serde_json::to_string_pretty(&r).unwrap_or_default(),
+                        ))
                     }
                 }
             }

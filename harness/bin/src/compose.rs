@@ -27,13 +27,14 @@ use harness_core::AppContext;
 use harness_core::LlmControl;
 use harness_core::Registration;
 use harness_llm::LlmProvider;
+#[cfg(feature = "aidops")]
+use harness_provider_aidops::AidopsBackend;
 use harness_provider_git::GitCli;
 use harness_provider_hook::ShellHook;
 use harness_provider_local::{LocalBash, LocalEditor, LocalFs, LocalLsp, PollingFileWatcher};
 use harness_provider_memory::FileMemory;
-#[cfg(feature = "aidops")]
-use harness_provider_aidops::AidopsBackend;
 use harness_provider_sandbox::Sandbox;
+use harness_provider_wasm::WasmPluginRuntime;
 use harness_session::SessionLog;
 use harness_tool::{BashTool, DelegateTool, EditTool, FsTool, MemoryTool, PlanTool, ToolRegistry};
 use harness_ui::Ui;
@@ -178,7 +179,11 @@ impl Plugin for HarnessPlugin {
                     harness_provider_aidops::AidopsConfig {
                         base_url: cfg.base_url.clone(),
                         api_key_env: cfg.api_key_env.clone(),
-                        api_key: if api_key.is_empty() { None } else { Some(api_key) },
+                        api_key: if api_key.is_empty() {
+                            None
+                        } else {
+                            Some(api_key)
+                        },
                         project_id: cfg.project_id,
                     },
                     native_conv.clone(),
@@ -214,6 +219,18 @@ impl Plugin for HarnessPlugin {
         regs.push(ctx.provide(wiki.clone()));
         regs.push(ctx.provide(code.clone()));
 
+        // 用户导入的 WASM 插件：只加载数据库中“已启用”的项。运行时默认零直接能力，
+        // 插件仅在显式导出 on_load 时执行初始化；坏插件不会阻断主程序启动。
+        let wasm_plugins = Arc::new(WasmPluginRuntime::new());
+        for plugin in self.settings.plugins() {
+            if let Some(path) = plugin.path.filter(|_| plugin.enabled) {
+                if let Err(error) = wasm_plugins.activate(&plugin.id, std::path::Path::new(&path)) {
+                    eprintln!("[harness] WASM 插件 {} 未加载: {error}", plugin.name);
+                }
+            }
+        }
+        regs.push(ctx.provide(wasm_plugins.clone()));
+
         // UI（事件总线消费者；headless 用 NullUi）。资产服务已注册，一并注入 GUI
         // 供记忆面板做后端实时查询（不连后端时服务即原生文件实现，面板展示本地）。
         let ui: Arc<dyn Ui> = make_ui(
@@ -226,6 +243,7 @@ impl Plugin for HarnessPlugin {
             skill.clone(),
             wiki.clone(),
             code.clone(),
+            wasm_plugins,
         );
         regs.push(ctx.provide(ui.clone()));
 
@@ -326,6 +344,7 @@ fn make_ui(
     skill: Arc<dyn SkillLibrary>,
     wiki: Arc<dyn WikiStore>,
     code: Arc<dyn CodeGraph>,
+    wasm_plugins: Arc<WasmPluginRuntime>,
 ) -> Arc<dyn Ui> {
     #[cfg(feature = "tui")]
     if profile == Profile::Tui {
@@ -351,6 +370,7 @@ fn make_ui(
             skill,
             wiki,
             code,
+            wasm_plugins,
         ));
     }
     Arc::new(ConsoleUi)

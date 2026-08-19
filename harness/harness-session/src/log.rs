@@ -11,22 +11,57 @@ pub type SessionId = Uuid;
 /// 持久会话事件（turn/*、step/*、assistant/*、tool/*）。实时扩展点不写入日志（原 §5.6）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionEvent {
-    TurnStart { id: EventId, input: String },
-    PreStep { id: EventId, msg: Vec<Message> },
-    StepStart { id: EventId, step: usize },
-    StepEnd { id: EventId, step: usize },
-    Assistant { id: EventId, chunk: Chunk },
+    TurnStart {
+        id: EventId,
+        input: String,
+    },
+    PreStep {
+        id: EventId,
+        msg: Vec<Message>,
+    },
+    StepStart {
+        id: EventId,
+        step: usize,
+    },
+    StepEnd {
+        id: EventId,
+        step: usize,
+    },
+    Assistant {
+        id: EventId,
+        chunk: Chunk,
+    },
     /// 模型思考链增量：仅 UI「思考中」反馈，不进入模型上下文。
-    Thinking { id: EventId, text: String },
-    ToolCall { id: EventId, call: ToolCall },
-    ToolResult { id: EventId, result: ToolResult },
+    Thinking {
+        id: EventId,
+        text: String,
+    },
+    ToolCall {
+        id: EventId,
+        call: ToolCall,
+    },
+    ToolResult {
+        id: EventId,
+        result: ToolResult,
+    },
     /// plan 工具发布的结构化任务计划（长周期任务规划真相源）。
-    PlanUpdate { id: EventId, items: Vec<PlanItem> },
-    TurnStopping { id: EventId, will_stop: bool },
-    TurnEnd { id: EventId },
+    PlanUpdate {
+        id: EventId,
+        items: Vec<PlanItem>,
+    },
+    TurnStopping {
+        id: EventId,
+        will_stop: bool,
+    },
+    TurnEnd {
+        id: EventId,
+    },
     /// 一次请求的 token 用量（AIOps 成本计量）。由 agent 循环从 `Chunk.usage` 派生，
     /// 不进入模型上下文，不影响多轮重建（落在 `_ => {}` 分支）。
-    Usage { id: EventId, usage: Usage },
+    Usage {
+        id: EventId,
+        usage: Usage,
+    },
 }
 
 /// 计划条目（status ∈ pending / doing / done）。
@@ -262,7 +297,8 @@ impl SessionLog {
 
     /// 持久化目录（历史列表扫描用）。
     pub fn dir(&self) -> Option<std::path::PathBuf> {
-        self.path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        self.path()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
     /// 新建会话（「新建对话」）：换新 uuid 文件，旧会话文件原样保留，
@@ -413,18 +449,14 @@ fn session_title(path: &std::path::Path) -> Option<String> {
 }
 
 /// 扫描目录取 mtime 最新的 `.jsonl` 重建事件（坏行跳过）；无文件返回空集。
-fn load_latest(
-    dir: &std::path::Path,
-) -> (Vec<SessionEvent>, EventId, Option<std::path::PathBuf>) {
-    let latest = std::fs::read_dir(dir)
-        .ok()
-        .and_then(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
-        });
+fn load_latest(dir: &std::path::Path) -> (Vec<SessionEvent>, EventId, Option<std::path::PathBuf>) {
+    let latest = std::fs::read_dir(dir).ok().and_then(|entries| {
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    });
     let Some(path) = latest else {
         let _ = std::fs::create_dir_all(dir);
         return (Vec::new(), 0, None);
@@ -458,8 +490,7 @@ mod tests {
 
     #[test]
     fn open_latest_resumes_and_closes_interrupted_turn() {
-        let dir =
-            std::env::temp_dir().join(format!("harness-session-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("harness-session-test-{}", Uuid::new_v4()));
         let log = SessionLog::persistent(&dir);
         log.append(SessionEvent::TurnStart {
             id: log.gen_id(),
@@ -497,8 +528,7 @@ mod tests {
 
     #[test]
     fn fresh_keeps_old_session_and_history_supports_switch_delete_prune() {
-        let dir =
-            std::env::temp_dir().join(format!("harness-history-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("harness-history-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // 会话 A：一条完整回合。
@@ -543,13 +573,19 @@ mod tests {
             id: log.gen_id(),
             input: "追加消息".into(),
         });
-        assert!(log.replay().iter().any(
-            |e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "追加消息")
-        ));
+        assert!(log
+            .replay()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "追加消息")));
 
         // 删除会话：活跃文件不受影响。
         let metas = list_sessions(&dir);
-        let victim = metas.iter().find(|m| m.file != name_a).unwrap().file.clone();
+        let victim = metas
+            .iter()
+            .find(|m| m.file != name_a)
+            .unwrap()
+            .file
+            .clone();
         assert!(delete_session(&dir, &victim));
         assert_eq!(list_sessions(&dir).len(), 1);
 

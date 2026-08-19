@@ -1,5 +1,10 @@
 # Extension Cookbook（功能 → 扩展点映射）
 
+## WASM 快速试用
+
+可直接在“插件管理”点击“＋ 添加新插件”，选择
+`extensions/wasm-samples/hello-plugin.wat`。它仅输出加载/卸载日志，不申请 Shell、文件或网络能力，适合验证导入、启用和禁用流程。
+
 本文件是 dsh「一切皆插件」思想在 harness 中的落地契约（完成文档 §11.3 / §11.5）。
 
 **判定标准（可验证）**：每一个产品功能都必须映射到 `harness_core::extension::ExtensionPoint`

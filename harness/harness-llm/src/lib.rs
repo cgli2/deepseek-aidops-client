@@ -267,11 +267,7 @@ impl harness_core::LlmControl for ManagedLlm {
         // 文件缺密钥时回退到运行时已缓存的 key（DPAPI 密钥不落 TOML）。
         let key = match &llm.api_key {
             Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-            _ => self
-                .key
-                .read()
-                .map(|k| k.clone())
-                .unwrap_or_default(),
+            _ => self.key.read().map(|k| k.clone()).unwrap_or_default(),
         };
         if key.is_empty() {
             return Err("运行时无可用 API Key；请先在设置页配置密钥再热重载".into());
@@ -305,7 +301,12 @@ mod managed_tests {
             .configure_deepseek("bad".into(), "deepseek-chat".into(), "key".into(), None)
             .is_err());
         assert!(managed
-            .configure_deepseek("https://api.deepseek.com".into(), "".into(), "key".into(), None)
+            .configure_deepseek(
+                "https://api.deepseek.com".into(),
+                "".into(),
+                "key".into(),
+                None
+            )
             .is_err());
         assert!(managed
             .configure_deepseek(

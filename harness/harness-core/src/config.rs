@@ -91,7 +91,11 @@ pub struct LlmConfig {
     /// 字面量 key（可选，不推荐落盘）。优先级低于同名环境变量 `api_key_env`。
     /// 别名 `DEEPSEEK_API_KEY`：若你在 toml 里直接写成 `DEEPSEEK_API_KEY = "sk-..."`，
     /// 也会被本字段接收（无需改字段名）。
-    #[serde(default, alias = "DEEPSEEK_API_KEY", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "DEEPSEEK_API_KEY",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub api_key: Option<String>,
     /// 思考档位 / 努力度（对齐 cc-switch 的 thinkingLevelMap）：发送给上游的字符串值，
     /// 如 `"low"` / `"medium"` / `"high"` / `"xhigh"` / `"max"`，`null`/None 表示不设置、由模型默认。
@@ -314,10 +318,7 @@ mod tests {
         let text = std::fs::read_to_string(p).unwrap();
         let reloaded = Config::from_toml(&text).unwrap();
         assert_eq!(reloaded.llm.model, "deepseek-reasoner");
-        assert_eq!(
-            reloaded.llm.reasoning_effort.as_deref(),
-            Some("high")
-        );
+        assert_eq!(reloaded.llm.reasoning_effort.as_deref(), Some("high"));
         // 未知字段必须保留
         let parsed: toml::Table = toml::from_str(&text).unwrap();
         assert_eq!(
@@ -339,13 +340,11 @@ mod tests {
         let parsed: toml::Table = toml::from_str(&text).unwrap();
         assert!(parsed.get("api_key").is_none());
         assert!(parsed.get("reasoning_effort").is_none());
-        assert!(
-            parsed
-                .get("ui")
-                .and_then(|v| v.as_table())
-                .and_then(|t| t.get("profile"))
-                .is_none()
-        );
+        assert!(parsed
+            .get("ui")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("profile"))
+            .is_none());
         // api_key_env 作为普通字段仍应写出
         assert!(parsed.get("llm").is_some());
     }

@@ -52,9 +52,7 @@ impl Shell for LocalBash {
             })
             .unwrap_or_else(|| ws_root.clone());
         let cwd = cwd.canonicalize()?;
-        let root = ws_root
-            .canonicalize()
-            .unwrap_or(ws_root);
+        let root = ws_root.canonicalize().unwrap_or(ws_root);
         if !cwd.starts_with(&root) {
             return Err(harness_core::error::Error::SandboxDenied(format!(
                 "cwd is outside workspace: {}",

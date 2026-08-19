@@ -170,7 +170,10 @@ pub fn check_for_update(
     let base = normalize_manifest_url(manifest_url);
     let url = manifest_url_with_channel(&base, channel);
     let client = http_client(std::time::Duration::from_secs(10))?;
-    let resp = client.get(&url).send().map_err(|e| format!("拉取清单失败: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("拉取清单失败: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("清单返回 HTTP {}", resp.status()));
     }
@@ -185,7 +188,10 @@ pub fn check_for_update(
 /// 下载文件到 dest（流式写入，避免大文件占内存）。
 pub fn download_file(url: &str, dest: &Path) -> Result<(), String> {
     let client = http_client(std::time::Duration::from_secs(300))?;
-    let resp = client.get(url).send().map_err(|e| format!("下载失败: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("下载失败: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("下载返回 HTTP {}", resp.status()));
     }
@@ -298,7 +304,9 @@ pub fn spawn_download(status: Arc<Mutex<UpdateStatus>>, rel: Release) {
                 Ok(actual) => {
                     let _ = std::fs::remove_file(&next);
                     if let Ok(mut g) = status.lock() {
-                        *g = UpdateStatus::Error(format!("校验失败：期望 {expected}，实际 {actual}"));
+                        *g = UpdateStatus::Error(format!(
+                            "校验失败：期望 {expected}，实际 {actual}"
+                        ));
                     }
                     return;
                 }

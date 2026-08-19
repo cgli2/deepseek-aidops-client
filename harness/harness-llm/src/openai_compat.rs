@@ -26,9 +26,7 @@ pub fn stream_chat(
 ) -> ChunkStream {
     // 出口统一 DSML 过滤：DeepSeek-v4 原生 DSML 工具调用文本会被解析为 ToolCall，
     // 不再裸显进回复正文，且工具真正得到执行。
-    crate::dsml::filter_stream(inner_stream_chat(
-        provider_label, base_url, api_key, body,
-    ))
+    crate::dsml::filter_stream(inner_stream_chat(provider_label, base_url, api_key, body))
 }
 
 fn inner_stream_chat(

@@ -44,6 +44,10 @@ if "%~1"=="package" (
     exit /b 1
   )
   if exist extensions\EXTENSION-COOKBOOK.md copy /Y extensions\EXTENSION-COOKBOOK.md dist\ >nul
+  if exist extensions\wasm-samples\hello-plugin.wat (
+    if not exist dist\wasm-samples mkdir dist\wasm-samples
+    copy /Y extensions\wasm-samples\hello-plugin.wat dist\wasm-samples\ >nul
+  )
   echo [build] packaged -^> dist\aidops-desktop.exe
   echo [build] full log: build.log
   exit /b 0

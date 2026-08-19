@@ -8,14 +8,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use harness_core::event::EventBusView;
-use harness_core::ui_input::UiInputSink;
-use harness_core::Config;
-use harness_core::LlmControl;
-use harness_core::update::UpdateStatus;
 use harness_capability::assets::{
     CodeGraph, ConversationMemory, FactKind, SkillLibrary, WikiStore,
 };
+use harness_core::event::EventBusView;
+use harness_core::ui_input::UiInputSink;
+use harness_core::update::UpdateStatus;
+use harness_core::Config;
+use harness_core::LlmControl;
 use harness_session::{SessionEvent, SessionLog, SessionMeta};
 
 use crate::Ui;
@@ -96,9 +96,7 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
 
 #[cfg(target_os = "macos")]
 fn macos_pingfang_path() -> Option<PathBuf> {
-    let root = std::path::Path::new(
-        "/System/Library/AssetsV2/com_apple_MobileAsset_Font8",
-    );
+    let root = std::path::Path::new("/System/Library/AssetsV2/com_apple_MobileAsset_Font8");
     std::fs::read_dir(root).ok()?.flatten().find_map(|entry| {
         let path = entry.path().join("AssetData/PingFang.ttc");
         path.is_file().then_some(path)
@@ -113,9 +111,11 @@ fn available_cjk_font() -> Option<(PathBuf, Vec<u8>)> {
         }
     }
 
-    CJK_FONT_CANDIDATES
-        .iter()
-        .find_map(|path| std::fs::read(path).ok().map(|bytes| (PathBuf::from(path), bytes)))
+    CJK_FONT_CANDIDATES.iter().find_map(|path| {
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| (PathBuf::from(path), bytes))
+    })
 }
 
 /// egui 默认字体不含中文，因此把操作系统 CJK 字体注册为比例和等宽族的 fallback。
@@ -127,15 +127,26 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     #[cfg(target_os = "macos")]
     {
         for (key, path, family) in [
-            ("mac-sf", "/System/Library/Fonts/SFNS.ttf", egui::FontFamily::Proportional),
-            ("mac-sf-mono", "/System/Library/Fonts/SFNSMono.ttf", egui::FontFamily::Monospace),
+            (
+                "mac-sf",
+                "/System/Library/Fonts/SFNS.ttf",
+                egui::FontFamily::Proportional,
+            ),
+            (
+                "mac-sf-mono",
+                "/System/Library/Fonts/SFNSMono.ttf",
+                egui::FontFamily::Monospace,
+            ),
         ] {
             if let Ok(bytes) = std::fs::read(path) {
-                fonts.font_data.insert(
-                    key.to_owned(),
-                    Arc::new(egui::FontData::from_owned(bytes)),
-                );
-                fonts.families.entry(family).or_default().insert(0, key.to_owned());
+                fonts
+                    .font_data
+                    .insert(key.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, key.to_owned());
                 trace(&format!("[fonts] loaded macOS UI font: {path}"));
             }
         }
@@ -166,10 +177,18 @@ fn install_cjk_fonts(ctx: &egui::Context) {
 #[cfg(target_os = "macos")]
 fn install_macos_ui_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
-    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
-    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.interact_size.y = 28.0;
@@ -287,6 +306,8 @@ pub struct EguiUi {
     skill: Arc<dyn SkillLibrary>,
     wiki: Arc<dyn WikiStore>,
     code: Arc<dyn CodeGraph>,
+    /// WASM 插件运行时：导入/启用即时生效，禁用/移除立即卸载实例。
+    wasm_plugins: Arc<harness_provider_wasm::WasmPluginRuntime>,
     /// 独立 tokio runtime（析构安全包装）：记忆面板驱动资产服务的异步查询（原生走文件 IO、
     /// 后端走网络）。注意 GUI 事件循环本身运行在 `#[tokio::main]` 的 runtime 主线程内，
     /// 不可在该线程直接 `block_on` 另一 runtime（会触发 "Cannot start a runtime from
@@ -348,6 +369,7 @@ impl EguiUi {
         skill: Arc<dyn SkillLibrary>,
         wiki: Arc<dyn WikiStore>,
         code: Arc<dyn CodeGraph>,
+        wasm_plugins: Arc<harness_provider_wasm::WasmPluginRuntime>,
     ) -> Self {
         Self {
             sink,
@@ -361,6 +383,7 @@ impl EguiUi {
             skill,
             wiki,
             code,
+            wasm_plugins,
             rt: UiRuntime::new("harness-ui-mem"),
         }
     }
@@ -385,6 +408,8 @@ struct PluginUiRow {
     /// 核心内置插件：默认启用且不可取消（系统必须保留必要能力）。
     core: bool,
     enabled: bool,
+    /// 已实例化并执行 on_load，才算真正运行中。
+    active: bool,
 }
 
 /// 核心内置插件（id, 名称, 描述）：默认勾选，禁止全部取消。
@@ -506,7 +531,9 @@ impl AppState {
             f_key: String::new(),
             f_effort: settings.get("llm.reasoning_effort").unwrap_or_default(),
             // aidops 后端连接：从 .harness.toml 的 [aidops] 段加载（无则空，仅用本地记忆）。
-            f_aidops_base: Config::load().map(|c| c.aidops.base_url).unwrap_or_default(),
+            f_aidops_base: Config::load()
+                .map(|c| c.aidops.base_url)
+                .unwrap_or_default(),
             f_aidops_key: Config::load()
                 .ok()
                 .and_then(|c| c.aidops.api_key)
@@ -521,7 +548,7 @@ impl AppState {
             permission: settings
                 .get("permission.mode")
                 .unwrap_or_else(|| "工作区写入".into()),
-            plugin_rows: Self::load_plugin_rows(settings),
+            plugin_rows: Self::load_plugin_rows(settings, &host.wasm_plugins),
             modal_panel_rect: None,
             modal_open_last_frame: false,
             last_event: 0,
@@ -563,9 +590,7 @@ impl AppState {
                     .get("update.last_check_ts")
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
-                if auto_check
-                    && harness_core::update::now_secs().saturating_sub(last) > 24 * 3600
-                {
+                if auto_check && harness_core::update::now_secs().saturating_sub(last) > 24 * 3600 {
                     let url = settings
                         .get("update.manifest_url")
                         .unwrap_or_else(|| harness_core::update::DEFAULT_MANIFEST_URL.to_string());
@@ -573,13 +598,7 @@ impl AppState {
                         .get("update.channel")
                         .unwrap_or_else(|| "stable".into());
                     let skip = settings.get("update.skipped_version").unwrap_or_default();
-                    harness_core::update::spawn_check(
-                        s.clone(),
-                        &url,
-                        &ch,
-                        &skip,
-                        false,
-                    );
+                    harness_core::update::spawn_check(s.clone(), &url, &ch, &skip, false);
                     let _ = settings.set(
                         "update.last_check_ts",
                         &harness_core::update::now_secs().to_string(),
@@ -593,21 +612,21 @@ impl AppState {
             f_update_channel: settings
                 .get("update.channel")
                 .unwrap_or_else(|| "stable".into()),
-    f_auto_check: settings
-        .get("update.auto_check")
-        .map(|v| v == "true")
-        .unwrap_or(true),
-    f_auto_install: settings
-        .get("update.auto_install")
-        .map(|v| v == "true")
-        .unwrap_or(false),
-    // 记忆面板状态（浏览本地原生记忆资产）
-    mem_tab: String::new(),
-    mem_query: String::new(),
-    mem_loaded: false,
-    mem_items: Vec::new(),
-    mem_bootstrapped: false,
-    mem_index_msg: String::new(),
+            f_auto_check: settings
+                .get("update.auto_check")
+                .map(|v| v == "true")
+                .unwrap_or(true),
+            f_auto_install: settings
+                .get("update.auto_install")
+                .map(|v| v == "true")
+                .unwrap_or(false),
+            // 记忆面板状态（浏览本地原生记忆资产）
+            mem_tab: String::new(),
+            mem_query: String::new(),
+            mem_loaded: false,
+            mem_items: Vec::new(),
+            mem_bootstrapped: false,
+            mem_index_msg: String::new(),
             // host/log 放最后：上方字段仍需借用 host.settings，提前移入会报 E0505。
             host,
             log,
@@ -634,88 +653,88 @@ impl AppState {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<MemItem>>();
         std::thread::spawn(move || {
             let items = handle.block_on(async move {
-            let mut out: Vec<MemItem> = Vec::new();
-            match tab.as_str() {
-                "chat" => {
-                    if let Ok(facts) = conv.list_facts().await {
-                        for f in facts {
-                            let kind_label = match f.kind {
-                                FactKind::Preference => "偏好",
-                                FactKind::Decision => "决策",
-                                _ => "事实",
+                let mut out: Vec<MemItem> = Vec::new();
+                match tab.as_str() {
+                    "chat" => {
+                        if let Ok(facts) = conv.list_facts().await {
+                            for f in facts {
+                                let kind_label = match f.kind {
+                                    FactKind::Preference => "偏好",
+                                    FactKind::Decision => "决策",
+                                    _ => "事实",
+                                };
+                                out.push(MemItem {
+                                    title: format!("[{}] {}", f.layer.as_str(), kind_label),
+                                    meta: f.id,
+                                    body: f.content,
+                                });
+                            }
+                        }
+                        if let Ok(turns) = conv.recent_turns(&session, 50).await {
+                            for t in turns {
+                                out.push(MemItem {
+                                    title: format!("{} / {}", t.role, t.session_id),
+                                    meta: t.ts,
+                                    body: t.content,
+                                });
+                            }
+                        }
+                    }
+                    "skill" => {
+                        let skills = if query.trim().is_empty() {
+                            skill.list_skills().await.unwrap_or_default()
+                        } else {
+                            skill.match_skills(&query).await.unwrap_or_default()
+                        };
+                        for s in skills {
+                            out.push(MemItem {
+                                title: format!("{} ({})", s.name, s.version),
+                                meta: s.id,
+                                body: format!(
+                                    "触发边界: {}\n步骤: {}",
+                                    s.trigger_boundary,
+                                    s.steps.join("；")
+                                ),
+                            });
+                        }
+                    }
+                    "wiki" => {
+                        let pages = if query.trim().is_empty() {
+                            wiki.list_pages().await.unwrap_or_default()
+                        } else {
+                            wiki.query_pages(&query).await.unwrap_or_default()
+                        };
+                        for p in pages {
+                            let body: String = p.blocks.join("\n");
+                            let body = if body.chars().count() > 400 {
+                                format!("{}…", body.chars().take(400).collect::<String>())
+                            } else {
+                                body
                             };
                             out.push(MemItem {
-                                title: format!("[{}] {}", f.layer.as_str(), kind_label),
-                                meta: f.id,
-                                body: f.content,
+                                title: p.title,
+                                meta: format!("{} 个链接", p.links.len()),
+                                body,
                             });
                         }
                     }
-                    if let Ok(turns) = conv.recent_turns(&session, 50).await {
-                        for t in turns {
-                            out.push(MemItem {
-                                title: format!("{} / {}", t.role, t.session_id),
-                                meta: t.ts,
-                                body: t.content,
-                            });
-                        }
-                    }
-                }
-                "skill" => {
-                    let skills = if query.trim().is_empty() {
-                        skill.list_skills().await.unwrap_or_default()
-                    } else {
-                        skill.match_skills(&query).await.unwrap_or_default()
-                    };
-                    for s in skills {
-                        out.push(MemItem {
-                            title: format!("{} ({})", s.name, s.version),
-                            meta: s.id,
-                            body: format!(
-                                "触发边界: {}\n步骤: {}",
-                                s.trigger_boundary,
-                                s.steps.join("；")
-                            ),
-                        });
-                    }
-                }
-                "wiki" => {
-                    let pages = if query.trim().is_empty() {
-                        wiki.list_pages().await.unwrap_or_default()
-                    } else {
-                        wiki.query_pages(&query).await.unwrap_or_default()
-                    };
-                    for p in pages {
-                        let body: String = p.blocks.join("\n");
-                        let body = if body.chars().count() > 400 {
-                            format!("{}…", body.chars().take(400).collect::<String>())
+                    "code" => {
+                        let syms = if query.trim().is_empty() {
+                            code.list_symbols().await.unwrap_or_default()
                         } else {
-                            body
+                            code.query_symbols(&query).await.unwrap_or_default()
                         };
-                        out.push(MemItem {
-                            title: p.title,
-                            meta: format!("{} 个链接", p.links.len()),
-                            body,
-                        });
+                        for x in syms {
+                            out.push(MemItem {
+                                title: format!("{} @ {}", x.name, x.file),
+                                meta: x.kind,
+                                body: format!("{} ｜ 调用: {}", x.summary, x.calls.join(", ")),
+                            });
+                        }
                     }
+                    _ => {}
                 }
-                "code" => {
-                    let syms = if query.trim().is_empty() {
-                        code.list_symbols().await.unwrap_or_default()
-                    } else {
-                        code.query_symbols(&query).await.unwrap_or_default()
-                    };
-                    for x in syms {
-                        out.push(MemItem {
-                            title: format!("{} @ {}", x.name, x.file),
-                            meta: x.kind,
-                            body: format!("{} ｜ 调用: {}", x.summary, x.calls.join(", ")),
-                        });
-                    }
-                }
-                _ => {}
-            }
-            out
+                out
             });
             let _ = tx.send(items);
         });
@@ -863,11 +882,7 @@ impl AppState {
                     self.push(
                         "tool",
                         "工具",
-                        &format!(
-                            "{} 返回: {}",
-                            if result.ok { "✓" } else { "✗" },
-                            preview
-                        ),
+                        &format!("{} 返回: {}", if result.ok { "✓" } else { "✗" }, preview),
                     );
                 }
                 SessionEvent::PlanUpdate { items, .. } => {
@@ -1043,7 +1058,10 @@ impl AppState {
     /// （对齐侧栏项目切换），再 SessionLog 切到该文件继续追加；
     /// poll_log 下帧从 0 重放全部消息流。忙碌时拒绝避免回合穿插。
     fn switch_session(&mut self, file: &str) {
-        trace(&format!("[session] restore attempt {file} busy={}", self.busy));
+        trace(&format!(
+            "[session] restore attempt {file} busy={}",
+            self.busy
+        ));
         if self.busy {
             return;
         }
@@ -1107,7 +1125,11 @@ impl AppState {
             .history
             .iter()
             .filter(|m| m.file != self.current_session)
-            .filter_map(|m| self.history_dirs.get(&m.file).map(|d| (m.file.clone(), d.clone())))
+            .filter_map(|m| {
+                self.history_dirs
+                    .get(&m.file)
+                    .map(|d| (m.file.clone(), d.clone()))
+            })
             .collect();
         for (f, dir) in &victims {
             harness_session::delete_session(dir, f);
@@ -1234,18 +1256,27 @@ impl AppState {
     // ── 版本更新：顶部横幅 ─────────────────────────────────────
     /// 中央面板顶部横幅：展示检查中 / 新版本提示 / 下载进度 / 待重启 / 错误。
     fn draw_update_banner(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let status = self.update_status.lock().map(|g| g.clone()).unwrap_or(UpdateStatus::Idle);
+        let status = self
+            .update_status
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(UpdateStatus::Idle);
         // 读取升级策略：自动安装开启时，「立即升级」走下载+重启；否则打开下载页。
-        let auto_install = cfg!(windows) && self
-            .host
-            .settings
-            .get("update.auto_install")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let auto_install = cfg!(windows)
+            && self
+                .host
+                .settings
+                .get("update.auto_install")
+                .map(|v| v == "true")
+                .unwrap_or(false);
         match status {
             UpdateStatus::Idle | UpdateStatus::UpToDate => {}
             UpdateStatus::Checking => {
-                ui.label(egui::RichText::new("正在检查更新…").size(12.0).color(pal.dim));
+                ui.label(
+                    egui::RichText::new("正在检查更新…")
+                        .size(12.0)
+                        .color(pal.dim),
+                );
                 ui.add_space(8.0);
             }
             UpdateStatus::Error(e) => {
@@ -1257,7 +1288,11 @@ impl AppState {
                 ui.add_space(8.0);
             }
             UpdateStatus::Downloading => {
-                ui.label(egui::RichText::new("正在下载新版本…").size(12.0).color(pal.accent));
+                ui.label(
+                    egui::RichText::new("正在下载新版本…")
+                        .size(12.0)
+                        .color(pal.accent),
+                );
                 ui.add_space(8.0);
             }
             UpdateStatus::ReadyToRestart { version, .. } => {
@@ -1313,9 +1348,7 @@ impl AppState {
                                 }
                             });
                             if let Some(notes) = &rel.notes {
-                                ui.label(
-                                    egui::RichText::new(notes).size(11.5).color(pal.dim),
-                                );
+                                ui.label(egui::RichText::new(notes).size(11.5).color(pal.dim));
                             }
                             ui.horizontal(|ui| {
                                 if auto_install {
@@ -1357,7 +1390,11 @@ impl AppState {
 
     /// 「更新」设置页：清单 URL / 通道 / 自动开关 / 立即检查 / 当前版本。
     fn draw_update_settings(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        field_label(ui, &pal, &format!("当前版本：v{}", harness_core::update::CURRENT_VERSION));
+        field_label(
+            ui,
+            &pal,
+            &format!("当前版本：v{}", harness_core::update::CURRENT_VERSION),
+        );
         ui.add_space(6.0);
 
         field_label(ui, &pal, "清单 URL（manifest.json）");
@@ -1465,7 +1502,10 @@ impl AppState {
     }
 
     /// 构建插件列表：核心内置恒启用（忽略历史禁用记录）；WASM 插件读持久化状态。
-    fn load_plugin_rows(settings: &crate::SettingsDb) -> Vec<PluginUiRow> {
+    fn load_plugin_rows(
+        settings: &crate::SettingsDb,
+        runtime: &harness_provider_wasm::WasmPluginRuntime,
+    ) -> Vec<PluginUiRow> {
         let mut rows: Vec<PluginUiRow> = BUILTIN_PLUGINS
             .iter()
             .map(|(id, name, desc)| PluginUiRow {
@@ -1474,16 +1514,19 @@ impl AppState {
                 desc: (*desc).into(),
                 core: true,
                 enabled: true,
+                active: true,
             })
             .collect();
         for p in settings.plugins() {
             if let Some(path) = p.path {
+                let active = runtime.is_active(&p.id);
                 rows.push(PluginUiRow {
                     id: p.id,
                     name: p.name,
                     desc: path,
                     core: false,
                     enabled: p.enabled,
+                    active,
                 });
             }
         }
@@ -1499,12 +1542,6 @@ impl AppState {
         else {
             return;
         };
-        // 导入前校验：沙箱内解析 + 实例化，字节码 / 导入表不合法直接拒绝。
-        let loader = harness_provider_wasm::WasmPluginLoader::new();
-        if let Err(e) = loader.load(&path) {
-            self.note = format!("插件校验失败: {e}");
-            return;
-        }
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1512,17 +1549,31 @@ impl AppState {
             .to_string();
         let id = format!("wasm:{stem}");
         let path_s = path.display().to_string();
+        // 真正启用：在零直接能力的 Wasmtime 容器中实例化并调用可选 on_load。
+        if let Err(e) = self.host.wasm_plugins.activate(&id, &path) {
+            self.note = format!("插件校验或启用失败: {e}");
+            return;
+        }
         if let Err(e) = self.host.settings.add_wasm_plugin(&id, &stem, &path_s) {
+            let _ = self.host.wasm_plugins.deactivate(&id);
             self.note = format!("登记插件失败: {e}");
             return;
         }
-        self.plugin_rows.push(PluginUiRow {
-            id,
-            name: stem.clone(),
-            desc: path_s,
-            core: false,
-            enabled: true,
-        });
+        if let Some(row) = self.plugin_rows.iter_mut().find(|row| row.id == id) {
+            row.name = stem.clone();
+            row.desc = path_s;
+            row.enabled = true;
+            row.active = true;
+        } else {
+            self.plugin_rows.push(PluginUiRow {
+                id,
+                name: stem.clone(),
+                desc: path_s,
+                core: false,
+                enabled: true,
+                active: true,
+            });
+        }
         self.note = format!("插件「{stem}」已通过沙箱校验并登记，默认启用");
     }
 }
@@ -1547,7 +1598,12 @@ fn draw_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color: egu
         // 对话气泡 + 内部文本线
         Icon::Chat => {
             let body = egui::Rect::from_min_size(r.min, egui::vec2(r.width(), r.height() * 0.7));
-            painter.rect(body, egui::Rounding::same(3.0), egui::Color32::TRANSPARENT, stroke);
+            painter.rect(
+                body,
+                egui::Rounding::same(3.0),
+                egui::Color32::TRANSPARENT,
+                stroke,
+            );
             painter.line_segment(
                 [
                     egui::pos2(body.min.x + 4.5, body.max.y),
@@ -1600,32 +1656,59 @@ fn draw_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color: egu
                 r.min + egui::vec2(0.0, 3.0),
                 egui::vec2(r.width() - 3.0, r.height() - 3.0),
             );
-            painter.rect(back, egui::Rounding::same(2.5), egui::Color32::TRANSPARENT, thin);
-            painter.rect(front, egui::Rounding::same(2.5), egui::Color32::TRANSPARENT, stroke);
+            painter.rect(
+                back,
+                egui::Rounding::same(2.5),
+                egui::Color32::TRANSPARENT,
+                thin,
+            );
+            painter.rect(
+                front,
+                egui::Rounding::same(2.5),
+                egui::Color32::TRANSPARENT,
+                stroke,
+            );
         }
         // 模型：芯片（内外框 + 四边引脚）
         Icon::Chip => {
             let c = r.center();
             let outer = egui::Rect::from_center_size(c, egui::vec2(10.5, 10.5));
             let inner = egui::Rect::from_center_size(c, egui::vec2(4.5, 4.5));
-            painter.rect(outer, egui::Rounding::same(2.0), egui::Color32::TRANSPARENT, stroke);
+            painter.rect(
+                outer,
+                egui::Rounding::same(2.0),
+                egui::Color32::TRANSPARENT,
+                stroke,
+            );
             painter.rect(inner, egui::Rounding::same(1.0), color, egui::Stroke::NONE);
             for i in 0..3 {
                 let off = -3.25 + i as f32 * 3.25;
                 painter.line_segment(
-                    [egui::pos2(c.x + off, outer.min.y - 2.5), egui::pos2(c.x + off, outer.min.y)],
+                    [
+                        egui::pos2(c.x + off, outer.min.y - 2.5),
+                        egui::pos2(c.x + off, outer.min.y),
+                    ],
                     thin,
                 );
                 painter.line_segment(
-                    [egui::pos2(c.x + off, outer.max.y), egui::pos2(c.x + off, outer.max.y + 2.5)],
+                    [
+                        egui::pos2(c.x + off, outer.max.y),
+                        egui::pos2(c.x + off, outer.max.y + 2.5),
+                    ],
                     thin,
                 );
                 painter.line_segment(
-                    [egui::pos2(outer.min.x - 2.5, c.y + off), egui::pos2(outer.min.x, c.y + off)],
+                    [
+                        egui::pos2(outer.min.x - 2.5, c.y + off),
+                        egui::pos2(outer.min.x, c.y + off),
+                    ],
                     thin,
                 );
                 painter.line_segment(
-                    [egui::pos2(outer.max.x, c.y + off), egui::pos2(outer.max.x + 2.5, c.y + off)],
+                    [
+                        egui::pos2(outer.max.x, c.y + off),
+                        egui::pos2(outer.max.x + 2.5, c.y + off),
+                    ],
                     thin,
                 );
             }
@@ -1691,11 +1774,17 @@ fn draw_trash_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32)
     let s = egui::Stroke::new(1.2_f32, color);
     // 盖沿 + 提手
     painter.line_segment(
-        [egui::pos2(c.x - 4.5, c.y - 2.8), egui::pos2(c.x + 4.5, c.y - 2.8)],
+        [
+            egui::pos2(c.x - 4.5, c.y - 2.8),
+            egui::pos2(c.x + 4.5, c.y - 2.8),
+        ],
         s,
     );
     painter.line_segment(
-        [egui::pos2(c.x - 1.8, c.y - 4.6), egui::pos2(c.x + 1.8, c.y - 4.6)],
+        [
+            egui::pos2(c.x - 1.8, c.y - 4.6),
+            egui::pos2(c.x + 1.8, c.y - 4.6),
+        ],
         s,
     );
     // 桶身（略收底）
@@ -1717,12 +1806,18 @@ fn draw_pencil_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32
     let s = egui::Stroke::new(1.2_f32, color);
     // 笔身（左下笔尖 → 右上笔尾）
     painter.line_segment(
-        [egui::pos2(c.x - 3.8, c.y + 3.8), egui::pos2(c.x + 3.4, c.y - 3.4)],
+        [
+            egui::pos2(c.x - 3.8, c.y + 3.8),
+            egui::pos2(c.x + 3.4, c.y - 3.4),
+        ],
         s,
     );
     // 笔尾加粗端
     painter.line_segment(
-        [egui::pos2(c.x + 2.2, c.y - 4.6), egui::pos2(c.x + 4.6, c.y - 2.2)],
+        [
+            egui::pos2(c.x + 2.2, c.y - 4.6),
+            egui::pos2(c.x + 4.6, c.y - 2.2),
+        ],
         s,
     );
     // 笔尖三角
@@ -1742,28 +1837,46 @@ fn draw_paperclip_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Colo
     let s = egui::Stroke::new(1.2_f32, color);
     // 外圈 U（左 → 下 → 右，右臂短）
     painter.line_segment(
-        [egui::pos2(c.x - 3.6, c.y - 3.8), egui::pos2(c.x - 3.6, c.y + 4.2)],
+        [
+            egui::pos2(c.x - 3.6, c.y - 3.8),
+            egui::pos2(c.x - 3.6, c.y + 4.2),
+        ],
         s,
     );
     painter.line_segment(
-        [egui::pos2(c.x - 3.6, c.y + 4.2), egui::pos2(c.x + 3.6, c.y + 4.2)],
+        [
+            egui::pos2(c.x - 3.6, c.y + 4.2),
+            egui::pos2(c.x + 3.6, c.y + 4.2),
+        ],
         s,
     );
     painter.line_segment(
-        [egui::pos2(c.x + 3.6, c.y + 4.2), egui::pos2(c.x + 3.6, c.y - 1.4)],
+        [
+            egui::pos2(c.x + 3.6, c.y + 4.2),
+            egui::pos2(c.x + 3.6, c.y - 1.4),
+        ],
         s,
     );
     // 内圈 U（更短，开口向上）
     painter.line_segment(
-        [egui::pos2(c.x - 1.6, c.y - 1.4), egui::pos2(c.x - 1.6, c.y + 2.0)],
+        [
+            egui::pos2(c.x - 1.6, c.y - 1.4),
+            egui::pos2(c.x - 1.6, c.y + 2.0),
+        ],
         s,
     );
     painter.line_segment(
-        [egui::pos2(c.x - 1.6, c.y + 2.0), egui::pos2(c.x + 1.6, c.y + 2.0)],
+        [
+            egui::pos2(c.x - 1.6, c.y + 2.0),
+            egui::pos2(c.x + 1.6, c.y + 2.0),
+        ],
         s,
     );
     painter.line_segment(
-        [egui::pos2(c.x + 1.6, c.y + 2.0), egui::pos2(c.x + 1.6, c.y - 0.6)],
+        [
+            egui::pos2(c.x + 1.6, c.y + 2.0),
+            egui::pos2(c.x + 1.6, c.y - 0.6),
+        ],
         s,
     );
 }
@@ -1844,7 +1957,11 @@ fn nav_item(
             egui::pos2(rect.min.x + 40.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(if cfg!(target_os = "macos") { 13.5 } else { 13.0 }),
+            egui::FontId::proportional(if cfg!(target_os = "macos") {
+                13.5
+            } else {
+                13.0
+            }),
             text_color,
         );
     }
@@ -1854,7 +1971,11 @@ fn nav_item(
 #[cfg(target_os = "macos")]
 fn macos_theme_button(ui: &mut egui::Ui, pal: &Palette, dark: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(62.0, 26.0), egui::Sense::click());
-    let fill = if response.hovered() { pal.hover } else { pal.field };
+    let fill = if response.hovered() {
+        pal.hover
+    } else {
+        pal.field
+    };
     ui.painter().rect(
         rect,
         egui::Rounding::same(6.0),
@@ -1863,9 +1984,17 @@ fn macos_theme_button(ui: &mut egui::Ui, pal: &Palette, dark: bool) -> bool {
     );
 
     let icon_center = egui::pos2(rect.left() + 13.0, rect.center().y);
-    let stroke = egui::Stroke::new(1.25, if response.hovered() { pal.text } else { pal.dim });
+    let stroke = egui::Stroke::new(
+        1.25,
+        if response.hovered() {
+            pal.text
+        } else {
+            pal.dim
+        },
+    );
     if dark {
-        ui.painter().circle(icon_center, 3.5, egui::Color32::TRANSPARENT, stroke);
+        ui.painter()
+            .circle(icon_center, 3.5, egui::Color32::TRANSPARENT, stroke);
         for i in 0..8 {
             let angle = i as f32 * std::f32::consts::TAU / 8.0;
             let direction = egui::vec2(angle.cos(), angle.sin());
@@ -1876,7 +2005,8 @@ fn macos_theme_button(ui: &mut egui::Ui, pal: &Palette, dark: bool) -> bool {
         }
     } else {
         ui.painter().circle_filled(icon_center, 5.5, stroke.color);
-        ui.painter().circle_filled(icon_center + egui::vec2(2.5, -2.0), 5.0, fill);
+        ui.painter()
+            .circle_filled(icon_center + egui::vec2(2.5, -2.0), 5.0, fill);
     }
     ui.painter().text(
         egui::pos2(rect.left() + 25.0, rect.center().y),
@@ -1898,8 +2028,14 @@ fn close_button(ui: &mut egui::Ui, pal: &Palette) -> bool {
     let c = rect.center();
     let d = 4.5;
     let stroke = egui::Stroke::new(1.6_f32, if resp.hovered() { pal.text } else { pal.dim });
-    ui.painter().line_segment([egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)], stroke);
-    ui.painter().line_segment([egui::pos2(c.x - d, c.y + d), egui::pos2(c.x + d, c.y - d)], stroke);
+    ui.painter().line_segment(
+        [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [egui::pos2(c.x - d, c.y + d), egui::pos2(c.x + d, c.y - d)],
+        stroke,
+    );
     resp.clicked()
 }
 
@@ -1912,8 +2048,13 @@ fn accent_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
         .sum();
     let w = (text_w + 44.0).max(130.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
-    let fill = if resp.hovered() { pal.btn_hover } else { pal.btn_fill };
-    ui.painter().rect_filled(rect, egui::Rounding::same(8.0), fill);
+    let fill = if resp.hovered() {
+        pal.btn_hover
+    } else {
+        pal.btn_fill
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(8.0), fill);
     ui.painter().rect(
         rect,
         egui::Rounding::same(8.0),
@@ -1930,9 +2071,10 @@ fn accent_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
     resp.clicked()
 }
 
-/// 插件列表单行：复选框 + 名称/徽标 + 描述；返回是否点了「移除」（仅 WASM 插件）。
-fn plugin_row_ui(ui: &mut egui::Ui, pal: &Palette, row: &mut PluginUiRow) -> bool {
+/// 插件列表单行：返回（是否移除、启用状态是否变化）。
+fn plugin_row_ui(ui: &mut egui::Ui, pal: &Palette, row: &mut PluginUiRow) -> (bool, bool) {
     let mut removed = false;
+    let was_enabled = row.enabled;
     // 统一行宽：内容区撑满外层可用宽度（扣除左右内边距），
     // 卡片边框左右对齐且不超出面板。
     let margin = egui::Margin::symmetric(12.0, 9.0);
@@ -1963,20 +2105,22 @@ fn plugin_row_ui(ui: &mut egui::Ui, pal: &Palette, row: &mut PluginUiRow) -> boo
                         );
                         if !row.core {
                             ui.label(
-                                egui::RichText::new(if row.enabled { "已启用" } else { "已禁用" })
-                                    .size(10.0)
-                                    .color(pal.dim),
+                                egui::RichText::new(if row.active {
+                                    "运行中"
+                                } else if row.enabled {
+                                    "待加载"
+                                } else {
+                                    "已禁用"
+                                })
+                                .size(10.0)
+                                .color(pal.dim),
                             );
                         }
                     });
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&row.desc)
-                                .size(11.0)
-                                .color(pal.dim),
-                        )
-                        // 描述单行展示不换行，超长截断省略。
-                        .wrap_mode(egui::TextWrapMode::Truncate),
+                        egui::Label::new(egui::RichText::new(&row.desc).size(11.0).color(pal.dim))
+                            // 描述单行展示不换行，超长截断省略。
+                            .wrap_mode(egui::TextWrapMode::Truncate),
                     );
                 });
                 if !row.core {
@@ -1989,7 +2133,7 @@ fn plugin_row_ui(ui: &mut egui::Ui, pal: &Palette, row: &mut PluginUiRow) -> boo
             });
         });
     ui.add_space(6.0);
-    removed
+    (removed, was_enabled != row.enabled)
 }
 
 /// 次级按钮（描边幽灵风格）。
@@ -2034,7 +2178,6 @@ struct MemItem {
     meta: String,
     body: String,
 }
-
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2094,32 +2237,88 @@ impl eframe::App for AppState {
                 {
                     self.new_session();
                 }
-                if nav_item(ui, &pal, Icon::Folder, "新建项目", self.sidebar_expanded, true, false) {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Folder,
+                    "新建项目",
+                    self.sidebar_expanded,
+                    true,
+                    false,
+                ) {
                     self.settings_page = "新建项目".into();
                     self.settings_open = true;
                 }
-                if nav_item(ui, &pal, Icon::Layers, "插件管理", self.sidebar_expanded, true, false) {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Layers,
+                    "插件管理",
+                    self.sidebar_expanded,
+                    true,
+                    false,
+                ) {
                     self.settings_page = "插件管理".into();
                     self.settings_open = true;
                 }
-                if nav_item(ui, &pal, Icon::Chip, "模型设置", self.sidebar_expanded, true, false) {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Chip,
+                    "模型设置",
+                    self.sidebar_expanded,
+                    true,
+                    false,
+                ) {
                     self.settings_page = "模型设置".into();
                     self.settings_open = true;
                 }
-                if nav_item(ui, &pal, Icon::Gear, "系统配置", self.sidebar_expanded, true, false) {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Gear,
+                    "系统配置",
+                    self.sidebar_expanded,
+                    true,
+                    false,
+                ) {
                     self.settings_page = "系统配置".into();
                     self.settings_open = true;
                 }
-                if nav_item(ui, &pal, Icon::Layers, "记忆中心", self.sidebar_expanded, true, false) {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Layers,
+                    "记忆中心",
+                    self.sidebar_expanded,
+                    true,
+                    false,
+                ) {
                     self.settings_page = "记忆".into();
                     self.settings_open = true;
                 }
-                if nav_item(ui, &pal, Icon::Update, "检查更新", self.sidebar_expanded, true, false) {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Update,
+                    "检查更新",
+                    self.sidebar_expanded,
+                    true,
+                    false,
+                ) {
                     self.settings_page = "更新".into();
                     self.settings_open = true;
                 }
                 ui.add_space(8.0);
-                if nav_item(ui, &pal, Icon::Menu, "收起侧栏", self.sidebar_expanded, true, false) {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Menu,
+                    "收起侧栏",
+                    self.sidebar_expanded,
+                    true,
+                    false,
+                ) {
                     self.sidebar_expanded = !self.sidebar_expanded;
                 }
                 // ── 项目列表（Codex/Cursor 式：点击即切上下文）────────────
@@ -2131,7 +2330,9 @@ impl eframe::App for AppState {
                             if ui
                                 .add_sized(
                                     [20.0, 20.0],
-                                    egui::Button::new(egui::RichText::new("+").size(14.0).color(pal.dim)),
+                                    egui::Button::new(
+                                        egui::RichText::new("+").size(14.0).color(pal.dim),
+                                    ),
                                 )
                                 .on_hover_text("添加新项目")
                                 .clicked()
@@ -2182,8 +2383,11 @@ impl eframe::App for AppState {
                                         egui::pos2(rect.min.x + 2.0, rect.min.y + 7.0),
                                         egui::vec2(2.5, rect.height() - 14.0),
                                     );
-                                    ui.painter()
-                                        .rect_filled(bar, egui::Rounding::same(2.0), pal.accent);
+                                    ui.painter().rect_filled(
+                                        bar,
+                                        egui::Rounding::same(2.0),
+                                        pal.accent,
+                                    );
                                 }
                                 draw_icon(
                                     &ui.painter(),
@@ -2302,7 +2506,10 @@ impl eframe::App for AppState {
                                 // 导致行失焦→按钮消失→再悬停→再浮出，逐帧振荡抖动。
                                 let hovered = resp.hovered()
                                     || (ctx.input(|i| i.pointer.has_pointer())
-                                        && rect.contains(ctx.input(|i| i.pointer.hover_pos()).unwrap_or(egui::pos2(-1.0, -1.0))));
+                                        && rect.contains(
+                                            ctx.input(|i| i.pointer.hover_pos())
+                                                .unwrap_or(egui::pos2(-1.0, -1.0)),
+                                        ));
                                 if is_active || hovered {
                                     ui.painter().rect_filled(
                                         rect.shrink(1.0),
@@ -2315,8 +2522,11 @@ impl eframe::App for AppState {
                                         egui::pos2(rect.min.x + 2.0, rect.min.y + 8.0),
                                         egui::vec2(2.5, rect.height() - 16.0),
                                     );
-                                    ui.painter()
-                                        .rect_filled(bar, egui::Rounding::same(2.0), pal.accent);
+                                    ui.painter().rect_filled(
+                                        bar,
+                                        egui::Rounding::same(2.0),
+                                        pal.accent,
+                                    );
                                 }
                                 // 标题截断适配窄侧栏。
                                 let mut title: String = meta.title.chars().take(15).collect();
@@ -2445,11 +2655,7 @@ impl eframe::App for AppState {
                         offset: egui::vec2(0.0, 6.0),
                         blur: 18.0,
                         spread: 0.0,
-                        color: egui::Color32::from_black_alpha(if self.dark {
-                            0x44
-                        } else {
-                            0x14
-                        }),
+                        color: egui::Color32::from_black_alpha(if self.dark { 0x44 } else { 0x14 }),
                     });
                 card_frame.show(ui, |ui| {
                     // 文本编辑区：去掉自身边框/背景，由卡片提供 chrome。
@@ -2461,15 +2667,12 @@ impl eframe::App for AppState {
                             .frame(false)
                             .margin(egui::Margin::same(0.0))
                             .hint_text(
-                                egui::RichText::new("描述任务、粘贴代码或提出问题…")
-                                    .color(pal.dim),
+                                egui::RichText::new("描述任务、粘贴代码或提出问题…").color(pal.dim),
                             ),
                     );
                     // Enter 发送 / Shift+Enter 换行：egui 会先插入换行，这里去掉尾随 \n 再提交。
                     let enter = response.has_focus()
-                        && ctx.input(|i| {
-                            i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
-                        });
+                        && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                     if enter {
                         while self.input.ends_with('\n') {
                             self.input.pop();
@@ -2483,18 +2686,19 @@ impl eframe::App for AppState {
                         ui.spacing_mut().item_spacing.x = 4.0;
 
                         // ── 模型 chip（点击 → 打开设置页） ──
-                        let model_label =
-                            format!("{} · {}", self.f_provider, self.f_model);
+                        let model_label = format!("{} · {}", self.f_provider, self.f_model);
                         let text_w: f32 = model_label
                             .chars()
                             .map(|c| if c.is_ascii() { 7.0 } else { 12.0 })
                             .sum();
                         let chip_w = (text_w + 40.0).max(110.0).min(240.0);
-                        let (mrect, mresp) = ui.allocate_exact_size(
-                            egui::vec2(chip_w, 28.0),
-                            egui::Sense::click(),
-                        );
-                        let mfill = if mresp.hovered() { pal.hover } else { pal.field };
+                        let (mrect, mresp) =
+                            ui.allocate_exact_size(egui::vec2(chip_w, 28.0), egui::Sense::click());
+                        let mfill = if mresp.hovered() {
+                            pal.hover
+                        } else {
+                            pal.field
+                        };
                         ui.painter()
                             .rect_filled(mrect, egui::Rounding::same(8.0), mfill);
                         ui.painter().rect(
@@ -2538,10 +2742,8 @@ impl eframe::App for AppState {
                             })
                             .fold(0.0_f32, f32::max);
                         let perm_w = (label_max_w + 40.0).max(96.0).min(160.0);
-                        let (prect, presp) = ui.allocate_exact_size(
-                            egui::vec2(perm_w, 28.0),
-                            egui::Sense::click(),
-                        );
+                        let (prect, presp) =
+                            ui.allocate_exact_size(egui::vec2(perm_w, 28.0), egui::Sense::click());
                         let pfill = if presp.hovered() || self.perm_menu_open {
                             pal.hover
                         } else {
@@ -2634,7 +2836,8 @@ impl eframe::App for AppState {
                                         .show(ui, |ui| {
                                             ui.set_min_width(perm_w);
                                             ui.spacing_mut().item_spacing.y = 2.0;
-                                            for mode in ["只读", "工作区写入", "完全访问"] {
+                                            for mode in ["只读", "工作区写入", "完全访问"]
+                                            {
                                                 let selected = self.permission == mode;
                                                 let r = ui.selectable_label(
                                                     selected,
@@ -2645,10 +2848,10 @@ impl eframe::App for AppState {
                                                 if r.clicked() {
                                                     self.permission = mode.to_string();
                                                     self.perm_menu_open = false;
-                                                    let _ = self.host.settings.set(
-                                                        "permission.mode",
-                                                        &self.permission,
-                                                    );
+                                                    let _ = self
+                                                        .host
+                                                        .settings
+                                                        .set("permission.mode", &self.permission);
                                                 }
                                             }
                                         });
@@ -2656,16 +2859,11 @@ impl eframe::App for AppState {
                         }
 
                         // ── 附件 icon button ──
-                        let (arect, aresp) = ui.allocate_exact_size(
-                            egui::vec2(28.0, 28.0),
-                            egui::Sense::click(),
-                        );
+                        let (arect, aresp) =
+                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
                         if aresp.hovered() {
-                            ui.painter().rect_filled(
-                                arect,
-                                egui::Rounding::same(8.0),
-                                pal.hover,
-                            );
+                            ui.painter()
+                                .rect_filled(arect, egui::Rounding::same(8.0), pal.hover);
                         }
                         let acolor = if !self.attachment.is_empty() {
                             pal.accent
@@ -2691,10 +2889,8 @@ impl eframe::App for AppState {
 
                         // 若已有附件，紧随其后放一个紧凑的清除 ✕
                         if !self.attachment.is_empty() {
-                            let (xrect, xresp) = ui.allocate_exact_size(
-                                egui::vec2(20.0, 28.0),
-                                egui::Sense::click(),
-                            );
+                            let (xrect, xresp) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 28.0), egui::Sense::click());
                             let xcolor = if xresp.hovered() { pal.accent } else { pal.dim };
                             ui.painter().text(
                                 xrect.center(),
@@ -2710,80 +2906,72 @@ impl eframe::App for AppState {
                         }
 
                         // 弹性空间 → 圆形发送/停止按钮
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let btn_size = 34.0;
-                                let (brect, bresp) = ui.allocate_exact_size(
-                                    egui::vec2(btn_size, btn_size),
-                                    egui::Sense::click(),
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btn_size = 34.0;
+                            let (brect, bresp) = ui.allocate_exact_size(
+                                egui::vec2(btn_size, btn_size),
+                                egui::Sense::click(),
+                            );
+                            let center = brect.center();
+                            let bfill = if self.busy {
+                                egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
+                            } else if can_send {
+                                pal.btn_fill
+                            } else {
+                                pal.field
+                            };
+                            ui.painter().circle_filled(center, btn_size / 2.0, bfill);
+                            if self.busy {
+                                // 停止：实心方块
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(center, egui::vec2(8.0, 8.0)),
+                                    egui::Rounding::same(1.2),
+                                    egui::Color32::from_rgb(0x1a, 0x24, 0x30),
                                 );
-                                let center = brect.center();
-                                let bfill = if self.busy {
-                                    egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
-                                } else if can_send {
-                                    pal.btn_fill
-                                } else {
-                                    pal.field
-                                };
-                                ui.painter()
-                                    .circle_filled(center, btn_size / 2.0, bfill);
+                            } else {
+                                let icon_color = if can_send { pal.btn_text } else { pal.dim };
+                                // 实心三角箭头
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    vec![
+                                        egui::pos2(center.x, center.y - 4.6),
+                                        egui::pos2(center.x + 4.2, center.y - 0.9),
+                                        egui::pos2(center.x - 4.2, center.y - 0.9),
+                                    ],
+                                    icon_color,
+                                    egui::Stroke::NONE,
+                                ));
+                                // 箭头柄
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(center.x, center.y - 0.9),
+                                        egui::pos2(center.x, center.y + 4.6),
+                                    ],
+                                    egui::Stroke::new(2.0_f32, icon_color),
+                                );
+                            }
+                            if bresp.hovered() {
+                                ui.painter().circle_stroke(
+                                    center,
+                                    btn_size / 2.0,
+                                    egui::Stroke::new(1.5_f32, pal.accent),
+                                );
+                            }
+                            if bresp.clicked() {
                                 if self.busy {
-                                    // 停止：实心方块
-                                    ui.painter().rect_filled(
-                                        egui::Rect::from_center_size(
-                                            center,
-                                            egui::vec2(8.0, 8.0),
-                                        ),
-                                        egui::Rounding::same(1.2),
-                                        egui::Color32::from_rgb(0x1a, 0x24, 0x30),
-                                    );
-                                } else {
-                                    let icon_color =
-                                        if can_send { pal.btn_text } else { pal.dim };
-                                    // 实心三角箭头
-                                    ui.painter().add(egui::Shape::convex_polygon(
-                                        vec![
-                                            egui::pos2(center.x, center.y - 4.6),
-                                            egui::pos2(center.x + 4.2, center.y - 0.9),
-                                            egui::pos2(center.x - 4.2, center.y - 0.9),
-                                        ],
-                                        icon_color,
-                                        egui::Stroke::NONE,
-                                    ));
-                                    // 箭头柄
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(center.x, center.y - 0.9),
-                                            egui::pos2(center.x, center.y + 4.6),
-                                        ],
-                                        egui::Stroke::new(2.0_f32, icon_color),
-                                    );
-                                }
-                                if bresp.hovered() {
-                                    ui.painter().circle_stroke(
-                                        center,
-                                        btn_size / 2.0,
-                                        egui::Stroke::new(1.5_f32, pal.accent),
-                                    );
-                                }
-                                if bresp.clicked() {
-                                    if self.busy {
-                                        trace("[cancel] requested");
-                                        self.host.sink.cancel();
-                                    } else if can_send {
-                                        send_now = true;
-                                    }
-                                }
-                                if self.busy {
-                                    bresp.on_hover_text("停止生成");
+                                    trace("[cancel] requested");
+                                    self.host.sink.cancel();
                                 } else if can_send {
-                                    bresp.on_hover_text("发送 (Enter)");
-                                } else {
-                                    bresp.on_hover_text("输入内容后可发送");
+                                    send_now = true;
                                 }
-                            },
-                        );
+                            }
+                            if self.busy {
+                                bresp.on_hover_text("停止生成");
+                            } else if can_send {
+                                bresp.on_hover_text("发送 (Enter)");
+                            } else {
+                                bresp.on_hover_text("输入内容后可发送");
+                            }
+                        });
                     });
                 });
 
@@ -2801,8 +2989,7 @@ impl eframe::App for AppState {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let usage = self.log.usage_total();
-                        let (dot, text): (egui::Color32, String) = if self.busy && self.thinking
-                        {
+                        let (dot, text): (egui::Color32, String) = if self.busy && self.thinking {
                             let secs = self
                                 .turn_started
                                 .map(|t| t.elapsed().as_secs())
@@ -2847,40 +3034,47 @@ impl eframe::App for AppState {
                     ))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    #[cfg(target_os = "macos")]
-                    ui.set_min_height(26.0);
-                    // 紧凑导航头：单行小标题，不再展示模型副标题。
-                    ui.label(
-                        egui::RichText::new("对话工作台")
-                            .size(15.0)
-                            .strong()
-                            .color(pal.text),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        #[cfg(target_os = "macos")]
-                        let toggle_theme = macos_theme_button(ui, &pal, self.dark);
-                        #[cfg(not(target_os = "macos"))]
-                        let toggle_theme = {
-                        let theme_label = if self.dark { "☀ 浅色" } else { "🌙 深色" };
-                        ui.button(theme_label).clicked()
-                        };
-                        if toggle_theme {
-                            self.dark = !self.dark;
-                            let _ = self
-                                .host
-                                .settings
-                                .set("ui.theme", if self.dark { "dark" } else { "light" });
-                        }
-                        #[cfg(target_os = "macos")]
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(self.host.llm_control.status())
-                                .size(11.0)
-                                .color(pal.accent),
-                        );
-                    });
-                });
+                        ui.horizontal(|ui| {
+                            #[cfg(target_os = "macos")]
+                            ui.set_min_height(26.0);
+                            // 紧凑导航头：单行小标题，不再展示模型副标题。
+                            ui.label(
+                                egui::RichText::new("对话工作台")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(pal.text),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    #[cfg(target_os = "macos")]
+                                    let toggle_theme = macos_theme_button(ui, &pal, self.dark);
+                                    #[cfg(not(target_os = "macos"))]
+                                    let toggle_theme = {
+                                        let theme_label = if self.dark {
+                                            "☀ 浅色"
+                                        } else {
+                                            "🌙 深色"
+                                        };
+                                        ui.button(theme_label).clicked()
+                                    };
+                                    if toggle_theme {
+                                        self.dark = !self.dark;
+                                        let _ = self.host.settings.set(
+                                            "ui.theme",
+                                            if self.dark { "dark" } else { "light" },
+                                        );
+                                    }
+                                    #[cfg(target_os = "macos")]
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(self.host.llm_control.status())
+                                            .size(11.0)
+                                            .color(pal.accent),
+                                    );
+                                },
+                            );
+                        });
                     });
                 ui.painter().hline(
                     head.response.rect.x_range(),
@@ -2899,13 +3093,14 @@ impl eframe::App for AppState {
                             if msg.text.is_empty() {
                                 continue; // 纯 DSML 气泡剥离后为空，不渲染空卡片
                             }
-                            let (fill, text_color): (egui::Color32, egui::Color32) = match msg.kind.as_str() {
-                                "user" => (pal.user_bubble, pal.user_text),
-                                "error" => (pal.err_bubble, pal.err_text),
-                                "tool" | "plan" => (pal.tool_bubble, pal.dim),
-                                "thinking" => (pal.field, pal.dim),
-                                _ => (pal.ai_bubble, pal.text),
-                            };
+                            let (fill, text_color): (egui::Color32, egui::Color32) =
+                                match msg.kind.as_str() {
+                                    "user" => (pal.user_bubble, pal.user_text),
+                                    "error" => (pal.err_bubble, pal.err_text),
+                                    "tool" | "plan" => (pal.tool_bubble, pal.dim),
+                                    "thinking" => (pal.field, pal.dim),
+                                    _ => (pal.ai_bubble, pal.text),
+                                };
                             // 所有气泡统一左对齐：用户消息不右对齐，阅读动线更连贯。
                             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                                 let bubble = egui::Frame::default()
@@ -2980,14 +3175,24 @@ impl eframe::App for AppState {
             // 短内容页（插件管理等）由 min_scrolled_height 保底，不会塌成扁条。
             let panel_w = (screen.width() - 320.0).clamp(520.0, 660.0);
             let scroll_h = (screen.height() - 150.0).clamp(480.0, 800.0);
-        
+            // 内容变化（插件行、提示文字、滚动条）不能影响面板位置；否则居中锚点会
+            // 和自动尺寸互相反馈，在 Windows 上表现为持续抖动。
+            let panel_h = scroll_h + 94.0;
+            let panel_pos = egui::pos2(
+                screen.left() + (screen.width() - panel_w) * 0.5,
+                screen.top() + ((screen.height() - panel_h) * 0.5).max(20.0),
+            );
+
             // 蒙层：纯装饰压暗（直接画到 Background 层，不注册任何交互控件）。
             // ⚠️ 不能用带 Sense 的 Area 做蒙层：egui 0.30 会给 interactable Area 自动注册
             // 覆盖整个区域的“置顶点击”控件（area.rs move_response），抢占面板交互并自动
             // 把蒙层提到 Foreground 最前，表现为弹窗被蒙层挡住/点不动。
-            ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("modal_dim")))
-                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(130));
-        
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("modal_dim"),
+            ))
+            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(130));
+
             // 点面板外关闭：原始输入判定（本帧不注册任何全屏交互控件，不与面板抢事件）。
             // modal_open_last_frame 守卫：打开当帧的 press 是侧栏触发点击，不得误关。
             if self.modal_open_last_frame {
@@ -3002,13 +3207,13 @@ impl eframe::App for AppState {
                     }
                 }
             }
-        
+
             // 面板层：Foreground 层。蒙层已无交互控件，本层是前景唯一可交互层，
             // 不会被抬到更前；层内 ComboBox 下拉注册更晚 → 盖住面板。
             // 切勿用 Tooltip：下拉菜单开在 Foreground 层，面板若更高会把菜单整个盖住。
             egui::Area::new("settings_panel".into())
                 .order(egui::Order::Foreground)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_pos(panel_pos)
                 .show(ctx, |ui| {
                     egui::Frame::default()
                         .fill(pal.panel)
@@ -3140,11 +3345,22 @@ impl eframe::App for AppState {
                                         field_label(ui, &pal, "内置核心插件（默认启用，系统必要能力不可取消）");
                                         for i in 0..self.plugin_rows.len() {
                                             if self.plugin_rows[i].core {
-                                                plugin_row_ui(ui, &pal, &mut self.plugin_rows[i]);
+                                                let _ = plugin_row_ui(ui, &pal, &mut self.plugin_rows[i]);
                                             }
                                         }
                                         ui.add_space(6.0);
                                         field_label(ui, &pal, "扩展插件（WASM · wasmtime 沙箱隔离，可自由启用 / 禁用或移除）");
+                                        let active_plugins = self.host.wasm_plugins.active_ids();
+                                        ui.label(
+                                            egui::RichText::new(if active_plugins.is_empty() {
+                                                "运行时：当前没有已加载的 WASM 插件".to_string()
+                                            } else {
+                                                format!("运行时：已加载 {}", active_plugins.join("、"))
+                                            })
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(4.0);
                                         let mut remove_ids: Vec<String> = Vec::new();
                                         let mut wasm_count = 0;
                                         for i in 0..self.plugin_rows.len() {
@@ -3152,7 +3368,27 @@ impl eframe::App for AppState {
                                                 continue;
                                             }
                                             wasm_count += 1;
-                                            if plugin_row_ui(ui, &pal, &mut self.plugin_rows[i]) {
+                                            let (remove, changed) = plugin_row_ui(ui, &pal, &mut self.plugin_rows[i]);
+                                            if changed {
+                                                let row = &mut self.plugin_rows[i];
+                                                let result = if row.enabled {
+                                                    self.host.wasm_plugins.activate(&row.id, std::path::Path::new(&row.desc))
+                                                } else {
+                                                    self.host.wasm_plugins.deactivate(&row.id)
+                                                };
+                                                match result {
+                                                    Ok(()) => {
+                                                        row.active = row.enabled;
+                                                        let _ = self.host.settings.set_plugin_enabled(&row.id, &row.name, row.enabled);
+                                                        self.note = format!("插件「{}」{}", row.name, if row.enabled { "已启用并开始运行" } else { "已禁用并卸载" });
+                                                    }
+                                                    Err(error) => {
+                                                        row.enabled = !row.enabled;
+                                                        self.note = format!("插件状态未变更: {error}");
+                                                    }
+                                                }
+                                            }
+                                            if remove {
                                                 remove_ids.push(self.plugin_rows[i].id.clone());
                                             }
                                         }
@@ -3166,6 +3402,7 @@ impl eframe::App for AppState {
                                         }
                                         if !remove_ids.is_empty() {
                                             for id in &remove_ids {
+                                                let _ = self.host.wasm_plugins.deactivate(id);
                                                 let _ = self.host.settings.remove_plugin(id);
                                             }
                                             self.plugin_rows.retain(|r| !remove_ids.contains(&r.id));
@@ -3183,7 +3420,7 @@ impl eframe::App for AppState {
                                         ui.add_space(6.0);
                                         ui.label(
                                             egui::RichText::new(
-                                                "添加新插件：选择 .wasm / .wat 产物，先在 wasmtime 沙箱中校验可加载性再登记；启用状态保存后生效。",
+                                                "操作方式：点击「＋ 添加新插件」导入 .wasm/.wat；勾选即立即加载并执行可选 on_load，取消勾选即卸载。插件仅获得 host_log，默认没有 Shell、文件或网络权限；「移除」只删除登记，不删除你的原始文件。",
                                             )
                                             .size(11.0)
                                             .color(pal.dim),
@@ -3405,7 +3642,9 @@ impl eframe::App for AppState {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label("为这个会话设置便于识别的名称（写入旁挂 .title 文件，不影响日志内容）：");
+                    ui.label(
+                        "为这个会话设置便于识别的名称（写入旁挂 .title 文件，不影响日志内容）：",
+                    );
                     ui.add_space(6.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.rename_buf)
@@ -3493,11 +3732,14 @@ mod macos_font_tests {
         let ctx = egui::Context::default();
         install_cjk_fonts(&ctx);
         ctx.begin_pass(Default::default());
-        let has_chinese = ctx.fonts(|fonts| {
-            fonts.has_glyphs(&egui::FontId::proportional(14.0), "中文界面")
-        });
+        let has_chinese =
+            ctx.fonts(|fonts| fonts.has_glyphs(&egui::FontId::proportional(14.0), "中文界面"));
         let _ = ctx.end_pass();
-        assert!(has_chinese, "loaded font cannot render Chinese: {}", path.display());
+        assert!(
+            has_chinese,
+            "loaded font cannot render Chinese: {}",
+            path.display()
+        );
     }
 }
 

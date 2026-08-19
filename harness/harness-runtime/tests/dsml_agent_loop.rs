@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use harness_capability::hook::Hook;
 use harness_core::{error::Result, types::UserInput, AppContext};
-use harness_llm::{dsml, Chunk, ChunkStream, LlmProvider, Message, ToolCall, ToolResult, ToolSchema};
+use harness_llm::{
+    dsml, Chunk, ChunkStream, LlmProvider, Message, ToolCall, ToolResult, ToolSchema,
+};
 use harness_provider_hook::NullHook;
 use harness_runtime::AgentLoop;
 use harness_session::{SessionEvent, SessionLog};
@@ -61,9 +63,7 @@ impl LlmProvider for ScriptedLlm {
                 ..Default::default()
             }]
         };
-        dsml::filter_stream(Box::pin(futures::stream::iter(
-            chunks.into_iter().map(Ok),
-        )))
+        dsml::filter_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
     }
 }
 

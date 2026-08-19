@@ -172,7 +172,11 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                         ),
                     );
                 } else {
-                    let color = if quote_depth > 0 { theme.dim } else { theme.text };
+                    let color = if quote_depth > 0 {
+                        theme.dim
+                    } else {
+                        theme.text
+                    };
                     append_str(
                         &mut job,
                         &t,
@@ -301,7 +305,11 @@ mod tests {
 
     #[test]
     fn renders_heading_list_and_code_as_sections() {
-        let job = to_job("# 标题\n\n- 项目一\n- 项目二\n\n```\ndir\n```\n", &theme(), 300.0);
+        let job = to_job(
+            "# 标题\n\n- 项目一\n- 项目二\n\n```\ndir\n```\n",
+            &theme(),
+            300.0,
+        );
         assert!(job.text.contains("标题"));
         assert!(job.text.contains("• 项目一"));
         assert!(job.text.contains("dir"));

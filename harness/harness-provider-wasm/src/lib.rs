@@ -13,7 +13,7 @@
 pub mod loader;
 
 #[cfg(feature = "wasm-tools")]
-pub use loader::WasmPluginLoader;
+pub use loader::{WasmPluginLoader, WasmPluginRuntime};
 
 // 未开启 `wasm-tools` 时的编译期占位：保留同名类型，避免下游 cfg 分支爆炸。
 #[cfg(not(feature = "wasm-tools"))]

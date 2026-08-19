@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_capability::assets::{
-    CodeGraph, CodeSymbol, ConversationMemory, FactKind, LifecycleLayer, MemoryFact, Skill,
-    SkillLibrary, WikiLink, WikiPage, WikiStore, ChatTurn,
+    ChatTurn, CodeGraph, CodeSymbol, ConversationMemory, FactKind, LifecycleLayer, MemoryFact,
+    Skill, SkillLibrary, WikiLink, WikiPage, WikiStore,
 };
 use harness_core::error::{Error, Result};
 
@@ -78,7 +78,9 @@ impl NativeConversationMemory {
     }
 
     fn conv_path(&self, session_id: &str) -> PathBuf {
-        self.root.join("conversations").join(sanitize(session_id) + ".jsonl")
+        self.root
+            .join("conversations")
+            .join(sanitize(session_id) + ".jsonl")
     }
 
     fn facts_path(&self) -> PathBuf {
@@ -273,7 +275,12 @@ impl SkillLibrary for NativeSkillLibrary {
         let mut scored: Vec<(f32, Skill)> = self
             .all_skills()
             .into_iter()
-            .map(|sk| (lex_score(context, &format!("{} {}", sk.trigger_boundary, sk.name)), sk))
+            .map(|sk| {
+                (
+                    lex_score(context, &format!("{} {}", sk.trigger_boundary, sk.name)),
+                    sk,
+                )
+            })
             .filter(|(s, _)| *s > 0.0)
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -436,9 +443,7 @@ impl NativeCodeGraph {
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
         for sym in &s.symbols {
             for callee in &sym.calls {
-                m.entry(callee.clone())
-                    .or_default()
-                    .push(sym.id.clone());
+                m.entry(callee.clone()).or_default().push(sym.id.clone());
             }
         }
         m
@@ -459,7 +464,10 @@ impl CodeGraph for NativeCodeGraph {
     }
 
     async fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>> {
-        Ok(self.callers_map(&self.load()).remove(symbol_id).unwrap_or_default())
+        Ok(self
+            .callers_map(&self.load())
+            .remove(symbol_id)
+            .unwrap_or_default())
     }
 
     async fn callees_of(&self, symbol_id: &str) -> Result<Vec<String>> {

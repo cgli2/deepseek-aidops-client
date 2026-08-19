@@ -215,10 +215,14 @@ fn parse_invoke(block: &str, counter: &mut u64) -> Option<ToolCall> {
     let mut idx = 0;
     while let Some(rel) = rest[idx..].find(PARAM_OPEN) {
         let tag_start = idx + rel;
-        let Some(gt_rel) = rest[tag_start..].find('>') else { break };
+        let Some(gt_rel) = rest[tag_start..].find('>') else {
+            break;
+        };
         let tag = &rest[tag_start..tag_start + gt_rel + 1];
         let val_start = tag_start + gt_rel + 1;
-        let Some(close_rel) = rest[val_start..].find(PARAM_CLOSE) else { break };
+        let Some(close_rel) = rest[val_start..].find(PARAM_CLOSE) else {
+            break;
+        };
         let value = &rest[val_start..val_start + close_rel];
         idx = val_start + close_rel + PARAM_CLOSE.len();
 
@@ -235,7 +239,11 @@ fn parse_invoke(block: &str, counter: &mut u64) -> Option<ToolCall> {
     }
 
     *counter += 1;
-    Some(map_native(&name, Value::Object(map), format!("dsml-{counter}")))
+    Some(map_native(
+        &name,
+        Value::Object(map),
+        format!("dsml-{counter}"),
+    ))
 }
 
 /// 取标签内 `key="..."` 属性值。
@@ -248,10 +256,7 @@ fn attr_value(tag: &str, key: &str) -> Option<String> {
 
 /// 原生 DSML 工具名 → harness 注册表工具名/参数形态映射；未知名透传（registry 报错让模型自纠）。
 fn map_native(name: &str, args: Value, id: String) -> ToolCall {
-    let get = |keys: &[&str]| {
-        keys.iter()
-            .find_map(|k| args.get(*k).cloned())
-    };
+    let get = |keys: &[&str]| keys.iter().find_map(|k| args.get(*k).cloned());
     let as_text = |v: Option<Value>| match v {
         Some(Value::String(s)) => s,
         Some(other) => other.to_string(),

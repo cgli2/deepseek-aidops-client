@@ -122,6 +122,22 @@ make dev-watch WORKSPACE=/path/to/project
 `cargo-watch` 会停止旧进程、增量编译并重新启动应用；SQLite 设置、会话日志等持久化数据
 会保留，尚未保存的输入框内容等内存状态会清空。使用 `Ctrl+C` 停止监听。
 
+### 融合窗口标题栏
+
+GUI 默认在 macOS 和 Windows 启用融合标题栏：macOS 保留原生交通灯并把工作台延伸到
+标题栏区域；Windows 使用自绘最小化、最大化/恢复、关闭按钮以及窗口拖动和八方向缩放。
+Linux 和其他平台继续使用系统装饰。遇到远程桌面或特殊窗口管理环境时可临时回退：
+
+```bash
+AIOPS_NATIVE_TITLEBAR=0 make dev
+```
+
+也可在「系统配置 → 窗口外观」中持久化开关，修改后重启应用生效；环境变量优先级高于
+持久化设置，适合在窗口异常时强制恢复系统标题栏。
+
+Windows 发布前需要在 Windows 10/11 真机验证 100%–200% DPI、跨屏拖动、最大化恢复和
+Snap Layout；macOS 发布前需要验证普通、最大化、全屏及多显示器交通灯安全区域。
+
 构建和 macOS 发布：
 
 ```bash

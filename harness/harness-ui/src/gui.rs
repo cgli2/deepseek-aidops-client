@@ -1895,14 +1895,36 @@ fn draw_brand_logo(ui: &egui::Ui, rect: egui::Rect, expanded: bool, pal: &Palett
     );
     let point = |x: f32, y: f32| origin + egui::vec2(x, y);
     let stroke = 2.3;
-    let left = [point(0.0, 18.0), point(7.0, 4.0), point(14.0, 15.0), point(25.0, 0.0)];
-    let right = [point(1.0, 23.0), point(11.0, 10.0), point(18.0, 20.0), point(27.0, 11.0)];
-    ui.painter().add(egui::Shape::line(left.to_vec(), egui::Stroke::new(stroke, blue)));
-    ui.painter().add(egui::Shape::line(right.to_vec(), egui::Stroke::new(stroke, mint)));
-    for (pos, color) in [(left[0], blue), (left[3], blue), (right[0], mint), (right[3], mint)] {
+    let left = [
+        point(0.0, 18.0),
+        point(7.0, 4.0),
+        point(14.0, 15.0),
+        point(25.0, 0.0),
+    ];
+    let right = [
+        point(1.0, 23.0),
+        point(11.0, 10.0),
+        point(18.0, 20.0),
+        point(27.0, 11.0),
+    ];
+    ui.painter().add(egui::Shape::line(
+        left.to_vec(),
+        egui::Stroke::new(stroke, blue),
+    ));
+    ui.painter().add(egui::Shape::line(
+        right.to_vec(),
+        egui::Stroke::new(stroke, mint),
+    ));
+    for (pos, color) in [
+        (left[0], blue),
+        (left[3], blue),
+        (right[0], mint),
+        (right[3], mint),
+    ] {
         ui.painter().circle_filled(pos, 2.1, color);
     }
-    ui.painter().circle_filled(right[1], 2.3, egui::Color32::from_rgb(0xf0, 0xf9, 0xff));
+    ui.painter()
+        .circle_filled(right[1], 2.3, egui::Color32::from_rgb(0xf0, 0xf9, 0xff));
 
     if expanded {
         ui.painter().text(
@@ -1966,56 +1988,6 @@ fn nav_item(
         );
     }
     response.clicked() && enabled
-}
-
-#[cfg(target_os = "macos")]
-fn macos_theme_button(ui: &mut egui::Ui, pal: &Palette, dark: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(62.0, 26.0), egui::Sense::click());
-    let fill = if response.hovered() {
-        pal.hover
-    } else {
-        pal.field
-    };
-    ui.painter().rect(
-        rect,
-        egui::Rounding::same(6.0),
-        fill,
-        egui::Stroke::new(1.0, pal.border),
-    );
-
-    let icon_center = egui::pos2(rect.left() + 13.0, rect.center().y);
-    let stroke = egui::Stroke::new(
-        1.25,
-        if response.hovered() {
-            pal.text
-        } else {
-            pal.dim
-        },
-    );
-    if dark {
-        ui.painter()
-            .circle(icon_center, 3.5, egui::Color32::TRANSPARENT, stroke);
-        for i in 0..8 {
-            let angle = i as f32 * std::f32::consts::TAU / 8.0;
-            let direction = egui::vec2(angle.cos(), angle.sin());
-            ui.painter().line_segment(
-                [icon_center + direction * 5.5, icon_center + direction * 7.0],
-                stroke,
-            );
-        }
-    } else {
-        ui.painter().circle_filled(icon_center, 5.5, stroke.color);
-        ui.painter()
-            .circle_filled(icon_center + egui::vec2(2.5, -2.0), 5.0, fill);
-    }
-    ui.painter().text(
-        egui::pos2(rect.left() + 25.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        if dark { "浅色" } else { "深色" },
-        egui::FontId::proportional(12.0),
-        pal.text,
-    );
-    response.clicked()
 }
 
 /// 模态面板右上角关闭按钮（矢量 ✕，悬停微亮）。
@@ -2168,7 +2140,11 @@ enum SidebarActionIcon {
 }
 
 fn sidebar_control_height() -> f32 {
-    if cfg!(target_os = "macos") { 26.0 } else { 24.0 }
+    if cfg!(target_os = "macos") {
+        26.0
+    } else {
+        24.0
+    }
 }
 
 /// 侧栏紧凑图标按钮：固定尺寸和矢量图形，避免平台字体造成基线偏移。
@@ -2180,28 +2156,60 @@ fn sidebar_icon_button(
 ) -> bool {
     let height = sidebar_control_height();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(height, height), egui::Sense::click());
-    let fill = if response.hovered() { pal.hover } else { pal.field };
+    let fill = if response.hovered() {
+        pal.hover
+    } else {
+        pal.field
+    };
     ui.painter().rect(
         rect,
         egui::Rounding::same(6.0),
         fill,
         egui::Stroke::new(1.0, pal.border),
     );
-    let color = if response.hovered() { pal.text } else { pal.dim };
+    let color = if response.hovered() {
+        pal.text
+    } else {
+        pal.dim
+    };
     let stroke = egui::Stroke::new(1.4, color);
     let c = rect.center();
     match icon {
         SidebarActionIcon::Add => {
-            ui.painter().line_segment([c + egui::vec2(-4.0, 0.0), c + egui::vec2(4.0, 0.0)], stroke);
-            ui.painter().line_segment([c + egui::vec2(0.0, -4.0), c + egui::vec2(0.0, 4.0)], stroke);
+            ui.painter().line_segment(
+                [c + egui::vec2(-4.0, 0.0), c + egui::vec2(4.0, 0.0)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [c + egui::vec2(0.0, -4.0), c + egui::vec2(0.0, 4.0)],
+                stroke,
+            );
         }
         SidebarActionIcon::Archive => {
-            let body = egui::Rect::from_center_size(c + egui::vec2(0.0, 1.5), egui::vec2(10.0, 7.0));
-            ui.painter().rect(body, egui::Rounding::same(1.5), egui::Color32::TRANSPARENT, stroke);
-            ui.painter().line_segment([c + egui::vec2(-5.5, -3.0), c + egui::vec2(5.5, -3.0)], stroke);
-            ui.painter().line_segment([c + egui::vec2(0.0, -6.0), c + egui::vec2(0.0, -1.0)], stroke);
-            ui.painter().line_segment([c + egui::vec2(-2.0, -3.0), c + egui::vec2(0.0, -1.0)], stroke);
-            ui.painter().line_segment([c + egui::vec2(2.0, -3.0), c + egui::vec2(0.0, -1.0)], stroke);
+            let body =
+                egui::Rect::from_center_size(c + egui::vec2(0.0, 1.5), egui::vec2(10.0, 7.0));
+            ui.painter().rect(
+                body,
+                egui::Rounding::same(1.5),
+                egui::Color32::TRANSPARENT,
+                stroke,
+            );
+            ui.painter().line_segment(
+                [c + egui::vec2(-5.5, -3.0), c + egui::vec2(5.5, -3.0)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [c + egui::vec2(0.0, -6.0), c + egui::vec2(0.0, -1.0)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [c + egui::vec2(-2.0, -3.0), c + egui::vec2(0.0, -1.0)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [c + egui::vec2(2.0, -3.0), c + egui::vec2(0.0, -1.0)],
+                stroke,
+            );
         }
     }
     response.on_hover_text(tooltip).clicked()
@@ -2211,7 +2219,11 @@ fn sidebar_icon_button(
 fn sidebar_text_button(ui: &mut egui::Ui, pal: &Palette, label: &str, tooltip: &str) -> bool {
     let height = sidebar_control_height();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, height), egui::Sense::click());
-    let fill = if response.hovered() { pal.hover } else { pal.field };
+    let fill = if response.hovered() {
+        pal.hover
+    } else {
+        pal.field
+    };
     ui.painter().rect(
         rect,
         egui::Rounding::same(6.0),
@@ -2222,8 +2234,16 @@ fn sidebar_text_button(ui: &mut egui::Ui, pal: &Palette, label: &str, tooltip: &
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(if cfg!(target_os = "macos") { 11.5 } else { 11.0 }),
-        if response.hovered() { pal.text } else { pal.dim },
+        egui::FontId::proportional(if cfg!(target_os = "macos") {
+            11.5
+        } else {
+            11.0
+        }),
+        if response.hovered() {
+            pal.text
+        } else {
+            pal.dim
+        },
     );
     response.on_hover_text(tooltip).clicked()
 }
@@ -2243,7 +2263,8 @@ fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut String) {
             ui.set_min_height(sidebar_control_height() - 8.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 let center = icon_rect.center() + egui::vec2(-1.0, -1.0);
                 let stroke = egui::Stroke::new(1.25, pal.dim);
                 ui.painter().circle_stroke(center, 4.0, stroke);
@@ -2260,14 +2281,22 @@ fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut String) {
                         .hint_text(egui::RichText::new("搜索历史…").color(pal.dim)),
                 );
                 if !value.is_empty() {
-                    let (clear_rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                    let (clear_rect, response) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
                     if response.hovered() {
-                        ui.painter().circle_filled(clear_rect.center(), 7.0, pal.hover);
+                        ui.painter()
+                            .circle_filled(clear_rect.center(), 7.0, pal.hover);
                     }
                     let c = clear_rect.center();
                     let stroke = egui::Stroke::new(1.15, pal.dim);
-                    ui.painter().line_segment([c + egui::vec2(-2.5, -2.5), c + egui::vec2(2.5, 2.5)], stroke);
-                    ui.painter().line_segment([c + egui::vec2(-2.5, 2.5), c + egui::vec2(2.5, -2.5)], stroke);
+                    ui.painter().line_segment(
+                        [c + egui::vec2(-2.5, -2.5), c + egui::vec2(2.5, 2.5)],
+                        stroke,
+                    );
+                    ui.painter().line_segment(
+                        [c + egui::vec2(-2.5, 2.5), c + egui::vec2(2.5, -2.5)],
+                        stroke,
+                    );
                     clear = response.on_hover_text("清除搜索").clicked();
                 }
             });
@@ -2336,9 +2365,38 @@ impl eframe::App for AppState {
         visuals.widgets.open.fg_stroke = w_text;
         ctx.set_visuals(visuals);
 
+        let chrome_colors = crate::window_chrome::ChromeColors {
+            fill: pal.head_fill,
+            border: pal.head_border,
+            text: pal.text,
+            dim: pal.dim,
+            accent: pal.accent,
+            #[cfg(target_os = "windows")]
+            hover: pal.hover,
+        };
+        let integrated_titlebar_setting = self.host.settings.get("ui.integrated_titlebar");
+        let integrated_titlebar = crate::window_chrome::integrated_titlebar_enabled(
+            integrated_titlebar_setting.as_deref(),
+        );
+        let sidebar_width = if self.sidebar_expanded { 220.0 } else { 56.0 };
+        if crate::window_chrome::show(
+            ctx,
+            chrome_colors,
+            self.dark,
+            &self.host.llm_control.status(),
+            integrated_titlebar,
+            sidebar_width,
+        ) {
+            self.dark = !self.dark;
+            let _ = self
+                .host
+                .settings
+                .set("ui.theme", if self.dark { "dark" } else { "light" });
+        }
+
         // ── 侧栏导航 ─────────────────────────────────────────────
         egui::SidePanel::left("nav")
-            .exact_width(if self.sidebar_expanded { 220.0 } else { 56.0 })
+            .exact_width(sidebar_width)
             .frame(egui::Frame::default().fill(pal.side).inner_margin(8.0))
             .show(ctx, |ui| {
                 ui.add_space(4.0);
@@ -2349,8 +2407,15 @@ impl eframe::App for AppState {
                 );
                 draw_brand_logo(ui, logo_rect, self.sidebar_expanded, &pal);
                 ui.add_space(6.0);
-                if nav_item(ui, &pal, Icon::Chat, "新建对话", self.sidebar_expanded, !self.busy, true)
-                {
+                if nav_item(
+                    ui,
+                    &pal,
+                    Icon::Chat,
+                    "新建对话",
+                    self.sidebar_expanded,
+                    !self.busy,
+                    true,
+                ) {
                     self.new_session();
                 }
                 if nav_item(
@@ -2443,12 +2508,8 @@ impl eframe::App for AppState {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("项目").size(11.0).color(pal.dim));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if sidebar_icon_button(
-                                ui,
-                                &pal,
-                                SidebarActionIcon::Add,
-                                "添加新项目",
-                            ) {
+                            if sidebar_icon_button(ui, &pal, SidebarActionIcon::Add, "添加新项目")
+                            {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                     let s = path.display().to_string();
                                     let _ = self.host.settings.add_project(&path);
@@ -2737,6 +2798,7 @@ impl eframe::App for AppState {
         // ── 底部输入区：圆角卡片 + 紧凑工具栏 + 圆形发送按钮（现代输入范式） ──
         let mut send_now = false;
         egui::TopBottomPanel::bottom("composer")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::default()
                     .fill(pal.bg)
@@ -2772,7 +2834,7 @@ impl eframe::App for AppState {
                         egui::TextEdit::multiline(&mut self.input)
                             .desired_width(f32::INFINITY)
                             .desired_rows(3)
-                            .font(egui::FontId::proportional(14.0))
+                            .font(egui::FontId::proportional(13.5))
                             .frame(false)
                             .margin(egui::Margin::same(0.0))
                             .hint_text(
@@ -3134,62 +3196,6 @@ impl eframe::App for AppState {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(pal.bg))
             .show(ctx, |ui| {
-                // 导航头色带：独立底色 + 底边主题色分隔线，与消息区拉开层次。
-                let head = egui::Frame::default()
-                    .fill(pal.head_fill)
-                    .inner_margin(egui::Margin::symmetric(
-                        14.0,
-                        if cfg!(target_os = "macos") { 7.0 } else { 5.0 },
-                    ))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            #[cfg(target_os = "macos")]
-                            ui.set_min_height(26.0);
-                            // 紧凑导航头：单行小标题，不再展示模型副标题。
-                            ui.label(
-                                egui::RichText::new("对话工作台")
-                                    .size(15.0)
-                                    .strong()
-                                    .color(pal.text),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    #[cfg(target_os = "macos")]
-                                    let toggle_theme = macos_theme_button(ui, &pal, self.dark);
-                                    #[cfg(not(target_os = "macos"))]
-                                    let toggle_theme = {
-                                        let theme_label = if self.dark {
-                                            "☀ 浅色"
-                                        } else {
-                                            "🌙 深色"
-                                        };
-                                        ui.button(theme_label).clicked()
-                                    };
-                                    if toggle_theme {
-                                        self.dark = !self.dark;
-                                        let _ = self.host.settings.set(
-                                            "ui.theme",
-                                            if self.dark { "dark" } else { "light" },
-                                        );
-                                    }
-                                    #[cfg(target_os = "macos")]
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(self.host.llm_control.status())
-                                            .size(11.0)
-                                            .color(pal.accent),
-                                    );
-                                },
-                            );
-                        });
-                    });
-                ui.painter().hline(
-                    head.response.rect.x_range(),
-                    head.response.rect.bottom(),
-                    egui::Stroke::new(1.0_f32, pal.head_border),
-                );
                 ui.add_space(4.0);
                 // 正文画布保留响应式左右 gutter：宽窗口更舒展，窄窗口不浪费空间。
                 // 顶部导航色带仍保持满宽，消息气泡按扣除 gutter 后的宽度排版。
@@ -3211,78 +3217,84 @@ impl eframe::App for AppState {
                         // ── 版本更新横幅（非 Idle 时显示）──
                         self.draw_update_banner(ui, &pal);
                         egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        let max_w = ui.available_width();
-                        for msg in self.messages.clone() {
-                            if msg.text.is_empty() {
-                                continue; // 纯 DSML 气泡剥离后为空，不渲染空卡片
-                            }
-                            let (fill, text_color): (egui::Color32, egui::Color32) =
-                                match msg.kind.as_str() {
-                                    "user" => (pal.user_bubble, pal.user_text),
-                                    "error" => (pal.err_bubble, pal.err_text),
-                                    "tool" | "plan" => (pal.tool_bubble, pal.dim),
-                                    "thinking" => (pal.field, pal.dim),
-                                    _ => (pal.ai_bubble, pal.text),
-                                };
-                            // 所有气泡统一左对齐：用户消息不右对齐，阅读动线更连贯。
-                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                let bubble = egui::Frame::default()
-                                    .fill(fill)
-                                    .rounding(egui::Rounding::same(10.0))
-                                    .inner_margin(if cfg!(target_os = "macos") {
-                                        egui::Margin::symmetric(12.0, 10.0)
-                                    } else {
-                                        egui::Margin::same(10.0)
-                                    })
-                                    .stroke(egui::Stroke::new(1.0_f32, pal.border));
-                                bubble.show(ui, |ui| {
-                                    ui.set_max_width(max_w * 0.78);
-                                    ui.label(
-                                        egui::RichText::new(&msg.label).size(10.5).color(pal.dim),
+                            .stick_to_bottom(true)
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                let max_w = ui.available_width();
+                                for msg in self.messages.clone() {
+                                    if msg.text.is_empty() {
+                                        continue; // 纯 DSML 气泡剥离后为空，不渲染空卡片
+                                    }
+                                    let (fill, text_color): (egui::Color32, egui::Color32) =
+                                        match msg.kind.as_str() {
+                                            "user" => (pal.user_bubble, pal.user_text),
+                                            "error" => (pal.err_bubble, pal.err_text),
+                                            "tool" | "plan" => (pal.tool_bubble, pal.dim),
+                                            "thinking" => (pal.field, pal.dim),
+                                            _ => (pal.ai_bubble, pal.text),
+                                        };
+                                    // 所有气泡统一左对齐：用户消息不右对齐，阅读动线更连贯。
+                                    ui.with_layout(
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            let bubble = egui::Frame::default()
+                                                .fill(fill)
+                                                .rounding(egui::Rounding::same(10.0))
+                                                .inner_margin(if cfg!(target_os = "macos") {
+                                                    egui::Margin::symmetric(12.0, 10.0)
+                                                } else {
+                                                    egui::Margin::same(10.0)
+                                                })
+                                                .stroke(egui::Stroke::new(1.0_f32, pal.border));
+                                            bubble.show(ui, |ui| {
+                                                ui.set_max_width(max_w * 0.78);
+                                                ui.label(
+                                                    egui::RichText::new(&msg.label)
+                                                        .size(10.0)
+                                                        .color(pal.dim),
+                                                );
+                                                #[cfg(target_os = "macos")]
+                                                ui.add_space(2.0);
+                                                // selectable(true)：正文支持鼠标拖选，选中后 Ctrl+C 复制。
+                                                let resp = if msg.kind == "assistant" {
+                                                    // Markdown 富文本渲染：标题/加粗/列表/代码块转 LayoutJob；
+                                                    // egui 按 job 哈希缓存 galley，同文本不重复排版。
+                                                    let job = crate::markdown::to_job(
+                                                        &msg.text,
+                                                        &crate::markdown::MdTheme {
+                                                            text: pal.text,
+                                                            dim: pal.dim,
+                                                            accent: pal.accent,
+                                                            code_text: pal.text,
+                                                            code_bg: pal.field,
+                                                        },
+                                                        max_w * 0.78 - 20.0,
+                                                    );
+                                                    ui.add(egui::Label::new(job).selectable(true))
+                                                } else {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&msg.text)
+                                                                .size(13.0)
+                                                                .color(text_color),
+                                                        )
+                                                        .selectable(true),
+                                                    )
+                                                };
+                                                // 右键菜单：一键复制整条消息内容。
+                                                resp.context_menu(|ui| {
+                                                    if ui.button("📋 复制全部内容").clicked()
+                                                    {
+                                                        ui.ctx().copy_text(msg.text.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            });
+                                        },
                                     );
-                                    #[cfg(target_os = "macos")]
-                                    ui.add_space(2.0);
-                                    // selectable(true)：正文支持鼠标拖选，选中后 Ctrl+C 复制。
-                                    let resp = if msg.kind == "assistant" {
-                                        // Markdown 富文本渲染：标题/加粗/列表/代码块转 LayoutJob；
-                                        // egui 按 job 哈希缓存 galley，同文本不重复排版。
-                                        let job = crate::markdown::to_job(
-                                            &msg.text,
-                                            &crate::markdown::MdTheme {
-                                                text: pal.text,
-                                                dim: pal.dim,
-                                                accent: pal.accent,
-                                                code_text: pal.text,
-                                                code_bg: pal.field,
-                                            },
-                                            max_w * 0.78 - 20.0,
-                                        );
-                                        ui.add(egui::Label::new(job).selectable(true))
-                                    } else {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&msg.text)
-                                                    .size(13.5)
-                                                    .color(text_color),
-                                            )
-                                            .selectable(true),
-                                        )
-                                    };
-                                    // 右键菜单：一键复制整条消息内容。
-                                    resp.context_menu(|ui| {
-                                        if ui.button("📋 复制全部内容").clicked() {
-                                            ui.ctx().copy_text(msg.text.clone());
-                                            ui.close_menu();
-                                        }
-                                    });
-                                });
+                                    ui.add_space(6.0);
+                                }
                             });
-                            ui.add_space(6.0);
-                        }
-                    });
                     });
             });
 
@@ -3669,6 +3681,36 @@ impl eframe::App for AppState {
                                                 }
                                             });
                                         ui.add_space(14.0);
+                                        field_label(ui, &pal, "窗口外观");
+                                        let stored_titlebar = self
+                                            .host
+                                            .settings
+                                            .get("ui.integrated_titlebar");
+                                        let mut integrated_titlebar =
+                                            crate::window_chrome::integrated_titlebar_enabled(
+                                                stored_titlebar.as_deref(),
+                                            );
+                                        if ui
+                                            .checkbox(
+                                                &mut integrated_titlebar,
+                                                "融合工作台与系统标题栏",
+                                            )
+                                            .changed()
+                                        {
+                                            let _ = self.host.settings.set(
+                                                "ui.integrated_titlebar",
+                                                if integrated_titlebar { "true" } else { "false" },
+                                            );
+                                            self.note = "窗口外观已保存，重启应用后生效".into();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "macOS 保留原生交通灯；Windows 使用应用窗口控制按钮。异常时关闭可恢复系统标题栏。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(14.0);
                                         if accent_button(ui, &pal, "保存系统设置") {
                                             self.save_preferences();
                                         }
@@ -3798,6 +3840,8 @@ impl eframe::App for AppState {
             self.submit();
         }
 
+        crate::window_chrome::handle_resize(ctx, integrated_titlebar);
+
         // 轮询 SessionLog 需要周期重绘（egui 默认按需重绘）。
         ctx.request_repaint_after(std::time::Duration::from_millis(80));
     }
@@ -3805,21 +3849,41 @@ impl eframe::App for AppState {
 
 impl Ui for EguiUi {
     fn run(self: Arc<Self>, _bus: EventBusView, log: Arc<SessionLog>) {
+        let integrated_titlebar_setting = self.settings.get("ui.integrated_titlebar");
+        let integrated_titlebar = crate::window_chrome::integrated_titlebar_enabled(
+            integrated_titlebar_setting.as_deref(),
+        );
         #[cfg(target_os = "macos")]
         let window_title = "";
         #[cfg(not(target_os = "macos"))]
         let window_title = "AIOPS Desktop";
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_title(window_title)
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([960.0, 600.0])
+            // egui 0.30：窗口图标挂在 ViewportBuilder 上（旧版 NativeOptions.icon_data 已移除）。
+            .with_icon(egui::IconData {
+                rgba: APP_ICON_RGBA.to_vec(),
+                width: APP_ICON_WIDTH,
+                height: APP_ICON_HEIGHT,
+            });
+        if integrated_titlebar {
+            #[cfg(target_os = "macos")]
+            {
+                viewport = viewport
+                    .with_decorations(true)
+                    .with_fullsize_content_view(true)
+                    .with_title_shown(false)
+                    .with_titlebar_shown(false)
+                    .with_titlebar_buttons_shown(true);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                viewport = viewport.with_decorations(false);
+            }
+        }
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_title(window_title)
-                .with_inner_size([1280.0, 800.0])
-                .with_min_inner_size([960.0, 600.0])
-                // egui 0.30：窗口图标挂在 ViewportBuilder 上（旧版 NativeOptions.icon_data 已移除）。
-                .with_icon(egui::IconData {
-                    rgba: APP_ICON_RGBA.to_vec(),
-                    width: APP_ICON_WIDTH,
-                    height: APP_ICON_HEIGHT,
-                }),
+            viewport,
             ..Default::default()
         };
         trace("EguiUi::run start");

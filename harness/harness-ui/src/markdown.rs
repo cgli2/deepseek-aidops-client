@@ -11,7 +11,10 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-const BASE: f32 = 13.5;
+const BODY_SIZE: f32 = 13.0;
+const CODE_SIZE: f32 = 12.0;
+const BLOCK_GAP_SIZE: f32 = 5.0;
+const HEADING_SIZES: [f32; 3] = [15.5, 14.5, 13.5];
 
 /// 渲染所需的主题色（从 gui `Palette` 拷贝，避免模块间循环依赖）。
 #[derive(Clone, Copy)]
@@ -47,7 +50,7 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                 if !job.text.ends_with('\n') {
                     append_str(&mut job, "\n", &plain(theme));
                 }
-                append_str(&mut job, "\n", &plain(theme));
+                append_str(&mut job, "\n", &spacer_fmt(theme));
             }
             pending_break = false;
         };
@@ -141,7 +144,7 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                         &mut job,
                         &t,
                         &fmt(
-                            BASE - 1.0,
+                            CODE_SIZE,
                             theme.code_text,
                             true,
                             theme.code_bg,
@@ -152,20 +155,16 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                         ),
                     );
                 } else if let Some(level) = heading {
-                    let size = match level {
-                        1 => 17.5,
-                        2 => 16.0,
-                        _ => 15.0,
-                    };
+                    let size = HEADING_SIZES[(level.saturating_sub(1) as usize).min(2)];
                     append_str(
                         &mut job,
                         &t,
                         &fmt(
                             size,
-                            theme.accent,
+                            heading_color(theme),
                             false,
                             Color32::TRANSPARENT,
-                            true,
+                            false,
                             italic > 0,
                             strike > 0,
                             false,
@@ -181,7 +180,7 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                         &mut job,
                         &t,
                         &fmt(
-                            BASE,
+                            BODY_SIZE,
                             color,
                             false,
                             Color32::TRANSPARENT,
@@ -197,7 +196,7 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                 &mut job,
                 &c,
                 &fmt(
-                    BASE - 1.0,
+                    CODE_SIZE,
                     theme.code_text,
                     true,
                     theme.code_bg,
@@ -227,8 +226,8 @@ fn append_str(job: &mut LayoutJob, s: &str, f: &TextFormat) {
     }
 }
 
-/// 粗体说明：egui `TextFormat` 无字重（`strong()` 仅换色），这里以轻微字距
-/// 近似粗体观感；标题另用放大字号 + 强调色区分层级。
+/// egui `TextFormat` 无独立字重，使用非常克制的字距表达正文强调；标题只靠
+/// 小幅字号差和柔化强调色区分，避免中文标题显得粗重。
 fn fmt(
     size: f32,
     color: Color32,
@@ -258,14 +257,14 @@ fn fmt(
         } else {
             Stroke::NONE
         },
-        extra_letter_spacing: if bold { 0.3 } else { 0.0 },
+        extra_letter_spacing: if bold { 0.15 } else { 0.0 },
         ..Default::default()
     }
 }
 
 fn plain(theme: &MdTheme) -> TextFormat {
     fmt(
-        BASE,
+        BODY_SIZE,
         theme.text,
         false,
         Color32::TRANSPARENT,
@@ -278,7 +277,7 @@ fn plain(theme: &MdTheme) -> TextFormat {
 
 fn dim_fmt(theme: &MdTheme) -> TextFormat {
     fmt(
-        BASE,
+        BODY_SIZE,
         theme.dim,
         false,
         Color32::TRANSPARENT,
@@ -286,6 +285,29 @@ fn dim_fmt(theme: &MdTheme) -> TextFormat {
         false,
         false,
         false,
+    )
+}
+
+fn spacer_fmt(theme: &MdTheme) -> TextFormat {
+    fmt(
+        BLOCK_GAP_SIZE,
+        theme.text,
+        false,
+        Color32::TRANSPARENT,
+        false,
+        false,
+        false,
+        false,
+    )
+}
+
+fn heading_color(theme: &MdTheme) -> Color32 {
+    // 适当混入次级文字色，降低高饱和强调色在大段技术内容中的视觉冲击。
+    let mix = |accent: u8, dim: u8| ((accent as u16 * 4 + dim as u16) / 5) as u8;
+    Color32::from_rgb(
+        mix(theme.accent.r(), theme.dim.r()),
+        mix(theme.accent.g(), theme.dim.g()),
+        mix(theme.accent.b(), theme.dim.b()),
     )
 }
 
@@ -322,5 +344,20 @@ mod tests {
         let job = to_job("普通段落文字", &theme(), 300.0);
         assert_eq!(job.sections.len(), 1);
         assert!(!job.text.ends_with('\n'));
+    }
+
+    #[test]
+    fn heading_scale_stays_compact_and_hierarchical() {
+        let job = to_job("# 一级\n\n## 二级\n\n### 三级\n\n正文", &theme(), 300.0);
+        let sizes: Vec<f32> = job
+            .sections
+            .iter()
+            .map(|section| section.format.font_id.size)
+            .collect();
+        for expected in HEADING_SIZES {
+            assert!(sizes.iter().any(|size| (*size - expected).abs() < 0.01));
+        }
+        assert!(sizes.iter().any(|size| (*size - BODY_SIZE).abs() < 0.01));
+        assert!(HEADING_SIZES[0] - BODY_SIZE <= 2.5);
     }
 }

@@ -59,15 +59,54 @@ pub struct PreviewLoadResult {
 
 /// 文件路径识别白名单扩展名（小写，不含点）。
 pub const FILE_EXTS: &[&str] = &[
-    "rs", "toml", "md", "txt", "json", "yaml", "yml", "js", "ts", "tsx", "jsx", "py", "go", "java",
-    "c", "cpp", "h", "hpp", "sh", "bash", "zsh", "fish", "css", "html", "xml", "sql", "proto",
-    "lock", "ini", "cfg", "conf", "env", "gitignore", "cmake",
+    "rs",
+    "toml",
+    "md",
+    "txt",
+    "json",
+    "yaml",
+    "yml",
+    "js",
+    "ts",
+    "tsx",
+    "jsx",
+    "py",
+    "go",
+    "java",
+    "c",
+    "cpp",
+    "h",
+    "hpp",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "css",
+    "html",
+    "xml",
+    "sql",
+    "proto",
+    "lock",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "gitignore",
+    "cmake",
 ];
 
 /// 无扩展名的知名文件名（小写匹配）。
 pub const KNOWN_FILENAMES: &[&str] = &[
-    "dockerfile", "makefile", "rakefile", "gemfile", "license", "readme",
-    "changelog", "authors", "contributors", "procfile",
+    "dockerfile",
+    "makefile",
+    "rakefile",
+    "gemfile",
+    "license",
+    "readme",
+    "changelog",
+    "authors",
+    "contributors",
+    "procfile",
 ];
 
 /// 文件树构建时忽略的目录名（性能 + 噪声考量）。
@@ -188,7 +227,16 @@ pub fn truncate_content(content: &str) -> (String, bool) {
 pub fn candidate_abs_paths(ws_root: &str, path: &str) -> Vec<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
     let p = Path::new(path);
-    if p.is_absolute() {
+    // `Path::is_absolute` follows the host platform. A Windows path received in
+    // a cross-platform session must still be treated as absolute on macOS/Linux.
+    let bytes = path.as_bytes();
+    let windows_absolute = (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || path.starts_with(r"\\")
+        || path.starts_with("//");
+    if p.is_absolute() || windows_absolute {
         return vec![p.to_path_buf()];
     }
     // 先定位仓库根：从 ws_root 向上找最近的含 .git 的祖先目录。

@@ -1,0 +1,36 @@
+//! Lightweight GUI data models without rendering or runtime behavior.
+
+#[derive(Clone)]
+pub(super) struct ChatMsg {
+    pub(super) kind: String,
+    pub(super) label: String,
+    pub(super) text: String,
+    /// Assistant 原文累积，用于跨分片剥离 DSML；其他消息类型保持为空。
+    pub(super) raw: String,
+}
+
+#[derive(Clone)]
+pub(super) struct PluginUiRow {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) desc: String,
+    pub(super) core: bool,
+    pub(super) enabled: bool,
+    pub(super) active: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct MemItem {
+    pub(super) title: String,
+    pub(super) meta: String,
+    pub(super) body: String,
+}
+
+/// 核心插件默认启用，且不可在界面中取消。
+pub(super) const BUILTIN_PLUGINS: &[(&str, &str, &str)] = &[
+    ("local-files", "本地文件", "读取、搜索与写入工作区文件"),
+    ("shell", "Shell", "在受限 Shell 中执行命令并回传输出"),
+    ("git", "Git", "查看差异、提交历史与分支操作"),
+    ("memory", "Memory", "跨会话记忆检索与沉淀"),
+    ("hooks", "Hooks", "生命周期钩子：提交前检查等自动化"),
+];

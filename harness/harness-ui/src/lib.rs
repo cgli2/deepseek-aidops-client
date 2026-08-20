@@ -39,6 +39,10 @@ mod gui;
 #[cfg(feature = "gui")]
 mod markdown;
 #[cfg(feature = "gui")]
+mod highlight;
+#[cfg(feature = "gui")]
+mod preview;
+#[cfg(feature = "gui")]
 mod window_chrome;
 #[cfg(feature = "gui")]
 pub use gui::EguiUi;

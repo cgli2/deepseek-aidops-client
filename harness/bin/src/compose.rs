@@ -358,6 +358,8 @@ fn make_ui(
         // `dyn UiInputSink`（而非 `Arc<dyn UiInputSink>`），否则 `ServiceCell` 的 TypeId 不匹配会 panic。
         let sink: Arc<dyn UiInputSink> = ctx.get::<dyn UiInputSink>();
         let llm_control: Arc<dyn LlmControl> = ctx.get::<dyn LlmControl>();
+        let fs: Arc<dyn harness_capability::fs::Fs> = ctx.get::<dyn harness_capability::fs::Fs>();
+        let git: Arc<dyn harness_capability::git::Git> = ctx.get::<dyn harness_capability::git::Git>();
         return Arc::new(EguiUi::new(
             sink,
             llm_control,
@@ -371,6 +373,8 @@ fn make_ui(
             wiki,
             code,
             wasm_plugins,
+            fs.clone(),
+            git.clone(),
         ));
     }
     Arc::new(ConsoleUi)

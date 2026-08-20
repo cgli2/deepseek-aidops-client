@@ -131,7 +131,44 @@ fn window_button(ui: &mut Ui, colors: ChromeColors, kind: u8, maximized: bool) -
     response
 }
 
-/// 绘制全宽标题栏，返回是否切换主题。
+/// 标题栏可触发的动作：主题切换 / 文件树面板开关。
+#[derive(Default)]
+pub struct ChromeActions {
+    pub toggle_theme: bool,
+    pub toggle_tree: bool,
+}
+
+/// 文件树开关按钮（矢量树形图标，激活态用 accent 色）。
+fn tree_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), Sense::click());
+    let border = if response.hovered() {
+        Stroke::new(1.0, colors.border)
+    } else {
+        Stroke::NONE
+    };
+    ui.painter().rect(rect, 6.0, Color32::TRANSPARENT, border);
+    let c = rect.center();
+    let color = if open { colors.accent } else { colors.dim };
+    let s = Stroke::new(1.25, color);
+    // 树形：根节点 + 子节点 + 连接线。
+    ui.painter().rect_stroke(
+        egui::Rect::from_center_size(c + egui::vec2(-4.0, -4.0), egui::vec2(6.0, 4.5)),
+        1.0,
+        s,
+    );
+    ui.painter().rect_stroke(
+        egui::Rect::from_center_size(c + egui::vec2(3.5, 3.5), egui::vec2(6.0, 4.5)),
+        1.0,
+        s,
+    );
+    ui.painter()
+        .line_segment([c + egui::vec2(-4.0, -1.8), c + egui::vec2(-4.0, 3.5)], s);
+    ui.painter()
+        .line_segment([c + egui::vec2(-4.0, 3.5), c + egui::vec2(0.5, 3.5)], s);
+    response.on_hover_text("项目文件树")
+}
+
+/// 绘制全宽标题栏，返回标题栏触发的动作。
 pub fn show(
     ctx: &Context,
     colors: ChromeColors,
@@ -139,8 +176,9 @@ pub fn show(
     status: &str,
     integrated: bool,
     workspace_left: f32,
-) -> bool {
-    let mut toggle_theme = false;
+    tree_open: bool,
+) -> ChromeActions {
+    let mut actions = ChromeActions::default();
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     egui::TopBottomPanel::top("integrated_workbench_titlebar")
         .exact_height(titlebar_height())
@@ -192,7 +230,11 @@ pub fn show(
                     }
                     ui.add_space(8.0);
                     if theme_button(ui, colors, dark).clicked() {
-                        toggle_theme = true;
+                        actions.toggle_theme = true;
+                    }
+                    ui.add_space(6.0);
+                    if tree_button(ui, colors, tree_open).clicked() {
+                        actions.toggle_tree = true;
                     }
                     ui.add_space(6.0);
                     ui.add(
@@ -209,7 +251,7 @@ pub fn show(
                 Stroke::new(1.0, colors.border),
             );
         });
-    toggle_theme
+    actions
 }
 
 #[cfg(target_os = "windows")]

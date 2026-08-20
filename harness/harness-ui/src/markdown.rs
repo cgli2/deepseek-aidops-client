@@ -220,6 +220,108 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
     job
 }
 
+/// Markdown 渲染块：普通富文本段或可点击文件路径。
+#[derive(Clone)]
+pub enum MarkdownBlock {
+    /// 普通富文本段（标题/段落/列表/代码块等）。
+    Job(LayoutJob),
+    /// 可点击的文件路径（行内代码或普通文本中识别出的路径）。
+    FilePath(String),
+}
+
+/// 把 Markdown 源文解析为渲染块列表。
+///
+/// 策略：先用 `to_job` 生成完整 LayoutJob，再扫描原文中的行内代码（`` `path` ``），
+/// 若内容是文件路径则拆出为 `FilePath` block。普通文本中的路径因误伤风险高，
+/// 仅在行内代码场景识别。
+pub fn parse_blocks(md: &str, theme: &MdTheme, max_width: f32) -> Vec<MarkdownBlock> {
+    use pulldown_cmark::{Event, Options, Parser};
+
+    let mut blocks: Vec<MarkdownBlock> = Vec::new();
+    let job = to_job(md, theme, max_width);
+
+    // 扫描行内代码：若为文件路径，从 job 中拆出。
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+
+    for event in Parser::new_ext(md, opts) {
+        match event {
+            Event::Code(c) => {
+                let code_str = c.to_string();
+                if crate::preview::looks_like_file_path(&code_str) {
+                    blocks.push(MarkdownBlock::FilePath(code_str));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 简化策略：如果没有任何文件路径被识别，直接返回整个 job 作为一个 block。
+    // 如果有文件路径，我们把 job 作为第一个 block，FilePath 作为后续 block。
+    // GUI 侧渲染时按顺序处理：Job block 渲染为 Label，FilePath block 渲染为可点击 label。
+    // 但这样会导致文件路径出现在文本末尾而非原位。
+    //
+    // 更好的方案：把 md 按行内代码分割，每段分别 to_job。
+    // 但 pulldown-cmark 的 Code 事件不直接给偏移量，需要手动扫描。
+    //
+    // 实用方案：直接扫描 md 中的 `` `path` `` 模式，按此分割。
+    if blocks.is_empty() {
+        return vec![MarkdownBlock::Job(job)];
+    }
+
+    // 有文件路径：按 `` `path` `` 分割 md，每段生成 Job，路径段生成 FilePath。
+    let mut result: Vec<MarkdownBlock> = Vec::new();
+    let mut remaining = md.to_string();
+
+    while !remaining.is_empty() {
+        // 找下一个行内代码块
+        let start = match remaining.find('`') {
+            Some(s) => s,
+            None => {
+                // 剩余纯文本
+                if !remaining.trim().is_empty() {
+                    let job = to_job(&remaining, theme, max_width);
+                    result.push(MarkdownBlock::Job(job));
+                }
+                break;
+            }
+        };
+        // 找闭合 backtick
+        let end = match remaining[start + 1..].find('`') {
+            Some(e) => e + start + 1,
+            None => {
+                // 不闭合，当普通文本
+                let job = to_job(&remaining, theme, max_width);
+                result.push(MarkdownBlock::Job(job));
+                break;
+            }
+        };
+
+        // 前缀文本
+        if start > 0 {
+            let prefix = &remaining[..start];
+            if !prefix.trim().is_empty() {
+                let job = to_job(prefix, theme, max_width);
+                result.push(MarkdownBlock::Job(job));
+            }
+        }
+
+        // 代码内容
+        let code_content = &remaining[start + 1..end];
+        if crate::preview::looks_like_file_path(code_content) {
+            result.push(MarkdownBlock::FilePath(code_content.to_string()));
+        } else {
+            // 非文件路径的行内代码：作为 job 的一部分
+            let job = to_job(&format!("`{code_content}`"), theme, max_width);
+            result.push(MarkdownBlock::Job(job));
+        }
+
+        remaining = remaining[end + 1..].to_string();
+    }
+
+    result
+}
+
 fn append_str(job: &mut LayoutJob, s: &str, f: &TextFormat) {
     if !s.is_empty() {
         job.append(s, 0.0, f.clone());

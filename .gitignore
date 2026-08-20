@@ -51,7 +51,7 @@ Desktop.ini
 .DS_Store
 .workbuddy
 .qoder
-
+.verifytemp
 # Temporary files
 *.tmp
 *.temp

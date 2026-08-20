@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use harness_capability::git::{Git, GitStatus, Worktree};
+use harness_capability::git::{Git, GitChange, GitStatus, Worktree};
 use harness_core::error::{Error, Result};
 
 /// git CLI Provider。
@@ -62,6 +62,53 @@ impl Git for GitCli {
 
     fn diff(&self) -> Result<String> {
         self.run(&["diff"])
+    }
+
+    fn diff_path(&self, path: &str) -> Result<String> {
+        self.run(&["diff", "--", path])
+    }
+
+    fn is_tracked(&self, path: &str) -> Result<bool> {
+        // ls-files --error-unmatch 对未跟踪文件返回非零退出码 → run() 报错。
+        // 成功即表示文件被跟踪；输出非空为双重确认。
+        self.run(&["ls-files", "--error-unmatch", path])
+            .map(|s| !s.trim().is_empty())
+    }
+
+    fn changed_files(&self) -> Result<Vec<GitChange>> {
+        // -z 以 NUL 分隔，正确处理含空格 / 中文的文件名。
+        // 格式：`XY PATH\0` —— 索引状态 + 工作树状态各 1 字符，随后一个空格 + 路径。
+        // 注意：**不能 trim 条目**（trim 会把工作树修改 ` M path` 开头的状态空格
+        // 吃掉，导致 bytes[2] 不再是分隔空格而误判跳过，只有 ?? 未跟踪能通过）。
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["status", "--porcelain", "-z"])
+            .output()
+            .map_err(Error::Io)?;
+        if !out.status.success() {
+            // 非 git 仓库 / 错误：返回空列表（UI 不崩溃，只是无标记）。
+            return Ok(Vec::new());
+        }
+        let raw = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut files = Vec::new();
+        for entry in raw.split('\0') {
+            if entry.len() < 4 {
+                // 空条目 / 重命名条目的第二个路径（纯路径，无状态码）。
+                continue;
+            }
+            let bytes = entry.as_bytes();
+            // 第 3 个字符必须是分隔空格；重命名第二个路径等无状态码条目会被跳过。
+            if bytes[2] != b' ' {
+                continue;
+            }
+            files.push(GitChange {
+                path: entry[3..].to_string(),
+                index: entry[..1].to_string(),
+                worktree: entry[1..2].to_string(),
+            });
+        }
+        Ok(files)
     }
 
     fn commit(&self, message: &str) -> Result<String> {

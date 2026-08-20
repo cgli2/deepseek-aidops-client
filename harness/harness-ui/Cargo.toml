@@ -50,7 +50,14 @@ features = ["glow", "default_fonts"]
 version = "0.10"
 optional = true
 
+# 代码预览语法高亮：syntect（纯 Rust，内置语法集与主题，无 C 依赖）。
+[dependencies.syntect]
+version = "5"
+optional = true
+default-features = false
+features = ["default-fancy"]
+
 [features]
 # 默认仅 Ui trait + NullUi（headless）。TUI 是产品默认形态（完成文档 §1），GUI 为可替换实现。
 tui = ["dep:ratatui", "dep:crossterm"]
-gui = ["dep:egui", "dep:eframe", "dep:pulldown-cmark", "dep:harness-provider-wasm"]
+gui = ["dep:egui", "dep:eframe", "dep:pulldown-cmark", "dep:syntect", "dep:harness-provider-wasm"]

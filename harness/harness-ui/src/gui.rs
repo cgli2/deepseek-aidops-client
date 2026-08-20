@@ -223,6 +223,16 @@ struct Palette {
     warn: egui::Color32,
     banner_ok: egui::Color32,
     banner_warn: egui::Color32,
+    /// Diff 视图：新增行背景（绿）
+    diff_add_bg: egui::Color32,
+    /// Diff 视图：删除行背景（红）
+    diff_del_bg: egui::Color32,
+    /// Diff 视图：hunk 头（@@）背景（蓝青）
+    diff_hunk_bg: egui::Color32,
+    /// Diff 视图：新增行 + 号颜色
+    diff_sign_add: egui::Color32,
+    /// Diff 视图：删除行 - 号颜色
+    diff_sign_del: egui::Color32,
 }
 
 fn palette(dark: bool) -> Palette {
@@ -247,15 +257,21 @@ fn palette(dark: bool) -> Palette {
             btn_text: C::from_rgb(0x8c, 0xec, 0xcd),
             btn_border: C::from_rgb(0x2f, 0x6b, 0x58),
             // 用户气泡：低饱和石板蓝灰，避免高饱和蓝底刺眼。
-            user_bubble: C::from_rgb(0x25, 0x31, 0x42),
+            user_bubble: C::from_rgb(0x2a, 0x38, 0x50),
             user_text: C::from_rgb(0xe6, 0xed, 0xf3),
-            ai_bubble: C::from_rgb(0x15, 0x1c, 0x26),
-            tool_bubble: C::from_rgb(0x10, 0x16, 0x1d),
+            ai_bubble: C::from_rgb(0x18, 0x22, 0x30),
+            tool_bubble: C::from_rgb(0x14, 0x1b, 0x24),
             err_bubble: C::from_rgb(0x33, 0x15, 0x1f),
             err_text: C::from_rgb(0xff, 0xa1, 0xb0),
             warn: C::from_rgb(0xff, 0xb8, 0x6b),
             banner_ok: C::from_rgb(0x16, 0x35, 0x2c),
             banner_warn: C::from_rgb(0x33, 0x2a, 0x12),
+            // Diff：深色主题用更高亮度绿/红，与深底拉开对比度。
+            diff_add_bg: C::from_rgb(0x1a, 0x3a, 0x28),
+            diff_del_bg: C::from_rgb(0x4a, 0x1f, 0x24),
+            diff_hunk_bg: C::from_rgb(0x1a, 0x2a, 0x40),
+            diff_sign_add: C::from_rgb(0x4a, 0xc9, 0x8a),
+            diff_sign_del: C::from_rgb(0xff, 0x8a, 0x95),
         }
     } else {
         Palette {
@@ -278,15 +294,21 @@ fn palette(dark: bool) -> Palette {
             btn_text: C::from_rgb(0x0c, 0x7a, 0x5b),
             btn_border: C::from_rgb(0xa9, 0xd8, 0xc6),
             // 用户气泡：淡灰蓝底 + 深色文字，与助手气泡区分但不刺眼。
-            user_bubble: C::from_rgb(0xde, 0xe7, 0xf2),
+            user_bubble: C::from_rgb(0xe3, 0xeb, 0xf5),
             user_text: C::from_rgb(0x1a, 0x24, 0x30),
-            ai_bubble: C::from_rgb(0xea, 0xef, 0xf5),
-            tool_bubble: C::from_rgb(0xf0, 0xf4, 0xf9),
+            ai_bubble: C::from_rgb(0xf0, 0xf3, 0xf8),
+            tool_bubble: C::from_rgb(0xf5, 0xf7, 0xfa),
             err_bubble: C::from_rgb(0xfb, 0xe5, 0xe9),
             err_text: C::from_rgb(0xb3, 0x26, 0x3c),
             warn: C::from_rgb(0xc2, 0x6a, 0x00),
             banner_ok: C::from_rgb(0xe2, 0xf4, 0xed),
             banner_warn: C::from_rgb(0xfd, 0xf1, 0xdc),
+            // Diff：浅色主题用 GitHub 风格浅绿/浅红底 + 深色符号。
+            diff_add_bg: C::from_rgb(0xe6, 0xff, 0xec),
+            diff_del_bg: C::from_rgb(0xff, 0xeb, 0xe9),
+            diff_hunk_bg: C::from_rgb(0xf0, 0xf6, 0xff),
+            diff_sign_add: C::from_rgb(0x0a, 0x84, 0x38),
+            diff_sign_del: C::from_rgb(0xcf, 0x22, 0x2e),
         }
     }
 }
@@ -308,6 +330,10 @@ pub struct EguiUi {
     code: Arc<dyn CodeGraph>,
     /// WASM 插件运行时：导入/启用即时生效，禁用/移除立即卸载实例。
     wasm_plugins: Arc<harness_provider_wasm::WasmPluginRuntime>,
+    /// 文件预览：只读查询工作区文件内容（沙箱根 = Workspace）。
+    fs: Arc<dyn harness_capability::fs::Fs>,
+    /// 文件预览：git diff / 跟踪状态查询（零 C 绑定，git CLI 子进程）。
+    git: Arc<dyn harness_capability::git::Git>,
     /// 独立 tokio runtime（析构安全包装）：记忆面板驱动资产服务的异步查询（原生走文件 IO、
     /// 后端走网络）。注意 GUI 事件循环本身运行在 `#[tokio::main]` 的 runtime 主线程内，
     /// 不可在该线程直接 `block_on` 另一 runtime（会触发 "Cannot start a runtime from
@@ -318,6 +344,7 @@ pub struct EguiUi {
 
 /// 独立 tokio runtime 的析构安全包装。
 ///
+
 /// 点右上角关闭窗口时，本对象可能在主 runtime（`#[tokio::main]`）的异步上下文中被 drop；
 /// tokio 禁止在该上下文 drop runtime（blocking 池无法安全关闭），直接 panic 并经
 /// services RwLock 中毒引发二次 panic → abort，表现为点关闭后卡顿数秒才退出。
@@ -370,6 +397,8 @@ impl EguiUi {
         wiki: Arc<dyn WikiStore>,
         code: Arc<dyn CodeGraph>,
         wasm_plugins: Arc<harness_provider_wasm::WasmPluginRuntime>,
+        fs: Arc<dyn harness_capability::fs::Fs>,
+        git: Arc<dyn harness_capability::git::Git>,
     ) -> Self {
         Self {
             sink,
@@ -384,6 +413,8 @@ impl EguiUi {
             wiki,
             code,
             wasm_plugins,
+            fs,
+            git,
             rt: UiRuntime::new("harness-ui-mem"),
         }
     }
@@ -494,6 +525,52 @@ struct AppState {
     mem_bootstrapped: bool,
     /// 最近一次索引/操作的反馈信息。
     mem_index_msg: String,
+    /// 首次索引的异步回传通道（非阻塞轮询，避免首次点击卡顿）。
+    mem_boot_rx: Option<std::sync::mpsc::Receiver<harness_core::error::Result<(harness_capability::index::IndexStats, usize)>>>,
+    /// 记忆面板刷新的异步回传通道。
+    mem_refresh_rx: Option<std::sync::mpsc::Receiver<Vec<MemItem>>>,
+    // ── 文件预览（纯 UI 本地状态，不持久化、不进 SessionLog）──
+    /// 预览窗是否展开。
+    preview_open: bool,
+    /// 当前预览的文件相对路径（相对 workspace_root）。
+    preview_path: Option<String>,
+    /// 预览窗内容缓存：避免每帧重读磁盘。
+    preview_content: Option<String>,
+    /// 预览模式：源码 / Diff。
+    preview_mode: crate::preview::PreviewMode,
+    /// diff 文本缓存（切换到 Diff 模式时按需加载）。
+    preview_diff: Option<String>,
+    /// 文件是否受 git 跟踪（决定是否显示 Diff tab）。
+    preview_tracked: bool,
+    /// 预览加载错误信息（文件不存在 / 超大 / 二进制）。
+    preview_error: Option<String>,
+    /// 预览内容是否被截断（超过 512KB）。
+    preview_truncated: bool,
+    /// 预览加载的异步回传通道（非阻塞模式：不在同帧等待结果）。
+    preview_rx: Option<std::sync::mpsc::Receiver<crate::preview::PreviewLoadResult>>,
+    /// 延迟打开预览（渲染期间收集点击，渲染后处理，避免同帧布局突变闪烁）。
+    pending_preview: Option<String>,
+    /// 预览内容缓存（path → (content, truncated)）：同一文件重复点击零加载、无空窗。
+    preview_cache: std::collections::HashMap<String, (String, bool)>,
+    /// 当前预览的语法高亮 LayoutJob（preview_content 就绪后一次性生成，渲染零成本）。
+    preview_highlight: Option<egui::text::LayoutJob>,
+    /// 文件树是否展开。
+    tree_open: bool,
+    /// 文件树根节点（懒构建）。
+    tree_root: Option<crate::preview::FileTreeNode>,
+    /// 文件树展开路径集合。
+    tree_expanded: std::collections::HashSet<String>,
+    /// 文件树上次刷新时间（节流）。
+    tree_last_refresh: Option<std::time::Instant>,
+    // ── Git 变更（统一入口：快速查看哪些文件被修改，点击审查 diff）──
+    /// 有未提交变更的文件列表（含状态码）。
+    git_changes: Vec<harness_capability::git::GitChange>,
+    /// 当前分支名。
+    git_branch: String,
+    /// Git 变更是否已加载过（避免重复刷新）。
+    git_loaded: bool,
+    /// 文件树区域当前视图：true = Git 变更列表，false = 文件树。
+    tree_show_git: bool,
 }
 
 impl AppState {
@@ -627,6 +704,30 @@ impl AppState {
             mem_items: Vec::new(),
             mem_bootstrapped: false,
             mem_index_msg: String::new(),
+            mem_boot_rx: None,
+            mem_refresh_rx: None,
+            // 文件预览初始状态
+            preview_open: false,
+            preview_path: None,
+            preview_content: None,
+            preview_mode: crate::preview::PreviewMode::Source,
+            preview_diff: None,
+            preview_tracked: false,
+            preview_error: None,
+            preview_truncated: false,
+            preview_rx: None,
+            pending_preview: None,
+            preview_cache: std::collections::HashMap::new(),
+            preview_highlight: None,
+            tree_open: false,
+            tree_root: None,
+            tree_expanded: std::collections::HashSet::new(),
+            tree_last_refresh: None,
+            // Git 变更初始状态
+            git_changes: Vec::new(),
+            git_branch: String::new(),
+            git_loaded: false,
+            tree_show_git: false,
             // host/log 放最后：上方字段仍需借用 host.settings，提前移入会报 E0505。
             host,
             log,
@@ -738,8 +839,46 @@ impl AppState {
             });
             let _ = tx.send(items);
         });
-        if let Ok(items) = rx.recv() {
-            self.mem_items = items;
+        // 非阻塞：只存接收端，下一帧 poll_mem 轮询填充 mem_items，不卡 UI 线程。
+        self.mem_refresh_rx = Some(rx);
+    }
+
+    /// 每帧轮询记忆索引/刷新的异步结果（非阻塞）。
+    fn poll_mem(&mut self) {
+        // 索引结果
+        if let Some(rx) = &self.mem_boot_rx {
+            match rx.try_recv() {
+                Ok(Ok((stats, facts))) => {
+                    self.mem_boot_rx = None;
+                    self.mem_index_msg = format!(
+                        "已索引：{} 技能 / {} 文档 / {} 符号 / {} 事实",
+                        stats.skills, stats.pages, stats.symbols, facts
+                    );
+                    self.mem_loaded = false; // 强制刷新
+                }
+                Ok(Err(e)) => {
+                    self.mem_boot_rx = None;
+                    self.mem_index_msg = format!("索引失败: {e}");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.mem_boot_rx = None;
+                    self.mem_index_msg = "索引失败: 后台任务异常退出".into();
+                }
+            }
+        }
+        // 刷新结果
+        if let Some(rx) = &self.mem_refresh_rx {
+            match rx.try_recv() {
+                Ok(items) => {
+                    self.mem_refresh_rx = None;
+                    self.mem_items = items;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.mem_refresh_rx = None;
+                }
+            }
         }
     }
 
@@ -754,10 +893,12 @@ impl AppState {
         let ws = self.host.workspace_root.clone();
         let path = std::path::Path::new(&ws).to_path_buf();
         // 同 refresh_mem：在独立 OS 线程 block_on，避免 GUI 线程重入 runtime 导致闪退。
+        // 非阻塞：只把接收端存起来，下一帧 poll_mem 轮询结果，不阻塞 UI 线程。
         let handle = self.host.rt.handle();
         let (tx, rx) = std::sync::mpsc::channel::<
             harness_core::error::Result<(harness_capability::index::IndexStats, usize)>,
         >();
+        self.mem_boot_rx = Some(rx);
         std::thread::spawn(move || {
             let res = handle.block_on(async move {
                 let stats =
@@ -783,23 +924,10 @@ impl AppState {
             });
             let _ = tx.send(res);
         });
-        match rx.recv() {
-            Ok(Ok((stats, facts))) => {
-                self.mem_index_msg = format!(
-                    "已索引：{} 技能 / {} 文档 / {} 符号 / {} 事实",
-                    stats.skills, stats.pages, stats.symbols, facts
-                );
-                self.mem_bootstrapped = true;
-                self.mem_loaded = false; // 强制刷新
-            }
-            Ok(Err(e)) => {
-                self.mem_index_msg = format!("索引失败: {e}");
-            }
-            Err(_) => {
-                self.mem_index_msg = "索引失败: 后台任务未返回结果".into();
-            }
-        }
+        // 标记为已触发，避免重复索引；索引完成由 poll_mem 填充反馈。
+        self.mem_bootstrapped = true;
     }
+
 
     fn push(&mut self, kind: &str, label: &str, text: &str) {
         self.messages.push(ChatMsg {
@@ -882,7 +1010,7 @@ impl AppState {
                     self.push(
                         "tool",
                         "工具",
-                        &format!("{} 返回: {}", if result.ok { "✓" } else { "✗" }, preview),
+                        &format!("{} 返回: {}", if result.ok { "->" } else { "X" }, preview),
                     );
                 }
                 SessionEvent::PlanUpdate { items, .. } => {
@@ -1189,8 +1317,19 @@ impl AppState {
         let _ = self.host.settings.add_project(&p);
         // 反向通道：Workspace 换根 + SessionLog 重载新项目目录的最近会话。
         self.host.sink.switch_workspace(&p);
-        self.active_project = path.to_string();
-        self.projects = self.host.settings.projects();
+        // 清空旧项目的预览与文件树缓存（基准根统一从 settings 读取）。
+        self.preview_open = false;
+        self.preview_path = None;
+        self.preview_content = None;
+        self.preview_diff = None;
+        self.preview_error = None;
+        self.preview_rx = None;
+        self.preview_cache.clear();
+        self.tree_open = false;
+        self.tree_root = None;
+        self.tree_expanded.clear();
+         self.tree_show_git = false;
+       self.active_project = path.to_string();   self.projects = self.host.settings.projects();
         // 视图复位：poll_log 下帧从 0 重放，右侧消息流刷新为该项目历史。
         self.last_event = 0;
         self.messages = vec![ChatMsg {
@@ -1298,7 +1437,7 @@ impl AppState {
             UpdateStatus::ReadyToRestart { version, .. } => {
                 egui::Frame::default()
                     .fill(pal.banner_ok)
-                    .rounding(egui::Rounding::same(10.0))
+                    .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -1324,7 +1463,7 @@ impl AppState {
                 let mandatory = rel.mandatory.unwrap_or(false);
                 egui::Frame::default()
                     .fill(pal.banner_warn)
-                    .rounding(egui::Rounding::same(10.0))
+                    .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
@@ -1576,6 +1715,797 @@ impl AppState {
         }
         self.note = format!("插件「{stem}」已通过沙箱校验并登记，默认启用");
     }
+
+    // ── 文件预览 ──────────────────────────────────────────────
+
+    /// 打开文件预览窗并加载指定文件。
+    ///
+    /// 防闪烁策略：
+    /// 1. 命中缓存 → 立即填入内容并打开面板（零等待、无空窗）；
+    /// 2. 未命中 → 先后台加载，**内容就绪后才打开面板**（poll_preview 里开），
+    ///    面板出现的第一帧就是完整内容，没有「加载中 → 内容」的跳变闪烁。
+    fn open_preview(&mut self, path: String) {
+        self.preview_path = Some(path.clone());
+        self.preview_mode = crate::preview::PreviewMode::Source;
+        self.preview_diff = None;
+        self.preview_tracked = false;
+        if let Some((content, truncated)) = self.preview_cache.get(&path).cloned() {
+            self.preview_content = Some(content);
+            self.preview_truncated = truncated;
+            self.preview_error = None;
+            self.preview_open = true;
+            // 缓存只存了内容；diff / tracked 仍需异步加载（已跟踪/未跟踪都算）。
+            self.load_preview(path);
+            return;
+        }
+        self.preview_content = None;
+        self.preview_error = None;
+        self.preview_truncated = false;
+        self.preview_highlight = None;
+        // 不立即 preview_open = true：等 poll_preview 内容就绪后再开。
+        self.load_preview(path);
+    }
+
+    /// 异步加载文件内容 + git 跟踪状态 + diff（复用 UiRuntime 独立线程模式）。
+    ///
+    /// 路径探测：气泡里模型写的路径通常相对「仓库根」，而 fs 沙箱根（Workspace）
+    /// 可能落在仓库子目录（如 exe 位于 `harness/dist` 时根是 `.../harness`）。
+    /// 因此从沙箱根开始逐级向父目录拼接候选绝对路径，第一个读得动的即命中。
+    fn load_preview(&mut self, path: String) {
+        let fs = self.host.fs.clone();
+        let git = self.host.git.clone();
+        // 基准根统一从 settings 读取（switch_project 已更新），避免 Arc 字段不可变。
+        let ws_root = self
+            .host
+            .settings
+            .get("workspace.root")
+            .filter(|p| std::path::Path::new(p).is_dir())
+            .unwrap_or_else(|| self.host.workspace_root.clone());
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::preview::PreviewLoadResult>();
+        self.preview_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = handle.block_on(async move {
+                let candidates = crate::preview::candidate_abs_paths(&ws_root, &path);
+                let mut content: Option<harness_core::error::Result<String>> = None;
+                let mut resolved: Option<std::path::PathBuf> = None;
+                for cand in &candidates {
+                    match fs.read(cand).await {
+                        Ok(c) => {
+                            content = Some(Ok(c));
+                            resolved = Some(cand.clone());
+                            break;
+                        }
+                        Err(e) => content = Some(Err(e)),
+                    }
+                }
+                let tracked = resolved
+                    .as_ref()
+                    .map(|p| git.is_tracked(&p.display().to_string()).unwrap_or(false))
+                    .unwrap_or(false);
+                // diff 内容：
+                // - 已跟踪文件 → git diff（可能有实际修改，也可能为空）
+                // - 未跟踪文件（is_tracked=false 但读取成功）→ 整文件作为新增行
+                //   （git diff 对未跟踪文件恒为空，全新增展示才符合预期）
+                let diff = if tracked {
+                    resolved
+                        .as_ref()
+                        .and_then(|p| git.diff_path(&p.display().to_string()).ok())
+                        .filter(|d| !d.trim().is_empty())
+                } else {
+                    // content: Option<Result<String>>，取 Ok 分支的内容。
+                    content.as_ref().and_then(|r| r.as_ref().ok()).map(|c| {
+                        c.lines()
+                            .map(|l| format!("+{l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                };
+                let has_diff = diff.is_some();
+                // tracked 语义 =「有 diff 可看」：未跟踪文件的"全新增 diff"也算，
+                // 这样预览窗会显示 Diff tab（源码 / Diff 切换可审查新增内容）。
+                crate::preview::PreviewLoadResult {
+                    content: content.unwrap_or_else(|| {
+                        Err(harness_core::error::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("file not found after probing {candidates:?}"),
+                        )))
+                    }),
+                    diff,
+                    tracked: has_diff,
+                }
+            });
+            let _ = tx.send(res);
+        });
+    }
+
+    /// 每帧轮询预览加载结果（非阻塞：try_recv 不等待）。
+    fn poll_preview(&mut self) {
+        let path = self.preview_path.clone();
+        if let Some(rx) = &self.preview_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.preview_rx = None;
+                    let cur_path = self.preview_path.clone();
+                    match res.content {
+                        Ok(content) => {
+                            if crate::preview::is_binary(&content) {
+                                self.preview_error = Some("二进制文件，无法预览".into());
+                                self.preview_content = None;
+                            } else {
+                                let (text, truncated) = crate::preview::truncate_content(&content);
+                                self.preview_content = Some(text.clone());
+                                self.preview_truncated = truncated;
+                                self.preview_error = None;
+                                // 生成语法高亮 LayoutJob（一次性，渲染零成本）。
+                                let file_name = cur_path
+                                    .as_ref()
+                                    .and_then(|p| std::path::Path::new(p).file_name())
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("file.txt");
+                                self.preview_highlight = Some(
+                                    crate::highlight::highlight_to_job(
+                                        &text,
+                                        file_name,
+                                        self.dark,
+                                        egui::Color32::TRANSPARENT,
+                                        pal_of(self.dark).dim,
+                                        f32::INFINITY,
+                                    ),
+                                );
+                                // 写入缓存：同一文件重复点击秒开，不重新加载。
+                                if let Some(p) = &cur_path {
+                                    self.preview_cache.insert(p.clone(), (text, truncated));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.preview_error = Some(format!("{e}"));
+                            self.preview_content = None;
+                        }
+                    }
+                    self.preview_tracked = res.tracked;
+                    self.preview_diff = res.diff;
+                    // 内容（或错误）就绪后打开面板：首帧即完整内容，无空窗闪烁。
+                    if !self.preview_open {
+                        self.preview_open = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // 仍在加载中，下一帧再查
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.preview_rx = None;
+                    self.preview_error = Some("加载失败：后台任务异常退出".into());
+                }
+            }
+        }
+        let _ = path;
+    }
+
+    /// 渲染文件预览窗。
+    fn render_preview(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        // 标题栏：文件名 + 模式切换 + 关闭
+        let head_h = if cfg!(target_os = "macos") { 32.0 } else { 28.0 };
+        egui::TopBottomPanel::top("preview_head")
+            .exact_height(head_h)
+            .frame(egui::Frame::default().fill(pal.head_fill).inner_margin(egui::Margin::symmetric(10.0, 4.0)))
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let name = self.preview_path.as_ref()
+                        .and_then(|p| std::path::Path::new(p).file_name())
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("预览");
+                    ui.label(egui::RichText::new(format!("{name}")).size(12.5).color(pal.text));
+                    // 模式切换（仅 git 跟踪文件显示 Diff tab）
+                    if self.preview_tracked {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if close_button(ui, pal) {
+                                self.preview_open = false;
+                                self.preview_path = None;
+                                self.preview_content = None;
+                            }
+                            ui.add_space(6.0);
+                            let diff_active = self.preview_mode == crate::preview::PreviewMode::Diff;
+                            let src_active = self.preview_mode == crate::preview::PreviewMode::Source;
+                            if ui.add(egui::SelectableLabel::new(src_active, egui::RichText::new("源码").size(11.0))).clicked() {
+                                self.preview_mode = crate::preview::PreviewMode::Source;
+                            }
+                            if ui.add(egui::SelectableLabel::new(diff_active, egui::RichText::new("Diff").size(11.0))).clicked() {
+                                self.preview_mode = crate::preview::PreviewMode::Diff;
+                            }
+                        });
+                    } else {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if close_button(ui, pal) {
+                                self.preview_open = false;
+                                self.preview_path = None;
+                                self.preview_content = None;
+                            }
+                        });
+                    }
+                });
+            });
+
+        // 内容区
+        egui::ScrollArea::both()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if self.preview_content.is_none() && self.preview_error.is_none() && self.preview_rx.is_some() {
+                    ui.add_space(20.0);
+                    ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                if let Some(err) = &self.preview_error {
+                    ui.add_space(20.0);
+                    ui.label(egui::RichText::new(format!("! {err}")).size(12.0).color(pal.err_text));
+                    return;
+                }
+                match self.preview_mode {
+                    crate::preview::PreviewMode::Source => {
+                        if self.preview_content.is_some() {
+                            if self.preview_truncated {
+                                ui.label(egui::RichText::new("文件过大，仅显示前 512KB").size(10.5).color(pal.warn));
+                                ui.add_space(4.0);
+                            }
+                            // 语法高亮渲染：行号 + 高亮 token 统一在 LayoutJob 里，
+                            // egui 按文本哈希缓存 galley，tokenize 只做一次。
+                            // 水平滚动：无限宽度 + 横向滚动区，长行不换行，按中键拖动查看。
+                            let job = self
+                                .preview_highlight
+                                .clone()
+                                .unwrap_or_else(|| egui::text::LayoutJob::default());
+                            let resp = ui.add(egui::Label::new(job).selectable(true));
+                            let _ = resp;
+                        }
+                    }
+                    crate::preview::PreviewMode::Diff => {
+                        // 加载中（点击瞬间 diff 尚未异步返回）：显示加载提示，不误导为"无修改"。
+                        if self.preview_rx.is_some() && self.preview_diff.is_none() {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Diff 加载中...").size(12.0).color(pal.dim));
+                            ui.ctx().request_repaint();
+                        } else if let Some(diff) = &self.preview_diff {
+                            let diff_lines = crate::preview::parse_diff(diff);
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            // 全宽色块渲染：每行 allocate 整行宽，painter 画背景 + 符号 + 文本。
+                            // 行高 20px，行号 + 符号列固定宽，背景色铺满整行（不随文本截断）。
+                            let row_h = 20.0;
+                            let mut line_no = 0usize;
+                            for dl in &diff_lines {
+                                let (bg, fg, sign, sign_color) = match dl.kind {
+                                    crate::preview::DiffLineKind::Add => (
+                                        pal.diff_add_bg,
+                                        pal.text,
+                                        "+",
+                                        pal.diff_sign_add,
+                                    ),
+                                    crate::preview::DiffLineKind::Del => (
+                                        pal.diff_del_bg,
+                                        pal.text,
+                                        "-",
+                                        pal.diff_sign_del,
+                                    ),
+                                    crate::preview::DiffLineKind::Hunk => (
+                                        pal.diff_hunk_bg,
+                                        pal.accent,
+                                        "@",
+                                        pal.accent,
+                                    ),
+                                    crate::preview::DiffLineKind::Meta => (
+                                        egui::Color32::TRANSPARENT,
+                                        pal.dim,
+                                        "",
+                                        pal.dim,
+                                    ),
+                                    crate::preview::DiffLineKind::Context => (
+                                        egui::Color32::TRANSPARENT,
+                                        pal.dim,
+                                        " ",
+                                        pal.dim,
+                                    ),
+                                };
+                                let (row_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), row_h),
+                                    egui::Sense::hover(),
+                                );
+                                // 整行背景色块
+                                if bg != egui::Color32::TRANSPARENT {
+                                    ui.painter().rect_filled(row_rect, 0.0, bg);
+                                }
+                                let cy = row_rect.center().y;
+                                // 符号列（+ / - / @）
+                                if !sign.is_empty() {
+                                    ui.painter().text(
+                                        egui::pos2(row_rect.min.x + 8.0, cy),
+                                        egui::Align2::LEFT_CENTER,
+                                        sign,
+                                        egui::FontId::monospace(11.5),
+                                        sign_color,
+                                    );
+                                }
+                                // 内容文本（去掉行首 + - @ 符号，避免重复）
+                                let text_content = dl.text.trim_start_matches(['+', '-', '@']).trim_start();
+                                ui.painter().text(
+                                    egui::pos2(row_rect.min.x + 22.0, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    text_content,
+                                    egui::FontId::monospace(11.5),
+                                    fg,
+                                );
+                                // Meta / Hunk 行也推进行号计数
+                                if matches!(
+                                    dl.kind,
+                                    crate::preview::DiffLineKind::Add
+                                        | crate::preview::DiffLineKind::Del
+                                        | crate::preview::DiffLineKind::Context
+                                ) {
+                                    line_no += 1;
+                                }
+                                let _ = line_no;
+                            }
+                        } else {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("该文件无未提交修改（已跟踪且干净）").size(12.0).color(pal.dim));
+                        }
+                    }
+                }
+            });
+    }
+
+    // ── 文件树 ──────────────────────────────────────────────────
+
+    /// 重新生成预览高亮（主题切换时调用）。
+    fn rehighlight_preview(&mut self) {
+        let Some(content) = self.preview_content.clone() else {
+            return;
+        };
+        let file_name = self
+            .preview_path
+            .as_ref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("file.txt");
+        self.preview_highlight = Some(crate::highlight::highlight_to_job(
+            &content,
+            file_name,
+            self.dark,
+            egui::Color32::TRANSPARENT,
+            palette(self.dark).dim,
+            f32::INFINITY,
+        ));
+    }
+
+    /// 异步刷新 Git 变更（分支名 + 变更文件列表，含状态码）。
+    fn refresh_git_changes(&mut self) {
+        let git = self.host.git.clone();
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<
+            (String, Vec<harness_capability::git::GitChange>),
+        >();
+        std::thread::spawn(move || {
+            let res = handle.block_on(async move {
+                let branch = git.current_branch().unwrap_or_default();
+                let changes = git.changed_files().unwrap_or_default();
+                (branch, changes)
+            });
+            let _ = tx.send(res);
+        });
+        if let Ok((branch, changes)) = rx.recv() {
+            self.git_branch = branch;
+            self.git_changes = changes;
+            self.git_loaded = true;
+        }
+    }
+
+    /// 构建文件树（懒构建 2 层）。
+    fn build_tree(&mut self) {
+        let fs = self.host.fs.clone();
+        let git = self.host.git.clone();
+        // 基准根统一从 settings 读取（与 load_preview 一致）。
+        let root = self
+            .host
+            .settings
+            .get("workspace.root")
+            .filter(|p| std::path::Path::new(p).is_dir())
+            .unwrap_or_else(|| self.host.workspace_root.clone());
+        let root_for_name = root.clone();
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::preview::FileTreeNode>>();
+        std::thread::spawn(move || {
+            let nodes = handle.block_on(async move {
+                // git 有未提交变化的文件集合（文件树标记用）；非 git 仓库为空。
+                let dirty: std::collections::HashSet<String> = git
+                    .changed_files()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| c.path.replace('\\', "/"))
+                    .collect();
+                list_dir_recursive(&fs, std::path::Path::new(&root), "", &dirty, 10).await
+            });
+            let _ = tx.send(nodes);
+        });
+        if let Ok(nodes) = rx.recv() {
+            self.tree_root = Some(crate::preview::FileTreeNode {
+                name: root_for_name,
+                path: String::new(),
+                is_dir: true,
+                dirty: false,
+                children: nodes,
+            });
+            self.tree_last_refresh = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 渲染文件树。
+    fn render_tree(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        // 标题栏
+        let head_h = if cfg!(target_os = "macos") { 32.0 } else { 28.0 };
+        egui::TopBottomPanel::top("tree_head")
+            .exact_height(head_h)
+            .frame(egui::Frame::default().fill(pal.head_fill).inner_margin(egui::Margin::symmetric(10.0, 4.0)))
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // 标题随视图切换：Git 变更视图显示统计，文件树视图显示"文件树"。
+                    let title = if self.tree_show_git {
+                        format!("Git 变更 ({})", self.git_changes.len())
+                    } else {
+                        "文件树".to_string()
+                    };
+                    ui.label(egui::RichText::new(title).size(12.5).color(pal.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if close_button(ui, pal) {
+                            self.tree_open = false;
+                        }
+                        // R 按钮：Git 变更视图 = 切回文件树；文件树视图 = 刷新文件树。
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("R").size(12.0)))
+                            .on_hover_text(if self.tree_show_git {
+                                "切回文件树"
+                            } else {
+                                "刷新文件树"
+                            })
+                            .clicked()
+                        {
+                            if self.tree_show_git {
+                                self.tree_show_git = false;
+                            } else {
+                                let need_refresh = self
+                                    .tree_last_refresh
+                                    .map(|t| t.elapsed().as_secs() > 5)
+                                    .unwrap_or(true);
+                                if need_refresh {
+                                    self.build_tree();
+                                }
+                            }
+                        }
+                        // Git 变更入口（刷新按钮左边）：矢量图标，点击切换 Git 变更视图。
+                        ui.add_space(4.0);
+                        let git_btn = ui.add_sized(
+                            [20.0, 20.0],
+                            egui::Button::new(egui::RichText::new("").size(10.0)),
+                        )
+                        .on_hover_text("Git 变更（查看未提交文件）");
+                        draw_icon(
+                            &ui.painter(),
+                            git_btn.rect.center(),
+                            Icon::GitBranch,
+                            if self.tree_show_git {
+                                pal.accent
+                            } else if self.git_changes.is_empty() {
+                                pal.dim
+                            } else {
+                                pal.warn
+                            },
+                        );
+                        if git_btn.clicked() {
+                            // 直接切换树区域视图，不弹窗。
+                            self.tree_show_git = true;
+                            self.refresh_git_changes();
+                        }
+                    });
+                });
+            });
+
+        // 内容区：按视图分支
+        egui::ScrollArea::both()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if self.tree_show_git {
+                    self.render_git_changes_list(ui, pal);
+                } else if let Some(root) = &self.tree_root.clone() {
+                    let mut clicked_path: Option<String> = None;
+                    let mut toggle_path: Option<String> = None;
+                    self.render_tree_node(ui, root, 0, pal, &mut clicked_path, &mut toggle_path);
+                    if let Some(path) = clicked_path {
+                        self.pending_preview = Some(path);
+                    }
+                    if let Some(path) = toggle_path {
+                        if self.tree_expanded.contains(&path) {
+                            self.tree_expanded.remove(&path);
+                        } else {
+                            self.tree_expanded.insert(path);
+                            // 懒加载子节点
+                            self.expand_tree_node();
+                        }
+                    }
+                } else {
+                    ui.add_space(20.0);
+                    ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
+                }
+            });
+    }
+
+    /// 渲染 Git 变更文件列表（状态色块 + 路径；点击在预览窗打开 Diff）。
+    fn render_git_changes_list(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        if !self.git_loaded {
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
+            ui.ctx().request_repaint();
+            return;
+        }
+        if self.git_changes.is_empty() {
+            ui.add_space(16.0);
+            ui.label(
+                egui::RichText::new("✨ 工作区干净，无未提交变更")
+                    .size(12.0)
+                    .color(pal.accent),
+            );
+            return;
+        }
+        let mut open_diff: Option<String> = None;
+        for ch in self.git_changes.clone() {
+            let (mark, mcolor) = match ch.marker() {
+                "M" => ("M", pal.warn),
+                "A" => ("A", pal.accent),
+                "D" => ("D", pal.err_text),
+                "R" => ("R", pal.accent),
+                "U" | "??" => ("?", pal.dim),
+                _ => ("*", pal.dim),
+            };
+            let row_h = 26.0;
+            let (rect, resp) = ui.allocate_at_least(
+                egui::vec2(ui.available_width(), row_h),
+                egui::Sense::click(),
+            );
+            let hovered = resp.hovered();
+            let is_active = self.preview_path.as_ref() == Some(&ch.path);
+            if hovered || is_active {
+                ui.painter().rect_filled(rect.shrink(1.0), egui::Rounding::same(5.0), pal.hover);
+            }
+            if is_active {
+                let bar = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + 2.0, rect.min.y + 5.0),
+                    egui::vec2(2.5, rect.height() - 10.0),
+                );
+                ui.painter().rect_filled(bar, egui::Rounding::same(2.0), pal.accent);
+            }
+            // 状态标记小方块
+            let badge = egui::Rect::from_center_size(
+                egui::pos2(rect.min.x + 13.0, rect.center().y),
+                egui::vec2(20.0, 16.0),
+            );
+            ui.painter().rect_filled(badge, egui::Rounding::same(4.0), mcolor.gamma_multiply(0.22));
+            ui.painter().text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                mark,
+                egui::FontId::monospace(10.5),
+                mcolor,
+            );
+            // 路径
+            ui.painter().text(
+                egui::pos2(rect.min.x + 40.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                &ch.path,
+                egui::FontId::monospace(11.5),
+                if is_active { pal.text } else { pal.dim },
+            );
+            if resp.clicked() {
+                open_diff = Some(ch.path.clone());
+            }
+            ui.add_space(2.0);
+        }
+        if let Some(path) = open_diff {
+            // 点击变更文件：预览窗直接打开 Diff 模式。
+            self.open_preview(path);
+            self.preview_mode = crate::preview::PreviewMode::Diff;
+        }
+    }
+
+    /// 递归渲染文件树节点。
+    fn render_tree_node(
+        &self,
+        ui: &mut egui::Ui,
+        node: &crate::preview::FileTreeNode,
+        depth: usize,
+        pal: &Palette,
+        clicked_path: &mut Option<String>,
+        toggle_path: &mut Option<String>,
+    ) {
+        let row_h = 24.0;
+        let indent = depth as f32 * 14.0;
+        let (rect, resp) = ui.allocate_at_least(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Sense::click(),
+        );
+        let hovered = resp.hovered();
+        let is_active = self.preview_path.as_ref() == Some(&node.path) && !node.is_dir;
+        let expanded = node.is_dir && self.tree_expanded.contains(&node.path);
+
+        // 行背景
+        if is_active || hovered {
+            ui.painter().rect_filled(
+                rect.shrink(1.0),
+                egui::Rounding::same(4.0),
+                pal.hover,
+            );
+        }
+        if is_active {
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + 2.0, rect.min.y + 4.0),
+                egui::vec2(2.5, rect.height() - 8.0),
+            );
+            ui.painter().rect_filled(bar, egui::Rounding::same(2.0), pal.accent);
+        }
+
+        // 树形连接线
+        if depth > 0 {
+            let line_color = pal.border;
+            let line_x = rect.min.x + indent - 7.0;
+            let center_y = rect.center().y;
+            ui.painter().line_segment(
+                [egui::pos2(line_x, rect.min.y), egui::pos2(line_x, center_y)],
+                egui::Stroke::new(1.0_f32, line_color),
+            );
+            ui.painter().line_segment(
+                [egui::pos2(line_x, center_y), egui::pos2(line_x + 7.0, center_y)],
+                egui::Stroke::new(1.0_f32, line_color),
+            );
+        }
+
+        let icon_x = rect.min.x + indent + 2.0;
+        let center_y = rect.center().y;
+        let text_x = icon_x + 16.0;
+
+        if node.is_dir {
+            // 矢量三角箭头（不用 Unicode 字符）
+            let arrow_size = 3.5;
+            let arrow_x = icon_x;
+            let arrow_color = if hovered || expanded { pal.text } else { pal.dim };
+            if expanded {
+                let pts = vec![
+                    egui::pos2(arrow_x, center_y - arrow_size),
+                    egui::pos2(arrow_x + arrow_size * 2.0, center_y - arrow_size),
+                    egui::pos2(arrow_x + arrow_size, center_y + arrow_size),
+                ];
+                ui.painter().add(egui::Shape::closed_line(pts, egui::Stroke::new(1.0_f32, arrow_color)));
+            } else {
+                let pts = vec![
+                    egui::pos2(arrow_x, center_y - arrow_size),
+                    egui::pos2(arrow_x, center_y + arrow_size),
+                    egui::pos2(arrow_x + arrow_size, center_y),
+                ];
+                ui.painter().add(egui::Shape::closed_line(pts, egui::Stroke::new(1.0_f32, arrow_color)));
+            }
+            
+            // 目录名
+            ui.painter().text(
+                egui::pos2(text_x, center_y),
+                egui::Align2::LEFT_CENTER,
+                &node.name,
+                egui::FontId::proportional(12.5),
+                pal.text,
+            );
+            // 子节点数量提示
+            if !node.children.is_empty() && !expanded {
+                let name_w = node.name.chars().count() as f32 * 7.5;
+                ui.painter().text(
+                    egui::pos2(text_x + name_w + 8.0, center_y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("({})", node.children.len()),
+                    egui::FontId::proportional(10.0),
+                    pal.dim,
+                );
+            }
+            if resp.clicked() {
+                *toggle_path = Some(node.path.clone());
+            }
+            if expanded {
+                for child in &node.children {
+                    self.render_tree_node(ui, child, depth + 1, pal, clicked_path, toggle_path);
+                }
+            }
+        } else {
+            
+                        // git 有未提交变化的文件：文件名左侧画橙色小圆点色块。
+            if node.dirty {
+                ui.painter().circle_filled(
+                    egui::pos2(text_x - 7.0, center_y),
+                    3.2,
+                    pal.warn,
+                );
+            }
+            ui.painter().text(
+                egui::pos2(text_x, center_y),
+                egui::Align2::LEFT_CENTER,
+                &node.name,
+                egui::FontId::proportional(12.5),
+                if is_active { pal.text } else { pal.dim },
+            );
+            if resp.clicked() {
+                *clicked_path = Some(node.path.clone());
+            }
+        }
+    }
+
+    /// 懒加载展开的目录节点子项。
+    fn expand_tree_node(&mut self) {
+        // 简化：直接重建树（对中小仓库足够快）。
+        self.build_tree();
+    }
+}
+
+/// 递归列出目录（深度限制），构建文件树节点。忽略 .git/target/node_modules 等。
+async fn list_dir_recursive(
+    fs: &Arc<dyn harness_capability::fs::Fs>,
+    dir: &std::path::Path,
+    rel_dir: &str,
+    dirty_files: &std::collections::HashSet<String>,
+    max_depth: usize,
+) -> Vec<crate::preview::FileTreeNode> {
+    if max_depth == 0 {
+        return Vec::new();
+    }
+    let mut nodes = Vec::new();
+    if let Ok(entries) = fs.list(dir).await {
+        let mut sorted: Vec<_> = entries.into_iter().collect();
+        sorted.sort_by(|a, b| {
+            let a_dir = a.is_dir();
+            let b_dir = b.is_dir();
+            b_dir.cmp(&a_dir).then_with(|| {
+                a.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .cmp(&b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase())
+            })
+        });
+        for entry in sorted {
+            let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if crate::preview::TREE_IGNORED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            let is_dir = entry.is_dir();
+            // 相对路径：手动拼接（不依赖 strip_prefix，避免 Windows canonicalize
+            // 返回 \?\ verbatim 前缀导致前缀不匹配、回退为纯文件名的 bug）。
+            let rel_path = if rel_dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", rel_dir, name)
+            };
+            let dirty = !is_dir && dirty_files.contains(&rel_path);
+            let children = if is_dir {
+                Box::pin(list_dir_recursive(fs, &entry, &rel_path, dirty_files, max_depth - 1)).await
+            } else {
+                Vec::new()
+            };
+            nodes.push(crate::preview::FileTreeNode {
+                name,
+                path: rel_path,
+                is_dir,
+                dirty,
+                children,
+            });
+        }
+    }
+    nodes
+}
+
+/// 主题调色板取值（供非渲染上下文使用，如后台生成高亮 LayoutJob）。
+fn pal_of(dark: bool) -> Palette {
+    palette(dark)
 }
 
 /// 侧栏功能图标：矢量线条绘制（不依赖字体字形，CJK 字体缺字也不会变豆腐块）。
@@ -1583,6 +2513,8 @@ impl AppState {
 enum Icon {
     Chat,
     Folder,
+    FolderTree,
+    GitBranch,
     Layers,
     Chip,
     Gear,
@@ -1766,6 +2698,63 @@ fn draw_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color: egu
             painter.line_segment([egui::pos2(head.x - 2.4, head.y - 1.6), head], stroke);
             painter.line_segment([egui::pos2(head.x - 0.4, head.y - 2.6), head], stroke);
         }
+        Icon::GitBranch => {
+            // Git 分支：圆点 + 两条分叉线
+            let c = r.center();
+            // 圆点（分叉起点）
+            painter.circle_filled(egui::pos2(c.x - 4.0, c.y + 4.0), 2.0, color);
+            // 主干线（圆点向右上）
+            painter.line_segment(
+                [egui::pos2(c.x - 2.5, c.y + 3.5), egui::pos2(c.x + 3.0, c.y - 3.0)],
+                stroke,
+            );
+            // 上分支端点圆点
+            painter.circle_filled(egui::pos2(c.x + 3.0, c.y - 3.0), 1.8, color);
+            // 上分支延伸线
+            painter.line_segment(
+                [egui::pos2(c.x + 3.0, c.y - 3.0), egui::pos2(c.x + 5.5, c.y - 5.5)],
+                stroke,
+            );
+            // 下分支线
+            painter.line_segment(
+                [egui::pos2(c.x - 4.0, c.y + 4.0), egui::pos2(c.x - 5.5, c.y + 5.5)],
+                stroke,
+            );
+        }
+        Icon::FolderTree => {
+            // 文件夹 + 下方树枝线（表示目录树）
+            let tab = r.height() * 0.26;
+            let pts = vec![
+                egui::pos2(r.min.x, r.max.y - 1.0),
+                egui::pos2(r.min.x, r.min.y + 1.0),
+                egui::pos2(r.min.x + r.width() * 0.42, r.min.y + 1.0),
+                egui::pos2(r.min.x + r.width() * 0.52, r.min.y + tab),
+                egui::pos2(r.max.x, r.min.y + tab),
+                egui::pos2(r.max.x, r.max.y - 1.0),
+            ];
+            painter.add(egui::Shape::closed_line(pts, stroke));
+            // 树枝线：从文件夹底部向下延伸，再水平分支
+            let trunk_x = r.center().x;
+            let top_y = r.max.y - 1.0;
+            let mid_y = r.max.y + 2.0;
+            let bot_y = r.max.y + 5.0;
+            painter.line_segment(
+                [egui::pos2(trunk_x, top_y), egui::pos2(trunk_x, mid_y)],
+                thin,
+            );
+            painter.line_segment(
+                [egui::pos2(trunk_x - 3.0, mid_y), egui::pos2(trunk_x + 3.0, mid_y)],
+                thin,
+            );
+            painter.line_segment(
+                [egui::pos2(trunk_x - 3.0, mid_y), egui::pos2(trunk_x - 3.0, bot_y)],
+                thin,
+            );
+            painter.line_segment(
+                [egui::pos2(trunk_x + 3.0, mid_y), egui::pos2(trunk_x + 3.0, bot_y)],
+                thin,
+            );
+        }
     }
 }
 
@@ -1834,48 +2823,49 @@ fn draw_pencil_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32
 /// 附件图标：矢量回形针（嵌套 U，外圈右臂短于左臂形成"夹口"）。
 /// 与 draw_pencil_icon 同一风格，不依赖字体字形。
 fn draw_paperclip_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
-    let s = egui::Stroke::new(1.2_f32, color);
+    // 线宽加粗 + 几何放大：小尺寸 chip 内更醒目。
+    let s = egui::Stroke::new(1.7_f32, color);
     // 外圈 U（左 → 下 → 右，右臂短）
     painter.line_segment(
         [
-            egui::pos2(c.x - 3.6, c.y - 3.8),
-            egui::pos2(c.x - 3.6, c.y + 4.2),
+            egui::pos2(c.x - 4.2, c.y - 4.4),
+            egui::pos2(c.x - 4.2, c.y + 4.8),
         ],
         s,
     );
     painter.line_segment(
         [
-            egui::pos2(c.x - 3.6, c.y + 4.2),
-            egui::pos2(c.x + 3.6, c.y + 4.2),
+            egui::pos2(c.x - 4.2, c.y + 4.8),
+            egui::pos2(c.x + 4.2, c.y + 4.8),
         ],
         s,
     );
     painter.line_segment(
         [
-            egui::pos2(c.x + 3.6, c.y + 4.2),
-            egui::pos2(c.x + 3.6, c.y - 1.4),
+            egui::pos2(c.x + 4.2, c.y + 4.8),
+            egui::pos2(c.x + 4.2, c.y - 1.6),
         ],
         s,
     );
     // 内圈 U（更短，开口向上）
     painter.line_segment(
         [
-            egui::pos2(c.x - 1.6, c.y - 1.4),
-            egui::pos2(c.x - 1.6, c.y + 2.0),
+            egui::pos2(c.x - 1.9, c.y - 1.6),
+            egui::pos2(c.x - 1.9, c.y + 2.3),
         ],
         s,
     );
     painter.line_segment(
         [
-            egui::pos2(c.x - 1.6, c.y + 2.0),
-            egui::pos2(c.x + 1.6, c.y + 2.0),
+            egui::pos2(c.x - 1.9, c.y + 2.3),
+            egui::pos2(c.x + 1.9, c.y + 2.3),
         ],
         s,
     );
     painter.line_segment(
         [
-            egui::pos2(c.x + 1.6, c.y + 2.0),
-            egui::pos2(c.x + 1.6, c.y - 0.6),
+            egui::pos2(c.x + 1.9, c.y + 2.3),
+            egui::pos2(c.x + 1.9, c.y - 0.7),
         ],
         s,
     );
@@ -1894,7 +2884,7 @@ fn draw_brand_logo(ui: &egui::Ui, rect: egui::Rect, expanded: bool, pal: &Palett
         rect.center().y - logo_height / 2.0,
     );
     let point = |x: f32, y: f32| origin + egui::vec2(x, y);
-    let stroke = 2.3;
+    let stroke = 2.3_f32;
     let left = [
         point(0.0, 18.0),
         point(7.0, 4.0),
@@ -2327,6 +3317,8 @@ struct MemItem {
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_log();
+        self.poll_preview();
+        self.poll_mem();
         self.busy = self.host.sink.busy();
 
         let pal = palette(self.dark);
@@ -2379,19 +3371,29 @@ impl eframe::App for AppState {
             integrated_titlebar_setting.as_deref(),
         );
         let sidebar_width = if self.sidebar_expanded { 220.0 } else { 56.0 };
-        if crate::window_chrome::show(
+        let chrome_actions = crate::window_chrome::show(
             ctx,
             chrome_colors,
             self.dark,
             &self.host.llm_control.status(),
             integrated_titlebar,
             sidebar_width,
-        ) {
+            self.tree_open,
+        );
+        if chrome_actions.toggle_theme {
             self.dark = !self.dark;
             let _ = self
                 .host
                 .settings
                 .set("ui.theme", if self.dark { "dark" } else { "light" });
+            // 主题切换后重生成高亮（旧 job 还是旧主题色）。
+            self.rehighlight_preview();
+        }
+        if chrome_actions.toggle_tree {
+            self.tree_open = !self.tree_open;
+            if self.tree_open && self.tree_root.is_none() {
+                self.build_tree();
+            }
         }
 
         // ── 侧栏导航 ─────────────────────────────────────────────
@@ -2470,7 +3472,7 @@ impl eframe::App for AppState {
                     ui,
                     &pal,
                     Icon::Layers,
-                    "记忆中心",
+                    "记忆系统",
                     self.sidebar_expanded,
                     true,
                     false,
@@ -2478,6 +3480,7 @@ impl eframe::App for AppState {
                     self.settings_page = "记忆".into();
                     self.settings_open = true;
                 }
+                
                 if nav_item(
                     ui,
                     &pal,
@@ -3029,19 +4032,32 @@ impl eframe::App for AppState {
                                 });
                         }
 
-                        // ── 附件 icon button ──
+                        // ── 附件按钮：与左侧权限 chip 同高(28)/同 chrome，图标更醒目 ──
                         let (arect, aresp) =
-                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
-                        if aresp.hovered() {
-                            ui.painter()
-                                .rect_filled(arect, egui::Rounding::same(8.0), pal.hover);
-                        }
-                        let acolor = if !self.attachment.is_empty() {
-                            pal.accent
-                        } else {
-                            pal.dim
-                        };
+                            ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click());
+                        let has_att = !self.attachment.is_empty();
+                        let afill = if aresp.hovered() { pal.hover } else { pal.field };
+                        ui.painter()
+                            .rect_filled(arect, egui::Rounding::same(8.0), afill);
+                        ui.painter().rect(
+                            arect,
+                            egui::Rounding::same(8.0),
+                            egui::Color32::TRANSPARENT,
+                            egui::Stroke::new(1.0_f32, if has_att { pal.accent } else { pal.border }),
+                        );
+                        let acolor = if has_att { pal.accent } else { pal.text };
                         draw_paperclip_icon(ui.painter(), arect.center(), acolor);
+                        // 右上角「+」角标：强化「添加」语义。
+                        let plus_c = egui::pos2(arect.max.x - 7.0, arect.min.y + 7.0);
+                        let ps = egui::Stroke::new(1.5_f32, acolor);
+                        ui.painter().line_segment(
+                            [egui::pos2(plus_c.x - 2.6, plus_c.y), egui::pos2(plus_c.x + 2.6, plus_c.y)],
+                            ps,
+                        );
+                        ui.painter().line_segment(
+                            [egui::pos2(plus_c.x, plus_c.y - 2.6), egui::pos2(plus_c.x, plus_c.y + 2.6)],
+                            ps,
+                        );
                         let tip = if self.attachment.is_empty() {
                             "添加附件".to_string()
                         } else {
@@ -3192,6 +4208,24 @@ impl eframe::App for AppState {
                 });
             });
 
+                // ── 最右：文件树（独立开关，show_animated 平滑展开/收起）────
+        egui::SidePanel::right("tree")
+            .resizable(true)
+            .default_width(240.0)
+            .width_range(180.0..=360.0)
+            .frame(egui::Frame::default().fill(pal.side).inner_margin(8.0))
+            .show_animated(ctx, self.tree_open, |ui| {
+                self.render_tree(ui, &pal);
+            });
+                // ── 次右：文件预览（独立开关，show_animated 平滑展开/收起）──
+        egui::SidePanel::right("preview")
+            .resizable(true)
+            .default_width(380.0)
+            .width_range(320.0..=600.0)
+            .frame(egui::Frame::default().fill(pal.panel).inner_margin(0.0))
+            .show_animated(ctx, self.preview_open, |ui| {
+                self.render_preview(ui, &pal);
+            });
         // ── 主区：头部 + 消息流 ──────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(pal.bg))
@@ -3239,18 +4273,18 @@ impl eframe::App for AppState {
                                         |ui| {
                                             let bubble = egui::Frame::default()
                                                 .fill(fill)
-                                                .rounding(egui::Rounding::same(10.0))
+                                                .rounding(egui::Rounding::same(12.0))
                                                 .inner_margin(if cfg!(target_os = "macos") {
                                                     egui::Margin::symmetric(12.0, 10.0)
                                                 } else {
-                                                    egui::Margin::same(10.0)
+                                                    egui::Margin::symmetric(14.0, 12.0)
                                                 })
                                                 .stroke(egui::Stroke::new(1.0_f32, pal.border));
                                             bubble.show(ui, |ui| {
-                                                ui.set_max_width(max_w * 0.78);
+                                                ui.set_max_width(max_w * 0.96);
                                                 ui.label(
                                                     egui::RichText::new(&msg.label)
-                                                        .size(10.0)
+                                                        .size(10.5)
                                                         .color(pal.dim),
                                                 );
                                                 #[cfg(target_os = "macos")]
@@ -3258,8 +4292,8 @@ impl eframe::App for AppState {
                                                 // selectable(true)：正文支持鼠标拖选，选中后 Ctrl+C 复制。
                                                 let resp = if msg.kind == "assistant" {
                                                     // Markdown 富文本渲染：标题/加粗/列表/代码块转 LayoutJob；
-                                                    // egui 按 job 哈希缓存 galley，同文本不重复排版。
-                                                    let job = crate::markdown::to_job(
+                                                    // 行内代码中的文件路径识别为可点击 chip。
+                                                    let blocks = crate::markdown::parse_blocks(
                                                         &msg.text,
                                                         &crate::markdown::MdTheme {
                                                             text: pal.text,
@@ -3268,14 +4302,49 @@ impl eframe::App for AppState {
                                                             code_text: pal.text,
                                                             code_bg: pal.field,
                                                         },
-                                                        max_w * 0.78 - 20.0,
+                                                        max_w * 0.96 - 20.0,
                                                     );
-                                                    ui.add(egui::Label::new(job).selectable(true))
+                                                    let mut last_resp = None;
+                                                    for block in blocks {
+                                                        match block {
+                                                            crate::markdown::MarkdownBlock::Job(job) => {
+                                                                last_resp = Some(ui.add(
+                                                                    egui::Label::new(job)
+                                                                        .selectable(true),
+                                                                ));
+                                                            }
+                                                            crate::markdown::MarkdownBlock::FilePath(path) => {
+                                                                // 用透明背景 Button 实现可点击文件路径：
+                                                                // - Button 悬停时自动变手型指针（Label+Sense::click 不会）
+                                                                // - 透明背景避免方块感，保持行内文本外观
+                                                                let label = egui::RichText::new(&path)
+                                                                    .monospace()
+                                                                    .color(pal.accent)
+                                                                    .underline()
+                                                                    .size(12.5);
+                                                                let btn = egui::Button::new(label)
+                                                                    .fill(egui::Color32::TRANSPARENT)
+                                                                    .stroke(egui::Stroke::NONE);
+                                                                let r = ui.add(btn);
+                                                                if r.hovered() {
+                                                                    ui.ctx().set_cursor_icon(
+                                                                        egui::CursorIcon::PointingHand,
+                                                                    );
+                                                                }
+                                                                let r = r.on_hover_text("点击预览此文件");
+                                                                if r.clicked() {
+                                                                    self.pending_preview = Some(path);
+                                                                }
+                                                                last_resp = Some(r);
+                                                            }
+                                                        }
+                                                    }
+                                                    last_resp.unwrap_or_else(|| ui.label(""))
                                                 } else {
                                                     ui.add(
                                                         egui::Label::new(
                                                             egui::RichText::new(&msg.text)
-                                                                .size(13.0)
+                                                                .size(13.5)
                                                                 .color(text_color),
                                                         )
                                                         .selectable(true),
@@ -3283,8 +4352,7 @@ impl eframe::App for AppState {
                                                 };
                                                 // 右键菜单：一键复制整条消息内容。
                                                 resp.context_menu(|ui| {
-                                                    if ui.button("📋 复制全部内容").clicked()
-                                                    {
+                                                    if ui.button("📋 复制全部内容").clicked() {
                                                         ui.ctx().copy_text(msg.text.clone());
                                                         ui.close_menu();
                                                     }
@@ -3297,6 +4365,12 @@ impl eframe::App for AppState {
                             });
                     });
             });
+
+        // ── 处理延迟的文件预览请求（避免渲染期间布局突变闪烁）──
+        if let Some(path) = self.pending_preview.take() {
+            self.open_preview(path);
+            ctx.request_repaint();
+        }
 
         // ── 设置弹层 ─────────────────────────────────────────────
         // ── 设置模态：全屏半透明遮罩 + 居中圆角面板（替代默认 Window 标题栏样式）──
@@ -3669,6 +4743,116 @@ impl eframe::App for AppState {
                                     }
                                     "更新" => {
                                         self.draw_update_settings(ui, &pal);
+                                    }
+                                    "Git 变更" => {
+                                        // 分支 + 统计 + 刷新
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "分支：{}",
+                                                    if self.git_branch.is_empty() {
+                                                        "未知"
+                                                    } else {
+                                                        &self.git_branch
+                                                    }
+                                                ))
+                                                .size(13.0)
+                                                .strong()
+                                                .color(pal.text),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ghost_button(ui, &pal, "刷新") {
+                                                        self.refresh_git_changes();
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        let n = self.git_changes.len();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "共 {} 个文件有未提交变更",
+                                                n
+                                            ))
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(8.0);
+                                        if n == 0 && self.git_loaded {
+                                            ui.label(
+                                                egui::RichText::new("✨ 工作区干净，无未提交变更")
+                                                    .size(12.0)
+                                                    .color(pal.accent),
+                                            );
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .max_height(scroll_h - 120.0)
+                                                .auto_shrink(false)
+                                                .show(ui, |ui| {
+                                                    let mut open_now: Option<String> = None;
+                                                    for ch in self.git_changes.clone() {
+                                                        // 状态色块
+                                                        let (mark, mcolor) = match ch.marker() {
+                                                            "M" => ("M", pal.warn),
+                                                            "A" => ("A", pal.accent),
+                                                            "D" => ("D", pal.err_text),
+                                                            "R" => ("R", pal.accent),
+                                                            "U" | "??" => ("?", pal.dim),
+                                                            _ => ("*", pal.dim),
+                                                        };
+                                                        let row_h = 30.0;
+                                                        let (rect, resp) = ui.allocate_at_least(
+                                                            egui::vec2(ui.available_width(), row_h),
+                                                            egui::Sense::click(),
+                                                        );
+                                                        if resp.hovered() {
+                                                            ui.painter().rect_filled(
+                                                                rect.shrink(1.0),
+                                                                egui::Rounding::same(6.0),
+                                                                pal.hover,
+                                                            );
+                                                        }
+                                                        // 状态标记小方块
+                                                        let badge = egui::Rect::from_center_size(
+                                                            egui::pos2(rect.min.x + 14.0, rect.center().y),
+                                                            egui::vec2(22.0, 18.0),
+                                                        );
+                                                        ui.painter().rect_filled(
+                                                            badge,
+                                                            egui::Rounding::same(4.0),
+                                                            mcolor.gamma_multiply(0.22),
+                                                        );
+                                                        ui.painter().text(
+                                                            badge.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            mark,
+                                                            egui::FontId::monospace(11.0),
+                                                            mcolor,
+                                                        );
+                                                        // 路径
+                                                        ui.painter().text(
+                                                            egui::pos2(rect.min.x + 44.0, rect.center().y),
+                                                            egui::Align2::LEFT_CENTER,
+                                                            &ch.path,
+                                                            egui::FontId::monospace(11.5),
+                                                            pal.text,
+                                                        );
+                                                        if resp.clicked() {
+                                                            open_now = Some(ch.path.clone());
+                                                        }
+                                                        ui.add_space(2.0);
+                                                    }
+                                                    if let Some(path) = open_now {
+                                                        // 关闭弹层，打开该文件的 Diff 预览
+                                                        self.settings_open = false;
+                                                        self.open_preview(path);
+                                                        self.preview_mode =
+                                                            crate::preview::PreviewMode::Diff;
+                                                    }
+                                                });
+                                        }
                                     }
                                     _ => {
                                         field_label(ui, &pal, "默认访问权限");

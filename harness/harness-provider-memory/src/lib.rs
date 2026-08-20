@@ -7,12 +7,14 @@
 //! 是 dsh 不接入 aidops 后端时的兜底 Provider。
 
 mod assets_native;
+mod superpowers;
 
 pub use assets_native::{
     NativeCodeGraph, NativeConversationMemory, NativeSkillLibrary, NativeWikiStore,
 };
 // 索引器实现位于 Definition 层（harness-capability::index），不耦合具体 Provider；此处仅转发。
 pub use harness_capability::index::{bootstrap_assets, IndexStats};
+pub use superpowers::{builtin_superpowers, ensure_builtin_skills};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

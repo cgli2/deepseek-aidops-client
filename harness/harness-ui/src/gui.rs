@@ -19,6 +19,7 @@ use crate::Ui;
 
 mod app;
 mod app_state;
+mod code_graph;
 mod composer;
 mod fonts;
 mod icons;
@@ -41,7 +42,7 @@ use fonts::install_macos_ui_style;
 use icons::{
     draw_brand_logo, draw_icon, draw_paperclip_icon, draw_pencil_icon, draw_trash_icon, Icon,
 };
-use model::{ChatMsg, MemItem, PluginUiRow};
+use model::{ChatMsg, MemItem, MemRefresh, PluginUiRow};
 use theme::{palette, Palette};
 use widgets::{
     accent_button, close_button, field_label, ghost_button, nav_item, plugin_row_ui,

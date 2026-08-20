@@ -320,6 +320,17 @@ impl SkillLibrary for AidopsBackend {
     async fn list_skills(&self) -> Result<Vec<Skill>> {
         self.skill.list_skills().await
     }
+
+    async fn delete_skill(&self, id: &str) -> Result<bool> {
+        // AIOps 当前只有 ingest / recall 接口，没有单资产删除端点；管理操作先
+        // 落在本地兜底库，保持离线模式和 GUI 技能管理的一致语义。
+        self.skill.delete_skill(id).await
+    }
+
+    async fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        // 同上：远端资产管理 API 尚未提供时，启停状态由本地技能库维护。
+        self.skill.set_skill_enabled(id, enabled).await
+    }
 }
 
 // ---- WikiStore ----

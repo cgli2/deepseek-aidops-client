@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use harness_capability::assets::{ChatTurn, ConversationMemory};
+use harness_capability::assets::{ChatTurn, ConversationMemory, Skill, SkillLibrary};
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
 use harness_core::event::Waterfall;
 use harness_core::{error::Result, types::UserInput, AppContext};
@@ -66,6 +66,16 @@ impl AgentLoop {
         // 跨步累积本轮助手最终文本，供回合结束时沉淀为 L0 记忆。
         let mut last_assistant = String::new();
         messages.push(Message::user(&input.text));
+        // 技能注入点：只匹配启用的 SKILL.md 资产，并在本回合的系统上下文中
+        // 提供可执行步骤与验收条件。禁用或删除后，SkillLibrary 不会返回它们，
+        // 因而从下一回合起立即不再影响模型行为。
+        if let Some(skills) = ctx.try_get::<dyn SkillLibrary>() {
+            if let Ok(matched) = skills.match_skills(&input.text).await {
+                if let Some(instructions) = render_skill_instructions(&matched) {
+                    messages.insert(1, Message::system(&instructions));
+                }
+            }
+        }
         let max_steps = max_steps_limit();
         let mut steps = 0usize;
         // 收尾宽限：撞上限后不立刻报错，再给模型一步「只总结不调工具」的机会。
@@ -244,14 +254,47 @@ impl AgentLoop {
                         continue;
                     }
 
-                    let res = match tools.dispatch(tc).await {
-                        Ok(result) => result,
-                        Err(error) => ToolResult {
-                            call_id: tc.id.clone(),
-                            ok: false,
-                            content: format!("tool execution failed: {error}"),
-                            continuation_debt: 0,
-                        },
+                    // 工具调用也必须有超时和取消通道。此前只有模型流设置了 idle
+                    // 超时，某个 shell / 插件工具卡住时 UI 会一直 busy，停止按钮也要等
+                    // 工具自己返回才生效。
+                    let tool_timeout_secs: u64 = std::env::var("HARNESS_TOOL_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(300);
+                    let (res, cancelled) = tokio::select! {
+                        _ = cancellation.cancelled() => (
+                            ToolResult {
+                                call_id: tc.id.clone(),
+                                ok: false,
+                                content: format!("[已停止] 工具 {} 已取消", tc.name),
+                                continuation_debt: 0,
+                            },
+                            true,
+                        ),
+                        outcome = tokio::time::timeout(
+                            std::time::Duration::from_secs(tool_timeout_secs),
+                            tools.dispatch(tc),
+                        ) => (
+                            match outcome {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(error)) => ToolResult {
+                                    call_id: tc.id.clone(),
+                                    ok: false,
+                                    content: format!("tool execution failed: {error}"),
+                                    continuation_debt: 0,
+                                },
+                                Err(_) => ToolResult {
+                                    call_id: tc.id.clone(),
+                                    ok: false,
+                                    content: format!(
+                                        "工具 {} 超过 {tool_timeout_secs} 秒未返回，已停止本次调用",
+                                        tc.name
+                                    ),
+                                    continuation_debt: 0,
+                                },
+                            },
+                            false,
+                        ),
                     };
                     // 钩子（PostToolUse）：审计 / 后处理挂钩点。
                     let _ = hook.run(&HookPayload {
@@ -266,6 +309,11 @@ impl AgentLoop {
                     });
                     messages.push(Message::tool(tc.id.clone(), res.content.clone()));
                     step_had_tools = true;
+                    if cancelled {
+                        debt = 0;
+                        hard_stop = true;
+                        break;
+                    }
                 }
             }
             last_assistant = assistant_text.clone();
@@ -326,6 +374,35 @@ impl AgentLoop {
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });
         Ok(())
     }
+}
+
+/// 生成紧凑的技能系统指令，避免用户导入的长技能文档无限放大上下文。
+fn render_skill_instructions(skills: &[Skill]) -> Option<String> {
+    const MAX_SKILLS: usize = 4;
+    const MAX_STEP_CHARS: usize = 360;
+    let mut out = String::from("[已启用的匹配技能]\n");
+    for skill in skills.iter().take(MAX_SKILLS) {
+        let steps = skill
+            .steps
+            .join("；")
+            .chars()
+            .take(MAX_STEP_CHARS)
+            .collect::<String>();
+        let checks = skill
+            .verification_rules
+            .join("；")
+            .chars()
+            .take(MAX_STEP_CHARS)
+            .collect::<String>();
+        out.push_str(&format!(
+            "- {}：适用范围：{}\n  执行：{}\n  验证：{}\n",
+            skill.name,
+            skill.trigger_boundary,
+            if steps.is_empty() { "遵循技能文档的步骤" } else { &steps },
+            if checks.is_empty() { "完成后进行必要验证" } else { &checks },
+        ));
+    }
+    (out.lines().count() > 1).then_some(out)
 }
 
 fn messages_from_events(events: &[SessionEvent]) -> Vec<Message> {
@@ -429,7 +506,28 @@ fn max_steps_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_capability::assets::Skill;
     use harness_llm::ToolCall;
+
+    #[test]
+    fn renders_matched_skills_as_compact_system_instructions() {
+        let skills = vec![Skill {
+            id: "review".into(),
+            name: "Code review".into(),
+            version: "1.0".into(),
+            trigger_boundary: "review code".into(),
+            steps: vec!["inspect diff".into(), "run tests".into()],
+            verification_rules: vec!["findings recorded".into()],
+            resource_files: vec![],
+            confidence: 1.0,
+            enabled: true,
+        }];
+        let rendered = render_skill_instructions(&skills).expect("matched skill should render");
+        assert!(rendered.contains("Code review"));
+        assert!(rendered.contains("inspect diff；run tests"));
+        assert!(rendered.contains("findings recorded"));
+        assert!(render_skill_instructions(&[]).is_none());
+    }
 
     #[test]
     fn rebuilds_multi_turn_and_tool_context() {

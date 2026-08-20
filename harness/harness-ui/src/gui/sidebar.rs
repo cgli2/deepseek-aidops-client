@@ -54,6 +54,18 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
             if nav_item(
                 ui,
                 &pal,
+                Icon::Layers,
+                "技能管理",
+                state.sidebar_expanded,
+                true,
+                false,
+            ) {
+                state.settings_page = "技能管理".into();
+                state.settings_open = true;
+            }
+            if nav_item(
+                ui,
+                &pal,
                 Icon::Chip,
                 "模型设置",
                 state.sidebar_expanded,

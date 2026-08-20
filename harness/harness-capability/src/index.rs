@@ -121,7 +121,7 @@ pub async fn bootstrap_assets(
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.eq_ignore_ascii_case("SKILL.md") && skills.len() < MAX_SKILLS {
             if let Ok(content) = std::fs::read_to_string(path) {
-                skills.push((rel.to_string(), parse_skill(rel, &content)));
+                skills.push((rel.to_string(), skill_from_markdown(rel, &content)));
             }
         }
     });
@@ -186,7 +186,10 @@ pub async fn bootstrap_assets(
 }
 
 /// 从 `SKILL.md` 内容解析出一条 Skill。
-fn parse_skill(rel: &str, content: &str) -> Skill {
+///
+/// 除工作区索引外，GUI 的“导入技能”也使用同一解析器，保证用户导入的
+/// `SKILL.md` 与自动扫描的资产拥有一致的触发、步骤和验证语义。
+pub fn skill_from_markdown(rel: &str, content: &str) -> Skill {
     let name = content
         .lines()
         .find_map(|l| l.trim_start().strip_prefix("# "))
@@ -245,6 +248,7 @@ fn parse_skill(rel: &str, content: &str) -> Skill {
         verification_rules: verify,
         resource_files: vec![],
         confidence: 0.6,
+        enabled: true,
     }
 }
 

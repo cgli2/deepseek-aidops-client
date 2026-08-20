@@ -2,7 +2,7 @@
 
 use harness_capability::assets::FactKind;
 
-use super::model::MemItem;
+use super::model::{MemItem, MemRefresh};
 use super::AppState;
 
 impl AppState {
@@ -21,10 +21,11 @@ impl AppState {
         // 关键修复：GUI 线程已处于 tokio 主 runtime 内，直接 block_on 会 panic 闪退。
         // 改在独立 OS 线程里 block_on（该线程无 runtime context，不重入），结果经 mpsc 回传。
         let handle = self.host.rt.handle();
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<MemItem>>();
+        let (tx, rx) = std::sync::mpsc::channel::<MemRefresh>();
         std::thread::spawn(move || {
-            let items = handle.block_on(async move {
+            let result = handle.block_on(async move {
                 let mut out: Vec<MemItem> = Vec::new();
+                let mut code_symbols: Vec<harness_capability::assets::CodeSymbol> = Vec::new();
                 match tab.as_str() {
                     "chat" => {
                         if let Ok(facts) = conv.list_facts().await {
@@ -52,14 +53,21 @@ impl AppState {
                         }
                     }
                     "skill" => {
+                        // 管理界面用全量（含禁用）；列表展示用匹配结果。
+                        let all = skill.list_skills().await.unwrap_or_default();
                         let skills = if query.trim().is_empty() {
-                            skill.list_skills().await.unwrap_or_default()
+                            all.clone()
                         } else {
                             skill.match_skills(&query).await.unwrap_or_default()
                         };
                         for s in skills {
                             out.push(MemItem {
-                                title: format!("{} ({})", s.name, s.version),
+                                title: format!(
+                                    "{} ({}){}",
+                                    s.name,
+                                    s.version,
+                                    if s.enabled { "" } else { " [已禁用]" }
+                                ),
                                 meta: s.id,
                                 body: format!(
                                     "触发边界: {}\n步骤: {}",
@@ -90,24 +98,23 @@ impl AppState {
                         }
                     }
                     "code" => {
+                        // 代码图谱：结构化视图需要原始符号（含文件/类型/调用关系），
+                        // 不再压成 MemItem 文本平铺，直接回传原始数据由 code_graph 渲染。
                         let syms = if query.trim().is_empty() {
                             code.list_symbols().await.unwrap_or_default()
                         } else {
                             code.query_symbols(&query).await.unwrap_or_default()
                         };
-                        for x in syms {
-                            out.push(MemItem {
-                                title: format!("{} @ {}", x.name, x.file),
-                                meta: x.kind,
-                                body: format!("{} ｜ 调用: {}", x.summary, x.calls.join(", ")),
-                            });
-                        }
+                        code_symbols = syms;
                     }
                     _ => {}
                 }
-                out
+                MemRefresh {
+                    items: out,
+                    code_symbols,
+                }
             });
-            let _ = tx.send(items);
+            let _ = tx.send(result);
         });
         // 非阻塞：只存接收端，下一帧 poll_mem 轮询填充 mem_items，不卡 UI 线程。
         self.mem_refresh_rx = Some(rx);
@@ -140,9 +147,16 @@ impl AppState {
         // 刷新结果
         if let Some(rx) = &self.mem_refresh_rx {
             match rx.try_recv() {
-                Ok(items) => {
+                Ok(flush) => {
                     self.mem_refresh_rx = None;
-                    self.mem_items = items;
+                    self.mem_items = flush.items;
+                    // 代码图谱：更新原始符号，并把已失效的选中项清空。
+                    self.mem_code_symbols = flush.code_symbols;
+                    if let Some(sel) = &self.mem_code_sel {
+                        if !self.mem_code_symbols.iter().any(|s| &s.id == sel) {
+                            self.mem_code_sel = None;
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -196,5 +210,95 @@ impl AppState {
         });
         // 标记为已触发，避免重复索引；索引完成由 poll_mem 填充反馈。
         self.mem_bootstrapped = true;
+    }
+
+    /// 刷新技能管理列表（全量，含启用状态）。
+    pub(super) fn refresh_skill_items(&mut self) {
+        let skill = self.host.skill.clone();
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<harness_capability::assets::Skill>>();
+        std::thread::spawn(move || {
+            let items = handle.block_on(async move {
+                skill.list_skills().await.unwrap_or_default()
+            });
+            let _ = tx.send(items);
+        });
+        if let Ok(items) = rx.recv() {
+            self.skill_items = items;
+        }
+    }
+
+    /// 切换技能启用状态（异步；完成后刷新列表）。
+    pub(super) fn toggle_skill(&mut self, id: &str, enabled: bool) {
+        let skill = self.host.skill.clone();
+        let id = id.to_string();
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            let ok = handle.block_on(async move {
+                skill.set_skill_enabled(&id, enabled).await.is_ok()
+            });
+            let _ = tx.send(ok);
+        });
+        let _ = rx.recv();
+        self.refresh_skill_items();
+        self.mem_loaded = false;
+    }
+
+    /// 删除技能（异步；完成后刷新列表）。
+    pub(super) fn delete_skill_ui(&mut self, id: &str) {
+        let skill = self.host.skill.clone();
+        let id = id.to_string();
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            let ok = handle.block_on(async move {
+                skill.delete_skill(&id).await.unwrap_or(false)
+            });
+            let _ = tx.send(ok);
+        });
+        let _ = rx.recv();
+        self.refresh_skill_items();
+        self.mem_loaded = false;
+    }
+
+    /// 导入用户选择的 `SKILL.md`（或普通 Markdown 技能文档）。
+    ///
+    /// 解析规则与工作区自动索引完全一致；同一路径重复导入会更新同一技能，
+    /// 避免产生难以管理的重复资产。
+    pub(super) fn import_skill_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("导入 SKILL.md")
+            .add_filter("Markdown 技能", &["md", "markdown"])
+            .pick_file()
+        else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                self.note = format!("无法读取技能文件: {error}");
+                return;
+            }
+        };
+        // 以绝对来源路径生成稳定 id：多个项目里的同名 `SKILL.md` 可以并存，
+        // 重复导入同一个文件则更新原技能而非制造副本。
+        let source = path.to_string_lossy();
+        let skill_doc = harness_capability::index::skill_from_markdown(&source, &content);
+        let skill_name = skill_doc.name.clone();
+        let skill_lib = self.host.skill.clone();
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            let ok = handle.block_on(async move { skill_lib.register_skill(skill_doc).await.is_ok() });
+            let _ = tx.send(ok);
+        });
+        if rx.recv().unwrap_or(false) {
+            self.note = format!("已导入技能「{skill_name}」");
+        } else {
+            self.note = "导入技能失败".into();
+        }
+        self.refresh_skill_items();
+        self.mem_loaded = false;
     }
 }

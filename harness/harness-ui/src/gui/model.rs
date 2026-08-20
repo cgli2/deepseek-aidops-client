@@ -26,6 +26,13 @@ pub(super) struct MemItem {
     pub(super) body: String,
 }
 
+/// 记忆面板一次刷新的完整结果：通用条目 + 代码图谱原始符号（结构化视图消费）。
+#[derive(Clone)]
+pub(super) struct MemRefresh {
+    pub(super) items: Vec<MemItem>,
+    pub(super) code_symbols: Vec<harness_capability::assets::CodeSymbol>,
+}
+
 /// 核心插件默认启用，且不可在界面中取消。
 pub(super) const BUILTIN_PLUGINS: &[(&str, &str, &str)] = &[
     ("local-files", "本地文件", "读取、搜索与写入工作区文件"),
@@ -33,4 +40,5 @@ pub(super) const BUILTIN_PLUGINS: &[(&str, &str, &str)] = &[
     ("git", "Git", "查看差异、提交历史与分支操作"),
     ("memory", "Memory", "跨会话记忆检索与沉淀"),
     ("hooks", "Hooks", "生命周期钩子：提交前检查等自动化"),
+    ("superpowers", "Superpowers", "系统工作流扩展：提供规划、执行、验证等内置技能"),
 ];

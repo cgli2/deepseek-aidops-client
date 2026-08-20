@@ -7,6 +7,7 @@ impl eframe::App for AppState {
         self.poll_log();
         self.poll_preview();
         self.poll_mem();
+        self.poll_models();
         self.busy = self.host.sink.busy();
 
         let pal = palette(self.dark);

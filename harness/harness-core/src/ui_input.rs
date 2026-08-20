@@ -46,10 +46,22 @@ impl AccessPolicy {
 
 /// 把用户输入驱动成后台回合的反向通道。
 pub trait UiInputSink: Any + Send + Sync + 'static {
-    /// 提交一条用户输入（实现方应后台串行执行一个 turn，避免并发回合互相穿插）。
+    /// 提交一条用户输入。实现方应后台串行执行；忙碌时输入进入 FIFO 队列。
     fn submit(&self, text: String);
-    /// 是否正在跑回合（UI 据此禁用「发送」并提示"思考中…"）。
+    /// 是否正在跑回合或有待执行任务。
     fn busy(&self) -> bool;
+    /// 正在等待前序任务完成的输入数（不含当前运行回合）。
+    fn queued_count(&self) -> usize {
+        0
+    }
+    /// 等待前序任务的输入快照，供 UI 展示并允许用户在真正提交前撤回。
+    fn queued_inputs(&self) -> Vec<QueuedInput> {
+        Vec::new()
+    }
+    /// 撤回一条尚未开始执行的队列输入。返回是否成功撤回。
+    fn remove_queued(&self, _id: u64) -> bool {
+        false
+    }
     /// 请求停止当前回合。无活动回合时应安全 no-op。
     fn cancel(&self) {}
     /// 清空当前上下文，开始新会话。忙碌时应拒绝或安全 no-op。
@@ -58,6 +70,13 @@ pub trait UiInputSink: Any + Send + Sync + 'static {
     /// 切换工作区根并装载对应项目的会话历史（侧栏项目切换入口）。
     /// 默认 no-op：仅 `SessionController` 等持有运行时的实现需要真正切换。
     fn switch_workspace(&self, _path: &std::path::Path) {}
+}
+
+/// 尚未开始执行的输入。ID 在队列生命周期内稳定，避免 UI 刷新时按下标误删。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedInput {
+    pub id: u64,
+    pub text: String,
 }
 
 /// GUI 可在运行时更新模型连接，无需编辑配置文件并重启。
@@ -97,4 +116,11 @@ pub trait LlmControl: Any + Send + Sync + 'static {
         )
     }
     fn status(&self) -> String;
+
+    /// 从上游拉取模型列表（OpenAI 兼容 `GET {base_url}/models`）。
+    /// 返回模型 id 列表；失败返回友好错误。默认实现返回空（不支持时 UI 隐藏按钮）。
+    fn fetch_models(&self, base_url: String, api_key: String) -> Result<Vec<String>, String> {
+        let _ = (base_url, api_key);
+        Ok(Vec::new())
+    }
 }

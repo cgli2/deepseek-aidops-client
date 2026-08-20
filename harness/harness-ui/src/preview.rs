@@ -52,6 +52,8 @@ pub struct DiffLine {
 /// 文件预览加载结果（经 mpsc 从独立 OS 线程回传）。
 #[derive(Debug)]
 pub struct PreviewLoadResult {
+    /// 请求加载的路径（回传以标识所属请求，poll_preview 据此丢弃过期结果）。
+    pub path: String,
     pub content: harness_core::error::Result<String>,
     pub diff: Option<String>,
     pub tracked: bool,
@@ -276,6 +278,54 @@ pub fn candidate_abs_paths(ws_root: &str, path: &str) -> Vec<std::path::PathBuf>
     out
 }
 
+/// 在工作区内按「文件名」递归搜索，返回首个精确匹配的绝对路径。
+///
+/// 用途：助手回复里常只写相对文件名（如 `memory_panel.rs`），直接拼接工作区根
+/// 找不到（文件实际在深层子目录）。此时在忽略目录之外做受限深度搜索，命中即预览。
+///
+/// 成本控制：限深度（避免扫完整棵 target/node_modules）、跳过忽略目录、找到即返回。
+/// 返回 `None` 表示未找到（预览窗显示"文件不存在"）。
+pub fn find_by_filename(ws_root: &str, file_name: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let base = Path::new(ws_root);
+    if !base.is_dir() {
+        return None;
+    }
+    let name_lower = file_name.to_lowercase();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(base.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 8 {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if TREE_IGNORED_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                stack.push((p, depth + 1));
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case(&file_name) || n.to_lowercase() == name_lower)
+                .unwrap_or(false)
+            {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +436,35 @@ mod tests {
         use std::path::PathBuf;
         let cands = candidate_abs_paths("ignored", r"C:\abs\path.rs");
         assert_eq!(cands, vec![PathBuf::from(r"C:\abs\path.rs")]);
+    }
+
+    #[test]
+    fn find_by_filename_locates_file_in_deep_subdir() {
+        use std::path::PathBuf;
+        let base = std::env::temp_dir().join(format!("harness-fbf-{}", std::process::id()));
+        let deep = base.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("memory_panel.rs"), "// hi").unwrap();
+
+        let found = find_by_filename(&base.to_string_lossy(), "memory_panel.rs");
+        assert_eq!(found, Some(deep.join("memory_panel.rs")));
+
+        // 不存在的文件名 → None
+        assert!(find_by_filename(&base.to_string_lossy(), "nope.rs").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_by_filename_skips_ignored_dirs() {
+        use std::path::PathBuf;
+        let base = std::env::temp_dir().join(format!("harness-fbf2-{}", std::process::id()));
+        let ignored = base.join("node_modules").join("x");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("wanted.rs"), "// skip").unwrap();
+
+        // 忽略目录内的同名文件不应被找到
+        assert!(find_by_filename(&base.to_string_lossy(), "wanted.rs").is_none());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

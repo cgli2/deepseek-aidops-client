@@ -20,6 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 记忆面板接后端实时查询：持有资产 Definition 服务 + 独立 tokio runtime 驱动异步查询。
 harness-capability = { path = "../harness-capability" }
+# 技能管理：导入内置 superpowers 技能集（幂等注册进技能库）。
+harness-provider-memory = { path = "../harness-provider-memory" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]

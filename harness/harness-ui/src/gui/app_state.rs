@@ -14,6 +14,10 @@ pub(super) struct AppState {
     pub(super) thinking_text: String,
     /// 本回合开始时刻：状态栏展示「已用时 Ns」，长等待不再像假死。
     pub(super) turn_started: Option<std::time::Instant>,
+    /// 当前后台阶段：由会话事件驱动，明确长任务正卡在哪个环节。
+    pub(super) activity: String,
+    /// 最近一次收到后台事件的时刻，用于提示用户是否仍有进展。
+    pub(super) last_activity: Option<std::time::Instant>,
     pub(super) dark: bool,
     pub(super) sidebar_expanded: bool,
     pub(super) settings_open: bool,
@@ -25,6 +29,16 @@ pub(super) struct AppState {
     pub(super) f_key: String,
     /// 思考档位 / 努力度（对齐 cc-switch thinkingLevelMap）：发给上游的 reasoning_effort 字符串。
     pub(super) f_effort: String,
+    /// 上游模型列表（点「获取上游模型列表」后填充）。
+    pub(super) f_models: Vec<String>,
+    /// 已勾选要启用的模型集合（空 = 未选择，保存时取第一个）。
+    pub(super) f_selected_models: std::collections::HashSet<String>,
+    /// 正在获取模型列表（按钮 loading 态）。
+    pub(super) models_loading: bool,
+    /// 获取模型列表的错误/状态提示。
+    pub(super) models_msg: String,
+    /// 获取模型列表的异步回传通道（非阻塞轮询）。
+    pub(super) models_rx: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<String>, String>>>,
     // aidops 后端连接配置表单（对应 Config.aidops；留空则仅用本地文件记忆）
     pub(super) f_aidops_base: String,
     pub(super) f_aidops_key: String,
@@ -71,6 +85,18 @@ pub(super) struct AppState {
     pub(super) mem_query: String,
     pub(super) mem_loaded: bool,
     pub(super) mem_items: Vec<MemItem>,
+    /// 代码图谱：原始符号列表（code tab 由结构化视图消费，不再压成 MemItem 文本）。
+    pub(super) mem_code_symbols: Vec<harness_capability::assets::CodeSymbol>,
+    /// 代码图谱：已展开的文件分组（按文件路径为键）。
+    pub(super) mem_code_expanded: std::collections::HashSet<String>,
+    /// 代码图谱：当前选中符号 id（点击详情/关系 chip 导航用）。
+    pub(super) mem_code_sel: Option<String>,
+    /// 代码图谱：跳转后需要滚动回顶的提示（下帧消费后清空）。
+    pub(super) mem_code_scroll: bool,
+    /// 记忆面板数据是否仍在加载（异步刷新进行中，展示轻量 loading）。
+    /// 当前未消费（刷新结果经 poll_mem 直接落盘），保留供后续加载态指示。
+    #[allow(dead_code)]
+    pub(super) mem_loading: bool,
     /// 是否已对当前工作区执行过资产索引（首次打开记忆面板时自动执行一次）。
     pub(super) mem_bootstrapped: bool,
     /// 最近一次索引/操作的反馈信息。
@@ -82,10 +108,16 @@ pub(super) struct AppState {
         >,
     >,
     /// 记忆面板刷新的异步回传通道。
-    pub(super) mem_refresh_rx: Option<std::sync::mpsc::Receiver<Vec<MemItem>>>,
+    pub(super) mem_refresh_rx: Option<std::sync::mpsc::Receiver<MemRefresh>>,
+    /// 技能管理数据：当前全部技能（含状态），供技能 tab 管理界面使用。
+    pub(super) skill_items: Vec<harness_capability::assets::Skill>,
     // ── 文件预览（纯 UI 本地状态，不持久化、不进 SessionLog）──
     /// 预览窗是否展开。
     pub(super) preview_open: bool,
+    /// 预览面板是否仍在开关动画中（动画结束后才真正释放面板，避免关闭瞬间跳变）。
+    pub(super) preview_animating: bool,
+    /// 预览浮层宽度（用户可拖拽调整；浮层不占布局，消息流宽度恒定）。
+    pub(super) preview_width: f32,
     /// 当前预览的文件相对路径（相对 workspace_root）。
     pub(super) preview_path: Option<String>,
     /// 预览窗内容缓存：避免每帧重读磁盘。
@@ -161,6 +193,11 @@ impl AppState {
             f_model: host.model.clone(),
             f_key: String::new(),
             f_effort: settings.get("llm.reasoning_effort").unwrap_or_default(),
+            f_models: Vec::new(),
+            f_selected_models: std::collections::HashSet::new(),
+            models_loading: false,
+            models_msg: String::new(),
+            models_rx: None,
             // aidops 后端连接：从 .harness.toml 的 [aidops] 段加载（无则空，仅用本地记忆）。
             f_aidops_base: Config::load()
                 .map(|c| c.aidops.base_url)
@@ -194,6 +231,8 @@ impl AppState {
             thinking: false,
             thinking_text: String::new(),
             turn_started: None,
+            activity: String::new(),
+            last_activity: None,
             dark,
             sidebar_expanded: true,
             settings_open: false,
@@ -256,12 +295,20 @@ impl AppState {
             mem_query: String::new(),
             mem_loaded: false,
             mem_items: Vec::new(),
+            mem_code_symbols: Vec::new(),
+            mem_code_expanded: std::collections::HashSet::new(),
+            mem_code_sel: None,
+            mem_code_scroll: false,
+            mem_loading: false,
             mem_bootstrapped: false,
             mem_index_msg: String::new(),
             mem_boot_rx: None,
             mem_refresh_rx: None,
+            skill_items: Vec::new(),
             // 文件预览初始状态
             preview_open: false,
+            preview_animating: false,
+            preview_width: 420.0,
             preview_path: None,
             preview_content: None,
             preview_mode: crate::preview::PreviewMode::Source,
@@ -341,17 +388,27 @@ impl AppState {
         }
         for event in &events {
             match event {
-                SessionEvent::TurnStart { input, .. } => self.push("user", "你", input),
+                SessionEvent::TurnStart { input, .. } => {
+                    self.push("user", "你", input);
+                    // 队列中的任务真正开始执行时重新计时，不能沿用前一个任务的耗时。
+                    self.turn_started = Some(std::time::Instant::now());
+                    self.record_activity("正在准备上下文");
+                }
+                SessionEvent::StepStart { step, .. } => {
+                    self.record_activity(&format!("正在请求模型（第 {step} 步）"));
+                }
                 SessionEvent::Assistant { chunk, .. } => {
                     if let Some(text) = &chunk.text {
                         self.finalize_thinking();
                         self.append_assistant(text);
+                        self.record_activity("正在生成回复");
                     }
                 }
                 SessionEvent::Thinking { text, .. } => {
                     // 思考链增量：累积全文并实时覆盖尾部「思考」气泡（只展示最近几十字，
                     // 不刷屏），长推理期用户能看到内容在滚动，而不是只剩状态栏一个标志。
                     self.thinking = true;
+                    self.record_activity("模型正在思考");
                     self.thinking_text.push_str(text);
                     if self.thinking_text.chars().count() > 400 {
                         let total = self.thinking_text.chars().count();
@@ -362,11 +419,17 @@ impl AppState {
                 }
                 SessionEvent::ToolCall { call, .. } => {
                     self.finalize_thinking();
+                    self.record_activity(&format!("正在执行工具：{}", call.name));
                     // 参数摘要（≤120 字）：agent 行为全程可见。
                     let summary: String = call.args.to_string().chars().take(120).collect();
                     self.push("tool", "工具", &format!("调用 {}: {}", call.name, summary));
                 }
                 SessionEvent::ToolResult { result, .. } => {
+                    self.record_activity(if result.ok {
+                        "已收到工具结果，继续分析"
+                    } else {
+                        "工具执行未成功，正在调整"
+                    });
                     let preview: String = result.content.chars().take(400).collect();
                     self.push(
                         "tool",
@@ -389,6 +452,13 @@ impl AppState {
                 SessionEvent::TurnEnd { .. } => {
                     self.finalize_thinking();
                     self.turn_started = None;
+                    let queued = self.host.sink.queued_count();
+                    if queued > 0 {
+                        self.record_activity(&format!("当前任务完成，等待队列中 {queued} 条任务"));
+                    } else {
+                        self.activity.clear();
+                        self.last_activity = None;
+                    }
                     // 回合已完整落盘：刷新历史列表（mtime / 标题可能变化）。
                     self.refresh_history();
                 }
@@ -397,6 +467,12 @@ impl AppState {
         }
         self.last_event = next;
         trace(&format!("[log] +{} events processed", events.len()));
+    }
+
+    /// 记录一个用户可见的后台阶段；时间戳只存在 UI 内存，不写入会话历史。
+    pub(super) fn record_activity(&mut self, activity: &str) {
+        self.activity = activity.to_string();
+        self.last_activity = Some(std::time::Instant::now());
     }
 
     /// 思考直播气泡：消息流尾部增量覆盖，只展示最近几十字；
@@ -445,7 +521,7 @@ impl AppState {
 
     pub(super) fn submit(&mut self) {
         let mut text = self.input.trim().to_string();
-        if text.is_empty() || self.busy {
+        if text.is_empty() {
             return;
         }
         if !self.attachment.trim().is_empty() {
@@ -470,11 +546,18 @@ impl AppState {
         // 用户气泡不在此本地推入：TurnStart 事件是真相源，poll_log 会渲染，
         // 本地再推一条会导致同一问题显示两次。
         trace(&format!("[send] you: {text}"));
+        let queued = self.busy;
         self.input.clear();
         self.busy = true;
-        self.thinking_text.clear();
-        self.turn_started = Some(std::time::Instant::now());
+        if !queued {
+            self.thinking_text.clear();
+            self.turn_started = Some(std::time::Instant::now());
+            self.record_activity("正在提交任务");
+        }
         sink.submit(text);
+        if queued {
+            self.note = format!("新任务已加入队列（当前待执行 {} 条）", sink.queued_count());
+        }
     }
 
     pub(super) fn new_session(&mut self) {
@@ -493,6 +576,8 @@ impl AppState {
         }];
         self.thinking_text.clear();
         self.turn_started = None;
+        self.activity.clear();
+        self.last_activity = None;
         self.refresh_history();
         trace("[session] new session");
     }
@@ -583,6 +668,8 @@ impl AppState {
         self.thinking = false;
         self.thinking_text.clear();
         self.turn_started = None;
+        self.activity.clear();
+        self.last_activity = None;
         trace(&format!("[session] restored {file}"));
     }
 
@@ -680,6 +767,7 @@ impl AppState {
         self.host.sink.switch_workspace(&p);
         // 清空旧项目的预览与文件树缓存（基准根统一从 settings 读取）。
         self.preview_open = false;
+        self.preview_animating = false;
         self.preview_path = None;
         self.preview_content = None;
         self.preview_diff = None;
@@ -708,6 +796,56 @@ impl AppState {
         trace(&format!("[project] switched to {path}"));
     }
 
+    /// 从上游拉取模型列表（非阻塞：后台线程请求，主线程每帧轮询结果，不卡 UI）。
+    pub(super) fn fetch_models_from_upstream(&mut self) {
+        if self.models_loading || self.models_rx.is_some() {
+            return;
+        }
+        self.models_loading = true;
+        self.models_msg = "正在获取上游模型列表…".into();
+        let base = self.f_base.clone();
+        let key = self.f_key.trim().to_string();
+        let llm = self.host.llm_control.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<Vec<String>, String>>();
+        self.models_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = llm.fetch_models(base, key);
+            let _ = tx.send(res);
+        });
+    }
+
+    /// 每帧轮询上游模型列表结果（非阻塞）。
+    pub(super) fn poll_models(&mut self) {
+        if let Some(rx) = &self.models_rx {
+            match rx.try_recv() {
+                Ok(Ok(models)) => {
+                    self.models_rx = None;
+                    self.models_loading = false;
+                    self.f_models = models;
+                    // 预勾选：当前填写的模型若在列表中则选中；否则默认全不选（保存取第一个）。
+                    if !self.f_model.trim().is_empty() {
+                        if self.f_models.iter().any(|m| m == &self.f_model) {
+                            self.f_selected_models.insert(self.f_model.clone());
+                        }
+                    }
+                    self.models_msg = format!("共获取 {} 个模型，可勾选多个启用", self.f_models.len());
+                }
+                Ok(Err(e)) => {
+                    self.models_rx = None;
+                    self.models_loading = false;
+                    self.f_models.clear();
+                    self.models_msg = format!("获取失败：{e}");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.models_rx = None;
+                    self.models_loading = false;
+                    self.models_msg = "获取模型列表失败：后台任务异常退出".into();
+                }
+            }
+        }
+    }
+
     pub(super) fn apply_model(&mut self) {
         let settings = &self.host.settings;
         let key = if self.f_key.trim().is_empty() {
@@ -715,6 +853,20 @@ impl AppState {
         } else {
             std::mem::take(&mut self.f_key)
         };
+        // 未填写模型名称但已获取上游列表 → 默认取第一个模型。
+        if self.f_model.trim().is_empty() {
+            if !self.f_models.is_empty() {
+                self.f_model = self.f_models[0].clone();
+            } else if !self.f_selected_models.is_empty() {
+                let first = self
+                    .f_selected_models
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_default();
+                self.f_model = first;
+            }
+        }
         let result = self.host.llm_control.configure_provider(
             self.f_provider.clone(),
             self.f_base.clone(),
@@ -729,6 +881,10 @@ impl AppState {
                 let _ = settings.set("llm.provider", &self.f_provider);
                 let _ = settings.set_secret("llm.api_key", &key);
                 let _ = settings.set("llm.reasoning_effort", &self.f_effort);
+                // 持久化多选模型集合（逗号分隔），供下次打开恢复勾选。
+                let mut sel: Vec<&str> = self.f_selected_models.iter().map(|s| s.as_str()).collect();
+                sel.sort_unstable();
+                let _ = settings.set("llm.selected_models", &sel.join(","));
                 let name = format!("{} · {}", self.f_provider, self.f_model);
                 let _ = settings.save_model_profile(&crate::ModelProfile {
                     name: name.clone(),

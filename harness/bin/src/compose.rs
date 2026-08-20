@@ -219,6 +219,17 @@ impl Plugin for HarnessPlugin {
         regs.push(ctx.provide(wiki.clone()));
         regs.push(ctx.provide(code.clone()));
 
+        // Superpowers 是随应用发布的系统插件，而不是用户手工导入的一组技能。
+        // 其工作流技能异步、幂等地注册到同一 SkillLibrary；GUI 中会在“插件管理”
+        // 显示该系统插件，在“技能管理”只展示其提供的只读技能资产。
+        let superpower_skill = skill.clone();
+        tokio::runtime::Handle::current().spawn(async move {
+            let added = harness_provider_memory::ensure_builtin_skills(&*superpower_skill).await;
+            if added > 0 {
+                eprintln!("[harness] Superpowers 系统插件已注册 {added} 个技能");
+            }
+        });
+
         // 用户导入的 WASM 插件：只加载数据库中“已启用”的项。运行时默认零直接能力，
         // 插件仅在显式导出 on_load 时执行初始化；坏插件不会阻断主程序启动。
         let wasm_plugins = Arc::new(WasmPluginRuntime::new());

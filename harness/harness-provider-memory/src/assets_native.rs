@@ -27,15 +27,87 @@ fn tokenize(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// 中文无空格：把连续 CJK 段按 2/3 字滑动窗口拆成 token，用于模糊匹配。
+/// 例如「请帮我规划一下这个任务」→ 「请帮」「帮我」「我规」「规划」…
+/// 这样触发边界里的「规划」等关键词能与查询长句命中。
+fn cjk_ngrams(s: &str, n: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() {
+            // 非 CJK（字母数字）整段保留，避免拆散英文词。
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            out.push(chars[start..i].iter().collect());
+        } else if ('\u{4e00}'..='\u{9fff}').contains(&c) {
+            // CJK 连续段：n-gram
+            let start = i;
+            while i < chars.len()
+                && ('\u{4e00}'..='\u{9fff}').contains(&chars[i])
+            {
+                i += 1;
+            }
+            let seg: Vec<char> = chars[start..i].to_vec();
+            if seg.len() <= n {
+                out.push(seg.iter().collect());
+            } else {
+                for w in seg.windows(n) {
+                    out.push(w.iter().collect());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// 词法打分：查询词在文本中的命中比例（0.0~1.0），命中越多分越高。
+///
+/// 中文无空格分词问题：整句被当成单个 token 几乎无法命中触发边界。
+/// 因此对中文连续段做 2/3-gram 滑动窗口拆解，让触发边界里的关键词
+/// （如「规划」「执行」「提交」）能与自然语言查询命中。
 fn lex_score(query: &str, text: &str) -> f32 {
-    let q = tokenize(query);
+    // 直接按空白/标点分词 + 中文 n-gram 双通道。
+    let mut q: Vec<String> = Vec::new();
+    for t in tokenize(query) {
+        // 若该 token 是中文长句，补充 2/3-gram；短词直接保留。
+        if t.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) && t.chars().count() > 1 {
+            q.push(t.clone());
+            q.extend(cjk_ngrams(&t, 2));
+            q.extend(cjk_ngrams(&t, 3));
+        } else {
+            q.push(t);
+        }
+    }
+    q.dedup();
     if q.is_empty() {
         return 0.0;
     }
     let t = text.to_lowercase();
-    let hits = q.iter().filter(|tok| t.contains(tok.as_str())).count();
-    hits as f32 / q.len() as f32
+    // 中文 n-gram 长度≥2 才参与匹配，避免单个汉字误命中。
+    let hits = q
+        .iter()
+        .filter(|tok| tok.chars().count() >= 2 && t.contains(tok.as_str()))
+        .count();
+    // 分母用「非 n-gram 的基础词 + 命中的 n-gram 权重」：让整句匹配到关键词时
+    // 分数显著 >0，同时不因 n-gram 太多而稀释。
+    let base_tokens = tokenize(query)
+        .into_iter()
+        .filter(|t| t.chars().count() >= 2)
+        .count()
+        .max(1);
+    let score = hits as f32 / (base_tokens * 2) as f32;
+    // 归一化到 0.2~1.0，保证命中即被采纳。
+    if score > 0.0 {
+        (score * 4.0 + 0.2).min(1.0)
+    } else {
+        0.0
+    }
 }
 
 fn now_rfc3339() -> String {
@@ -255,6 +327,17 @@ impl NativeSkillLibrary {
         }
         out
     }
+
+    /// 只返回已启用的技能（match_skills 用）。
+    fn enabled_skills(&self) -> Vec<Skill> {
+        self.all_skills().into_iter().filter(|s| s.enabled).collect()
+    }
+
+    /// 写回某个技能的完整信息（启用状态变更时用）。
+    fn write_skill(&self, skill: &Skill) -> harness_core::error::Result<()> {
+        let body = serde_json::to_string_pretty(skill).map_err(harness_core::error::Error::Serde)?;
+        std::fs::write(self.skill_path(&skill.id), body).map_err(harness_core::error::Error::Io)
+    }
 }
 
 #[async_trait]
@@ -273,7 +356,7 @@ impl SkillLibrary for NativeSkillLibrary {
 
     async fn match_skills(&self, context: &str) -> Result<Vec<Skill>> {
         let mut scored: Vec<(f32, Skill)> = self
-            .all_skills()
+            .enabled_skills()
             .into_iter()
             .map(|sk| {
                 (
@@ -305,6 +388,24 @@ impl SkillLibrary for NativeSkillLibrary {
 
     async fn list_skills(&self) -> Result<Vec<Skill>> {
         Ok(self.all_skills())
+    }
+
+    async fn delete_skill(&self, id: &str) -> Result<bool> {
+        let p = self.skill_path(id);
+        match std::fs::remove_file(&p) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(harness_core::error::Error::Io(e)),
+        }
+    }
+
+    async fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let mut skill = self
+            .get_skill(id)
+            .await?
+            .ok_or_else(|| harness_core::error::Error::Runtime(format!("skill not found: {id}")))?;
+        skill.enabled = enabled;
+        self.write_skill(&skill)
     }
 }
 

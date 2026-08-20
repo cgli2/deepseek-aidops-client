@@ -145,8 +145,58 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         ui.add(egui::TextEdit::singleline(&mut state.f_provider).desired_width(f32::INFINITY));
                                         field_label(ui, &pal, "API 地址");
                                         ui.add(egui::TextEdit::singleline(&mut state.f_base).desired_width(f32::INFINITY));
-                                        field_label(ui, &pal, "模型名称（可自由填写）");
-                                        ui.add(egui::TextEdit::singleline(&mut state.f_model).desired_width(f32::INFINITY));
+                                        field_label(ui, &pal, "模型名称（可自由填写；留空则保存时取上游列表第一个）");
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::TextEdit::singleline(&mut state.f_model).desired_width(ui.available_width() - 150.0));
+                                            if state.models_loading {
+                                                ui.spinner();
+                                                ui.label(egui::RichText::new("获取中…").size(11.0).color(pal.dim));
+                                            } else if ghost_button(ui, &pal, "获取上游模型列表") {
+                                                state.fetch_models_from_upstream();
+                                            }
+                                        });
+                                        if !state.models_msg.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&state.models_msg)
+                                                    .size(11.0)
+                                                    .color(if state.f_models.is_empty() { pal.err_text } else { pal.accent }),
+                                            );
+                                        }
+                                        if !state.f_models.is_empty() {
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "勾选要启用的模型（共 {} 个）：",
+                                                    state.f_models.len()
+                                                ))
+                                                .size(11.5)
+                                                .color(pal.dim),
+                                            );
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("model_list_scroll")
+                                                .max_height(120.0)
+                                                .show(ui, |ui| {
+                                                    for m in state.f_models.clone() {
+                                                        let mut checked = state.f_selected_models.contains(&m);
+                                                        if ui.checkbox(&mut checked, &m).changed() {
+                                                            if checked {
+                                                                state.f_selected_models.insert(m.clone());
+                                                            } else {
+                                                                state.f_selected_models.remove(&m);
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            ui.add_space(4.0);
+                                            let n = state.f_selected_models.len();
+                                            if n > 0 {
+                                                ui.label(
+                                                    egui::RichText::new(format!("已选 {n} 个 · 保存后以第一个为当前模型，其余作为可用模型"))
+                                                        .size(11.0)
+                                                        .color(pal.accent),
+                                                );
+                                            }
+                                        }
                                         field_label(ui, &pal, "API Key（AES-256-GCM 加密后保存至 SQLite，跨操作系统通用）");
                                         ui.add(egui::TextEdit::singleline(&mut state.f_key).password(true).desired_width(f32::INFINITY));
                                         field_label(ui, &pal, "思考档位 reasoning_effort（可选：off/low/medium/high/xhigh/max/auto，留空=默认）");
@@ -186,7 +236,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         );
                                     }
                                     "插件管理" => {
-                                        field_label(ui, &pal, "内置核心插件（默认启用，系统必要能力不可取消）");
+                                        field_label(ui, &pal, "系统插件（随应用发布，默认启用且不可移除）");
                                         for i in 0..state.plugin_rows.len() {
                                             if state.plugin_rows[i].core {
                                                 let _ = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
@@ -264,11 +314,67 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         ui.add_space(6.0);
                                         ui.label(
                                             egui::RichText::new(
-                                                "操作方式：点击「＋ 添加新插件」导入 .wasm/.wat；勾选即立即加载并执行可选 on_load，取消勾选即卸载。插件仅获得 host_log，默认没有 Shell、文件或网络权限；「移除」只删除登记，不删除你的原始文件。",
+                                                "系统插件包含基础工具和 Superpowers 工作流扩展。自定义插件可导入 .wasm/.wat；勾选即立即加载并执行可选 on_load，取消勾选即卸载。插件仅获得 host_log，默认没有 Shell、文件或网络权限；「移除」只删除登记，不删除你的原始文件。",
                                             )
                                             .size(11.0)
                                             .color(pal.dim),
                                         );
+                                    }
+                                    "技能管理" => {
+                                        if state.skill_items.is_empty() {
+                                            state.refresh_skill_items();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "技能是可导入的 SKILL.md 指令资产。启用的自定义技能会在每个回合按任务匹配后注入模型上下文；禁用或删除后立即停止注入。",
+                                            )
+                                            .size(12.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            if accent_button(ui, &pal, "导入 SKILL.md") {
+                                                state.import_skill_file();
+                                            }
+                                            if ghost_button(ui, &pal, "刷新") {
+                                                state.refresh_skill_items();
+                                            }
+                                        });
+                                        ui.add_space(8.0);
+                                        egui::ScrollArea::vertical().show(ui, |ui| {
+                                            if state.skill_items.is_empty() {
+                                                ui.label(egui::RichText::new("暂无自定义技能。导入一个 SKILL.md 即可开始管理。").size(12.0).color(pal.dim));
+                                            }
+                                            for sk in state.skill_items.clone() {
+                                                let system_skill = sk.id.starts_with("sp-");
+                                                ui.group(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        let mut enabled = sk.enabled;
+                                                        ui.add_enabled(
+                                                            !system_skill,
+                                                            egui::Checkbox::new(&mut enabled, ""),
+                                                        )
+                                                        .on_hover_text(if system_skill { "由 Superpowers 系统插件管理" } else { "启用 / 禁用此技能" });
+                                                        if !system_skill && enabled != sk.enabled {
+                                                            state.toggle_skill(&sk.id, enabled);
+                                                        }
+                                                        ui.label(egui::RichText::new(&sk.name).size(13.0).strong().color(pal.text));
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            if system_skill {
+                                                                ui.label(egui::RichText::new("系统插件提供").size(10.5).color(pal.accent));
+                                                            } else if ghost_button(ui, &pal, "删除") {
+                                                                state.delete_skill_ui(&sk.id);
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.label(egui::RichText::new(&sk.trigger_boundary).size(11.5).color(pal.dim));
+                                                    if !sk.steps.is_empty() {
+                                                        ui.label(egui::RichText::new(format!("步骤: {}", sk.steps.join(" → "))).size(11.0).color(pal.dim));
+                                                    }
+                                                });
+                                                ui.add_space(6.0);
+                                            }
+                                        });
                                     }
                                     "记忆" => {
                                         // 标签切换：对话记忆 / 技能 / 知识库 / 代码图谱
@@ -315,6 +421,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                 state.bootstrap_mem();
                                             }
                                             state.refresh_mem();
+                                            state.refresh_skill_items();
                                             state.mem_loaded = true;
                                         }
                                         ui.horizontal(|ui| {
@@ -330,16 +437,99 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                             }
                                         });
                                         ui.add_space(4.0);
+                                        // 代码图谱用结构化视图，展示符号数；其余 tab 展示条目数。
+                                        let mem_count = if state.mem_tab == "code" {
+                                            state.mem_code_symbols.len()
+                                        } else {
+                                            state.mem_items.len()
+                                        };
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "共 {} 条 · 本地原生记忆（若已连接 aidops 后端，以远端为准）",
-                                                state.mem_items.len()
+                                                "共 {mem_count} 条 · 本地原生记忆（若已连接 aidops 后端，以远端为准）"
                                             ))
                                             .size(11.0)
                                             .color(pal.dim),
                                         );
                                         ui.add_space(6.0);
-                                        egui::ScrollArea::vertical().show(ui, |ui| {
+if state.mem_tab == "code" {
+                                            // 代码图谱：结构化视图（统计卡 + 按文件分组折叠 + 调用关系导航）。
+                                            super::code_graph::render(
+                                                ui,
+                                                &pal,
+                                                &state.mem_code_symbols,
+                                                &mut state.mem_code_expanded,
+                                                &mut state.mem_code_sel,
+                                                &mut state.mem_code_scroll,
+                                            );
+                                        } else if state.mem_tab == "skill" {
+                                            // 兼容旧“记忆 → 技能”入口；完整管理入口在侧栏“技能管理”。
+                                            ui.horizontal(|ui| {
+                                                if ghost_button(ui, &pal, "导入 SKILL.md") {
+                                                    state.import_skill_file();
+                                                }
+                                            });
+                                            ui.add_space(4.0);
+                                            if state.skill_items.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "暂无技能。点击「导入 SKILL.md」导入自定义技能，或「重新索引资产」扫描工作区中的 SKILL.md。",
+                                                    )
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                                );
+                                            } else {
+                                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                                    for sk in state.skill_items.clone() {
+                                                        ui.group(|ui| {
+                                                            ui.horizontal(|ui| {
+                                                                let mut enabled = sk.enabled;
+                                                                if ui
+                                                                    .checkbox(&mut enabled, "")
+                                                                    .on_hover_text("启用 / 禁用此技能")
+                                                                    .changed()
+                                                                {
+                                                                    state.toggle_skill(&sk.id, enabled);
+                                                                }
+                                                                ui.label(
+                                                                    egui::RichText::new(&sk.name)
+                                                                        .size(13.0)
+                                                                        .color(pal.text)
+                                                                        .strong(),
+                                                                );
+                                                                ui.label(
+                                                                    egui::RichText::new(format!("v{}", sk.version))
+                                                                        .size(10.5)
+                                                                        .color(pal.dim),
+                                                                );
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        if ghost_button(ui, &pal, "删除") {
+                                                                            state.delete_skill_ui(&sk.id);
+                                                                        }
+                                                                    },
+                                                                );
+                                                            });
+                                                            ui.label(
+                                                                egui::RichText::new(&sk.trigger_boundary)
+                                                                    .size(11.5)
+                                                                    .color(if sk.enabled { pal.dim } else { pal.err_text }),
+                                                            );
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "步骤: {}",
+                                                                    sk.steps.join(" → ")
+                                                                ))
+                                                                .size(11.0)
+                                                                .color(pal.dim),
+                                                            );
+                                                        });
+                                                        ui.add_space(6.0);
+                                                    }
+                                                });
+                                            }
+                                        } else {
+                                                                                egui::ScrollArea::vertical().show(ui, |ui| {
                                             if state.mem_items.is_empty() {
                                                 ui.label(
                                                     egui::RichText::new(
@@ -372,6 +562,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                             }
                                         });
                                     }
+                                    }
+
                                     "更新" => {
                                         state.draw_update_settings(ui, &pal);
                                     }
@@ -538,22 +730,50 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                             .size(11.0)
                                             .color(pal.dim),
                                         );
+                                        egui::Frame::default()
+                                            .fill(pal.bg)
+                                            .rounding(egui::Rounding::same(10.0))
+                                            .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                                            .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.add_sized([110.0, 22.0], egui::Label::new(
+                                                egui::RichText::new("后端地址").size(12.0).color(pal.text),
+                                            ));
+                                            ui.add_space(8.0);
+
                                         ui.add(
                                             egui::TextEdit::singleline(&mut state.f_aidops_base)
                                                 .desired_width(f32::INFINITY)
                                                 .hint_text("后端地址，如 http://localhost:8000"),
                                         );
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.add_sized([110.0, 22.0], egui::Label::new(
+                                                egui::RichText::new("API Key").size(12.0).color(pal.text),
+                                            ));
+                                            ui.add_space(8.0);
+
                                         ui.add(
                                             egui::TextEdit::singleline(&mut state.f_aidops_key)
                                                 .desired_width(f32::INFINITY)
                                                 .hint_text("API Key（可选；亦可用环境变量 AIDOPS_API_KEY）")
                                                 .password(true),
                                         );
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.add_sized([110.0, 22.0], egui::Label::new(
+                                                egui::RichText::new("项目 ID").size(12.0).color(pal.text),
+                                            ));
+                                            ui.add_space(8.0);
+
                                         ui.add(
                                             egui::TextEdit::singleline(&mut state.f_aidops_project)
                                                 .desired_width(f32::INFINITY)
                                                 .hint_text("项目 ID（可选，整数）"),
                                         );
+                                        });
+                                            });
                                         ui.add_space(10.0);
                                         field_label(ui, &pal, "配置文件 .harness.toml");
                                         ui.horizontal(|ui| {

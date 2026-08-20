@@ -44,6 +44,8 @@ async fn submit_writes_turn_events() {
 
     let ctrl = SessionController::new(ctx.clone(), tokio::runtime::Handle::current());
     ctrl.submit("hello".into());
+    ctrl.submit("queued follow-up".into());
+    assert!(ctrl.busy());
 
     // 轮询等待 turn 结束（最多 2s）。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -51,7 +53,9 @@ async fn submit_writes_turn_events() {
         let evs = log.replay();
         if evs
             .iter()
-            .any(|e| matches!(e, SessionEvent::TurnEnd { .. }))
+            .filter(|e| matches!(e, SessionEvent::TurnEnd { .. }))
+            .count()
+            == 2
         {
             break;
         }
@@ -74,4 +78,12 @@ async fn submit_writes_turn_events() {
         "expected TurnEnd in log, got: {:?}",
         evs
     );
+    let inputs: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::TurnStart { input, .. } => Some(input.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inputs, vec!["hello", "queued follow-up"]);
 }

@@ -1913,6 +1913,7 @@ dependencies = [
  "harness-capability",
  "harness-core",
  "harness-llm",
+ "harness-provider-memory",
  "harness-provider-wasm",
  "harness-session",
  "pulldown-cmark",

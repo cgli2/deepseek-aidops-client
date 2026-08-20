@@ -287,6 +287,10 @@ impl harness_core::LlmControl for ManagedLlm {
             .map(|s| s.clone())
             .unwrap_or_else(|_| "模型状态不可用".into())
     }
+
+    fn fetch_models(&self, base_url: String, api_key: String) -> std::result::Result<Vec<String>, String> {
+        crate::openai_compat::fetch_models(base_url, api_key)
+    }
 }
 
 #[cfg(test)]

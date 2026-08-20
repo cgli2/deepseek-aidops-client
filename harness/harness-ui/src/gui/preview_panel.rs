@@ -10,7 +10,8 @@ use super::AppState;
 impl AppState {
     /// 打开文件预览窗并加载指定文件。
     ///
-    /// 命中缓存时立即打开；未命中时后台加载，并在内容就绪后打开。
+    /// 命中缓存时立即打开；未命中时也**立即打开面板**（面板内显示"加载中…"），
+    /// 内容就绪后原地更新——避免面板在异步返回后"空降"，导致中央消息流宽度突变闪烁。
     pub(super) fn open_preview(&mut self, path: String) {
         self.preview_path = Some(path.clone());
         self.preview_mode = if crate::preview::is_markdown_path(&path) {
@@ -20,11 +21,25 @@ impl AppState {
         };
         self.preview_diff = None;
         self.preview_tracked = false;
+        // 面板立即打开：内容未就绪前渲染"加载中…"占位，稳定面板宽度。
+        self.preview_open = true;
         if let Some((content, truncated)) = self.preview_cache.get(&path).cloned() {
+            // 缓存命中也要重建语法高亮：否则沿用上一个文件的高亮 job，内容与高亮错乱。
+            let file_name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file.txt");
+            self.preview_highlight = Some(crate::highlight::highlight_to_job(
+                &content,
+                file_name,
+                self.dark,
+                egui::Color32::TRANSPARENT,
+                palette(self.dark).dim,
+                f32::INFINITY,
+            ));
             self.preview_content = Some(content);
             self.preview_truncated = truncated;
             self.preview_error = None;
-            self.preview_open = true;
             // 缓存只存了内容；diff / tracked 仍需异步加载（已跟踪/未跟踪都算）。
             self.load_preview(path);
             return;
@@ -33,7 +48,7 @@ impl AppState {
         self.preview_error = None;
         self.preview_truncated = false;
         self.preview_highlight = None;
-        // 不立即 preview_open = true：等 poll_preview 内容就绪后再开。
+        // 面板已立即打开；等 poll_preview 内容就绪后原地更新。
         self.load_preview(path);
     }
 
@@ -45,6 +60,8 @@ impl AppState {
     pub(super) fn load_preview(&mut self, path: String) {
         let fs = self.host.fs.clone();
         let git = self.host.git.clone();
+        // 回传请求路径：poll_preview 据此丢弃过期结果（快速切换文件时防污染）。
+        let req_path = path.clone();
         // 基准根统一从 settings 读取（switch_project 已更新），避免 Arc 字段不可变。
         let ws_root = self
             .host
@@ -68,6 +85,26 @@ impl AppState {
                             break;
                         }
                         Err(e) => content = Some(Err(e)),
+                    }
+                }
+                // 相对文件名（如 `memory_panel.rs`）直接拼接工作区根找不到时，
+                // 在工作区内按文件名受限搜索，命中即作为最终候选读取。
+                // 仅当路径是「裸文件名或很浅的相对路径」时搜索，避免对深层路径误搜。
+                if resolved.is_none() {
+                    let basename = std::path::Path::new(&path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if !basename.is_empty() && !path.contains('/') && !path.contains('\\') {
+                        if let Some(found) = crate::preview::find_by_filename(&ws_root, basename) {
+                            match fs.read(&found).await {
+                                Ok(c) => {
+                                    content = Some(Ok(c));
+                                    resolved = Some(found);
+                                }
+                                Err(e) => content = Some(Err(e)),
+                            }
+                        }
                     }
                 }
                 let tracked = resolved
@@ -96,6 +133,7 @@ impl AppState {
                 // tracked 语义 =「有 diff 可看」：未跟踪文件的"全新增 diff"也算，
                 // 这样预览窗会显示 Diff tab（源码 / Diff 切换可审查新增内容）。
                 crate::preview::PreviewLoadResult {
+                    path: req_path,
                     content: content.unwrap_or_else(|| {
                         Err(harness_core::error::Error::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
@@ -116,6 +154,12 @@ impl AppState {
         if let Some(rx) = &self.preview_rx {
             match rx.try_recv() {
                 Ok(res) => {
+                    // 过期结果守卫：快速连续点击不同文件时，旧请求可能晚到。
+                    // 只应用与当前预览路径一致的结果，其余直接丢弃（并清空 rx 防残留）。
+                    if self.preview_path.as_ref() != Some(&res.path) {
+                        self.preview_rx = None;
+                        return;
+                    }
                     self.preview_rx = None;
                     let cur_path = self.preview_path.clone();
                     match res.content {
@@ -155,10 +199,10 @@ impl AppState {
                     }
                     self.preview_tracked = res.tracked;
                     self.preview_diff = res.diff;
-                    // 内容（或错误）就绪后打开面板：首帧即完整内容，无空窗闪烁。
-                    if !self.preview_open {
-                        self.preview_open = true;
-                    }
+                    // 面板已在 open_preview 时立即打开；这里只更新内容，不再触发打开，
+                    // 避免面板"空降"导致中央消息流宽度突变闪烁。
+                    // 若用户已主动关闭（切到别处），则不强开。
+                    let _ = self.preview_open;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // 仍在加载中，下一帧再查
@@ -172,22 +216,23 @@ impl AppState {
         let _ = path;
     }
 
-    /// 渲染文件预览窗。
+    /// 渲染文件预览窗（右侧 SidePanel 分隔面板：自绘头部 + 内容滚动区）。
     pub(super) fn render_preview(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        // 标题栏：文件名 + 模式切换 + 关闭
-        let head_h = if cfg!(target_os = "macos") {
-            32.0
-        } else {
-            28.0
-        };
-        egui::TopBottomPanel::top("preview_head")
-            .exact_height(head_h)
-            .frame(
-                egui::Frame::default()
-                    .fill(pal.head_fill)
-                    .inner_margin(egui::Margin::symmetric(10.0, 4.0)),
-            )
-            .show_inside(ui, |ui| {
+        // 闪烁缓解：面板打开瞬间用透明度淡入（约 0.15s），
+        // 中央消息流宽度突变被淡入柔化，减轻视觉冲击。
+        let fade = ui
+            .ctx()
+            .animate_bool(egui::Id::new("preview_fade"), self.preview_open);
+        if fade < 0.98 {
+            ui.set_opacity(fade);
+        }
+        // 自绘头部：文件名 + 模式切换 + 关闭。
+        let head_h = 34.0;
+        egui::Frame::default()
+            .fill(pal.head_fill)
+            .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+            .show(ui, |ui| {
+                ui.set_min_height(head_h - 10.0);
                 ui.horizontal(|ui| {
                     let name = self
                         .preview_path
@@ -195,8 +240,15 @@ impl AppState {
                         .and_then(|p| std::path::Path::new(p).file_name())
                         .and_then(|n| n.to_str())
                         .unwrap_or("预览");
+                    // 文件名截断，防止超长文件名把关闭按钮挤出。
+                    let name_trunc: String = name.chars().take(24).collect();
+                    let name_disp = if name.chars().count() > 24 {
+                        format!("{name_trunc}…")
+                    } else {
+                        name_trunc
+                    };
                     ui.label(
-                        egui::RichText::new(format!("{name}"))
+                        egui::RichText::new(&name_disp)
                             .size(12.5)
                             .color(pal.text),
                     );
@@ -208,6 +260,8 @@ impl AppState {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if close_button(ui, pal) {
                             self.preview_open = false;
+                            // 触发关闭滑出动画（面板继续渲染直到宽度缩回 0）。
+                            self.preview_animating = true;
                             self.preview_path = None;
                             self.preview_content = None;
                         }
@@ -245,16 +299,25 @@ impl AppState {
                     });
                 });
             });
+        // 头部下方分隔线
+        let sep = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover()).0;
+        ui.painter().rect_filled(sep, 0.0, pal.border);
 
-        // 内容区
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+        // 内容区（滚动区填满面板可用高）
+        let avail_h = ui.available_height().max(120.0);
+        egui::ScrollArea::both()
+            .id_salt("preview_scroll")
+            .auto_shrink(false)
+            .max_height(avail_h)
+            .show(ui, |ui| {
             if self.preview_content.is_none()
                 && self.preview_error.is_none()
                 && self.preview_rx.is_some()
             {
                 ui.add_space(20.0);
                 ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
-                ui.ctx().request_repaint();
+                // 不在此逐帧 request_repaint：app.rs 已按 80ms 周期重绘并轮询 poll_preview，
+                // 内容就绪后自然更新，避免点击后 CPU 满载空转。
                 return;
             }
             if let Some(err) = &self.preview_error {
@@ -326,7 +389,6 @@ impl AppState {
                                 .size(12.0)
                                 .color(pal.dim),
                         );
-                        ui.ctx().request_repaint();
                     } else if let Some(diff) = &self.preview_diff {
                         let diff_lines = crate::preview::parse_diff(diff);
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -567,31 +629,47 @@ impl AppState {
                 });
             });
 
-        // 内容区：按视图分支
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            if self.tree_show_git {
-                self.render_git_changes_list(ui, pal);
-            } else if let Some(root) = &self.tree_root.clone() {
-                let mut clicked_path: Option<String> = None;
-                let mut toggle_path: Option<String> = None;
-                self.render_tree_node(ui, root, 0, pal, &mut clicked_path, &mut toggle_path);
-                if let Some(path) = clicked_path {
-                    self.pending_preview = Some(path);
-                }
-                if let Some(path) = toggle_path {
-                    if self.tree_expanded.contains(&path) {
-                        self.tree_expanded.remove(&path);
+        // 内容区：按视图分支（面板 frame 边距为 0 以让头部贴顶，内边距在这里补）
+        egui::Frame::default()
+            .inner_margin(egui::Margin {
+                left: 8.0,
+                right: 8.0,
+                top: 4.0,
+                bottom: 8.0,
+            })
+            .show(ui, |ui| {
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    if self.tree_show_git {
+                        self.render_git_changes_list(ui, pal);
+                    } else if let Some(root) = &self.tree_root.clone() {
+                        let mut clicked_path: Option<String> = None;
+                        let mut toggle_path: Option<String> = None;
+                        self.render_tree_node(
+                            ui,
+                            root,
+                            0,
+                            pal,
+                            &mut clicked_path,
+                            &mut toggle_path,
+                        );
+                        if let Some(path) = clicked_path {
+                            self.pending_preview = Some(path);
+                        }
+                        if let Some(path) = toggle_path {
+                            if self.tree_expanded.contains(&path) {
+                                self.tree_expanded.remove(&path);
+                            } else {
+                                self.tree_expanded.insert(path);
+                                // 懒加载子节点
+                                self.expand_tree_node();
+                            }
+                        }
                     } else {
-                        self.tree_expanded.insert(path);
-                        // 懒加载子节点
-                        self.expand_tree_node();
+                        ui.add_space(20.0);
+                        ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
                     }
-                }
-            } else {
-                ui.add_space(20.0);
-                ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
-            }
-        });
+                });
+            });
     }
 
     /// 渲染 Git 变更文件列表（状态色块 + 路径；点击在预览窗打开 Diff）。

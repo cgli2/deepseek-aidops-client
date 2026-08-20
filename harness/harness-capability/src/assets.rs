@@ -122,6 +122,14 @@ pub struct Skill {
     pub resource_files: Vec<String>,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// 是否启用：禁用的技能不参与 match_skills 匹配（管理面板可切换）。
+    /// 默认启用；旧数据无此字段时视为启用。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 一个知识页面（Wiki 资产的结构化块）。
@@ -187,8 +195,12 @@ pub trait SkillLibrary: Any + Send + Sync + 'static {
     async fn match_skills(&self, context: &str) -> Result<Vec<Skill>>;
     /// 执行后按验证规则对成果打分（0.0~1.0）。
     async fn verify_skill(&self, id: &str, outcome: &str) -> Result<f32>;
-    /// 列出全部技能（无查询过滤），供面板浏览。
+    /// 列出全部技能（无查询过滤），供面板浏览（含已禁用的）。
     async fn list_skills(&self) -> Result<Vec<Skill>>;
+    /// 删除技能（移除本地资产文件）。返回是否真的删除了。
+    async fn delete_skill(&self, id: &str) -> Result<bool>;
+    /// 启用 / 禁用技能。禁用的技能不再被 `match_skills` 匹配。
+    async fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<()>;
 }
 
 /// 知识页面库能力（Wiki，含链接图谱）。

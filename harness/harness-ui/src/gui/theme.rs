@@ -20,6 +20,8 @@ pub(super) struct Palette {
     pub(super) user_bubble: egui::Color32,
     pub(super) user_text: egui::Color32,
     pub(super) ai_bubble: egui::Color32,
+    /// 工具执行气泡底色（当前消息流已改用 render_work_batch 配色，暂保留供后续复用）。
+    #[allow(dead_code)]
     pub(super) tool_bubble: egui::Color32,
     pub(super) err_bubble: egui::Color32,
     pub(super) err_text: egui::Color32,

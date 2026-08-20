@@ -17,7 +17,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 }),
         )
         .show(ctx, |ui| {
-            let can_send = !state.busy && !state.input.trim().is_empty();
+            // 忙碌时仍允许发送：控制器会把输入放入 FIFO 任务队列。
+            let can_send = !state.input.trim().is_empty();
+            // ── 待发送队列：挂在输入框正上方（紧挨输入卡片），有队列时显示 ──
+            super::workspace::render_pending_queue(ui, state, pal);
             // ── 输入卡片：圆角 + 细边框 + 阴影浮起，卡片自身提供 chrome ──
             let card_frame = egui::Frame::default()
                 .fill(pal.panel)
@@ -313,15 +316,15 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             egui::Sense::click(),
                         );
                         let center = brect.center();
-                        let bfill = if state.busy {
-                            egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
-                        } else if can_send {
+                        let bfill = if can_send {
                             pal.btn_fill
+                        } else if state.busy {
+                            egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
                         } else {
                             pal.field
                         };
                         ui.painter().circle_filled(center, btn_size / 2.0, bfill);
-                        if state.busy {
+                        if state.busy && !can_send {
                             // 停止：实心方块
                             ui.painter().rect_filled(
                                 egui::Rect::from_center_size(center, egui::vec2(8.0, 8.0)),
@@ -357,14 +360,16 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             );
                         }
                         if bresp.clicked() {
-                            if state.busy {
+                            if can_send {
+                                send_now = true;
+                            } else if state.busy {
                                 trace("[cancel] requested");
                                 state.host.sink.cancel();
-                            } else if can_send {
-                                send_now = true;
                             }
                         }
-                        if state.busy {
+                        if can_send && state.busy {
+                            bresp.on_hover_text("加入任务队列 (Enter)");
+                        } else if state.busy {
                             bresp.on_hover_text("停止生成");
                         } else if can_send {
                             bresp.on_hover_text("发送 (Enter)");
@@ -389,23 +394,37 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let usage = state.log.usage_total();
-                    let (dot, text): (egui::Color32, String) = if state.busy && state.thinking {
+                    let queued = state.host.sink.queued_count();
+                    let (dot, text): (egui::Color32, String) = if state.busy {
                         let secs = state
                             .turn_started
                             .map(|t| t.elapsed().as_secs())
                             .unwrap_or(0);
-                        (
-                            egui::Color32::from_rgb(0x81, 0x8d, 0xf8),
-                            format!("● 模型思考中 · 已用时 {secs} 秒"),
-                        )
-                    } else if state.busy {
-                        let secs = state
-                            .turn_started
+                        let quiet_secs = state
+                            .last_activity
                             .map(|t| t.elapsed().as_secs())
                             .unwrap_or(0);
+                        let spinner = ["◐", "◓", "◑", "◒"][(secs % 4) as usize];
+                        let activity = if state.activity.is_empty() {
+                            "正在启动任务"
+                        } else {
+                            &state.activity
+                        };
+                        let freshness = if quiet_secs >= 10 {
+                            format!(" · 最近反馈 {quiet_secs} 秒前")
+                        } else {
+                            String::new()
+                        };
                         (
-                            egui::Color32::from_rgb(0xfb, 0xbf, 0x24),
-                            format!("● 正在处理 · 已用时 {secs} 秒，可随时停止"),
+                            if quiet_secs >= 10 {
+                                egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
+                            } else {
+                                egui::Color32::from_rgb(0x81, 0x8d, 0xf8)
+                            },
+                            format!(
+                                "{spinner} {activity} · 已用时 {secs} 秒{freshness}{} · 可随时停止",
+                                if queued > 0 { format!(" · 队列中 {queued} 条") } else { String::new() },
+                            ),
                         )
                     } else {
                         (

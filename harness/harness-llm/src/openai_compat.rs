@@ -304,6 +304,78 @@ pub fn coding_tools() -> Vec<ToolSchema> {
     ]
 }
 
+/// 拉取上游模型列表（OpenAI 兼容 `GET {base_url}/models`）。
+///
+/// 解析响应的 `data[].id` 作为模型 id 列表。部分服务（如某些本地网关）把
+/// 模型列表放在 `models[].id` 或 `data[].name`，这里做兼容解析。失败返回
+/// 友好错误（网络/认证/HTTP 状态均给出可读原因）。
+pub fn fetch_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("reqwest init: {e}"))?;
+
+    let mut req = client
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
+        .header("Accept", "application/json");
+    if !api_key.trim().is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
+    }
+
+    let resp = req
+        .send()
+        .map_err(|e| {
+            if e.is_timeout() {
+                "请求超时，请检查网络、代理和 API 地址".to_string()
+            } else if e.is_connect() {
+                "无法连接模型服务，请检查网络、代理、防火墙和 API 地址".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("获取模型列表失败: HTTP {status} {body}"));
+    }
+
+    let text = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
+    parse_models_json(&text)
+}
+
+/// 从模型列表 JSON 文本中解析模型 id（与 `fetch_models` 相同的兼容解析）。
+/// 拆出以便离线单测（fetch_models 本身是网络请求）。
+pub fn parse_models_json(text: &str) -> std::result::Result<Vec<String>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("响应不是合法 JSON: {e}"))?;
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                ids.push(id.to_string());
+            } else if let Some(name) = item.get("name").and_then(|x| x.as_str()) {
+                ids.push(name.to_string());
+            }
+        }
+    }
+    if ids.is_empty() {
+        if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+            for item in arr {
+                if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|m| seen.insert(m.clone()));
+    if ids.is_empty() {
+        return Err(format!("上游返回了空模型列表：{text}"));
+    }
+    Ok(ids)
+}
+
 fn friendly_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         "请求超时，请检查网络、代理和 API 地址".to_string()
@@ -347,5 +419,27 @@ mod tests {
         assert_eq!(v.len(), 5);
         assert_eq!(v[0]["type"], "function");
         assert_eq!(v[0]["function"]["name"], "fs");
+    }
+
+    #[test]
+    fn parse_models_json_extracts_ids() {
+        // OpenAI / DeepSeek 标准：data[].id
+        let ids = parse_models_json(r#"{"object":"list","data":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner"}]}"#).unwrap();
+        assert_eq!(ids, vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]);
+    }
+
+    #[test]
+    fn parse_models_json_falls_back_to_models_array() {
+        // 部分网关：models[].id
+        let ids = parse_models_json(r#"{"models":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn parse_models_json_dedups_and_rejects_empty() {
+        let ids = parse_models_json(r#"{"data":[{"id":"a"},{"id":"a"},{"id":"b"}]}"#).unwrap();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        assert!(parse_models_json(r#"{"data":[]}"#).is_err());
     }
 }

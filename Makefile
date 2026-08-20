@@ -7,11 +7,15 @@ APP := $(HARNESS)/dist/AIOPS Desktop.app
 DMG := $(HARNESS)/dist/AIOPS-Desktop-$(VERSION).dmg
 WORKSPACE ?= $(ROOT)
 NOTARY_PROFILE ?= aidops-notary
+UI_WATCH_ARGS := \
+	-w harness-ui/src -w harness-ui/Cargo.toml \
+	-w bin/src -w bin/Cargo.toml \
+	-w Cargo.toml -w Cargo.lock
 
 .DEFAULT_GOAL := help
 
 .PHONY: help doctor install-dev-tools watch-ready dev dev-replay dev-watch \
-	dev-replay-watch check test fmt icon build release \
+	dev-replay-watch dev-watch-all check test fmt icon build release \
 	package package-mac-dev package-mac-release package-mac-notarize \
 	package-mac-universal verify-mac open-mac logs
 
@@ -26,6 +30,7 @@ help: ## 显示快捷命令
 	  '  make dev-replay          使用离线 Replay 模型启动 GUI' \
 	  '  make dev-watch           监听源码，自动重编译并重启 GUI' \
 	  '  make dev-replay-watch    离线 Replay 热重启开发模式' \
+	  '  make dev-watch-all       监听整个 Rust workspace（高频重启）' \
 	  '  make check               全 workspace 编译检查' \
 	  '  make test                运行全 workspace 测试' \
 	  '  make fmt                 仅检查 Rust 格式，不改文件' \
@@ -82,10 +87,13 @@ dev-replay: ## 使用离线 Replay 模型启动 GUI
 	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" HARNESS_REPLAY=1 cargo run -p harness-bin -- --gui
 
 dev-watch: watch-ready ## 监听源码并自动重启真实模型 GUI
-	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" cargo watch --delay 0.3 -x 'run -p harness-bin -- --gui'
+	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" cargo watch $(UI_WATCH_ARGS) --delay 0.3 -x 'run -p harness-bin -- --gui'
 
 dev-replay-watch: watch-ready ## 监听源码并自动重启 Replay GUI
-	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" HARNESS_REPLAY=1 cargo watch --delay 0.3 -x 'run -p harness-bin -- --gui'
+	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" HARNESS_REPLAY=1 cargo watch $(UI_WATCH_ARGS) --delay 0.3 -x 'run -p harness-bin -- --gui'
+
+dev-watch-all: watch-ready ## 监听整个 Rust workspace 并自动重启 GUI
+	cd "$(HARNESS)" && HARNESS_WORKSPACE="$(WORKSPACE)" cargo watch --delay 0.3 -x 'run -p harness-bin -- --gui'
 
 check: ## 全功能编译检查
 	cd "$(HARNESS)" && cargo check --workspace --all-features

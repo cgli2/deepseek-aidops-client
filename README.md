@@ -105,6 +105,7 @@ make install-dev-tools    # 首次安装 cargo-watch
 make dev                  # 启动 GUI 开发版
 make dev-replay           # 离线 Replay 模型启动，不需要 API Key
 make dev-watch            # 源码变化后自动重编译并重启 GUI
+make dev-watch-all        # 监听整个 Rust workspace，任意源码变化都会重启
 make dev-replay-watch     # Replay 离线热重启开发模式
 make check                # workspace 全功能编译检查
 make test                 # workspace 全功能测试
@@ -119,6 +120,8 @@ make dev-watch WORKSPACE=/path/to/project
 ```
 
 `dev-watch` 属于自动重编译并重启模式，不是 Web 前端式的组件 HMR。修改 Rust 源码后，
+默认只监听桌面 UI 与启动入口，避免应用执行任务时工作区文件变化触发重启；需要调试底层
+crate 时使用 `make dev-watch-all`。
 `cargo-watch` 会停止旧进程、增量编译并重新启动应用；SQLite 设置、会话日志等持久化数据
 会保留，尚未保存的输入框内容等内存状态会清空。使用 `Ctrl+C` 停止监听。
 

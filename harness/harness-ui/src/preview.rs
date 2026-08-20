@@ -3,11 +3,21 @@
 //! 本模块为纯 UI 辅助逻辑（解析与数据结构），不依赖 egui——渲染由 `gui.rs` 调用。
 //! 文件读取 / diff 生成经 `Arc<dyn Fs>` / `Arc<dyn Git>` 能力服务（只读查询，不触发 turn）。
 
-/// 预览模式：源码 / Diff。
+/// 预览模式：源码 / Markdown 渲染 / Diff。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PreviewMode {
     Source,
+    Markdown,
     Diff,
+}
+
+/// Markdown 文件默认使用排版预览，仍可在预览窗切回原文。
+pub fn is_markdown_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
+        .unwrap_or(false)
 }
 
 /// 文件树节点（懒构建：目录的 `children` 在展开时填充）。
@@ -272,6 +282,14 @@ mod tests {
     fn is_binary_detects_nul() {
         assert!(is_binary("abc\0def"));
         assert!(!is_binary("普通文本"));
+    }
+
+    #[test]
+    fn markdown_path_detection_is_case_insensitive() {
+        assert!(is_markdown_path("README.md"));
+        assert!(is_markdown_path("docs/guide.MARKDOWN"));
+        assert!(!is_markdown_path("notes.txt"));
+        assert!(!is_markdown_path("md"));
     }
 
     #[test]

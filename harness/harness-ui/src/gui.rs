@@ -1726,7 +1726,11 @@ impl AppState {
     ///    面板出现的第一帧就是完整内容，没有「加载中 → 内容」的跳变闪烁。
     fn open_preview(&mut self, path: String) {
         self.preview_path = Some(path.clone());
-        self.preview_mode = crate::preview::PreviewMode::Source;
+        self.preview_mode = if crate::preview::is_markdown_path(&path) {
+            crate::preview::PreviewMode::Markdown
+        } else {
+            crate::preview::PreviewMode::Source
+        };
         self.preview_diff = None;
         self.preview_tracked = false;
         if let Some((content, truncated)) = self.preview_cache.get(&path).cloned() {
@@ -1897,33 +1901,40 @@ impl AppState {
                         .and_then(|n| n.to_str())
                         .unwrap_or("预览");
                     ui.label(egui::RichText::new(format!("{name}")).size(12.5).color(pal.text));
-                    // 模式切换（仅 git 跟踪文件显示 Diff tab）
-                    if self.preview_tracked {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if close_button(ui, pal) {
-                                self.preview_open = false;
-                                self.preview_path = None;
-                                self.preview_content = None;
-                            }
-                            ui.add_space(6.0);
-                            let diff_active = self.preview_mode == crate::preview::PreviewMode::Diff;
-                            let src_active = self.preview_mode == crate::preview::PreviewMode::Source;
-                            if ui.add(egui::SelectableLabel::new(src_active, egui::RichText::new("源码").size(11.0))).clicked() {
-                                self.preview_mode = crate::preview::PreviewMode::Source;
-                            }
-                            if ui.add(egui::SelectableLabel::new(diff_active, egui::RichText::new("Diff").size(11.0))).clicked() {
-                                self.preview_mode = crate::preview::PreviewMode::Diff;
-                            }
-                        });
-                    } else {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if close_button(ui, pal) {
-                                self.preview_open = false;
-                                self.preview_path = None;
-                                self.preview_content = None;
-                            }
-                        });
-                    }
+                    let is_markdown = self.preview_path.as_deref()
+                        .map(crate::preview::is_markdown_path)
+                        .unwrap_or(false);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if close_button(ui, pal) {
+                            self.preview_open = false;
+                            self.preview_path = None;
+                            self.preview_content = None;
+                        }
+                        ui.add_space(6.0);
+                        if self.preview_tracked
+                            && ui.add(egui::SelectableLabel::new(
+                                self.preview_mode == crate::preview::PreviewMode::Diff,
+                                egui::RichText::new("Diff").size(11.0),
+                            )).clicked()
+                        {
+                            self.preview_mode = crate::preview::PreviewMode::Diff;
+                        }
+                        if ui.add(egui::SelectableLabel::new(
+                            self.preview_mode == crate::preview::PreviewMode::Source,
+                            egui::RichText::new(if is_markdown { "原文" } else { "源码" }).size(11.0),
+                        )).clicked()
+                        {
+                            self.preview_mode = crate::preview::PreviewMode::Source;
+                        }
+                        if is_markdown
+                            && ui.add(egui::SelectableLabel::new(
+                                self.preview_mode == crate::preview::PreviewMode::Markdown,
+                                egui::RichText::new("预览").size(11.0),
+                            )).clicked()
+                        {
+                            self.preview_mode = crate::preview::PreviewMode::Markdown;
+                        }
+                    });
                 });
             });
 
@@ -1943,6 +1954,31 @@ impl AppState {
                     return;
                 }
                 match self.preview_mode {
+                    crate::preview::PreviewMode::Markdown => {
+                        if let Some(content) = &self.preview_content {
+                            if self.preview_truncated {
+                                ui.label(egui::RichText::new("文件过大，仅显示前 512KB").size(10.5).color(pal.warn));
+                                ui.add_space(4.0);
+                            }
+                            let width = (ui.available_width() - 24.0).max(80.0);
+                            let job = crate::markdown::to_job(
+                                content,
+                                &crate::markdown::MdTheme {
+                                    text: pal.text,
+                                    dim: pal.dim,
+                                    accent: pal.accent,
+                                    code_text: pal.text,
+                                    code_bg: pal.field,
+                                },
+                                width,
+                            );
+                            egui::Frame::default()
+                                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(job).selectable(true));
+                                });
+                        }
+                    }
                     crate::preview::PreviewMode::Source => {
                         if self.preview_content.is_some() {
                             if self.preview_truncated {
@@ -4217,15 +4253,20 @@ impl eframe::App for AppState {
             .show_animated(ctx, self.tree_open, |ui| {
                 self.render_tree(ui, &pal);
             });
-                // ── 次右：文件预览（独立开关，show_animated 平滑展开/收起）──
-        egui::SidePanel::right("preview")
-            .resizable(true)
-            .default_width(380.0)
-            .width_range(320.0..=600.0)
-            .frame(egui::Frame::default().fill(pal.panel).inner_margin(0.0))
-            .show_animated(ctx, self.preview_open, |ui| {
-                self.render_preview(ui, &pal);
-            });
+        // ── 次右：文件预览 ──────────────────────────────────────
+        // 内容加载完成后直接以稳定宽度显示。不要使用 show_animated：侧栏展开动画
+        // 会让 CentralPanel 连续重排，预览内容也会在变化的宽度下逐帧重新布局，
+        // 点击文件时视觉上表现为整个窗口闪烁。
+        if self.preview_open {
+            egui::SidePanel::right("preview")
+                .resizable(true)
+                .default_width(380.0)
+                .width_range(320.0..=600.0)
+                .frame(egui::Frame::default().fill(pal.panel).inner_margin(0.0))
+                .show(ctx, |ui| {
+                    self.render_preview(ui, &pal);
+                });
+        }
         // ── 主区：头部 + 消息流 ──────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(pal.bg))

@@ -134,7 +134,7 @@ pub struct PlanItem {
 pub struct SessionMeta {
     /// 会话文件名（如 `{uuid}.jsonl`）。
     pub file: String,
-    /// 首条用户输入截断作标题；无回合时回退文件名。
+    /// 首条用户输入提炼的简洁标题；无回合时回退文件名。
     pub title: String,
     /// 所属项目名（sessions 目录的上两级目录名）。
     pub project: String,
@@ -507,7 +507,54 @@ fn prune_dir(dir: &std::path::Path, keep: usize, active: Option<&str>) {
     }
 }
 
-/// 读会话标题：自定义标题（旁挂 `<uuid>.title`）优先，回退首条 TurnStart 输入（截断 30 字）。
+/// 从用户输入提炼简洁历史标题：折叠空白、去除常见控制前缀，再按句读边界截断。
+/// 纯确定性文本处理（侧栏元数据读取路径），不引入模型调用。
+fn summarize_title(input: &str) -> String {
+    const MAX: usize = 24;
+    // 折叠所有空白（含换行）为单个空格，避免多行输入撑爆侧栏标题。
+    let s: String = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim();
+    // 剥离历史文件中可能残留的流程控制前缀。
+    let s = s
+        .strip_prefix("[HARNESS_MULTI_AGENT]")
+        .map(str::trim_start)
+        .unwrap_or(s);
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    // 在 MAX 内找最近的句读/空白边界，优先保留完整语义片段而非生硬切字。
+    let mut cut = MAX;
+    for i in (1..=MAX).rev() {
+        if matches!(
+            chars[i - 1],
+            '。' | '！' | '？' | '，' | '；' | '、' | '.' | '!' | '?' | ',' | ';' | ' '
+        ) {
+            cut = i;
+            break;
+        }
+    }
+    let head = chars[..cut].iter().collect::<String>();
+    let head = head.trim_end();
+    if head.is_empty() {
+        return s.chars().take(MAX).collect();
+    }
+    let last = head.chars().last().unwrap();
+    if matches!(last, '。' | '！' | '？' | '.' | '!' | '?') {
+        head.to_string()
+    } else {
+        // 去掉收尾的轻标点再补省略号，避免“xxx，”这类残缺样式。
+        let trimmed = head.trim_end_matches(|c: char| {
+            matches!(c, '，' | '；' | '、' | ',' | ';' | ' ')
+        });
+        format!("{trimmed}…")
+    }
+}
+
+/// 读会话标题：自定义标题（旁挂 `<uuid>.title`）优先，回退首条 TurnStart 输入提炼的简洁摘要。
 fn session_title(path: &std::path::Path) -> Option<String> {
     // 自定义标题优先：重命名时写入的旁挂文件。
     let sidecar = path.with_extension("title");
@@ -527,7 +574,7 @@ fn session_title(path: &std::path::Path) -> Option<String> {
         if let Ok(SessionEvent::TurnStart { input, .. }) =
             serde_json::from_str::<SessionEvent>(&line)
         {
-            let t: String = input.trim().chars().take(30).collect();
+            let t = summarize_title(&input);
             if !t.is_empty() {
                 return Some(t);
             }
@@ -575,6 +622,24 @@ fn load_file(path: &std::path::Path) -> (Vec<SessionEvent>, EventId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_title_extracts_clean_titles() {
+        // 短标题原样保留。
+        assert_eq!(summarize_title("第一个问题"), "第一个问题");
+        // 折叠空白（含换行）。
+        assert_eq!(summarize_title("  多  行\n输入  "), "多 行 输入");
+        // 剥离流程控制前缀。
+        assert_eq!(summarize_title("[HARNESS_MULTI_AGENT] 开始协作"), "开始协作");
+        // 长标题按句读边界截断并补省略号，长度受限。
+        let long = "请帮我分析一下这个项目的整体架构，然后给出优化建议";
+        let t = summarize_title(long);
+        assert!(t.chars().count() <= 24);
+        assert!(t.ends_with('…'));
+        // 以结束标点结尾时不补省略号。
+        let q = "这是一个很长的问题吗？是的它真的很长很长很长很长很长很长";
+        assert!(summarize_title(q).ends_with('？'));
+    }
 
     #[test]
     fn open_latest_resumes_and_closes_interrupted_turn() {

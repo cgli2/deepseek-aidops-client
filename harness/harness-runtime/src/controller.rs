@@ -53,6 +53,10 @@ impl SessionController {
 
 impl UiInputSink for SessionController {
     fn submit(&self, text: String) {
+        self.submit_with_attachments(text, vec![]);
+    }
+
+    fn submit_with_attachments(&self, text: String, attachments: Vec<harness_core::Attachment>) {
         if text.trim().is_empty() {
             return;
         }
@@ -61,6 +65,7 @@ impl UiInputSink for SessionController {
                 queue.pending.push_back(QueuedInput {
                     id: self.inner.next_queue_id.fetch_add(1, Ordering::Relaxed),
                     text,
+                    attachments,
                 });
                 if queue.running {
                     false
@@ -153,9 +158,9 @@ impl UiInputSink for SessionController {
 
 async fn run_turn_queue(inner: Arc<Inner>) {
     loop {
-        let text = match inner.queue.lock() {
+        let input = match inner.queue.lock() {
             Ok(mut queue) => match queue.pending.pop_front() {
-                Some(item) => item.text,
+                Some(item) => item,
                 None => {
                     queue.running = false;
                     break;
@@ -163,6 +168,8 @@ async fn run_turn_queue(inner: Arc<Inner>) {
             },
             Err(_) => break,
         };
+        let text = input.text;
+        let attachments = input.attachments;
 
         let cancellation = CancellationToken::new();
         if let Ok(mut active) = inner.cancellation.lock() {
@@ -180,8 +187,13 @@ async fn run_turn_queue(inner: Arc<Inner>) {
         let outcome = std::panic::AssertUnwindSafe(async {
             tokio::time::timeout(std::time::Duration::from_secs(turn_timeout_secs), async {
                 if is_council {
+                    let attachment_note = attachment_note(&attachments);
                     CouncilOrchestrator::default()
-                        .run(&inner.ctx, clean_text, cancellation)
+                        .run(
+                            &inner.ctx,
+                            format!("{clean_text}{attachment_note}"),
+                            cancellation,
+                        )
                         .await
                 } else {
                     AgentLoop::new()
@@ -189,7 +201,7 @@ async fn run_turn_queue(inner: Arc<Inner>) {
                             &inner.ctx,
                             UserInput {
                                 text: clean_text,
-                                attachments: vec![],
+                                attachments,
                             },
                             cancellation,
                         )
@@ -224,4 +236,27 @@ async fn run_turn_queue(inner: Arc<Inner>) {
             *active = None;
         }
     }
+}
+
+fn attachment_note(attachments: &[harness_core::Attachment]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let files = attachments
+        .iter()
+        .map(|attachment| {
+            format!(
+                "{}（{}，{}）",
+                attachment
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("附件"),
+                attachment.mime,
+                attachment.path.display(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    format!("\n\n[用户附件，必须作为任务输入条件处理：{files}]")
 }

@@ -51,7 +51,8 @@ pub(super) struct AppState {
     pub(super) f_aidops_project: String,
     pub(super) profiles: Vec<String>,
     pub(super) selected_profile: String,
-    pub(super) attachment: String,
+    /// 当前待发送附件。可由文件选择或粘贴文件路径加入。
+    pub(super) attachments: Vec<harness_core::Attachment>,
     pub(super) permission: String,
     // 运行时调参（「参数配置」页）：上下文预算（字符）/ 进展检查间隔 / 最大输出 tokens。
     // 空字符串 = 未配置（回退环境变量 / 默认值）；保存时写入 settings.db 并即时生效。
@@ -223,7 +224,7 @@ impl AppState {
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             selected_profile: String::new(),
-            attachment: String::new(),
+            attachments: Vec::new(),
             permission: settings
                 .get("permission.mode")
                 .unwrap_or_else(|| "工作区写入".into()),
@@ -652,9 +653,7 @@ impl AppState {
         if text.is_empty() {
             return;
         }
-        if !self.attachment.trim().is_empty() {
-            text.push_str(&format!("\n\n[附件: {}]", self.attachment));
-        }
+        let attachments = std::mem::take(&mut self.attachments);
         let sink = self.host.sink.clone();
         sink.set_permission(self.permission.clone());
         let settings = &self.host.settings;
@@ -701,7 +700,7 @@ impl AppState {
             self.turn_started = Some(std::time::Instant::now());
             self.record_activity("正在提交任务");
         }
-        sink.submit(text);
+        sink.submit_with_attachments(text, attachments);
         if queued {
             self.note = format!("新任务已加入队列（当前待执行 {} 条）", sink.queued_count());
         }

@@ -7,7 +7,7 @@ pub struct UserInput {
     pub attachments: Vec<Attachment>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
     pub mime: String,

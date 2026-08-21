@@ -239,24 +239,27 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                 } else {
                                     state.activity.as_str()
                                 };
+                                // 紧凑版 loading 气泡：缩小上下内边距与字号，降低单条占用高度。
                                 egui::Frame::default()
                                     .fill(pal.ai_bubble)
                                     .rounding(egui::Rounding::same(12.0))
                                     .stroke(egui::Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.55)))
-                                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                                    .inner_margin(egui::Margin::symmetric(12.0, 5.0))
                                     .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
                                         ui.horizontal(|ui| {
-                                            ui.spinner();
+                                            ui.add(egui::Spinner::new().size(12.0));
                                             ui.label(
                                                 egui::RichText::new(format!("{activity} · {secs} 秒"))
-                                                    .size(12.5)
+                                                    .size(11.0)
                                                     .color(pal.text),
                                             );
                                         });
                                         if state.last_activity.map(|t| t.elapsed().as_secs() >= 10).unwrap_or(false) {
+                                            ui.add_space(2.0);
                                             ui.label(
                                                 egui::RichText::new("仍在等待模型或工具返回；任务没有静默停止，可随时点击停止")
-                                                    .size(10.5)
+                                                    .size(10.0)
                                                     .color(pal.warn),
                                             );
                                         }

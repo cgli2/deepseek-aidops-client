@@ -48,6 +48,35 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     color: egui::Color32::from_black_alpha(if state.dark { 0x44 } else { 0x14 }),
                 });
             card_frame.show(ui, |ui| {
+                // 附件占输入框左上方独立一行，文件名与删除入口始终可见。
+                if !state.attachments.is_empty() {
+                    let mut remove = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, attachment) in state.attachments.iter().enumerate() {
+                            let name = attachment
+                                .path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("附件");
+                            let response = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("📎 {name}  ×"))
+                                        .size(11.5)
+                                        .color(pal.text),
+                                )
+                                .fill(pal.field),
+                            );
+                            if response.clicked() {
+                                remove = Some(index);
+                            }
+                            response.on_hover_text("点击删除此附件");
+                        }
+                    });
+                    if let Some(index) = remove {
+                        state.attachments.remove(index);
+                    }
+                    ui.add_space(6.0);
+                }
                 // 文本编辑区：去掉自身边框/背景，由卡片提供 chrome。
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut state.input)
@@ -63,6 +92,39 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 // Enter 发送 / Shift+Enter 换行：egui 会先插入换行，这里去掉尾随 \n 再提交。
                 let enter = response.has_focus()
                     && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                // 从资源管理器复制文件路径后直接粘贴：识别真实文件并按上传处理。
+                // 普通文本粘贴仍保留在编辑器中，不会误变成附件。
+                let pasted_paths: Vec<std::path::PathBuf> = ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::Paste(text) => Some(text),
+                            _ => None,
+                        })
+                        .flat_map(|text| text.lines())
+                        .map(|text| text.trim().trim_matches('"'))
+                        .filter(|text| std::path::Path::new(text).is_file())
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                });
+                if !pasted_paths.is_empty() {
+                    for path in pasted_paths {
+                        let rendered = path.display().to_string();
+                        if state.input.trim() == rendered {
+                            state.input.clear();
+                        }
+                        add_attachment(state, path);
+                    }
+                }
+                // 图片剪贴板不一定会转换成 Egui 的文本 Paste 事件。检测 Ctrl+V 后
+                // 直接读取系统图像剪贴板，落为临时 PNG，再与普通上传走同一附件链路。
+                let image_paste = response.has_focus()
+                    && ctx.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
+                if image_paste {
+                    if let Some(path) = paste_clipboard_image() {
+                        add_attachment(state, path);
+                    }
+                }
                 if enter {
                     while state.input.ends_with('\n') {
                         state.input.pop();
@@ -326,7 +388,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     // ── 附件按钮：与左侧权限 chip 同高(28)/同 chrome，图标更醒目 ──
                     let (arect, aresp) =
                         ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click());
-                    let has_att = !state.attachment.is_empty();
+                    let has_att = !state.attachments.is_empty();
                     let afill = if aresp.hovered() {
                         pal.hover
                     } else {
@@ -342,28 +404,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     );
                     let acolor = if has_att { pal.accent } else { pal.text };
                     draw_paperclip_icon(ui.painter(), arect.center(), acolor);
-                    // 右上角「+」角标：强化「添加」语义。
-                    let plus_c = egui::pos2(arect.max.x - 7.0, arect.min.y + 7.0);
-                    let ps = egui::Stroke::new(1.5_f32, acolor);
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(plus_c.x - 2.6, plus_c.y),
-                            egui::pos2(plus_c.x + 2.6, plus_c.y),
-                        ],
-                        ps,
-                    );
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(plus_c.x, plus_c.y - 2.6),
-                            egui::pos2(plus_c.x, plus_c.y + 2.6),
-                        ],
-                        ps,
-                    );
-                    let tip = if state.attachment.is_empty() {
-                        "添加附件".to_string()
-                    } else {
-                        format!("附件: {}\n（点击重新选择）", state.attachment)
-                    };
+                    let tip = "添加附件";
                     if aresp.on_hover_text(tip).clicked() {
                         let picked = if state.settings_page == "新建项目" {
                             rfd::FileDialog::new().pick_folder()
@@ -371,26 +412,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             rfd::FileDialog::new().pick_file()
                         };
                         if let Some(path) = picked {
-                            state.attachment = path.display().to_string();
+                            add_attachment(state, path);
                         }
-                    }
-
-                    // 若已有附件，紧随其后放一个紧凑的清除 ✕
-                    if !state.attachment.is_empty() {
-                        let (xrect, xresp) =
-                            ui.allocate_exact_size(egui::vec2(20.0, 28.0), egui::Sense::click());
-                        let xcolor = if xresp.hovered() { pal.accent } else { pal.dim };
-                        ui.painter().text(
-                            xrect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "✕",
-                            egui::FontId::proportional(12.0),
-                            xcolor,
-                        );
-                        if xresp.clicked() {
-                            state.attachment.clear();
-                        }
-                        xresp.on_hover_text("清除附件");
                     }
 
                     // 弹性空间 → 圆形发送/停止按钮
@@ -529,4 +552,85 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
             });
         });
     send_now
+}
+
+fn add_attachment(state: &mut AppState, path: std::path::PathBuf) {
+    if state
+        .attachments
+        .iter()
+        .any(|attachment| attachment.path == path)
+    {
+        return;
+    }
+    let mime = match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => "image/*",
+        "txt" | "md" | "csv" | "json" | "toml" | "yaml" | "yml" => "text/plain",
+        "doc" | "docx" => "application/msword",
+        "xls" | "xlsx" => "application/vnd.ms-excel",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+    .into();
+    state
+        .attachments
+        .push(harness_core::Attachment { path, mime });
+}
+
+fn paste_clipboard_image() -> Option<std::path::PathBuf> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let image = clipboard.get_image().ok()?;
+    let dir = std::env::temp_dir().join("deepseek-aidops-attachments");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("clipboard-{}.bmp", uuid_like_suffix()));
+    save_rgba_as_bmp(&path, image.width as u32, image.height as u32, &image.bytes).ok()?;
+    Some(path)
+}
+
+/// 无额外图像依赖地写出 32-bit BGRA BMP；用于把系统剪贴板图片转成普通附件文件。
+fn save_rgba_as_bmp(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> std::io::Result<()> {
+    let pixels = width as usize * height as usize;
+    if width == 0 || height == 0 || rgba.len() < pixels * 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid clipboard image",
+        ));
+    }
+    let image_bytes = pixels * 4;
+    let file_size = 54 + image_bytes;
+    let mut out = Vec::with_capacity(file_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(54u32).to_le_bytes());
+    out.extend_from_slice(&(40u32).to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(-(height as i32)).to_le_bytes()); // top-down
+    out.extend_from_slice(&(1u16).to_le_bytes());
+    out.extend_from_slice(&(32u16).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(image_bytes as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 16]);
+    for pixel in rgba.chunks_exact(4).take(pixels) {
+        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    std::fs::write(path, out)
+}
+
+fn uuid_like_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "image".into())
 }

@@ -23,6 +23,7 @@ harness-capability = { path = "../harness-capability" }
 # 技能管理：导入内置 superpowers 技能集（幂等注册进技能库）。
 harness-provider-memory = { path = "../harness-provider-memory" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+arboard = "3.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

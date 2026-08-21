@@ -12,6 +12,8 @@
 use std::any::Any;
 use std::sync::RwLock;
 
+use crate::Attachment;
+
 pub struct AccessPolicy {
     mode: RwLock<String>,
 }
@@ -48,6 +50,10 @@ impl AccessPolicy {
 pub trait UiInputSink: Any + Send + Sync + 'static {
     /// 提交一条用户输入。实现方应后台串行执行；忙碌时输入进入 FIFO 队列。
     fn submit(&self, text: String);
+    /// 提交带结构化附件的输入。默认兼容旧实现，附件不会阻断纯文本通道。
+    fn submit_with_attachments(&self, text: String, _attachments: Vec<Attachment>) {
+        self.submit(text);
+    }
     /// 是否正在跑回合或有待执行任务。
     fn busy(&self) -> bool;
     /// 正在等待前序任务完成的输入数（不含当前运行回合）。
@@ -77,6 +83,7 @@ pub trait UiInputSink: Any + Send + Sync + 'static {
 pub struct QueuedInput {
     pub id: u64,
     pub text: String,
+    pub attachments: Vec<Attachment>,
 }
 
 /// GUI 可在运行时更新模型连接，无需编辑配置文件并重启。

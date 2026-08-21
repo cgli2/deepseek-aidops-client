@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -21,6 +23,59 @@ use crate::execution::{
 ///
 /// `Turn` = 0..n `Step`；`debt` 计数控制续跑；`agent/turn-stopping` 为唯一串行终止点。
 pub struct AgentLoop;
+
+/// 将循环定义为“相同调用连续产生相同结果”，而非仅仅相同命令。
+/// 结果只保留哈希，避免控制状态复制工具原文。
+#[derive(Default)]
+struct ToolRepeatGuard {
+    previous: Option<(String, u64)>,
+    identical_outcomes: u8,
+    recovery_attempts: HashMap<String, u8>,
+}
+
+impl ToolRepeatGuard {
+    fn should_block(&self, signature: &str) -> bool {
+        self.previous
+            .as_ref()
+            .is_some_and(|(previous, _)| previous == signature)
+            && self.identical_outcomes >= 2
+    }
+
+    fn record_result(&mut self, signature: &str, result: &ToolResult) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        result.ok.hash(&mut hasher);
+        result.content.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let changed_path =
+            self.previous
+                .as_ref()
+                .is_none_or(|(previous_signature, previous_fingerprint)| {
+                    previous_signature != signature || *previous_fingerprint != fingerprint
+                });
+        if changed_path {
+            // 一次真正不同的观察意味着模型已改变调查路径；旧的恢复次数不再相关。
+            self.recovery_attempts.clear();
+        }
+        self.identical_outcomes = match &self.previous {
+            Some((previous_signature, previous_fingerprint))
+                if previous_signature == signature && *previous_fingerprint == fingerprint =>
+            {
+                self.identical_outcomes.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.previous = Some((signature.to_string(), fingerprint));
+    }
+
+    fn note_recovery(&mut self, signature: &str) -> u8 {
+        let attempts = self
+            .recovery_attempts
+            .entry(signature.to_string())
+            .or_default();
+        *attempts = attempts.saturating_add(1);
+        *attempts
+    }
+}
 
 /// 默认确定性压缩器：复用会话重建、工具输出压缩与上下文预算规则。
 /// 作为能力注册后，后续可替换为远程摘要器；默认实现绝不额外请求模型。
@@ -115,7 +170,11 @@ impl AgentLoop {
         let mut debt: usize = 1;
         // 跨步累积本轮助手最终文本，供回合结束时沉淀为 L0 记忆。
         let mut last_assistant = String::new();
+        let attachment_context = render_attachment_context(&input.attachments);
         messages.push(Message::user(&input_text));
+        if !attachment_context.is_empty() {
+            messages.insert(1, Message::system(&attachment_context));
+        }
         messages.insert(
             1,
             Message::system(
@@ -135,11 +194,10 @@ impl AgentLoop {
             }
         }
         let mut steps = 0usize;
-        // 重复调用检测：完全相同的工具调用「连续」出现 3 次才判定为死循环；
-        // 累计计数会误杀正常任务中隔多步重跑同一命令的场景。
-        let mut last_sig: Option<String> = None;
-        let mut consec = 0u32;
-        // 硬终止标记（取消/流错误/循环守卫）：阻止步末的 debt 记账复活回合，
+        // 只有“同一调用连续得到相同结果”才被视为停滞；先要求模型换路，不立即终止。
+        const MAX_LOOP_RECOVERY_PROMPTS: u8 = 2;
+        let mut repeat_guard = ToolRepeatGuard::default();
+        // 硬终止标记（取消/流错误/反复无视循环恢复）：阻止步末的 debt 记账复活回合，
         // 否则带着「已宣告未执行」的 tool_call 续跑会直接 400。
         let mut hard_stop = false;
         let mut convergence_notified = false;
@@ -173,6 +231,8 @@ impl AgentLoop {
             let mut assistant_text = String::new();
             let mut assistant_tools = Vec::new();
             let mut step_had_tools = false;
+            let mut loop_recovery_prompts = Vec::new();
+            let mut loop_recovery_exhausted = false;
             let mut empty_response_reason: Option<String> = None;
             // 本步（单次请求）的 token 用量累计（AIOps 成本计量）。
             let mut step_usage = Usage::default();
@@ -235,34 +295,39 @@ impl AgentLoop {
                 }
                 assistant_tools.extend(chunk.tool_calls.clone());
                 for tc in &chunk.tool_calls {
-                    // 死循环防护：同名同参调用连续 3 次说明模型在原地打转，
-                    // 继续执行只会烧光步数预算，提前终止并给出可读原因。
                     let sig = format!("{}:{}", tc.name, tc.args);
-                    consec = if last_sig.as_deref() == Some(sig.as_str()) {
-                        consec + 1
-                    } else {
-                        1
-                    };
-                    last_sig = Some(sig);
-                    if consec >= 3 {
-                        log.append(SessionEvent::Assistant {
-                            id: log.gen_id(),
-                            chunk: Chunk {
-                                text: Some(format!(
-                                    "[error] 检测到连续 3 次相同的工具调用（{}），判定为循环，已停止。请换一种方式描述任务或检查结果是否符合预期。",
-                                    tc.name
-                                )),
-                                ..Default::default()
-                            },
-                        });
-                        debt = 0;
-                        hard_stop = true;
-                        break;
-                    }
                     log.append(SessionEvent::ToolCall {
                         id: log.gen_id(),
                         call: tc.clone(),
                     });
+
+                    if repeat_guard.should_block(&sig) {
+                        let recovery = repeat_guard.note_recovery(&sig);
+                        let blocked = ToolResult {
+                            call_id: tc.id.clone(),
+                            ok: false,
+                            content: format!(
+                                "[tool-loop guard] 工具 {} 使用相同参数已连续两次得到相同结果；本次未执行。请分析该结果、检查前置条件、换用诊断工具或调整参数，不要原样重试。",
+                                tc.name
+                            ),
+                            continuation_debt: 0,
+                        };
+                        log.append(SessionEvent::ToolResult {
+                            id: log.gen_id(),
+                            result: blocked.clone(),
+                        });
+                        messages.push(Message::tool(tc.id.clone(), blocked.content));
+                        step_had_tools = true;
+                        if recovery <= MAX_LOOP_RECOVERY_PROMPTS {
+                            loop_recovery_prompts.push(format!(
+                                "[循环恢复] 工具 {} 的相同调用已连续两次产生相同结果，本次已拦截（恢复提示 {recovery}/{MAX_LOOP_RECOVERY_PROMPTS}）。任务尚未完成：先解释现有结果，再选择不同参数、不同工具或下一项验证；禁止原样重试。",
+                                tc.name
+                            ));
+                        } else {
+                            loop_recovery_exhausted = true;
+                        }
+                        continue;
+                    }
 
                     // 通用行动门禁：每个工具动作必须关联验收目标。调用/时间预算是软检查点，
                     // 只触发进展诊断与续期，不会因为任务耗时较长而拒绝必要动作。
@@ -280,6 +345,7 @@ impl AgentLoop {
                             id: log.gen_id(),
                             result: denied.clone(),
                         });
+                        repeat_guard.record_result(&sig, &denied);
                         messages.push(Message::tool(tc.id.clone(), denied.content));
                         step_had_tools = true;
                         continue;
@@ -299,6 +365,7 @@ impl AgentLoop {
                                 id: log.gen_id(),
                                 result: denied.clone(),
                             });
+                            repeat_guard.record_result(&sig, &denied);
                             messages.push(Message::tool(tc.id.clone(), denied.content));
                             step_had_tools = true;
                             continue;
@@ -323,6 +390,7 @@ impl AgentLoop {
                             id: log.gen_id(),
                             result: blocked.clone(),
                         });
+                        repeat_guard.record_result(&sig, &blocked);
                         messages.push(Message::tool(tc.id.clone(), blocked.content.clone()));
                         step_had_tools = true;
                         continue;
@@ -381,6 +449,7 @@ impl AgentLoop {
                         id: log.gen_id(),
                         result: res.clone(),
                     });
+                    repeat_guard.record_result(&sig, &res);
                     execution.record_tool_result(&proposal, res.ok, &res.content);
                     messages.push(Message::tool(tc.id.clone(), res.content.clone()));
                     step_had_tools = true;
@@ -411,6 +480,9 @@ impl AgentLoop {
                     Message::assistant_with_tools(assistant_text, assistant_tools),
                 );
             }
+            for prompt in loop_recovery_prompts {
+                messages.push(Message::user(prompt));
+            }
             // 续跑记账：本步无论并行多少个工具调用只续跑一次。旧的按调用 +1
             // 会让 N 个并行调用触发 N 次额外模型往返，步数预算被成倍消耗。
             // 硬终止（取消/错误/循环守卫）时禁止复活：此时可能有「已宣告未执行」的
@@ -437,6 +509,18 @@ impl AgentLoop {
                     debt = 0;
                     hard_stop = true;
                 }
+            } else if loop_recovery_exhausted {
+                log.append(SessionEvent::Assistant {
+                    id: log.gen_id(),
+                    chunk: Chunk {
+                        text: Some(
+                            "[error] 模型在收到两次循环恢复提示后仍重复同一工具调用；任务未完成，但继续执行不会产生新信息。请检查该工具结果、补充任务约束或切换模型后继续。".into(),
+                        ),
+                        ..Default::default()
+                    },
+                });
+                debt = 0;
+                hard_stop = true;
             } else if step_had_tools && !hard_stop {
                 debt += 1;
             }
@@ -600,6 +684,49 @@ fn messages_from_events(events: &[SessionEvent]) -> Vec<Message> {
 
 /// 工具原文对用户日志仍完整保留；送回模型时按层压缩，避免一次构建/搜索输出挤掉
 /// 近期对话。短内容不变，长内容保留开头、错误附近和结尾。
+/// 显式上传的附件是本回合输入条件。文本附件直接提供受限摘录；二进制附件保留
+/// 文件名、MIME 与路径，要求 Agent 在用户授权范围内按需调用合适工具处理。
+fn render_attachment_context(attachments: &[harness_core::Attachment]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("[用户已附加以下文件；必须作为任务输入条件处理]\n");
+    for attachment in attachments {
+        let name = attachment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("未命名文件");
+        out.push_str(&format!(
+            "- {name}（{}，路径：{}）",
+            attachment.mime,
+            attachment.path.display()
+        ));
+        let ext = attachment
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            ext.as_str(),
+            "txt" | "md" | "rs" | "toml" | "json" | "yaml" | "yml" | "csv" | "log" | "xml"
+        ) {
+            if let Ok(text) = std::fs::read_to_string(&attachment.path) {
+                let excerpt: String = text.chars().take(8_000).collect();
+                out.push_str(&format!("\n  文本摘录：\n{excerpt}"));
+                if text.chars().count() > 8_000 {
+                    out.push_str("\n  [摘录已截断，请按需读取文件]\n");
+                }
+            }
+        } else {
+            out.push_str("\n  [二进制或富媒体附件：请基于文件类型和任务要求处理，不得忽略]\n");
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn compress_tool_context(content: &str) -> String {
     const LIMIT: usize = 6_000;
     if content.chars().count() <= LIMIT {
@@ -896,5 +1023,35 @@ mod tests {
         );
         assert!(compacted.iter().any(|m| m.content == "LATEST-QUESTION"));
         assert!(compacted.iter().map(message_chars).sum::<usize>() < 55_000);
+    }
+
+    #[test]
+    fn repeat_guard_only_blocks_identical_calls_with_identical_outcomes() {
+        let mut guard = ToolRepeatGuard::default();
+        let first = ToolResult {
+            call_id: "c1".into(),
+            ok: true,
+            content: "still running".into(),
+            continuation_debt: 0,
+        };
+        let changed = ToolResult {
+            content: "finished".into(),
+            ..first.clone()
+        };
+        guard.record_result("shell:{\"cmd\":\"status\"}", &first);
+        assert!(!guard.should_block("shell:{\"cmd\":\"status\"}"));
+        guard.record_result("shell:{\"cmd\":\"status\"}", &changed);
+        assert!(!guard.should_block("shell:{\"cmd\":\"status\"}"));
+
+        guard.record_result("shell:{\"cmd\":\"status\"}", &changed);
+        assert!(guard.should_block("shell:{\"cmd\":\"status\"}"));
+        assert_eq!(guard.note_recovery("shell:{\"cmd\":\"status\"}"), 1);
+        let new_observation = ToolResult {
+            content: "state changed".into(),
+            ..changed
+        };
+        guard.record_result("shell:{\"cmd\":\"status\"}", &new_observation);
+        assert!(!guard.should_block("shell:{\"cmd\":\"status\"}"));
+        assert_eq!(guard.note_recovery("shell:{\"cmd\":\"status\"}"), 1);
     }
 }

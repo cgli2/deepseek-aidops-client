@@ -10,6 +10,7 @@ harness-session = { path = "../harness-session" }
 harness-llm = { path = "../harness-llm" }
 # GUI 插件管理导入 WASM 插件时，用 wasmtime 沙箱加载器做导入前校验。
 harness-provider-wasm = { path = "../harness-provider-wasm", optional = true, features = ["wasm-tools"] }
+harness-provider-trellis = { path = "../harness-provider-trellis", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rfd = "0.15"
 # 密钥加密：OS 无关的 AES-256-GCM（取代 Windows DPAPI，Linux/macOS 同样加密落盘）。
@@ -63,4 +64,4 @@ features = ["default-fancy"]
 [features]
 # 默认仅 Ui trait + NullUi（headless）。TUI 是产品默认形态（完成文档 §1），GUI 为可替换实现。
 tui = ["dep:ratatui", "dep:crossterm"]
-gui = ["dep:egui", "dep:eframe", "dep:pulldown-cmark", "dep:syntect", "dep:harness-provider-wasm"]
+gui = ["dep:egui", "dep:eframe", "dep:pulldown-cmark", "dep:syntect", "dep:harness-provider-wasm", "dep:harness-provider-trellis"]

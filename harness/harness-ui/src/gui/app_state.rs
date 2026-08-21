@@ -231,7 +231,7 @@ impl AppState {
             f_context_budget: settings.get("runtime.context_budget").unwrap_or_default(),
             f_max_steps: settings.get("runtime.max_steps").unwrap_or_default(),
             f_max_tokens: settings.get("runtime.max_tokens").unwrap_or_default(),
-            plugin_rows: Self::load_plugin_rows(settings, &host.wasm_plugins),
+            plugin_rows: Self::load_plugin_rows(settings, &host.wasm_plugins, &host.trellis),
             modal_panel_rect: None,
             modal_open_last_frame: false,
             last_event: 0,

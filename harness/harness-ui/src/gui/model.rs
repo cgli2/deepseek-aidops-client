@@ -29,14 +29,32 @@ pub(super) struct CouncilTaskUi {
     pub(super) detail: String,
 }
 
+/// 插件分类：核心内置 / WASM 扩展 / Trellis（进程内数据面插件）。
+///
+/// 插件管理页按分类分区展示；新增插件类型时在此扩展枚举，
+/// 并在 `load_plugin_rows` 中追加对应行即可接入「启用 / 停用 / 配置」。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PluginKind {
+    /// 随应用发布的核心插件：恒启用，不可停用、不可移除。
+    Core,
+    /// 用户导入的 WASM 插件：可启用 / 停用 / 移除，经 wasmtime 沙箱隔离。
+    Wasm,
+    /// Trellis（spec 驱动开发）：进程内 PreStep 注入，可启用 / 停用，可配置规格与任务文件。
+    Trellis,
+}
+
 #[derive(Clone)]
 pub(super) struct PluginUiRow {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) desc: String,
-    pub(super) core: bool,
+    pub(super) kind: PluginKind,
     pub(super) enabled: bool,
     pub(super) active: bool,
+    /// Trellis 插件特有：规格文件路径（空 = 不注入规格）。
+    pub(super) spec_file: String,
+    /// Trellis 插件特有：任务状态机文件路径（空 = 不维护任务）。
+    pub(super) tasks_file: String,
 }
 
 #[derive(Clone)]

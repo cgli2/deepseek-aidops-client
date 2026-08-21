@@ -10,6 +10,7 @@ members = [
   "harness-provider-memory",
   "harness-provider-aidops",
   "harness-provider-hook",
+"harness-provider-trellis",
   "harness-provider-git",
   "harness-llm",
   "harness-tool",

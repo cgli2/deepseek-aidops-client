@@ -114,6 +114,9 @@ pub struct EguiUi {
     code: Arc<dyn CodeGraph>,
     /// WASM 插件运行时：导入/启用即时生效，禁用/移除立即卸载实例。
     wasm_plugins: Arc<harness_provider_wasm::WasmPluginRuntime>,
+    /// Trellis（spec 驱动开发插件）控制句柄：插件管理页热启停 / 配置规格与任务文件，
+    /// 与 bin 装配注入的是同一实例（共享 PreStep 中间件状态）。
+    trellis: Arc<harness_provider_trellis::TrellisControl>,
     /// 文件预览：只读查询工作区文件内容（沙箱根 = Workspace）。
     fs: Arc<dyn harness_capability::fs::Fs>,
     /// 文件预览：git diff / 跟踪状态查询（零 C 绑定，git CLI 子进程）。
@@ -181,6 +184,7 @@ impl EguiUi {
         wiki: Arc<dyn WikiStore>,
         code: Arc<dyn CodeGraph>,
         wasm_plugins: Arc<harness_provider_wasm::WasmPluginRuntime>,
+        trellis: Arc<harness_provider_trellis::TrellisControl>,
         fs: Arc<dyn harness_capability::fs::Fs>,
         git: Arc<dyn harness_capability::git::Git>,
     ) -> Self {
@@ -197,6 +201,7 @@ impl EguiUi {
             wiki,
             code,
             wasm_plugins,
+            trellis,
             fs,
             git,
             rt: UiRuntime::new("harness-ui-mem"),

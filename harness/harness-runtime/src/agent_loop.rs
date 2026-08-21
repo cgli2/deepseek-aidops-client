@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use futures::StreamExt;
 use harness_capability::assets::{ChatTurn, ConversationMemory, Skill, SkillLibrary};
 use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
-use harness_core::event::Waterfall;
 use harness_core::{AppContext, error::Result, types::UserInput};
 use harness_llm::{Chunk, LlmProvider, Message, Role, ToolResult, Usage};
 use harness_session::{SessionEvent, SessionLog};
@@ -215,7 +213,10 @@ impl AgentLoop {
             });
 
             // 瀑布前处理：可重写/拒绝消息；空链返回输入本身（终态恒等）。
-            let chain: Vec<Arc<dyn Waterfall<PreStep>>> = vec![];
+            // 链从事件总线注册表收集：插件可经 `on_waterfall::<PreStep>` 注入
+            // around-middleware（如 Trellis 的 spec 注入 / 任务状态机）；
+            // 无注册时为空 vec = 与旧行为完全一致。
+            let chain = bus.collect_waterfall::<PreStep>();
             let pre = bus.waterfall(
                 PreStep {
                     input: messages.clone(),

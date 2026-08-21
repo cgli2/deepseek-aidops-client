@@ -386,6 +386,10 @@ fn make_ui(
         let fs: Arc<dyn harness_capability::fs::Fs> = ctx.get::<dyn harness_capability::fs::Fs>();
         let git: Arc<dyn harness_capability::git::Git> =
             ctx.get::<dyn harness_capability::git::Git>();
+        // Trellis 控制句柄：TrellisPlugin 先于 HarnessPlugin 注册，故此处必可取到
+        // （register 无条件 provide；enabled=false 时仅状态关闭，句柄仍存在）。
+        let trellis: Arc<harness_provider_trellis::TrellisControl> =
+            ctx.get::<harness_provider_trellis::TrellisControl>();
         return Arc::new(EguiUi::new(
             sink,
             llm_control,
@@ -399,6 +403,7 @@ fn make_ui(
             wiki,
             code,
             wasm_plugins,
+            trellis,
             fs.clone(),
             git.clone(),
         ));

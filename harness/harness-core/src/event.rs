@@ -41,8 +41,8 @@ pub(crate) struct SerialObj<E: Event> {
     pub h: Arc<dyn SerialHandler<E>>,
 }
 pub(crate) struct WaterfallObj<E: Event> {
-    // 注册即入表（drop 时按 id 回滚）；`waterfall()` 的链由调用方显式传入，故此处为写后暂未读。
-    #[allow(dead_code)]
+    // 注册即入表（drop 时按 id 回滚）；`waterfall()` 的分发链由调用方
+    // 经 `EventBusView::collect_waterfall` 从注册表取回后显式传入。
     pub h: Arc<dyn Waterfall<E>>,
 }
 
@@ -160,6 +160,20 @@ impl EventBusView {
             .handlers
             .add(Bucket::Waterfall, etype, Arc::new(WaterfallObj { h }));
         Registration::handler(Arc::downgrade(&self.inner), etype, Bucket::Waterfall, id)
+    }
+
+    /// 取回某事件类型在 waterfall 桶下的全部处理器（注册顺序）。
+    ///
+    /// 与 `on_waterfall` 对称：`waterfall()` 的分发链由调用方显式传入，
+    /// 本方法把"注册表"与"分发点"打通——插件注册的中间件可被真正执行，
+    /// 无注册时返回空 vec（分发退化为恒等，等价于旧行为）。
+    pub fn collect_waterfall<E: Event>(&self) -> Vec<Arc<dyn Waterfall<E>>> {
+        self.inner
+            .handlers
+            .collect::<E, WaterfallObj<E>>(Bucket::Waterfall)
+            .into_iter()
+            .map(|o| o.h.clone())
+            .collect()
     }
 
     // ---- 分发 ----

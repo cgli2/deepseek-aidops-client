@@ -1,7 +1,7 @@
 //! Stateless reusable GUI controls.
 
 use super::icons::{draw_icon, Icon};
-use super::model::PluginUiRow;
+use super::model::{PluginKind, PluginUiRow};
 use super::theme::Palette;
 
 /// 侧栏扁平导航项：透明底、悬停微亮、矢量图标。返回是否点击。
@@ -124,7 +124,7 @@ pub(super) fn plugin_row_ui(
             ui.set_min_width(row_w);
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
-                if row.core {
+                if row.kind == PluginKind::Core {
                     // 核心插件恒启用：禁用态控件直观传达「不可取消勾选」。
                     let mut on = true;
                     ui.add_enabled(false, egui::Checkbox::new(&mut on, ""));
@@ -135,11 +135,15 @@ pub(super) fn plugin_row_ui(
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&row.name).size(13.0).color(pal.text));
                         ui.label(
-                            egui::RichText::new(if row.core { "核心" } else { "WASM" })
-                                .size(10.0)
-                                .color(pal.accent),
+                            egui::RichText::new(match row.kind {
+                                PluginKind::Core => "核心",
+                                PluginKind::Wasm => "WASM",
+                                PluginKind::Trellis => "Trellis",
+                            })
+                            .size(10.0)
+                            .color(pal.accent),
                         );
-                        if !row.core {
+                        if row.kind != PluginKind::Core {
                             ui.label(
                                 egui::RichText::new(if row.active {
                                     "运行中"
@@ -159,7 +163,7 @@ pub(super) fn plugin_row_ui(
                             .wrap_mode(egui::TextWrapMode::Truncate),
                     );
                 });
-                if !row.core {
+                if row.kind == PluginKind::Wasm {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ghost_button(ui, pal, "移除") {
                             removed = true;

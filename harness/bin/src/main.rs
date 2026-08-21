@@ -98,11 +98,19 @@ async fn main() -> harness_core::error::Result<()> {
     }
 
     // 编译期组合：等价于 dsh `inject` 推导加载顺序 + 逐 effect 收集进 guard。
-    let plugins: Vec<Arc<dyn harness_core::plugin::Plugin>> = vec![Arc::new(HarnessPlugin {
-        profile,
-        config,
-        settings,
-    })];
+    // Trellis（spec 驱动开发插件，可开可关）：默认关闭（enabled=false 时零副作用）。
+    // 注意：必须先于 HarnessPlugin 注册——HarnessPlugin::register 组装 GUI 时需要从
+    // ctx 取出 TrellisControl 注入插件管理页（同一实例，勾选启停即热生效）。
+    let trellis_cfg = config.trellis.clone();
+    let trellis_plugin = harness_provider_trellis::TrellisPlugin::new(trellis_cfg);
+    let plugins: Vec<Arc<dyn harness_core::plugin::Plugin>> = vec![
+        trellis_plugin,
+        Arc::new(HarnessPlugin {
+            profile,
+            config,
+            settings,
+        }),
+    ];
     let (ctx, _guard) = compose_plugins(plugins);
 
     // 取默认会话日志与 UI（均为事件总线消费者接口）。

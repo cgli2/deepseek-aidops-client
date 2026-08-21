@@ -1741,6 +1741,7 @@ dependencies = [
  "harness-provider-local",
  "harness-provider-memory",
  "harness-provider-sandbox",
+ "harness-provider-trellis",
  "harness-provider-wasm",
  "harness-runtime",
  "harness-session",
@@ -1865,6 +1866,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-provider-trellis"
+version = "0.2.0"
+dependencies = [
+ "harness-core",
+ "harness-llm",
+ "harness-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harness-provider-wasm"
 version = "0.2.0"
 dependencies = [
@@ -1941,6 +1953,7 @@ dependencies = [
  "harness-core",
  "harness-llm",
  "harness-provider-memory",
+ "harness-provider-trellis",
  "harness-provider-wasm",
  "harness-session",
  "pulldown-cmark",

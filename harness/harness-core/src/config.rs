@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,9 @@ pub struct Config {
     /// 可选的后端记忆服务（智程平台 aidops）。不配置则 dsh 完全离线、使用原生文件记忆。
     #[serde(default)]
     pub aidops: AidopsConfig,
+    /// Trellis 插件（spec 驱动开发）配置（见 `[trellis]` 表）。默认关闭。
+    #[serde(default)]
+    pub trellis: TrellisConfig,
 }
 
 /// 可选后端（智程平台 aidops）连接配置（见 `[aidops]` 表）。
@@ -61,6 +64,34 @@ impl Default for AidopsConfig {
             api_key_env: default_aidops_key_env(),
             api_key: None,
             project_id: None,
+        }
+    }
+}
+
+/// Trellis 插件（spec 驱动开发）配置（见 `[trellis]` 表）。
+///
+/// 默认关闭：`enabled = false` 时插件不注册任何事件监听，行为与未引入前完全一致。
+/// 启用后：每回合开始前把 `spec_file` 中的项目规格注入系统消息，
+/// 并在 `tasks_file` 中维护任务状态机（新任务 / 进行中 / 完成）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrellisConfig {
+    /// 是否启用 Trellis 插件。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 项目规格文件路径（Markdown）。为空时不注入规格。
+    #[serde(default)]
+    pub spec_file: String,
+    /// 任务状态机文件路径（JSON）。为空时不维护任务状态。
+    #[serde(default)]
+    pub tasks_file: String,
+}
+
+impl Default for TrellisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            spec_file: String::new(),
+            tasks_file: String::new(),
         }
     }
 }
@@ -154,6 +185,7 @@ impl Default for Config {
                 api_key: None,
                 project_id: None,
             },
+            trellis: TrellisConfig::default(),
         }
     }
 }

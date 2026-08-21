@@ -1,8 +1,10 @@
 //! Settings, update, profile, and plugin management behavior.
 
+use std::sync::Arc;
+
 use harness_core::update::UpdateStatus;
 
-use super::model::{PluginUiRow, BUILTIN_PLUGINS};
+use super::model::{PluginKind, PluginUiRow, BUILTIN_PLUGINS};
 use super::theme::Palette;
 use super::widgets::{accent_button, field_label, ghost_button};
 use super::AppState;
@@ -249,7 +251,19 @@ impl AppState {
         let settings = &self.host.settings;
         let _ = settings.set("permission.mode", &self.permission);
         for row in &self.plugin_rows {
-            let _ = settings.set_plugin_enabled(&row.id, &row.name, row.enabled);
+            if row.kind == PluginKind::Wasm {
+                let _ = settings.set_plugin_enabled(&row.id, &row.name, row.enabled);
+            }
+        }
+        // Trellis 插件：启停与文件路径在勾选/编辑时已热生效（共享控制句柄），
+        // 这里无损写回 .harness.toml（未知字段保留 + 原子写），保证重启后保持。
+        if let Some(t) = self.plugin_rows.iter().find(|r| r.kind == PluginKind::Trellis) {
+            if let Ok((mut cfg, raw, Some(path))) = harness_core::Config::load_with_raw() {
+                cfg.trellis.enabled = t.enabled;
+                cfg.trellis.spec_file = t.spec_file.clone();
+                cfg.trellis.tasks_file = t.tasks_file.clone();
+                let _ = cfg.save_preserving(&path, &raw);
+            }
         }
         // 运行时调参：持久化到 settings.db，并写入进程级开关（立即生效，无需重启）。
         // 空输入解析失败 → None → 回退环境变量 / 默认值。
@@ -264,10 +278,13 @@ impl AppState {
         // 不自动关闭：note 在弹窗内可见，给用户明确的保存反馈。
     }
 
-    /// 构建插件列表：核心内置恒启用（忽略历史禁用记录）；WASM 插件读持久化状态。
+    /// 构建插件列表：核心内置恒启用（忽略历史禁用记录）；WASM 插件读持久化状态；
+    /// Trellis（spec 驱动开发插件）读共享控制句柄——与 bin 装配注入 UI 的是同一实例，
+    /// 勾选启停即时生效（无需重启）。
     pub(super) fn load_plugin_rows(
         settings: &crate::SettingsDb,
         runtime: &harness_provider_wasm::WasmPluginRuntime,
+        trellis: &Arc<harness_provider_trellis::TrellisControl>,
     ) -> Vec<PluginUiRow> {
         let mut rows: Vec<PluginUiRow> = BUILTIN_PLUGINS
             .iter()
@@ -275,9 +292,11 @@ impl AppState {
                 id: (*id).into(),
                 name: (*name).into(),
                 desc: (*desc).into(),
-                core: true,
+                kind: PluginKind::Core,
                 enabled: true,
                 active: true,
+                spec_file: String::new(),
+                tasks_file: String::new(),
             })
             .collect();
         for p in settings.plugins() {
@@ -287,12 +306,24 @@ impl AppState {
                     id: p.id,
                     name: p.name,
                     desc: path,
-                    core: false,
+                    kind: PluginKind::Wasm,
                     enabled: p.enabled,
                     active,
+                    spec_file: String::new(),
+                    tasks_file: String::new(),
                 });
             }
         }
+        rows.push(PluginUiRow {
+            id: "trellis".into(),
+            name: "Trellis".into(),
+            desc: "spec 驱动开发：PreStep 注入项目规格并维护任务状态机".into(),
+            kind: PluginKind::Trellis,
+            enabled: trellis.enabled(),
+            active: trellis.enabled(),
+            spec_file: trellis.spec_file(),
+            tasks_file: trellis.tasks_file(),
+        });
         rows
     }
 
@@ -332,9 +363,11 @@ impl AppState {
                 id,
                 name: stem.clone(),
                 desc: path_s,
-                core: false,
+                kind: PluginKind::Wasm,
                 enabled: true,
                 active: true,
+                spec_file: String::new(),
+                tasks_file: String::new(),
             });
         }
         self.note = format!("插件「{stem}」已通过沙箱校验并登记，默认启用");

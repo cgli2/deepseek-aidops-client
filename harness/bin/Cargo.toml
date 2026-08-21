@@ -21,6 +21,7 @@ harness-provider-wasm = { path = "../harness-provider-wasm" }
 harness-provider-memory = { path = "../harness-provider-memory" }
 harness-provider-aidops = { path = "../harness-provider-aidops", optional = true }
 harness-provider-hook = { path = "../harness-provider-hook" }
+harness-provider-trellis = { path = "../harness-provider-trellis" }
 harness-provider-git = { path = "../harness-provider-git" }
 harness-ui = { path = "../harness-ui" }
 harness-acp = { path = "../harness-acp", optional = true }

@@ -1,5 +1,6 @@
 //! Settings modal layout and page routing.
 
+use super::model::PluginKind;
 use super::*;
 
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
@@ -315,7 +316,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     "插件管理" => {
                                         field_label(ui, &pal, "系统插件（随应用发布，默认启用且不可移除）");
                                         for i in 0..state.plugin_rows.len() {
-                                            if state.plugin_rows[i].core {
+                                            if state.plugin_rows[i].kind == PluginKind::Core {
                                                 let _ = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
                                             }
                                         }
@@ -335,7 +336,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         let mut remove_ids: Vec<String> = Vec::new();
                                         let mut wasm_count = 0;
                                         for i in 0..state.plugin_rows.len() {
-                                            if state.plugin_rows[i].core {
+                                            if state.plugin_rows[i].kind != PluginKind::Wasm {
                                                 continue;
                                             }
                                             wasm_count += 1;
@@ -378,6 +379,42 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                             }
                                             state.plugin_rows.retain(|r| !remove_ids.contains(&r.id));
                                             state.note = format!("已移除 {} 个插件", remove_ids.len());
+                                        }
+                                        ui.add_space(12.0);
+                                        field_label(ui, &pal, "Trellis（spec 驱动开发 · 进程内 PreStep 注入，可启用 / 停用 / 配置）");
+                                        for i in 0..state.plugin_rows.len() {
+                                            if state.plugin_rows[i].kind != PluginKind::Trellis {
+                                                continue;
+                                            }
+                                            let (_, changed) = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
+                                            if changed {
+                                                let enabled = state.plugin_rows[i].enabled;
+                                                state.host.trellis.set_enabled(enabled);
+                                                state.plugin_rows[i].active = enabled;
+                                                state.note = format!(
+                                                    "Trellis 插件已{}",
+                                                    if enabled { "启用（每步 LLM 前注入规格与任务文件）" } else { "停用" }
+                                                );
+                                            }
+                                        }
+                                        if let Some(row) = state.plugin_rows.iter_mut().find(|r| r.kind == PluginKind::Trellis) {
+                                            ui.add_space(4.0);
+                                            ui.horizontal(|ui| {
+                                                field_label(ui, &pal, "规格文件");
+                                                let mut spec = row.spec_file.clone();
+                                                if ui.add(egui::TextEdit::singleline(&mut spec).desired_width(320.0)).changed() {
+                                                    row.spec_file = spec.clone();
+                                                    state.host.trellis.set_spec_file(spec);
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                field_label(ui, &pal, "任务文件");
+                                                let mut tasks = row.tasks_file.clone();
+                                                if ui.add(egui::TextEdit::singleline(&mut tasks).desired_width(320.0)).changed() {
+                                                    row.tasks_file = tasks.clone();
+                                                    state.host.trellis.set_tasks_file(tasks);
+                                                }
+                                            });
                                         }
                                         ui.add_space(8.0);
                                         ui.horizontal(|ui| {

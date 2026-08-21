@@ -2,14 +2,20 @@
 
 pub mod agent_loop;
 pub mod controller;
+pub mod council;
 pub mod events;
+pub mod execution;
 pub mod scheduler;
 pub mod subagent;
 pub mod task;
 
-pub use agent_loop::AgentLoop;
+pub use agent_loop::{AgentLoop, DeterministicCompaction};
 pub use controller::SessionController;
 pub use events::{PreStep, TurnStopping};
+pub use execution::{
+    ActionGate, ActionProposal, Budget, BudgetManager, Completion, CompletionJudge, DomainPolicy,
+    ExecutionState, GeneralDomainPolicy, StrategyKind, TaskContract,
+};
 pub use scheduler::Scheduler;
 pub use subagent::InProcessSubagent;
 pub use task::{SessionId, Task};

@@ -52,6 +52,7 @@ impl LlmProvider for OpenAI {
             "model": self.model,
             "messages": openai_compat::messages_json(&msgs),
             "stream": true,
+            "max_tokens": crate::max_output_tokens(),
             "tools": openai_compat::tools_json(&openai_compat::coding_tools()),
             "tool_choice": "auto",
             "stream_options": { "include_usage": true },

@@ -62,6 +62,63 @@ pub enum SessionEvent {
         id: EventId,
         usage: Usage,
     },
+    /// 专家团编排事件。所有任务状态、证据与门禁结果均落盘，可恢复和审计。
+    Council {
+        id: EventId,
+        event: CouncilEvent,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CouncilTaskState {
+    Pending,
+    Ready,
+    Running,
+    Done,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouncilTaskSpec {
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    pub role: String,
+    pub depends_on: Vec<String>,
+    pub write_scopes: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouncilGateResult {
+    pub name: String,
+    pub passed: bool,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CouncilEvent {
+    Started { council_id: String, goal: String, max_parallel: usize },
+    PlanCreated { council_id: String, tasks: Vec<CouncilTaskSpec> },
+    TaskStateChanged {
+        council_id: String,
+        task_id: String,
+        state: CouncilTaskState,
+        attempt: u32,
+        detail: String,
+    },
+    ArtifactPublished {
+        council_id: String,
+        task_id: String,
+        summary: String,
+        evidence: Vec<String>,
+    },
+    GateEvaluated { council_id: String, gate: CouncilGateResult },
+    Blocked { council_id: String, reason: String },
+    Completed { council_id: String, summary: String },
+    Cancelled { council_id: String, reason: String },
 }
 
 /// 计划条目（status ∈ pending / doing / done）。
@@ -102,7 +159,8 @@ fn event_id(ev: &SessionEvent) -> EventId {
         | SessionEvent::PlanUpdate { id, .. }
         | SessionEvent::TurnStopping { id, .. }
         | SessionEvent::TurnEnd { id }
-        | SessionEvent::Usage { id, .. } => *id,
+        | SessionEvent::Usage { id, .. }
+        | SessionEvent::Council { id, .. } => *id,
     }
 }
 
@@ -119,6 +177,36 @@ pub struct SessionLog {
 }
 
 impl SessionLog {
+    /// 恢复未正常闭合的回合时，不只补 TurnEnd；先留下用户可见的中断原因，
+    /// 避免历史记录看起来像助手无缘无故写到一半便消失。
+    fn close_interrupted_turn(&self) {
+        let mut active_council = None;
+        for event in self.replay() {
+            match event {
+                SessionEvent::Council { event: CouncilEvent::Started { council_id, .. }, .. } => active_council = Some(council_id),
+                SessionEvent::Council { event: CouncilEvent::Completed { council_id, .. } | CouncilEvent::Cancelled { council_id, .. } | CouncilEvent::Blocked { council_id, .. }, .. }
+                    if active_council.as_deref() == Some(council_id.as_str()) => active_council = None,
+                _ => {}
+            }
+        }
+        if let Some(council_id) = active_council {
+            self.append(SessionEvent::Council {
+                id: self.gen_id(),
+                event: CouncilEvent::Cancelled {
+                    council_id,
+                    reason: "程序退出或意外中断；恢复后未自动重启可能产生副作用的专家任务".into(),
+                },
+            });
+        }
+        self.append(SessionEvent::Assistant {
+            id: self.gen_id(),
+            chunk: Chunk {
+                text: Some("[error] 上次任务在完成前被程序退出或意外中断，已恢复会话。之前的输出可能不完整，请重试或要求继续。".into()),
+                ..Default::default()
+            },
+        });
+        self.append(SessionEvent::TurnEnd { id: self.gen_id() });
+    }
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             id: Uuid::new_v4(),
@@ -260,7 +348,7 @@ impl SessionLog {
             Some(ev) if !matches!(ev, SessionEvent::TurnEnd { .. })
         );
         if needs_close {
-            self.append(SessionEvent::TurnEnd { id: self.gen_id() });
+            self.close_interrupted_turn();
         }
     }
 
@@ -285,7 +373,7 @@ impl SessionLog {
             Some(ev) if !matches!(ev, SessionEvent::TurnEnd { .. })
         );
         if needs_close {
-            log.append(SessionEvent::TurnEnd { id: log.gen_id() });
+            log.close_interrupted_turn();
         }
         log
     }
@@ -335,7 +423,7 @@ impl SessionLog {
             Some(ev) if !matches!(ev, SessionEvent::TurnEnd { .. })
         );
         if needs_close {
-            self.append(SessionEvent::TurnEnd { id: self.gen_id() });
+            self.close_interrupted_turn();
         }
         true
     }

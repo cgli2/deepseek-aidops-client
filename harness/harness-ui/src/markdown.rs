@@ -11,10 +11,10 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-const BODY_SIZE: f32 = 13.0;
-const CODE_SIZE: f32 = 12.0;
-const BLOCK_GAP_SIZE: f32 = 5.0;
-const HEADING_SIZES: [f32; 3] = [15.5, 14.5, 13.5];
+const BODY_SIZE: f32 = 13.5;
+const CODE_SIZE: f32 = 12.5;
+const BLOCK_GAP_SIZE: f32 = 7.0;
+const HEADING_SIZES: [f32; 3] = [18.0, 16.0, 14.5];
 
 /// 渲染所需的主题色（从 gui `Palette` 拷贝，避免模块间循环依赖）。
 #[derive(Clone, Copy)]
@@ -97,7 +97,7 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                         _ => "• ".into(),
                     };
                     let indent = "  ".repeat(depth + 1);
-                    append_str(&mut job, &format!("{indent}{marker}"), &plain(theme));
+                    append_str(&mut job, &format!("{indent}{marker}"), &list_marker_fmt(theme));
                 }
                 Tag::CodeBlock(_) => {
                     block_break!();
@@ -238,88 +238,42 @@ pub fn parse_blocks(md: &str, theme: &MdTheme, max_width: f32) -> Vec<MarkdownBl
     use pulldown_cmark::{Event, Options, Parser};
 
     let mut blocks: Vec<MarkdownBlock> = Vec::new();
-    let job = to_job(md, theme, max_width);
-
-    // 扫描行内代码：若为文件路径，从 job 中拆出。
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
 
+    // 事件流遍历：普通文本/非路径行内代码累积进 pending，
+    // 遇到文件路径行内代码时先把 pending 刷成 Job，再输出 FilePath chip。
+    // 这样非文件路径的行内代码保持在文本原位（不会因拆块导致不合理换行）。
+    let mut pending = String::new();
     for event in Parser::new_ext(md, opts) {
         match event {
             Event::Code(c) => {
                 let code_str = c.to_string();
                 if crate::preview::looks_like_file_path(&code_str) {
+                    if !pending.trim().is_empty() {
+                        blocks.push(MarkdownBlock::Job(to_job(&pending, theme, max_width)));
+                        pending.clear();
+                    }
                     blocks.push(MarkdownBlock::FilePath(code_str));
+                } else {
+                    // 非文件路径的行内代码：保留 backtick 原样，由 to_job 渲染为行内代码。
+                    pending.push('`');
+                    pending.push_str(&code_str);
+                    pending.push('`');
                 }
             }
+            Event::Text(t) => pending.push_str(&t),
+            Event::SoftBreak | Event::HardBreak => pending.push('\n'),
             _ => {}
         }
     }
-
-    // 简化策略：如果没有任何文件路径被识别，直接返回整个 job 作为一个 block。
-    // 如果有文件路径，我们把 job 作为第一个 block，FilePath 作为后续 block。
-    // GUI 侧渲染时按顺序处理：Job block 渲染为 Label，FilePath block 渲染为可点击 label。
-    // 但这样会导致文件路径出现在文本末尾而非原位。
-    //
-    // 更好的方案：把 md 按行内代码分割，每段分别 to_job。
-    // 但 pulldown-cmark 的 Code 事件不直接给偏移量，需要手动扫描。
-    //
-    // 实用方案：直接扫描 md 中的 `` `path` `` 模式，按此分割。
+    if !pending.trim().is_empty() {
+        blocks.push(MarkdownBlock::Job(to_job(&pending, theme, max_width)));
+    }
     if blocks.is_empty() {
-        return vec![MarkdownBlock::Job(job)];
+        blocks.push(MarkdownBlock::Job(to_job(md, theme, max_width)));
     }
-
-    // 有文件路径：按 `` `path` `` 分割 md，每段生成 Job，路径段生成 FilePath。
-    let mut result: Vec<MarkdownBlock> = Vec::new();
-    let mut remaining = md.to_string();
-
-    while !remaining.is_empty() {
-        // 找下一个行内代码块
-        let start = match remaining.find('`') {
-            Some(s) => s,
-            None => {
-                // 剩余纯文本
-                if !remaining.trim().is_empty() {
-                    let job = to_job(&remaining, theme, max_width);
-                    result.push(MarkdownBlock::Job(job));
-                }
-                break;
-            }
-        };
-        // 找闭合 backtick
-        let end = match remaining[start + 1..].find('`') {
-            Some(e) => e + start + 1,
-            None => {
-                // 不闭合，当普通文本
-                let job = to_job(&remaining, theme, max_width);
-                result.push(MarkdownBlock::Job(job));
-                break;
-            }
-        };
-
-        // 前缀文本
-        if start > 0 {
-            let prefix = &remaining[..start];
-            if !prefix.trim().is_empty() {
-                let job = to_job(prefix, theme, max_width);
-                result.push(MarkdownBlock::Job(job));
-            }
-        }
-
-        // 代码内容
-        let code_content = &remaining[start + 1..end];
-        if crate::preview::looks_like_file_path(code_content) {
-            result.push(MarkdownBlock::FilePath(code_content.to_string()));
-        } else {
-            // 非文件路径的行内代码：作为 job 的一部分
-            let job = to_job(&format!("`{code_content}`"), theme, max_width);
-            result.push(MarkdownBlock::Job(job));
-        }
-
-        remaining = remaining[end + 1..].to_string();
-    }
-
-    result
+    blocks
 }
 
 fn append_str(job: &mut LayoutJob, s: &str, f: &TextFormat) {
@@ -384,6 +338,19 @@ fn dim_fmt(theme: &MdTheme) -> TextFormat {
         false,
         Color32::TRANSPARENT,
         false,
+        false,
+        false,
+        false,
+    )
+}
+
+fn list_marker_fmt(theme: &MdTheme) -> TextFormat {
+    fmt(
+        BODY_SIZE,
+        heading_color(theme),
+        false,
+        Color32::TRANSPARENT,
+        true,
         false,
         false,
         false,
@@ -460,6 +427,50 @@ mod tests {
             assert!(sizes.iter().any(|size| (*size - expected).abs() < 0.01));
         }
         assert!(sizes.iter().any(|size| (*size - BODY_SIZE).abs() < 0.01));
-        assert!(HEADING_SIZES[0] - BODY_SIZE <= 2.5);
+        assert!(HEADING_SIZES[0] - BODY_SIZE <= 5.0, "一级标题比正文大 4.5px，属合理层次");
+    }
+    /// 回归：非文件路径的行内代码不拆分（保持文本原位），
+    /// 只有文件路径才拆成 FilePath chip。避免行内代码被拆成独立块导致不合理换行。
+    #[test]
+    fn parse_blocks_only_splits_file_path_inline_code() {
+        let t = theme();
+        // 含非文件路径行内代码 + 文件路径
+        let md = "编译通过，见 `OK` 和 `exit 0`；文件在 `src/gui.rs`。";
+        let blocks = parse_blocks(md, &t, 300.0);
+        // 非文件路径的 `OK`/`exit 0` 应留在文本内，不被拆成独立 block；
+        // 文件路径 src/gui.rs 应被拆成 FilePath。
+        let file_paths: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                MarkdownBlock::FilePath(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(file_paths, vec!["src/gui.rs"], "should only extract file path");
+        // 所有 Job block 的文本拼起来应包含行内代码内容（未被丢弃）
+        let job_text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                MarkdownBlock::Job(j) => Some(j.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(job_text.contains("OK"), "inline code OK should stay in text");
+        assert!(job_text.contains("exit 0"), "inline code exit 0 should stay in text");
+        assert!(job_text.contains("文件在"), "prefix text should be kept");
+    }
+
+    /// 回归：全是普通文本（无文件路径）时返回单个 Job block。
+    #[test]
+    fn parse_blocks_no_file_path_returns_single_job() {
+        let t = theme();
+        let blocks = parse_blocks("你好，世界 `code` 内容", &t, 300.0);
+        assert_eq!(blocks.len(), 1, "no file path should yield one job");
+        if let MarkdownBlock::Job(j) = &blocks[0] {
+            assert!(j.text.contains("code"));
+        } else {
+            panic!("expected Job block");
+        }
     }
 }

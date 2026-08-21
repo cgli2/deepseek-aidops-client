@@ -3,9 +3,9 @@
 use egui::{Color32, Context, Response, Sense, Stroke, Ui, ViewportCommand};
 
 #[cfg(target_os = "windows")]
-const TITLEBAR_HEIGHT: f32 = 42.0;
+const TITLEBAR_HEIGHT: f32 = 38.0;
 #[cfg(not(target_os = "windows"))]
-const TITLEBAR_HEIGHT: f32 = 40.0;
+const TITLEBAR_HEIGHT: f32 = 36.0;
 
 #[derive(Clone, Copy)]
 pub struct ChromeColors {
@@ -37,7 +37,7 @@ pub fn titlebar_height() -> f32 {
 }
 
 fn theme_button(ui: &mut Ui, colors: ChromeColors, dark: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(62.0, 26.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(60.0, 24.0), Sense::click());
     let border = if response.hovered() {
         Stroke::new(1.0, colors.border)
     } else {
@@ -141,7 +141,7 @@ pub struct ChromeActions {
 
 /// 主导航最左侧的侧栏开关，仅绘制图标，文字通过悬停提示呈现。
 fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(rect, 6.0, colors.border.gamma_multiply(0.35));
     }
@@ -154,7 +154,7 @@ fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response
 
 /// 文件树开关按钮（矢量树形图标，激活态用 accent 色）。
 fn tree_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
     let border = if response.hovered() {
         Stroke::new(1.0, colors.border)
     } else {
@@ -227,10 +227,10 @@ pub fn show(
                     actions.toggle_sidebar = true;
                 }
                 // 标题仍与工作区起点大致对齐，侧栏开关固定在导航最左侧。
-                ui.add_space((workspace_left - system_safe_space - 30.0).max(12.0));
+                ui.add_space((workspace_left - system_safe_space - 28.0).max(12.0));
                 ui.label(
                     egui::RichText::new("对话工作台")
-                        .size(15.0)
+                        .size(14.0)
                         .strong()
                         .color(colors.text),
                 );

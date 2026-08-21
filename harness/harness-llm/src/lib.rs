@@ -29,6 +29,20 @@ pub use anthropic::Anthropic;
 pub use deepseek::DeepSeek;
 pub use local::LocalLlm;
 pub use openai::OpenAI;
+
+/// OpenAI 兼容服务的单次最大输出长度。默认 4096，足够完成常规交付且能防止
+/// 无约束的长回复；部署方可用 `HARNESS_MAX_TOKENS` 在 256..=32768 范围调整，
+/// GUI「参数配置」页的显式设置优先于环境变量。
+pub(crate) fn max_output_tokens() -> u64 {
+    harness_core::tuning::max_output_tokens()
+        .or_else(|| {
+            std::env::var("HARNESS_MAX_TOKENS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(4_096)
+        .clamp(256, 32_768)
+}
 pub use replay::ReplayLlm;
 
 /// 消息角色。
@@ -102,6 +116,8 @@ impl Message {
 /// 仅用于 UI「思考中」反馈与会话日志展示，不进入模型上下文。
 /// `usage` 承载一次请求的最终 token 用量（由 `stream_options.include_usage` 触发，
 /// 在流末尾单独成帧），用于 AIOps 用量/成本计量，不进入模型上下文。
+/// `empty_response` 表示上游正常结束却既没有正文也没有工具调用；它不是给用户展示的
+/// 助手文本，Runtime 应根据 `finish_reason` 发起受限恢复重试。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chunk {
     pub text: Option<String>,
@@ -110,6 +126,10 @@ pub struct Chunk {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    #[serde(default)]
+    pub empty_response: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 /// 一次请求的 token 用量（AIOps 可观测性：每会话/每回合的 prompt/completion token）。
@@ -216,16 +236,43 @@ impl harness_core::LlmControl for ManagedLlm {
         provider: String,
         base_url: String,
         model: String,
-        api_key: String,
+        key: String,
         reasoning_effort: Option<String>,
     ) -> std::result::Result<(), String> {
         let provider = provider.trim().to_string();
         if provider.is_empty() {
             return Err("厂商名称不能为空".into());
         }
-        self.configure_deepseek(base_url, model.clone(), api_key, reasoning_effort)?;
+        let base_url = base_url.trim().trim_end_matches('/').to_string();
+        if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+            return Err("API 地址必须以 http:// 或 https:// 开头".into());
+        }
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err("模型名称不能为空".into());
+        }
+        // 优先用本次输入的 key；为空则回退运行时缓存（兼容“只在设置页配过一次”的场景）。
+        let key = key.trim().to_string();
+        let key = if !key.is_empty() {
+            key
+        } else {
+            self.key.read().map(|k| k.clone()).unwrap_or_default()
+        };
+        if key.is_empty() {
+            return Err("API Key 不能为空，请先在设置页配置".into());
+        }
+        // 缓存 key，供 reload_config 在文件缺密钥时兜底复用。
+        if let Ok(mut k) = self.key.write() {
+            *k = key.clone();
+        }
+        // 按厂商构造对应 provider 并真正替换运行时实例：切换模型即时生效。
+        let next: Arc<dyn LlmProvider> = match provider.as_str() {
+            "deepseek" => crate::DeepSeek::new(base_url, key, model.clone(), reasoning_effort),
+            _ => crate::OpenAI::with_endpoint(base_url, key, model.clone()),
+        };
+        *self.provider.write().map_err(|_| "模型配置锁异常")? = next;
         *self.status.write().map_err(|_| "模型状态锁异常")? =
-            format!("{provider} / {} / 已配置 Key", model.trim());
+            format!("{provider} / {model} / 已配置 Key");
         Ok(())
     }
 
@@ -288,7 +335,11 @@ impl harness_core::LlmControl for ManagedLlm {
             .unwrap_or_else(|_| "模型状态不可用".into())
     }
 
-    fn fetch_models(&self, base_url: String, api_key: String) -> std::result::Result<Vec<String>, String> {
+    fn fetch_models(
+        &self,
+        base_url: String,
+        api_key: String,
+    ) -> std::result::Result<Vec<String>, String> {
         crate::openai_compat::fetch_models(base_url, api_key)
     }
 }
@@ -301,25 +352,31 @@ mod managed_tests {
     #[test]
     fn runtime_configuration_validates_and_switches_provider() {
         let managed = ManagedLlm::new(ReplayLlm::new(vec![]), "演示模式");
-        assert!(managed
-            .configure_deepseek("bad".into(), "deepseek-chat".into(), "key".into(), None)
-            .is_err());
-        assert!(managed
-            .configure_deepseek(
-                "https://api.deepseek.com".into(),
-                "".into(),
-                "key".into(),
-                None
-            )
-            .is_err());
-        assert!(managed
-            .configure_deepseek(
-                "https://api.deepseek.com".into(),
-                "deepseek-chat".into(),
-                "".into(),
-                None
-            )
-            .is_err());
+        assert!(
+            managed
+                .configure_deepseek("bad".into(), "deepseek-chat".into(), "key".into(), None)
+                .is_err()
+        );
+        assert!(
+            managed
+                .configure_deepseek(
+                    "https://api.deepseek.com".into(),
+                    "".into(),
+                    "key".into(),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            managed
+                .configure_deepseek(
+                    "https://api.deepseek.com".into(),
+                    "deepseek-chat".into(),
+                    "".into(),
+                    None
+                )
+                .is_err()
+        );
         managed
             .configure_deepseek(
                 "https://api.deepseek.com/".into(),
@@ -329,5 +386,62 @@ mod managed_tests {
             )
             .unwrap();
         assert!(managed.status().contains("已配置 Key"));
+    }
+
+    /// 验证 configure_provider 真正替换运行时 provider 并缓存 key。
+    /// 修复前它只更新 status 文字、不替换 provider（切换模型不生效）。
+    #[test]
+    fn configure_provider_swaps_runtime_provider() {
+        let managed = ManagedLlm::new(ReplayLlm::new(vec![]), "演示模式");
+
+        // 非法地址：拒绝
+        assert!(
+            managed
+                .configure_provider(
+                    "openai".into(),
+                    "bad".into(),
+                    "deepseek-v4".into(),
+                    "k".into(),
+                    None
+                )
+                .is_err()
+        );
+
+        // 合法 openai 厂商：成功并替换 provider
+        managed
+            .configure_provider(
+                "openai".into(),
+                "http://localhost:8000".into(),
+                "deepseek-v4".into(),
+                "sk-test".into(),
+                None,
+            )
+            .unwrap();
+        assert!(managed.status().contains("deepseek-v4"));
+        assert!(managed.status().contains("已配置 Key"));
+
+        // deepseek 厂商：同样成功
+        managed
+            .configure_provider(
+                "deepseek".into(),
+                "https://api.deepseek.com".into(),
+                "deepseek-reasoner".into(),
+                "sk-ds".into(),
+                Some("high".into()),
+            )
+            .unwrap();
+        assert!(managed.status().contains("deepseek-reasoner"));
+
+        // key 缓存：空 key 时回退上次配置的 key，不报错
+        managed
+            .configure_provider(
+                "openai".into(),
+                "http://localhost:8000".into(),
+                "other-model".into(),
+                String::new(),
+                None,
+            )
+            .unwrap();
+        assert!(managed.status().contains("other-model"));
     }
 }

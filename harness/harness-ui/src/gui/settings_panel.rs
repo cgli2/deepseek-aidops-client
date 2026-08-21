@@ -251,8 +251,16 @@ impl AppState {
         for row in &self.plugin_rows {
             let _ = settings.set_plugin_enabled(&row.id, &row.name, row.enabled);
         }
+        // 运行时调参：持久化到 settings.db，并写入进程级开关（立即生效，无需重启）。
+        // 空输入解析失败 → None → 回退环境变量 / 默认值。
+        let _ = settings.set("runtime.context_budget", self.f_context_budget.trim());
+        let _ = settings.set("runtime.max_steps", self.f_max_steps.trim());
+        let _ = settings.set("runtime.max_tokens", self.f_max_tokens.trim());
+        harness_core::tuning::set_context_budget_chars(self.f_context_budget.trim().parse().ok());
+        harness_core::tuning::set_max_steps(self.f_max_steps.trim().parse().ok());
+        harness_core::tuning::set_max_output_tokens(self.f_max_tokens.trim().parse().ok());
         self.host.sink.set_permission(self.permission.clone());
-        self.note = "偏好已保存".into();
+        self.note = "偏好与运行时参数已保存并生效".into();
         // 不自动关闭：note 在弹窗内可见，给用户明确的保存反馈。
     }
 

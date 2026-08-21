@@ -6,6 +6,7 @@
 
 mod log;
 pub use log::{
-    delete_session, list_sessions, prune_sessions, rename_session, EventId, PlanItem, SessionEvent,
-    SessionId, SessionLog, SessionMeta,
+    delete_session, list_sessions, prune_sessions, rename_session, CouncilEvent,
+    CouncilGateResult, CouncilTaskSpec, CouncilTaskState, EventId, PlanItem, SessionEvent, SessionId,
+    SessionLog, SessionMeta,
 };

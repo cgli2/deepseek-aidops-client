@@ -48,11 +48,9 @@ async fn main() -> harness_core::error::Result<()> {
     if let Some(value) = settings.get("llm.api_key") {
         config.llm.api_key = Some(value);
     }
-    if std::env::var_os("HARNESS_WORKSPACE").is_none() {
-        if let Some(value) = settings.get("workspace.root") {
-            std::env::set_var("HARNESS_WORKSPACE", value);
-        }
-    }
+    // 不在 Tokio 运行时启动后修改进程环境（Rust 2024 中这既不安全也会造成
+    // 并发读取竞态）。compose 阶段会直接从同一个 SettingsDb 读取 workspace.root，
+    // 显式 HARNESS_WORKSPACE 仍由 workspace_root() 保持最高优先级。
     let profile = parse_profile(&config);
 
     // 真正启用 GUI（profile 请求 gui 且二进制含 gui 特性）时，若当前附带了控制台，

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use harness_capability::assets::{CodeGraph, ConversationMemory, SkillLibrary, WikiStore};
+use harness_capability::compaction::Compaction;
 use harness_capability::editor::Editor;
 use harness_capability::fs::Fs;
 use harness_capability::git::Git;
@@ -17,15 +18,15 @@ use harness_capability::memory::Memory;
 use harness_capability::shell::Shell;
 use harness_capability::subagent::Subagent;
 use harness_capability::watcher::FileWatcher;
+use harness_core::AccessPolicy;
+use harness_core::AppContext;
+use harness_core::LlmControl;
+use harness_core::Registration;
 use harness_core::config::Config;
 use harness_core::extension::{ExtensionPoint, ExtensionRegistry};
 use harness_core::plugin::Plugin;
 use harness_core::types::Profile;
 use harness_core::ui_input::UiInputSink;
-use harness_core::AccessPolicy;
-use harness_core::AppContext;
-use harness_core::LlmControl;
-use harness_core::Registration;
 use harness_llm::LlmProvider;
 #[cfg(feature = "aidops")]
 use harness_provider_aidops::AidopsBackend;
@@ -39,7 +40,7 @@ use harness_session::SessionLog;
 use harness_tool::{BashTool, DelegateTool, EditTool, FsTool, MemoryTool, PlanTool, ToolRegistry};
 use harness_ui::Ui;
 
-use harness_runtime::{InProcessSubagent, SessionController};
+use harness_runtime::{DeterministicCompaction, InProcessSubagent, SessionController};
 
 use harness_ui::ConsoleUi;
 #[cfg(feature = "gui")]
@@ -124,9 +125,20 @@ impl Plugin for HarnessPlugin {
         let log = SessionLog::open_latest(cwd.join(".harness").join("sessions"));
         regs.push(ctx.provide(log.clone()));
 
+        // 默认确定性压缩器：实际接入 AgentLoop，长会话不再绕过 Compaction 接缝。
+        let compaction: Arc<dyn Compaction> = Arc::new(DeterministicCompaction);
+        regs.push(ctx.provide(compaction));
+
         // 进程内子代理 Provider（DelegateTool 依赖，先于工具注册创建）。
-        let subagent: Arc<dyn Subagent> =
-            InProcessSubagent::new(ctx.clone(), 4, std::time::Duration::from_secs(180));
+        let subagent_timeout = std::env::var("HARNESS_SUBAGENT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120);
+        let subagent: Arc<dyn Subagent> = InProcessSubagent::new(
+            ctx.clone(),
+            4,
+            std::time::Duration::from_secs(subagent_timeout),
+        );
         regs.push(ctx.provide(subagent.clone()));
 
         // 工具注册表 + 注册工具（仅依赖 capability trait，零 Provider 耦合）。
@@ -304,6 +316,7 @@ fn make_llm(cfg: &Config) -> Arc<dyn LlmProvider> {
             tool_calls: vec![],
             reasoning: None,
             usage: None,
+            ..Default::default()
         }]);
     }
     if cfg!(feature = "deepseek") {
@@ -325,6 +338,7 @@ fn make_llm(cfg: &Config) -> Arc<dyn LlmProvider> {
                 tool_calls: vec![],
                 reasoning: None,
                 usage: None,
+                ..Default::default()
             }]);
         }
         return harness_llm::DeepSeek::new(
@@ -370,7 +384,8 @@ fn make_ui(
         let sink: Arc<dyn UiInputSink> = ctx.get::<dyn UiInputSink>();
         let llm_control: Arc<dyn LlmControl> = ctx.get::<dyn LlmControl>();
         let fs: Arc<dyn harness_capability::fs::Fs> = ctx.get::<dyn harness_capability::fs::Fs>();
-        let git: Arc<dyn harness_capability::git::Git> = ctx.get::<dyn harness_capability::git::Git>();
+        let git: Arc<dyn harness_capability::git::Git> =
+            ctx.get::<dyn harness_capability::git::Git>();
         return Arc::new(EguiUi::new(
             sink,
             llm_control,

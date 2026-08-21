@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_stream::stream;
 use futures::StreamExt;
 use harness_core::error::Error;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::openai_compat;
 use crate::{Chunk, ChunkStream, LlmProvider, Message, Role, ToolCall, ToolSchema};
@@ -194,7 +194,8 @@ impl LlmProvider for Anthropic {
                 });
             } else if !saw_text {
                 yield Ok(Chunk {
-                    text: Some("[Anthropic 返回了空内容]".into()),
+                    empty_response: true,
+                    finish_reason: Some("unknown".into()),
                     ..Default::default()
                 });
             }

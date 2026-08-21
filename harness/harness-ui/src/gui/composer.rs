@@ -4,14 +4,23 @@ use super::*;
 
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> bool {
     let mut send_now = false;
+    // 右侧分栏已由 app 在本面板前创建，因此这里得到的就是中央剩余区域。
+    let main_width = ctx.available_rect().width().max(0.0);
+    let gutter = if main_width >= 1100.0 {
+        24.0
+    } else if main_width >= 760.0 {
+        18.0
+    } else {
+        12.0
+    };
     egui::TopBottomPanel::bottom("composer")
         .show_separator_line(false)
         .frame(
             egui::Frame::default()
                 .fill(pal.bg)
                 .inner_margin(egui::Margin {
-                    left: 10.0,
-                    right: 10.0,
+                    left: gutter,
+                    right: gutter,
                     top: 4.0,
                     bottom: 6.0,
                 }),
@@ -66,13 +75,89 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
 
+                    let mode_text = if state.multi_agent {
+                        "团队"
+                    } else {
+                        "标准"
+                    };
+                    // 模式 chip：与模型/权限控件共用同一套 28px chrome，
+                    // 仅以状态圆点和强调色描边表达启用，避免标准 Button 的突兀块感。
+                    let mode_w = 64.0_f32;
+                    let (mode_rect, mode_resp) =
+                        ui.allocate_exact_size(egui::vec2(mode_w, 28.0), egui::Sense::click());
+                    let mode_fill = if mode_resp.hovered() {
+                        pal.hover
+                    } else {
+                        pal.field
+                    };
+                    ui.painter()
+                        .rect_filled(mode_rect, egui::Rounding::same(8.0), mode_fill);
+                    ui.painter().rect(
+                        mode_rect,
+                        egui::Rounding::same(8.0),
+                        egui::Color32::TRANSPARENT,
+                        egui::Stroke::new(
+                            1.0_f32,
+                            if state.multi_agent {
+                                pal.accent
+                            } else {
+                                pal.border
+                            },
+                        ),
+                    );
+                    ui.painter().circle_filled(
+                        mode_rect.left_center() + egui::vec2(11.0, 0.0),
+                        3.0,
+                        if state.multi_agent {
+                            pal.accent
+                        } else {
+                            pal.dim
+                        },
+                    );
+                    ui.painter().text(
+                        mode_rect.left_center() + egui::vec2(20.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        mode_text,
+                        egui::FontId::proportional(12.0),
+                        pal.text,
+                    );
+                    if mode_resp.clicked() {
+                        state.multi_agent = !state.multi_agent;
+                        let _ = state.host.settings.set(
+                            "ui.multi_agent",
+                            if state.multi_agent { "true" } else { "false" },
+                        );
+                        state.note = if state.multi_agent {
+                            "已开启专家团 DAG：任务状态、证据和质量门禁会实时显示并持久化".into()
+                        } else {
+                            "已切换为标准模式".into()
+                        };
+                    }
+                    mode_resp.on_hover_text(if state.multi_agent {
+                        "已启用：依赖 DAG、最多 3 个并行专家、自动重试和质量门禁"
+                    } else {
+                        "切换到专家团：需求、风险、设计、实现、测试、审查和交付门禁"
+                    });
+
                     // ── 模型 chip（点击 → 打开设置页） ──
                     let model_label = format!("{} · {}", state.f_provider, state.f_model);
                     let text_w: f32 = model_label
                         .chars()
                         .map(|c| if c.is_ascii() { 7.0 } else { 12.0 })
                         .sum();
-                    let chip_w = (text_w + 40.0).max(110.0).min(240.0);
+                    let chip_w = (text_w + 30.0).max(92.0).min(190.0);
+                    let text_limit = chip_w - 34.0;
+                    let mut used_w = 0.0_f32;
+                    let mut model_display = String::new();
+                    for c in model_label.chars() {
+                        let char_w = if c.is_ascii() { 7.0 } else { 12.0 };
+                        if used_w + char_w > text_limit {
+                            model_display.push('…');
+                            break;
+                        }
+                        model_display.push(c);
+                        used_w += char_w;
+                    }
                     let (mrect, mresp) =
                         ui.allocate_exact_size(egui::vec2(chip_w, 28.0), egui::Sense::click());
                     let mfill = if mresp.hovered() {
@@ -91,7 +176,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     ui.painter().text(
                         mrect.left_center() + egui::vec2(10.0, 0.0),
                         egui::Align2::LEFT_CENTER,
-                        &model_label,
+                        &model_display,
                         egui::FontId::proportional(12.0),
                         pal.text,
                     );
@@ -423,7 +508,11 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             },
                             format!(
                                 "{spinner} {activity} · 已用时 {secs} 秒{freshness}{} · 可随时停止",
-                                if queued > 0 { format!(" · 队列中 {queued} 条") } else { String::new() },
+                                if queued > 0 {
+                                    format!(" · 队列中 {queued} 条")
+                                } else {
+                                    String::new()
+                                },
                             ),
                         )
                     } else {

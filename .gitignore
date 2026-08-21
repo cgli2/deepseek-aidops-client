@@ -57,3 +57,5 @@ Desktop.ini
 *.temp
 *.bak
 *.orig
+*.ps1
+*.txt

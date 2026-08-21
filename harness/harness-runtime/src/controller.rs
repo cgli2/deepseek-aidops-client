@@ -1,17 +1,18 @@
 //! 会话控制器：把 UI 输入变成按 FIFO 串行执行的后台 agent turn。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::FutureExt;
+use harness_core::AppContext;
 use harness_core::types::UserInput;
 use harness_core::ui_input::{QueuedInput, UiInputSink};
-use harness_core::AppContext;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::AgentLoop;
+use crate::council::{COUNCIL_PREFIX, CouncilOrchestrator};
 
 #[derive(Clone)]
 pub struct SessionController {
@@ -78,7 +79,11 @@ impl UiInputSink for SessionController {
     }
 
     fn busy(&self) -> bool {
-        self.inner.queue.lock().map(|queue| queue.running).unwrap_or(false)
+        self.inner
+            .queue
+            .lock()
+            .map(|queue| queue.running)
+            .unwrap_or(false)
     }
 
     fn queued_count(&self) -> usize {
@@ -159,7 +164,6 @@ async fn run_turn_queue(inner: Arc<Inner>) {
             Err(_) => break,
         };
 
-        let loop_ = AgentLoop::new();
         let cancellation = CancellationToken::new();
         if let Ok(mut active) = inner.cancellation.lock() {
             *active = Some(cancellation.clone());
@@ -168,22 +172,36 @@ async fn run_turn_queue(inner: Arc<Inner>) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1800);
+        let is_council = text.starts_with(COUNCIL_PREFIX);
+        let clean_text = text
+            .strip_prefix(COUNCIL_PREFIX)
+            .unwrap_or(&text)
+            .to_string();
         let outcome = std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(turn_timeout_secs),
-                loop_.run_turn_cancellable(
-                    &inner.ctx,
-                    UserInput {
-                        text,
-                        attachments: vec![],
-                    },
-                    cancellation,
-                ),
-            )
+            tokio::time::timeout(std::time::Duration::from_secs(turn_timeout_secs), async {
+                if is_council {
+                    CouncilOrchestrator::default()
+                        .run(&inner.ctx, clean_text, cancellation)
+                        .await
+                } else {
+                    AgentLoop::new()
+                        .run_turn_cancellable(
+                            &inner.ctx,
+                            UserInput {
+                                text: clean_text,
+                                attachments: vec![],
+                            },
+                            cancellation,
+                        )
+                        .await
+                }
+            })
             .await
-            .map_err(|_| harness_core::error::Error::Runtime(format!(
-                "回合超过 {turn_timeout_secs} 秒未完成，已强制中止以避免无限等待"
-            )))?
+            .map_err(|_| {
+                harness_core::error::Error::Runtime(format!(
+                    "回合超过 {turn_timeout_secs} 秒未完成，已强制中止以避免无限等待"
+                ))
+            })?
         })
         .catch_unwind()
         .await;

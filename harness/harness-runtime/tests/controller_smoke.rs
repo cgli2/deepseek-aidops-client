@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harness_capability::hook::{Hook, HookDecision, HookPayload};
+use harness_core::AppContext;
 use harness_core::error::Result;
 use harness_core::ui_input::UiInputSink;
-use harness_core::AppContext;
 use harness_llm::{Chunk, LlmProvider, ReplayLlm};
 use harness_runtime::SessionController;
 use harness_session::{SessionEvent, SessionLog};
@@ -33,6 +33,7 @@ async fn submit_writes_turn_events() {
         tool_calls: vec![],
         reasoning: None,
         usage: None,
+        ..Default::default()
     }]);
     _regs.push(ctx.provide(llm));
 

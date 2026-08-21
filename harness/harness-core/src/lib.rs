@@ -15,6 +15,7 @@ pub mod error;
 pub mod event;
 pub mod extension;
 pub mod plugin;
+pub mod tuning;
 pub mod types;
 pub mod ui_input;
 pub mod update;

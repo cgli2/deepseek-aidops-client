@@ -2,20 +2,37 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use harness_capability::assets::{ChatTurn, ConversationMemory, Skill, SkillLibrary};
+use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
 use harness_core::event::Waterfall;
-use harness_core::{error::Result, types::UserInput, AppContext};
+use harness_core::{AppContext, error::Result, types::UserInput};
 use harness_llm::{Chunk, LlmProvider, Message, Role, ToolResult, Usage};
 use harness_session::{SessionEvent, SessionLog};
 use harness_tool::ToolRegistry;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{PreStep, TurnStopping};
+use crate::execution::{
+    ActionGate, ActionProposal, BudgetManager, Completion, CompletionJudge, DomainPolicy,
+    ExecutionState, GateDecision, GeneralDomainPolicy, TaskContract,
+};
 
 /// Agent 循环 / Turn-Step 生命周期（原 §5.6）。
 ///
 /// `Turn` = 0..n `Step`；`debt` 计数控制续跑；`agent/turn-stopping` 为唯一串行终止点。
 pub struct AgentLoop;
+
+/// 默认确定性压缩器：复用会话重建、工具输出压缩与上下文预算规则。
+/// 作为能力注册后，后续可替换为远程摘要器；默认实现绝不额外请求模型。
+#[derive(Default)]
+pub struct DeterministicCompaction;
+
+#[async_trait::async_trait]
+impl Compaction for DeterministicCompaction {
+    async fn compact(&self, events: Vec<SessionEvent>) -> Result<Vec<Message>> {
+        Ok(messages_from_events(&events))
+    }
+}
 
 impl AgentLoop {
     pub fn new() -> Self {
@@ -40,13 +57,46 @@ impl AgentLoop {
         let hook = ctx.get::<dyn Hook>();
         let bus = ctx.events();
 
+        let input_text = input.text.clone();
+
+        // 先把自然语言请求编译成通用执行契约，再由可替换的领域策略选择执行方式。
+        // 没有注册领域策略时使用通用分类器，不把代码修复等场景写死在 Agent Loop。
+        let contract = TaskContract::from_input(&input_text);
+        let default_policy = GeneralDomainPolicy;
+        let strategy = ctx
+            .try_get::<dyn DomainPolicy>()
+            .map(|policy| policy.select_strategy(&contract))
+            .unwrap_or_else(|| default_policy.select_strategy(&contract));
+        let mut budget = BudgetManager::for_contract(&contract, strategy);
+        if let Some(policy) = ctx.try_get::<dyn DomainPolicy>() {
+            policy.adjust_budget(&contract, &mut budget);
+        }
+        // 现有 UI/env 步数设置继续作为管理员硬上限；动态预算只会进一步收紧。
+        BudgetManager::cap_initial_step_window(&mut budget, max_steps_limit());
+        let mut execution = ExecutionState::new(contract, strategy);
+
         // 从追加日志重建多轮上下文；不能每个 turn 都只发送当前一句，否则 GUI 看似能聊天，
         // 实际模型完全不记得上一轮以及之前的工具结果。
-        let mut messages = messages_from_events(&log.replay());
+        let history = log.replay();
+        let mut messages = if let Some(compaction) = ctx.try_get::<dyn Compaction>() {
+            // 压缩器不可用不能阻断对话；保留旧路径作为可靠回退。
+            compaction
+                .compact(history.clone())
+                .await
+                .unwrap_or_else(|_| messages_from_events(&history))
+        } else {
+            messages_from_events(&history)
+        };
 
         log.append(SessionEvent::TurnStart {
             id: log.gen_id(),
-            input: input.text.clone(),
+            input: input_text.clone(),
+        });
+        // 在网络握手、排队或模型首个分片到来前立即驱动 UI 的思考气泡，避免主界面
+        // 留白而被误认为卡死。Thinking 事件不会被写入下一轮模型上下文，也不消耗 token。
+        log.append(SessionEvent::Thinking {
+            id: log.gen_id(),
+            text: "正在理解你的问题…".into(),
         });
 
         // 记忆自动沉淀（L0 工作记忆）：每个用户回合写入对话记忆（无后端则落本地文件）。
@@ -56,7 +106,7 @@ impl AgentLoop {
                 .record_turn(ChatTurn {
                     session_id: log.id().to_string(),
                     role: "user".into(),
-                    content: input.text.clone(),
+                    content: input_text.clone(),
                     ts: String::new(),
                 })
                 .await;
@@ -65,7 +115,15 @@ impl AgentLoop {
         let mut debt: usize = 1;
         // 跨步累积本轮助手最终文本，供回合结束时沉淀为 L0 记忆。
         let mut last_assistant = String::new();
-        messages.push(Message::user(&input.text));
+        messages.push(Message::user(&input_text));
+        messages.insert(
+            1,
+            Message::system(
+                execution
+                    .contract
+                    .render_for_model(execution.strategy, &budget),
+            ),
+        );
         // 技能注入点：只匹配启用的 SKILL.md 资产，并在本回合的系统上下文中
         // 提供可执行步骤与验收条件。禁用或删除后，SkillLibrary 不会返回它们，
         // 因而从下一回合起立即不再影响模型行为。
@@ -76,10 +134,7 @@ impl AgentLoop {
                 }
             }
         }
-        let max_steps = max_steps_limit();
         let mut steps = 0usize;
-        // 收尾宽限：撞上限后不立刻报错，再给模型一步「只总结不调工具」的机会。
-        let mut wrapping_up = false;
         // 重复调用检测：完全相同的工具调用「连续」出现 3 次才判定为死循环；
         // 累计计数会误杀正常任务中隔多步重跑同一命令的场景。
         let mut last_sig: Option<String> = None;
@@ -87,28 +142,14 @@ impl AgentLoop {
         // 硬终止标记（取消/流错误/循环守卫）：阻止步末的 debt 记账复活回合，
         // 否则带着「已宣告未执行」的 tool_call 续跑会直接 400。
         let mut hard_stop = false;
+        let mut convergence_notified = false;
+        // 上游可能正常结束却没有正文/工具调用（例如网关截断、reasoning-only 帧）。
+        // 这不是完成；允许有限恢复重试，避免把占位文本污染会话上下文。
+        const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
+        let mut empty_response_retries = 0usize;
         while debt > 0 {
             steps += 1;
-            if steps > max_steps {
-                if !wrapping_up {
-                    wrapping_up = true;
-                    // 仅进入本地上下文，不写日志：下回合重建不依赖这条指令。
-                    messages.push(Message::user(&format!(
-                        "[系统提示] 本回合已达到最大步数（{max_steps}）。请立即停止调用任何工具，直接给出已完成工作的简洁总结。"
-                    )));
-                } else {
-                    log.append(SessionEvent::Assistant {
-                        id: log.gen_id(),
-                        chunk: Chunk {
-                            text: Some(format!(
-                                "[error] 回合超过 {max_steps} 步且收尾后仍在调用工具，已强制停止（可用 HARNESS_MAX_STEPS 调整上限）"
-                            )),
-                            ..Default::default()
-                        },
-                    });
-                    break;
-                }
-            }
+            execution.steps = steps;
             debt -= 1;
             log.append(SessionEvent::StepStart {
                 id: log.gen_id(),
@@ -126,10 +167,13 @@ impl AgentLoop {
             // PreStep 包含不断增长的完整上下文，持久化会造成 O(n²) 日志膨胀。
             // 真正的会话重建只依赖 TurnStart/Assistant/ToolResult，因此不写入 SessionLog。
 
-            let mut s = llm.stream(pre.input);
+            // 每一步都执行上下文预算，而非仅在回合开始时裁剪；工具循环越长，
+            // 节省的重复 prompt token 越明显。
+            let mut s = llm.stream(apply_context_budget(pre.input));
             let mut assistant_text = String::new();
             let mut assistant_tools = Vec::new();
             let mut step_had_tools = false;
+            let mut empty_response_reason: Option<String> = None;
             // 本步（单次请求）的 token 用量累计（AIOps 成本计量）。
             let mut step_usage = Usage::default();
             loop {
@@ -173,6 +217,13 @@ impl AgentLoop {
                 if let Some(u) = &chunk.usage {
                     step_usage = step_usage.saturating_add(*u);
                 }
+                if chunk.empty_response {
+                    empty_response_reason = chunk
+                        .finish_reason
+                        .clone()
+                        .or_else(|| Some("unknown".into()));
+                    continue;
+                }
                 if chunk.text.is_some() || !chunk.tool_calls.is_empty() {
                     log.append(SessionEvent::Assistant {
                         id: log.gen_id(),
@@ -212,6 +263,29 @@ impl AgentLoop {
                         id: log.gen_id(),
                         call: tc.clone(),
                     });
+
+                    // 通用行动门禁：每个工具动作必须关联验收目标。调用/时间预算是软检查点，
+                    // 只触发进展诊断与续期，不会因为任务耗时较长而拒绝必要动作。
+                    let proposal = ActionProposal::from_tool_call(tc, &execution.contract);
+                    if let GateDecision::Deny(reason) =
+                        ActionGate::authorize(&proposal, &execution, &budget)
+                    {
+                        let denied = ToolResult {
+                            call_id: tc.id.clone(),
+                            ok: false,
+                            content: format!("[execution gate] {reason}"),
+                            continuation_debt: 0,
+                        };
+                        log.append(SessionEvent::ToolResult {
+                            id: log.gen_id(),
+                            result: denied.clone(),
+                        });
+                        messages.push(Message::tool(tc.id.clone(), denied.content));
+                        step_had_tools = true;
+                        continue;
+                    }
+                    execution.tool_calls =
+                        execution.tool_calls.saturating_add(proposal.estimated_cost);
 
                     if let Some(policy) = ctx.try_get::<harness_core::AccessPolicy>() {
                         if !policy.allows(&tc.name, &tc.args) {
@@ -307,6 +381,7 @@ impl AgentLoop {
                         id: log.gen_id(),
                         result: res.clone(),
                     });
+                    execution.record_tool_result(&proposal, res.ok, &res.content);
                     messages.push(Message::tool(tc.id.clone(), res.content.clone()));
                     step_had_tools = true;
                     if cancelled {
@@ -316,7 +391,12 @@ impl AgentLoop {
                     }
                 }
             }
-            last_assistant = assistant_text.clone();
+            let should_recover_empty = empty_response_reason.is_some()
+                && assistant_text.trim().is_empty()
+                && assistant_tools.is_empty();
+            if !assistant_text.trim().is_empty() {
+                last_assistant = assistant_text.clone();
+            }
             // 本步用量落盘：Usage 事件不进模型上下文、不影响多轮重建，
             // 仅用于会话级成本计量（usage_total）。
             if step_usage.total_tokens > 0 {
@@ -325,15 +405,39 @@ impl AgentLoop {
                     usage: step_usage,
                 });
             }
-            messages.insert(
-                messages.len().saturating_sub(assistant_tools.len()),
-                Message::assistant_with_tools(assistant_text, assistant_tools),
-            );
+            if !should_recover_empty {
+                messages.insert(
+                    messages.len().saturating_sub(assistant_tools.len()),
+                    Message::assistant_with_tools(assistant_text, assistant_tools),
+                );
+            }
             // 续跑记账：本步无论并行多少个工具调用只续跑一次。旧的按调用 +1
             // 会让 N 个并行调用触发 N 次额外模型往返，步数预算被成倍消耗。
             // 硬终止（取消/错误/循环守卫）时禁止复活：此时可能有「已宣告未执行」的
             // tool_call 缺对应 tool 消息，续跑必 400。
-            if step_had_tools && !hard_stop {
+            if should_recover_empty && !hard_stop {
+                let reason = empty_response_reason.as_deref().unwrap_or("unknown");
+                if empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES {
+                    empty_response_retries += 1;
+                    debt += 1;
+                    messages.push(Message::user(format!(
+                        "[恢复请求] 上一次模型响应为空（finish_reason={reason}），没有生成正文或工具调用；这不代表任务完成。请基于现有上下文继续：若需要信息或执行操作，调用恰当工具；否则给出可验证的完整答复。不要只输出思考过程。自动重试第 {empty_response_retries}/{MAX_EMPTY_RESPONSE_RETRIES} 次。"
+                    )));
+                } else {
+                    log.append(SessionEvent::Assistant {
+                        id: log.gen_id(),
+                        chunk: Chunk {
+                            text: Some(format!(
+                                "[error] 模型连续 {} 次返回空响应（最后 finish_reason={reason}）。请求未被视为完成；请检查模型/网关日志、输出 token 限制或切换模型后重试。",
+                                MAX_EMPTY_RESPONSE_RETRIES + 1
+                            )),
+                            ..Default::default()
+                        },
+                    });
+                    debt = 0;
+                    hard_stop = true;
+                }
+            } else if step_had_tools && !hard_stop {
                 debt += 1;
             }
             log.append(SessionEvent::StepEnd {
@@ -341,9 +445,23 @@ impl AgentLoop {
                 step: steps,
             });
 
-            // 收尾步无论模型是否仍调工具都强制结束（宽限只给一次）。
-            if wrapping_up {
-                break;
+            if should_recover_empty {
+                // 恢复重试已经重新记账，不能再被“本步没有工具”误判为完成。
+            } else if BudgetManager::phase(&execution, &budget)
+                == crate::execution::BudgetPhase::Exhausted
+            {
+                let diagnosis = BudgetManager::diagnose_and_renew(&mut execution, &mut budget);
+                convergence_notified = false;
+                messages.push(Message::user(&diagnosis));
+            } else {
+                match CompletionJudge::evaluate(&execution, &budget, step_had_tools) {
+                    Completion::Converge(reason) if !convergence_notified => {
+                        convergence_notified = true;
+                        messages.push(Message::user(&format!("[系统提示] {reason}")));
+                    }
+                    Completion::Complete => debt = 0,
+                    _ => {}
+                }
             }
 
             // 唯一终止检查点（serial，无 next()）。
@@ -398,8 +516,16 @@ fn render_skill_instructions(skills: &[Skill]) -> Option<String> {
             "- {}：适用范围：{}\n  执行：{}\n  验证：{}\n",
             skill.name,
             skill.trigger_boundary,
-            if steps.is_empty() { "遵循技能文档的步骤" } else { &steps },
-            if checks.is_empty() { "完成后进行必要验证" } else { &checks },
+            if steps.is_empty() {
+                "遵循技能文档的步骤"
+            } else {
+                &steps
+            },
+            if checks.is_empty() {
+                "完成后进行必要验证"
+            } else {
+                &checks
+            },
         ));
     }
     (out.lines().count() > 1).then_some(out)
@@ -428,9 +554,10 @@ fn messages_from_events(events: &[SessionEvent]) -> Vec<Message> {
                     chunk.tool_calls.clone(),
                 ));
             }
-            SessionEvent::ToolResult { result, .. } => {
-                messages.push(Message::tool(&result.call_id, &result.content))
-            }
+            SessionEvent::ToolResult { result, .. } => messages.push(Message::tool(
+                &result.call_id,
+                &compress_tool_context(&result.content),
+            )),
             // Thinking / Step* / PlanUpdate 仅 UI 展示，不进入模型上下文。
             _ => {}
         }
@@ -468,7 +595,122 @@ fn messages_from_events(events: &[SessionEvent]) -> Vec<Message> {
         Role::Assistant => !(m.content.is_empty() && m.tool_calls.is_empty()),
         _ => true,
     });
-    messages
+    apply_context_budget(messages)
+}
+
+/// 工具原文对用户日志仍完整保留；送回模型时按层压缩，避免一次构建/搜索输出挤掉
+/// 近期对话。短内容不变，长内容保留开头、错误附近和结尾。
+fn compress_tool_context(content: &str) -> String {
+    const LIMIT: usize = 6_000;
+    if content.chars().count() <= LIMIT {
+        return content.into();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let mut selected: Vec<&str> = lines.iter().take(36).copied().collect();
+    selected.extend(
+        lines
+            .iter()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains("error") || lower.contains("failed") || lower.contains("warning")
+            })
+            .take(24)
+            .copied(),
+    );
+    selected.extend(lines.iter().rev().take(28).rev().copied());
+    selected.dedup();
+    let mut out = format!("[工具输出已压缩：原 {} 字符]\n", content.chars().count());
+    for line in selected {
+        if out.chars().count() + line.chars().count() + 1 > LIMIT {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// 确定性的上下文预算器：保留系统提示和最近完整回合，较早对话压成短摘要。
+/// 从 User 边界裁剪，避免拆开 assistant tool_call / tool result 协议对。
+fn apply_context_budget(messages: Vec<Message>) -> Vec<Message> {
+    // UI「参数配置」显式设置优先；其次 `HARNESS_CONTEXT_MAX_CHARS` 环境变量；最后默认 48k 字符。
+    let budget = harness_core::tuning::context_budget_chars()
+        .or_else(|| {
+            std::env::var("HARNESS_CONTEXT_MAX_CHARS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(48_000usize)
+        .clamp(12_000, 240_000);
+    let total: usize = messages.iter().map(message_chars).sum();
+    if total <= budget {
+        return messages;
+    }
+
+    let user_starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == Role::User).then_some(index))
+        .collect();
+    let Some(&latest_user) = user_starts.last() else {
+        return messages;
+    };
+    let mut start = latest_user;
+    let mut retained: usize = messages[start..].iter().map(message_chars).sum();
+    for &candidate in user_starts.iter().rev().skip(1) {
+        let added: usize = messages[candidate..start].iter().map(message_chars).sum();
+        if retained.saturating_add(added) > budget.saturating_sub(4_000) {
+            break;
+        }
+        start = candidate;
+        retained += added;
+    }
+    if start <= 1 {
+        return messages;
+    }
+
+    let mut result: Vec<Message> = messages[..start]
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .cloned()
+        .collect();
+    let omitted = start.saturating_sub(result.len());
+    let mut summary = format!("[较早会话已按上下文预算压缩，共省略 {omitted} 条消息]\n");
+    for message in messages[1..start].iter().rev() {
+        if !matches!(message.role, Role::User | Role::Assistant)
+            || message.content.trim().is_empty()
+        {
+            continue;
+        }
+        let role = if message.role == Role::User {
+            "用户"
+        } else {
+            "助手"
+        };
+        let compact = message
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let excerpt: String = compact.chars().take(240).collect();
+        let line = format!("{role}: {excerpt}\n");
+        if summary.chars().count() + line.chars().count() > 4_000 {
+            break;
+        }
+        summary.push_str(&line);
+    }
+    result.push(Message::system(summary));
+    result.extend(messages.into_iter().skip(start));
+    result
+}
+
+fn message_chars(message: &Message) -> usize {
+    message.content.chars().count()
+        + message
+            .tool_calls
+            .iter()
+            .map(|call| call.name.len() + call.args.to_string().chars().count())
+            .sum::<usize>()
 }
 
 /// 结构化系统提示词：语言跟随、工具契约、长周期工作流、安全边界。
@@ -493,12 +735,16 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 仅当用户明确要求检查/修改/构建/测试/操作工作区时才使用文件系统或 shell 工具。\n\
 - 永不搜索或泄露 API key、凭据、token 等秘密。";
 
-/// 步上限（env `HARNESS_MAX_STEPS` 覆盖，默认 128）：真实编码任务单回合常需数十次
-/// 工具往返；失控风险由 turn watchdog 与 SSE idle 超时兜底，不靠小上限硬防。
+/// 进展检查间隔（沿用 env `HARNESS_MAX_STEPS` 保持兼容，默认 128）。
+/// 这不是完成期限；到点后诊断调用价值并自动续期。失控由循环守卫、取消与 turn timeout 兜底。
 fn max_steps_limit() -> usize {
-    std::env::var("HARNESS_MAX_STEPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    // UI 显式设置优先；其次兼容旧环境变量；最后默认 128。
+    harness_core::tuning::max_steps()
+        .or_else(|| {
+            std::env::var("HARNESS_MAX_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(128)
         .max(1)
 }
@@ -527,6 +773,19 @@ mod tests {
         assert!(rendered.contains("inspect diff；run tests"));
         assert!(rendered.contains("findings recorded"));
         assert!(render_skill_instructions(&[]).is_none());
+    }
+
+    #[test]
+    fn tool_context_keeps_errors_and_bounds_long_output() {
+        let input = format!(
+            "{}\nerror: expected failure\n{}",
+            "first line\n".repeat(2_000),
+            "last line\n".repeat(2_000)
+        );
+        let compacted = compress_tool_context(&input);
+        assert!(compacted.chars().count() <= 6_000);
+        assert!(compacted.contains("error: expected failure"));
+        assert!(compacted.contains("工具输出已压缩"));
     }
 
     #[test]
@@ -619,5 +878,23 @@ mod tests {
         assert_eq!(messages[2].tool_calls.len(), 1);
         assert_eq!(messages[2].tool_calls[0].id, "c1");
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn context_budget_keeps_latest_turn_and_compacts_old_history() {
+        let mut messages = vec![Message::system("system")];
+        for index in 0..8 {
+            messages.push(Message::user(format!("old-{index}-{}", "x".repeat(8_000))));
+            messages.push(Message::assistant(format!("answer-{index}")));
+        }
+        messages.push(Message::user("LATEST-QUESTION"));
+        let compacted = apply_context_budget(messages);
+        assert!(
+            compacted
+                .iter()
+                .any(|m| m.content.contains("较早会话已按上下文预算压缩"))
+        );
+        assert!(compacted.iter().any(|m| m.content == "LATEST-QUESTION"));
+        assert!(compacted.iter().map(message_chars).sum::<usize>() < 55_000);
     }
 }

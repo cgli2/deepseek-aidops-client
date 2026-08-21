@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use async_stream::stream;
 use futures::StreamExt;
 use harness_core::error::Error;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{Chunk, ChunkStream, Message, Role, ToolCall, ToolSchema, Usage};
 
@@ -77,9 +77,41 @@ fn inner_stream_chat(
             return;
         }
 
+        // 少数 OpenAI 兼容网关会忽略 `stream: true`，却以 200 + application/json 返回完整
+        // Chat Completions 响应。旧实现把它交给 SSE 解析器后会得到零帧，再误报“空内容”。
+        // 对明确的 JSON 响应走完整响应回退解析；真正的 SSE 仍使用下方增量路径。
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if content_type.contains("application/json") {
+            let response: Value = match resp.json().await {
+                Ok(value) => value,
+                Err(error) => {
+                    yield Err(Error::Llm(format!(
+                        "{provider_label} 返回了非 SSE JSON，但解析失败: {error}"
+                    )));
+                    return;
+                }
+            };
+            match complete_response_chunks(&response) {
+                Ok(chunks) => {
+                    for chunk in chunks {
+                        yield Ok(chunk);
+                    }
+                }
+                Err(error) => yield Err(Error::Llm(format!("{provider_label} 非流式响应无有效内容: {error}"))),
+            }
+            return;
+        }
+
         // index -> (id, name, arguments)；name/arguments 均为增量拼接。
         let mut tools: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
         let mut saw_text = false;
+        let mut saw_reasoning = false;
+        let mut finish_reason: Option<String> = None;
         // 末尾 token 用量（stream_options.include_usage 触发）：累计最新一份，流结束后单独成帧。
         let mut last_usage: Option<Usage> = None;
 
@@ -91,12 +123,25 @@ fn inner_stream_chat(
             .unwrap_or(120);
         let idle = std::time::Duration::from_secs(idle_secs);
 
+        let first_frame_secs: u64 = std::env::var("HARNESS_STREAM_FIRST_FRAME_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30)
+            .clamp(5, 120);
+        let first_frame = std::time::Duration::from_secs(first_frame_secs);
+        let mut received_frame = false;
         let mut events = Box::pin(crate::sse::sse_events(resp));
         loop {
-            let item = match tokio::time::timeout(idle, events.next()).await {
+            let wait = if received_frame { idle } else { first_frame };
+            let item = match tokio::time::timeout(wait, events.next()).await {
                 Err(_) => {
+                    let reason = if received_frame {
+                        format!("超过 {idle_secs} 秒无新数据")
+                    } else {
+                        format!("连接成功后 {first_frame_secs} 秒仍未收到首帧")
+                    };
                     yield Err(Error::Llm(format!(
-                        "{provider_label} 模型服务长时间无响应（超过 {idle_secs} 秒无新数据），已中止以避免无限等待，请重试或检查网络/模型状态"
+                        "{provider_label} 模型服务长时间无响应（{reason}），已中止以避免无限等待，请重试或检查网络/模型状态"
                     )));
                     return;
                 }
@@ -112,6 +157,7 @@ fn inner_stream_chat(
                     return;
                 }
             };
+            received_frame = true;
             if data == "[DONE]" {
                 break;
             }
@@ -122,6 +168,11 @@ fn inner_stream_chat(
             if let Some(err) = v.get("error") {
                 yield Err(Error::Llm(format!("{provider_label} 流内错误: {err}")));
                 return;
+            }
+            if let Some(reason) = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+                if !reason.is_empty() {
+                    finish_reason = Some(reason.to_string());
+                }
             }
             // 末尾用量（include_usage 触发）：取 prompt/completion/total_tokens 累计。
             if let Some(u) = v.get("usage") {
@@ -155,6 +206,7 @@ fn inner_stream_chat(
             // 不并入回复文本、不进模型上下文。
             if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
                 if !r.is_empty() {
+                    saw_reasoning = true;
                     yield Ok(Chunk {
                         reasoning: Some(r.to_string()),
                         ..Default::default()
@@ -216,11 +268,102 @@ fn inner_stream_chat(
             });
         } else if !saw_text {
             yield Ok(Chunk {
-                text: Some(format!("[{provider_label} 返回了空内容]")),
+                empty_response: true,
+                finish_reason: Some(match finish_reason {
+                    Some(reason) => reason,
+                    None if saw_reasoning => "reasoning_only".into(),
+                    None => "unknown".into(),
+                }),
                 ..Default::default()
             });
         }
     })
+}
+
+/// 解析兼容服务返回的标准（非 SSE）Chat Completions 响应。
+/// 仅作为 `Content-Type: application/json` 的回退，避免把代理行为误判为模型空响应。
+fn complete_response_chunks(response: &Value) -> std::result::Result<Vec<Chunk>, String> {
+    if let Some(error) = response.get("error") {
+        return Err(format!("上游错误: {error}"));
+    }
+    let choice = response
+        .pointer("/choices/0")
+        .ok_or_else(|| "缺少 choices[0]".to_string())?;
+    let message = choice
+        .get("message")
+        .ok_or_else(|| "缺少 choices[0].message".to_string())?;
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut chunks = Vec::new();
+    if let Some(content) = message.get("content").and_then(Value::as_str) {
+        if !content.is_empty() {
+            chunks.push(Chunk {
+                text: Some(content.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| {
+            let name = call.pointer("/function/name").and_then(Value::as_str)?;
+            if name.is_empty() {
+                return None;
+            }
+            let raw_args = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            Some(ToolCall {
+                id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or("call")
+                    .to_string(),
+                name: name.to_string(),
+                args: serde_json::from_str(raw_args).unwrap_or_else(|_| json!({})),
+            })
+        })
+        .collect::<Vec<_>>();
+    if !tool_calls.is_empty() {
+        chunks.push(Chunk {
+            tool_calls,
+            ..Default::default()
+        });
+    }
+    if chunks.is_empty() {
+        chunks.push(Chunk {
+            empty_response: true,
+            finish_reason: Some(finish_reason.unwrap_or_else(|| "unknown".into())),
+            ..Default::default()
+        });
+    }
+    if let Some(usage) = response.get("usage") {
+        if let Some(prompt_tokens) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+            chunks.push(Chunk {
+                usage: Some(Usage {
+                    prompt_tokens,
+                    completion_tokens: usage
+                        .get("completion_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    total_tokens: usage
+                        .get("total_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                }),
+                ..Default::default()
+            });
+        }
+    }
+    Ok(chunks)
 }
 
 /// 内部消息 → OpenAI 兼容 messages 数组。
@@ -235,14 +378,15 @@ pub fn messages_json(msgs: &[Message]) -> Vec<Value> {
             };
             let mut value = json!({ "role": role, "content": m.content });
             if !m.tool_calls.is_empty() {
-                value["tool_calls"] = json!(m
-                    .tool_calls
-                    .iter()
-                    .map(|t| json!({
-                        "id": t.id, "type": "function",
-                        "function": { "name": t.name, "arguments": t.args.to_string() }
-                    }))
-                    .collect::<Vec<_>>());
+                value["tool_calls"] = json!(
+                    m.tool_calls
+                        .iter()
+                        .map(|t| json!({
+                            "id": t.id, "type": "function",
+                            "function": { "name": t.name, "arguments": t.args.to_string() }
+                        }))
+                        .collect::<Vec<_>>()
+                );
             }
             if let Some(id) = &m.tool_call_id {
                 value["tool_call_id"] = json!(id);
@@ -323,17 +467,15 @@ pub fn fetch_models(base_url: String, api_key: String) -> Result<Vec<String>, St
         req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
     }
 
-    let resp = req
-        .send()
-        .map_err(|e| {
-            if e.is_timeout() {
-                "请求超时，请检查网络、代理和 API 地址".to_string()
-            } else if e.is_connect() {
-                "无法连接模型服务，请检查网络、代理、防火墙和 API 地址".to_string()
-            } else {
-                e.to_string()
-            }
-        })?;
+    let resp = req.send().map_err(|e| {
+        if e.is_timeout() {
+            "请求超时，请检查网络、代理和 API 地址".to_string()
+        } else if e.is_connect() {
+            "无法连接模型服务，请检查网络、代理、防火墙和 API 地址".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -424,14 +566,21 @@ mod tests {
     #[test]
     fn parse_models_json_extracts_ids() {
         // OpenAI / DeepSeek 标准：data[].id
-        let ids = parse_models_json(r#"{"object":"list","data":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner"}]}"#).unwrap();
-        assert_eq!(ids, vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]);
+        let ids = parse_models_json(
+            r#"{"object":"list","data":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ids,
+            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]
+        );
     }
 
     #[test]
     fn parse_models_json_falls_back_to_models_array() {
         // 部分网关：models[].id
-        let ids = parse_models_json(r#"{"models":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#).unwrap();
+        let ids =
+            parse_models_json(r#"{"models":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"gpt-4o".to_string()));
     }
@@ -441,5 +590,33 @@ mod tests {
         let ids = parse_models_json(r#"{"data":[{"id":"a"},{"id":"a"},{"id":"b"}]}"#).unwrap();
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
         assert!(parse_models_json(r#"{"data":[]}"#).is_err());
+    }
+
+    #[test]
+    fn complete_response_fallback_preserves_text_tools_usage_and_finish_reason() {
+        let response = json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "我先检查。",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "function": { "name": "fs", "arguments": "{\"op\":\"read\"}" }
+                    }]
+                }
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14 }
+        });
+        let chunks = complete_response_chunks(&response).unwrap();
+        assert_eq!(chunks[0].text.as_deref(), Some("我先检查。"));
+        assert_eq!(chunks[1].tool_calls[0].name, "fs");
+        assert_eq!(chunks[2].usage.unwrap().total_tokens, 14);
+
+        let empty = complete_response_chunks(&json!({
+            "choices": [{ "finish_reason": "length", "message": { "content": null } }]
+        }))
+        .unwrap();
+        assert!(empty[0].empty_response);
+        assert_eq!(empty[0].finish_reason.as_deref(), Some("length"));
     }
 }

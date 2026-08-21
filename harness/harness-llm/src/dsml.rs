@@ -17,7 +17,7 @@
 //! - [`strip_dsml`]：渲染防御，移除完整 DSML 块与尾部不完整标记（旧日志回放用）。
 
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{Chunk, ChunkStream, ToolCall};
 
@@ -127,6 +127,14 @@ pub fn filter_stream(inner: ChunkStream) -> ChunkStream {
                     // 用量帧（只带 usage）必须透传，否则 AIOps 计量数据被静默丢弃。
                     if chunk.usage.is_some() {
                         yield Ok(Chunk { usage: chunk.usage.clone(), ..Default::default() });
+                    }
+                    // 空响应是 Runtime 的恢复信号，不能被 DSML 文本过滤器吞掉。
+                    if chunk.empty_response {
+                        yield Ok(Chunk {
+                            empty_response: true,
+                            finish_reason: chunk.finish_reason.clone(),
+                            ..Default::default()
+                        });
                     }
                 }
                 Err(e) => yield Err(e),

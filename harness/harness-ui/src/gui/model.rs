@@ -9,6 +9,26 @@ pub(super) struct ChatMsg {
     pub(super) raw: String,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct CouncilUi {
+    pub(super) id: String,
+    pub(super) goal: String,
+    pub(super) phase: String,
+    pub(super) max_parallel: usize,
+    pub(super) started_at: Option<std::time::Instant>,
+    pub(super) tasks: std::collections::BTreeMap<String, CouncilTaskUi>,
+    pub(super) gates: Vec<harness_session::CouncilGateResult>,
+    pub(super) detail: String,
+}
+
+#[derive(Clone)]
+pub(super) struct CouncilTaskUi {
+    pub(super) spec: harness_session::CouncilTaskSpec,
+    pub(super) state: harness_session::CouncilTaskState,
+    pub(super) attempt: u32,
+    pub(super) detail: String,
+}
+
 #[derive(Clone)]
 pub(super) struct PluginUiRow {
     pub(super) id: String,

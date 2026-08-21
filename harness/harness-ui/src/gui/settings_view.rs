@@ -16,10 +16,21 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
         let page = state.settings_page.clone();
         let system_page = matches!(
             page.as_str(),
-            "模型配置" | "模型设置" | "技能管理" | "记忆系统" | "记忆" | "参数配置"
-                | "系统配置" | "系统更新" | "更新"
+            "模型配置"
+                | "模型设置"
+                | "技能管理"
+                | "记忆系统"
+                | "记忆"
+                | "参数配置"
+                | "系统配置"
+                | "系统更新"
+                | "更新"
         );
-        let display_title = if system_page { "系统管理" } else { page.as_str() };
+        let display_title = if system_page {
+            "系统管理"
+        } else {
+            page.as_str()
+        };
         let screen = ctx.screen_rect();
         // 系统管理采用紧凑、稳定的双栏尺寸；内容多少不再改变弹窗大小。
         let panel_w = if system_page {
@@ -753,6 +764,69 @@ if state.mem_tab == "code" {
                                                     ui.selectable_value(&mut state.permission, mode.to_string(), mode);
                                                 }
                                             });
+                                        ui.add_space(14.0);
+                                        field_label(ui, &pal, "上下文预算（字符）");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_context_budget)
+                                                    .desired_width(140.0)
+                                                    .hint_text("48000"),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("默认 48000 · 12000–240000")
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "超过预算时，较早对话被压缩为摘要（保留系统提示与最新回合），控制上下文长度、节省 token。留空 = 默认。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(10.0);
+                                        field_label(ui, &pal, "进展检查间隔");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_max_steps)
+                                                    .desired_width(140.0)
+                                                    .hint_text("128"),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("默认 128 · ≥1")
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "每执行这些步骤就评估一次新增证据、失败和重复调用；任务未完成时会诊断原因并自动续期，不会强制收尾。留空 = 默认。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(10.0);
+                                        field_label(ui, &pal, "最大输出 tokens");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_max_tokens)
+                                                    .desired_width(140.0)
+                                                    .hint_text("4096"),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("默认 4096 · 256–32768")
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "单次模型回复的最大输出长度；调小可节省 completion token。留空 = 默认。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
                                         ui.add_space(14.0);
                                         field_label(ui, &pal, "窗口外观");
                                         let stored_titlebar = state

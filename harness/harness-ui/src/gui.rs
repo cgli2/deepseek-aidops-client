@@ -13,7 +13,7 @@ use harness_core::ui_input::UiInputSink;
 use harness_core::update::UpdateStatus;
 use harness_core::Config;
 use harness_core::LlmControl;
-use harness_session::{SessionEvent, SessionLog, SessionMeta};
+use harness_session::{CouncilEvent, CouncilTaskState, SessionEvent, SessionLog, SessionMeta};
 
 use crate::Ui;
 
@@ -42,7 +42,7 @@ use fonts::install_macos_ui_style;
 use icons::{
     draw_brand_logo, draw_icon, draw_paperclip_icon, draw_pencil_icon, draw_trash_icon, Icon,
 };
-use model::{ChatMsg, MemItem, MemRefresh, PluginUiRow};
+use model::{ChatMsg, CouncilTaskUi, CouncilUi, MemItem, MemRefresh, PluginUiRow};
 use theme::{palette, Palette};
 use widgets::{
     accent_button, close_button, field_label, ghost_button, nav_item, plugin_row_ui,

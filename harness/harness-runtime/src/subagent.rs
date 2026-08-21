@@ -2,11 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use harness_capability::subagent::Subagent;
+use harness_core::AppContext;
 use harness_core::error::{Error, Result};
 use harness_core::types::UserInput;
-use harness_core::AppContext;
+use harness_llm::{LlmProvider, Message};
 use harness_session::{SessionEvent, SessionLog};
+use harness_tool::ToolRegistry;
 use tokio::sync::Semaphore;
 
 use crate::AgentLoop;
@@ -39,13 +42,25 @@ impl Subagent for InProcessSubagent {
         let child = self.parent.fork();
         let log = SessionLog::new();
         let _log_registration = child.provide(log.clone());
+        // 子 Agent 不得再次 delegate 形成递归专家树；共享 PlanTool 绑定的是主日志，
+        // 也必须排除，避免子任务状态污染主会话。fs/edit/shell 等实际执行工具仍保留。
+        let child_tools = self
+            .parent
+            .get::<ToolRegistry>()
+            .snapshot_excluding(&["delegate", "plan"]);
+        let _tools_registration = child.provide(child_tools);
         let input = UserInput {
             text: task.to_string(),
             attachments: vec![],
         };
         tokio::time::timeout(self.timeout, AgentLoop::new().run_turn(&child, input))
             .await
-            .map_err(|_| Error::Subagent("child timed out".into()))??;
+            .map_err(|_| {
+                Error::Subagent(format!(
+                    "child timed out after {} seconds",
+                    self.timeout.as_secs()
+                ))
+            })??;
         let answer = log
             .replay()
             .into_iter()
@@ -59,6 +74,44 @@ impl Subagent for InProcessSubagent {
         } else {
             Ok(answer)
         }
+    }
+
+    async fn spawn_brief(&self, task: &str) -> Result<String> {
+        let _permit = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| Error::Subagent("scheduler closed".into()))?;
+        let llm = self.parent.get::<dyn LlmProvider>();
+        let mut stream = llm.stream(vec![
+            Message::system(
+                "你是专家团的轻量分析专家。直接分析并给出简洁、结构化、可交接的结论；不得调用工具，不展开冗长思考。",
+            ),
+            Message::user(task),
+        ]);
+        let collect = async {
+            let mut answer = String::new();
+            while let Some(chunk) = stream.next().await {
+                if let Some(text) = chunk?.text {
+                    answer.push_str(&text);
+                }
+            }
+            if answer.trim().is_empty() {
+                Err(Error::Subagent(
+                    "brief child returned no assistant text".into(),
+                ))
+            } else {
+                Ok(answer)
+            }
+        };
+        tokio::time::timeout(self.timeout, collect)
+            .await
+            .map_err(|_| {
+                Error::Subagent(format!(
+                    "brief child timed out after {} seconds",
+                    self.timeout.as_secs()
+                ))
+            })?
     }
 }
 
@@ -80,6 +133,7 @@ mod tests {
             tool_calls: vec![],
             reasoning: None,
             usage: None,
+            ..Default::default()
         }]);
         let _b = ctx.provide(llm);
         let _c = ctx.provide(ToolRegistry::new());

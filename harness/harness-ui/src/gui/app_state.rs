@@ -7,9 +7,14 @@ pub(super) struct AppState {
     pub(super) log: Arc<SessionLog>,
     pub(super) last_event: usize,
     pub(super) messages: Vec<ChatMsg>,
+    /// 专家团结构化投影（由持久化 CouncilEvent 重建）。
+    pub(super) councils: std::collections::BTreeMap<String, CouncilUi>,
     pub(super) input: String,
     pub(super) busy: bool,
     pub(super) thinking: bool,
+    /// 团队协作模式开关。启用后发送消息时自动包裹 [HARNESS_EXPERT_COUNCIL]，
+    /// 由 CouncilOrchestrator 编排专家协作（并非主 Agent 的 delegate 拆分）。
+    pub(super) multi_agent: bool,
     /// 当前思考链累积文本（回合结束/正文到达时固化入气泡）。
     pub(super) thinking_text: String,
     /// 本回合开始时刻：状态栏展示「已用时 Ns」，长等待不再像假死。
@@ -38,7 +43,8 @@ pub(super) struct AppState {
     /// 获取模型列表的错误/状态提示。
     pub(super) models_msg: String,
     /// 获取模型列表的异步回传通道（非阻塞轮询）。
-    pub(super) models_rx: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<String>, String>>>,
+    pub(super) models_rx:
+        Option<std::sync::mpsc::Receiver<std::result::Result<Vec<String>, String>>>,
     // aidops 后端连接配置表单（对应 Config.aidops；留空则仅用本地文件记忆）
     pub(super) f_aidops_base: String,
     pub(super) f_aidops_key: String,
@@ -47,6 +53,11 @@ pub(super) struct AppState {
     pub(super) selected_profile: String,
     pub(super) attachment: String,
     pub(super) permission: String,
+    // 运行时调参（「参数配置」页）：上下文预算（字符）/ 进展检查间隔 / 最大输出 tokens。
+    // 空字符串 = 未配置（回退环境变量 / 默认值）；保存时写入 settings.db 并即时生效。
+    pub(super) f_context_budget: String,
+    pub(super) f_max_steps: String,
+    pub(super) f_max_tokens: String,
     /// 权限 chip 下拉菜单是否展开。用自定义 chip + Area 弹层代替默认 ComboBox，
     /// 保证与模型 chip 同 28px 高度 / 同圆角 / 同边框，水平基线对齐。
     pub(super) perm_menu_open: bool,
@@ -216,6 +227,9 @@ impl AppState {
             permission: settings
                 .get("permission.mode")
                 .unwrap_or_else(|| "工作区写入".into()),
+            f_context_budget: settings.get("runtime.context_budget").unwrap_or_default(),
+            f_max_steps: settings.get("runtime.max_steps").unwrap_or_default(),
+            f_max_tokens: settings.get("runtime.max_tokens").unwrap_or_default(),
             plugin_rows: Self::load_plugin_rows(settings, &host.wasm_plugins),
             modal_panel_rect: None,
             modal_open_last_frame: false,
@@ -226,9 +240,11 @@ impl AppState {
                 text: READY.into(),
                 raw: String::new(),
             }],
+            councils: std::collections::BTreeMap::new(),
             input: String::new(),
             busy: false,
             thinking: false,
+            multi_agent: settings.get("ui.multi_agent").as_deref() == Some("true"),
             thinking_text: String::new(),
             turn_started: None,
             activity: String::new(),
@@ -333,6 +349,11 @@ impl AppState {
             host,
             log,
         };
+        // 运行时调参：把持久化的参数配置载入进程级开关（agent 循环 / LLM 客户端读取）。
+        // 空字符串解析失败 → None → 回退环境变量 / 默认值。
+        harness_core::tuning::set_context_budget_chars(state.f_context_budget.parse().ok());
+        harness_core::tuning::set_max_steps(state.f_max_steps.parse().ok());
+        harness_core::tuning::set_max_output_tokens(state.f_max_tokens.parse().ok());
         state.refresh_history();
         state
     }
@@ -449,6 +470,9 @@ impl AppState {
                     }
                     self.push("plan", "计划", s.trim_end());
                 }
+                SessionEvent::Council { event, .. } => {
+                    self.apply_council_event(event);
+                }
                 SessionEvent::TurnEnd { .. } => {
                     self.finalize_thinking();
                     self.turn_started = None;
@@ -467,6 +491,112 @@ impl AppState {
         }
         self.last_event = next;
         trace(&format!("[log] +{} events processed", events.len()));
+    }
+
+    fn apply_council_event(&mut self, event: &CouncilEvent) {
+        match event {
+            CouncilEvent::Started {
+                council_id,
+                goal,
+                max_parallel,
+            } => {
+                self.councils.insert(
+                    council_id.clone(),
+                    CouncilUi {
+                        id: council_id.clone(),
+                        goal: goal.clone(),
+                        phase: "规划中".into(),
+                        max_parallel: *max_parallel,
+                        started_at: Some(std::time::Instant::now()),
+                        ..Default::default()
+                    },
+                );
+                self.record_activity("专家团正在创建任务图");
+            }
+            CouncilEvent::PlanCreated { council_id, tasks } => {
+                if let Some(run) = self.councils.get_mut(council_id) {
+                    run.phase = "执行中".into();
+                    run.tasks = tasks
+                        .iter()
+                        .map(|spec| {
+                            (
+                                spec.id.clone(),
+                                CouncilTaskUi {
+                                    spec: spec.clone(),
+                                    state: CouncilTaskState::Pending,
+                                    attempt: 0,
+                                    detail: "等待依赖".into(),
+                                },
+                            )
+                        })
+                        .collect();
+                }
+                self.record_activity("专家团任务图已创建，开始调度");
+            }
+            CouncilEvent::TaskStateChanged {
+                council_id,
+                task_id,
+                state,
+                attempt,
+                detail,
+            } => {
+                if let Some(run) = self.councils.get_mut(council_id) {
+                    if let Some(task) = run.tasks.get_mut(task_id) {
+                        task.state = state.clone();
+                        task.attempt = *attempt;
+                        task.detail = detail.clone();
+                    }
+                }
+                self.record_activity(match state {
+                    CouncilTaskState::Running => "专家正在并行执行任务",
+                    CouncilTaskState::Done => "专家任务完成，正在解锁下游",
+                    CouncilTaskState::Failed | CouncilTaskState::Blocked => "专家任务遇到阻塞",
+                    _ => "专家团正在更新任务状态",
+                });
+            }
+            CouncilEvent::ArtifactPublished {
+                council_id,
+                task_id,
+                summary,
+                ..
+            } => {
+                if let Some(task) = self
+                    .councils
+                    .get_mut(council_id)
+                    .and_then(|r| r.tasks.get_mut(task_id))
+                {
+                    task.detail = summary.clone();
+                }
+            }
+            CouncilEvent::GateEvaluated { council_id, gate } => {
+                if let Some(run) = self.councils.get_mut(council_id) {
+                    run.phase = "质量门禁".into();
+                    run.gates.push(gate.clone());
+                }
+                self.record_activity("正在评估质量门禁");
+            }
+            CouncilEvent::Blocked { council_id, reason } => {
+                if let Some(run) = self.councils.get_mut(council_id) {
+                    run.phase = "已阻塞".into();
+                    run.detail = reason.clone();
+                }
+            }
+            CouncilEvent::Completed {
+                council_id,
+                summary,
+            } => {
+                if let Some(run) = self.councils.get_mut(council_id) {
+                    run.phase = "已完成".into();
+                    run.detail = summary.clone();
+                }
+            }
+            CouncilEvent::Cancelled { council_id, reason } => {
+                if let Some(run) = self.councils.get_mut(council_id) {
+                    run.phase = "已取消".into();
+                    run.detail = reason.clone();
+                }
+            }
+        }
     }
 
     /// 记录一个用户可见的后台阶段；时间戳只存在 UI 内存，不写入会话历史。
@@ -505,20 +635,18 @@ impl AppState {
             return;
         }
         let mut t = std::mem::take(&mut self.thinking_text);
-        let total = t.chars().count();
-        if total > 500 {
-            let tail: String = t.chars().skip(total - 500).collect();
-            t = format!("…{tail}");
-        }
+        // 收拢：思考过程只保留一行简短摘要，不占对话屏。
+        // 完整思考不属于对话正文；需要时可通过摘要引导上下文，不再铺满屏幕。
+        let compact = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let summary: String = compact.chars().take(60).collect();
         if let Some(last) = self.messages.last_mut() {
             if last.kind == "thinking" {
-                last.text = t;
+                last.text = summary.clone();
                 return;
             }
         }
-        self.push("thinking", "思考", &t);
+        self.push("thinking", "思考", &summary);
     }
-
     pub(super) fn submit(&mut self) {
         let mut text = self.input.trim().to_string();
         if text.is_empty() {
@@ -533,7 +661,22 @@ impl AppState {
         let _ = settings.set("permission.mode", &self.permission);
         let _ = settings.set("llm.model", &self.f_model);
         let _ = settings.set("llm.provider", &self.f_provider);
-        if let (Some(base), Some(key)) = (settings.get("llm.base_url"), settings.get("llm.api_key"))
+        // 级联路由不写死模型名：从用户保存且勾选的模型中选取。轻量问答优先
+        // flash/mini/lite/small 候选；涉及代码、工具、多步骤的请求优先其它候选。
+        let selected = self.select_profile_for(&text);
+        if let Some(profile) = selected {
+            let _ = self.host.llm_control.configure_provider(
+                profile.provider.clone(),
+                profile.base_url.clone(),
+                profile.model.clone(),
+                profile.api_key.clone(),
+                self.effort(),
+            );
+            self.f_provider = profile.provider;
+            self.f_base = profile.base_url;
+            self.f_model = profile.model;
+        } else if let (Some(base), Some(key)) =
+            (settings.get("llm.base_url"), settings.get("llm.api_key"))
         {
             let _ = self.host.llm_control.configure_provider(
                 self.f_provider.clone(),
@@ -546,6 +689,10 @@ impl AppState {
         // 用户气泡不在此本地推入：TurnStart 事件是真相源，poll_log 会渲染，
         // 本地再推一条会导致同一问题显示两次。
         trace(&format!("[send] you: {text}"));
+        if self.multi_agent {
+            // 控制标记只存在于 UI→运行时通道；编排器在写日志前剥离。
+            text = format!("[HARNESS_EXPERT_COUNCIL]\n{text}");
+        }
         let queued = self.busy;
         self.input.clear();
         self.busy = true;
@@ -557,6 +704,76 @@ impl AppState {
         sink.submit(text);
         if queued {
             self.note = format!("新任务已加入队列（当前待执行 {} 条）", sink.queued_count());
+        }
+    }
+
+    fn select_profile_for(&self, input: &str) -> Option<crate::ModelProfile> {
+        let selected: std::collections::HashSet<String> = self
+            .host
+            .settings
+            .get("llm.selected_models")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let mut profiles: Vec<_> = self
+            .host
+            .settings
+            .model_profiles()
+            .into_iter()
+            .filter(|profile| selected.is_empty() || selected.contains(&profile.model))
+            .collect();
+        if profiles.is_empty() {
+            return None;
+        }
+        let lower = input.to_lowercase();
+        let complex = input.chars().count() > 260
+            || [
+                "代码",
+                "修复",
+                "实现",
+                "重构",
+                "文件",
+                "测试",
+                "编译",
+                "专家团",
+                "架构",
+                "安全",
+                "database",
+                "refactor",
+                "implement",
+                "debug",
+            ]
+            .iter()
+            .any(|term| lower.contains(term));
+        let lightweight = |profile: &crate::ModelProfile| {
+            let name = profile.model.to_lowercase();
+            ["flash", "mini", "lite", "small", "fast"]
+                .iter()
+                .any(|term| name.contains(term))
+        };
+        profiles.sort_by_key(|profile| profile.model.len());
+        if complex {
+            profiles
+                .into_iter()
+                .find(|profile| !lightweight(profile))
+                .or_else(|| {
+                    self.host
+                        .settings
+                        .model_profiles()
+                        .into_iter()
+                        .find(|p| p.model == self.f_model)
+                })
+        } else {
+            profiles.into_iter().find(lightweight).or_else(|| {
+                self.host
+                    .settings
+                    .model_profiles()
+                    .into_iter()
+                    .find(|p| p.model == self.f_model)
+            })
         }
     }
 
@@ -574,6 +791,7 @@ impl AppState {
             text: READY.into(),
             raw: String::new(),
         }];
+        self.councils.clear();
         self.thinking_text.clear();
         self.turn_started = None;
         self.activity.clear();
@@ -664,6 +882,7 @@ impl AppState {
             text: READY.into(),
             raw: String::new(),
         }];
+        self.councils.clear();
         self.input.clear();
         self.thinking = false;
         self.thinking_text.clear();
@@ -828,7 +1047,8 @@ impl AppState {
                             self.f_selected_models.insert(self.f_model.clone());
                         }
                     }
-                    self.models_msg = format!("共获取 {} 个模型，可勾选多个启用", self.f_models.len());
+                    self.models_msg =
+                        format!("共获取 {} 个模型，可勾选多个启用", self.f_models.len());
                 }
                 Ok(Err(e)) => {
                     self.models_rx = None;
@@ -882,7 +1102,8 @@ impl AppState {
                 let _ = settings.set_secret("llm.api_key", &key);
                 let _ = settings.set("llm.reasoning_effort", &self.f_effort);
                 // 持久化多选模型集合（逗号分隔），供下次打开恢复勾选。
-                let mut sel: Vec<&str> = self.f_selected_models.iter().map(|s| s.as_str()).collect();
+                let mut sel: Vec<&str> =
+                    self.f_selected_models.iter().map(|s| s.as_str()).collect();
                 sel.sort_unstable();
                 let _ = settings.set("llm.selected_models", &sel.join(","));
                 let name = format!("{} · {}", self.f_provider, self.f_model);

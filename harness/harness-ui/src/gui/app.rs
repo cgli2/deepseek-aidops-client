@@ -89,9 +89,11 @@ impl eframe::App for AppState {
             }
         }
         sidebar::show(self, ctx, pal, sidebar_width);
+        // 边缘分栏必须先创建；这样输入区与中央会话区共享同一块剩余矩形，
+        // 文件树/预览也能自然延伸到窗口底部。
+        workspace::show_side_panels(self, ctx, pal);
         let send_now = composer::show(self, ctx, pal);
-
-        workspace::show(self, ctx, pal);
+        workspace::show_main(self, ctx, pal);
 
         settings_view::show(self, ctx, pal);
 

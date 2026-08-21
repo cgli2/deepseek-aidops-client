@@ -54,75 +54,14 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
             if nav_item(
                 ui,
                 &pal,
-                Icon::Layers,
-                "技能管理",
-                state.sidebar_expanded,
-                true,
-                false,
-            ) {
-                state.settings_page = "技能管理".into();
-                state.settings_open = true;
-            }
-            if nav_item(
-                ui,
-                &pal,
-                Icon::Chip,
-                "模型设置",
-                state.sidebar_expanded,
-                true,
-                false,
-            ) {
-                state.settings_page = "模型设置".into();
-                state.settings_open = true;
-            }
-            if nav_item(
-                ui,
-                &pal,
                 Icon::Gear,
-                "系统配置",
+                "系统管理",
                 state.sidebar_expanded,
                 true,
                 false,
             ) {
-                state.settings_page = "系统配置".into();
+                state.settings_page = "模型配置".into();
                 state.settings_open = true;
-            }
-            if nav_item(
-                ui,
-                &pal,
-                Icon::Layers,
-                "记忆系统",
-                state.sidebar_expanded,
-                true,
-                false,
-            ) {
-                state.settings_page = "记忆".into();
-                state.settings_open = true;
-            }
-
-            if nav_item(
-                ui,
-                &pal,
-                Icon::Update,
-                "检查更新",
-                state.sidebar_expanded,
-                true,
-                false,
-            ) {
-                state.settings_page = "更新".into();
-                state.settings_open = true;
-            }
-            ui.add_space(8.0);
-            if nav_item(
-                ui,
-                &pal,
-                Icon::Menu,
-                "收起侧栏",
-                state.sidebar_expanded,
-                true,
-                false,
-            ) {
-                state.sidebar_expanded = !state.sidebar_expanded;
             }
             // ── 项目列表（Codex/Cursor 式：点击即切上下文）────────────
             if state.sidebar_expanded {

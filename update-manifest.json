@@ -1,5 +1,5 @@
 {
-  "version": "0.1.1",
+  "version": "0.2.0",
   "channel": "stable",
   "notes": "当前发布版本。发版时把 version 改为新版本号，并将 url 指向新 exe（可放 GitHub Release 资产直链）。可选填 sha256 做下载完整性校验，mandatory 为 true 时仅允许「立即升级」。",
   "url": "https://github.com/cgli2/deepseek-aidops-client/releases/download/v0.1.0/aidops-desktop.exe",

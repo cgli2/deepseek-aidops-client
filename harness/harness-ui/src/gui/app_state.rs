@@ -236,7 +236,7 @@ impl AppState {
             dark,
             sidebar_expanded: true,
             settings_open: false,
-            settings_page: "模型设置".into(),
+            settings_page: "模型配置".into(),
             note: String::new(),
             projects,
             active_project,

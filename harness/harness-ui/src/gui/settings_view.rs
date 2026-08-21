@@ -14,14 +14,27 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
     }
     if state.settings_open {
         let page = state.settings_page.clone();
+        let system_page = matches!(
+            page.as_str(),
+            "模型配置" | "模型设置" | "技能管理" | "记忆系统" | "记忆" | "参数配置"
+                | "系统配置" | "系统更新" | "更新"
+        );
+        let display_title = if system_page { "系统管理" } else { page.as_str() };
         let screen = ctx.screen_rect();
-        // 面板比例：宽度收窄、高度尽量占满视口——
-        // 短内容页（插件管理等）由 min_scrolled_height 保底，不会塌成扁条。
-        let panel_w = (screen.width() - 320.0).clamp(520.0, 660.0);
-        let scroll_h = (screen.height() - 150.0).clamp(480.0, 800.0);
+        // 系统管理采用紧凑、稳定的双栏尺寸；内容多少不再改变弹窗大小。
+        let panel_w = if system_page {
+            (screen.width() - 180.0).clamp(700.0, 860.0)
+        } else {
+            (screen.width() - 320.0).clamp(520.0, 660.0)
+        };
+        let panel_h = if system_page {
+            (screen.height() - 100.0).clamp(520.0, 680.0)
+        } else {
+            (screen.height() - 56.0).clamp(534.0, 914.0)
+        };
+        let scroll_h = panel_h - 94.0;
         // 内容变化（插件行、提示文字、滚动条）不能影响面板位置；否则居中锚点会
         // 和自动尺寸互相反馈，在 Windows 上表现为持续抖动。
-        let panel_h = scroll_h + 94.0;
         let panel_pos = egui::pos2(
             screen.left() + (screen.width() - panel_w) * 0.5,
             screen.top() + ((screen.height() - panel_h) * 0.5).max(20.0),
@@ -72,10 +85,11 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                         .inner_margin(egui::Margin::symmetric(20.0, 16.0))
                         .show(ui, |ui| {
                             ui.set_width(panel_w);
+                            ui.set_height(panel_h);
                             // 头部：标题 + 关闭按钮
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new(&page)
+                                    egui::RichText::new(display_title)
                                         .size(16.0)
                                         .strong()
                                         .color(pal.text),
@@ -94,21 +108,73 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                 .0;
                             ui.painter().rect_filled(sep, 0.0, pal.border);
                             ui.add_space(10.0);
-                            if !state.note.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(&state.note).size(12.0).color(pal.accent),
-                                );
-                                ui.add_space(6.0);
-                            }
-                            egui::ScrollArea::vertical()
+                            // 固定反馈区高度，保存提示出现/消失时弹窗与内容区均不跳动。
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 24.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    if !state.note.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&state.note)
+                                                .size(12.0)
+                                                .color(pal.accent),
+                                        );
+                                    }
+                                },
+                            );
+                            ui.horizontal(|ui| {
+                                if system_page {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(156.0);
+                                        ui.add_space(2.0);
+                                        for (target, label) in [
+                                            ("模型配置", "模型配置"),
+                                            ("技能管理", "技能管理"),
+                                            ("记忆系统", "记忆系统"),
+                                            ("参数配置", "参数配置"),
+                                            ("系统更新", "系统更新"),
+                                        ] {
+                                            let selected = match target {
+                                                "模型配置" => matches!(page.as_str(), "模型配置" | "模型设置"),
+                                                "记忆系统" => matches!(page.as_str(), "记忆系统" | "记忆"),
+                                                "参数配置" => matches!(page.as_str(), "参数配置" | "系统配置"),
+                                                "系统更新" => matches!(page.as_str(), "系统更新" | "更新"),
+                                                _ => page == target,
+                                            };
+                                            if ui
+                                                .add_sized(
+                                                    [148.0, 36.0],
+                                                    egui::SelectableLabel::new(selected, label),
+                                                )
+                                                .clicked()
+                                            {
+                                                state.settings_page = target.into();
+                                                state.note.clear();
+                                            }
+                                            ui.add_space(4.0);
+                                        }
+                                    });
+                                    ui.separator();
+                                    ui.add_space(10.0);
+                                }
+                                egui::ScrollArea::vertical()
                                 .min_scrolled_height(scroll_h)
                                 .max_height(scroll_h)
-                                .show(ui, |ui| match page.as_str() {
-                                    "模型设置" => {
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // 外层是系统管理的左右分栏；右侧内容必须重新建立纵向布局，
+                                    // 否则会继承 horizontal，把所有表单项排成一整行并撑宽弹窗。
+                                    ui.vertical(|ui| match page.as_str() {
+                                    "模型配置" | "模型设置" => {
+                                        ui.set_min_width(if system_page { panel_w - 220.0 } else { panel_w - 12.0 });
                                         field_label(ui, &pal, "已保存的配置");
                                         ui.horizontal(|ui| {
                                             egui::ComboBox::from_id_salt("profiles")
-                                                .width((panel_w - 96.0).max(260.0))
+                                                .width(
+                                                    (panel_w
+                                                        - if system_page { 304.0 } else { 96.0 })
+                                                    .max(260.0),
+                                                )
                                                 .selected_text(if state.selected_profile.is_empty() {
                                                     "选择已保存的配置…"
                                                 } else {
@@ -376,7 +442,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                             }
                                         });
                                     }
-                                    "记忆" => {
+                                    "记忆系统" | "记忆" => {
                                         // 标签切换：对话记忆 / 技能 / 知识库 / 代码图谱
                                         ui.horizontal_wrapped(|ui| {
                                             for (t, label) in [
@@ -564,7 +630,7 @@ if state.mem_tab == "code" {
                                     }
                                     }
 
-                                    "更新" => {
+                                    "系统更新" | "更新" => {
                                         state.draw_update_settings(ui, &pal);
                                     }
                                     "Git 变更" => {
@@ -718,7 +784,7 @@ if state.mem_tab == "code" {
                                             .color(pal.dim),
                                         );
                                         ui.add_space(14.0);
-                                        if accent_button(ui, &pal, "保存系统设置") {
+                                        if accent_button(ui, &pal, "保存参数配置") {
                                             state.save_preferences();
                                         }
                                         ui.add_space(10.0);
@@ -828,7 +894,9 @@ if state.mem_tab == "code" {
                                             .color(pal.dim),
                                         );
                                     }
+                                    });
                                 });
+                            });
                             // 记录面板矩形：供下一帧“点外部关闭”守卫判定。
                             state.modal_panel_rect = Some(ui.min_rect());
                         });

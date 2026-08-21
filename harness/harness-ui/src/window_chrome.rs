@@ -136,6 +136,20 @@ fn window_button(ui: &mut Ui, colors: ChromeColors, kind: u8, maximized: bool) -
 pub struct ChromeActions {
     pub toggle_theme: bool,
     pub toggle_tree: bool,
+    pub toggle_sidebar: bool,
+}
+
+/// 主导航最左侧的侧栏开关，仅绘制图标，文字通过悬停提示呈现。
+fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 6.0, colors.border.gamma_multiply(0.35));
+    }
+    let stroke = Stroke::new(1.35, if response.hovered() { colors.text } else { colors.dim });
+    let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 13.0));
+    ui.painter().rect_stroke(icon, 2.0, stroke);
+    ui.painter().vline(icon.left() + 4.5, icon.y_range(), stroke);
+    response.on_hover_text(if expanded { "收起" } else { "展开" })
 }
 
 /// 文件树开关按钮（矢量树形图标，激活态用 accent 色）。
@@ -177,6 +191,7 @@ pub fn show(
     integrated: bool,
     workspace_left: f32,
     tree_open: bool,
+    sidebar_expanded: bool,
 ) -> ChromeActions {
     let mut actions = ChromeActions::default();
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -207,8 +222,12 @@ pub fn show(
                 } else {
                     14.0
                 };
-                // 标题跟随侧栏边界对齐到工作区，同时不得侵入 macOS 交通灯安全区。
-                ui.add_space((workspace_left + 14.0).max(system_safe_space));
+                ui.add_space(system_safe_space);
+                if sidebar_button(ui, colors, sidebar_expanded).clicked() {
+                    actions.toggle_sidebar = true;
+                }
+                // 标题仍与工作区起点大致对齐，侧栏开关固定在导航最左侧。
+                ui.add_space((workspace_left - system_safe_space - 30.0).max(12.0));
                 ui.label(
                     egui::RichText::new("对话工作台")
                         .size(15.0)

@@ -68,7 +68,11 @@ impl eframe::App for AppState {
             integrated_titlebar,
             sidebar_width,
             self.tree_open,
+            self.sidebar_expanded,
         );
+        if chrome_actions.toggle_sidebar {
+            self.sidebar_expanded = !self.sidebar_expanded;
+        }
         if chrome_actions.toggle_theme {
             self.dark = !self.dark;
             let _ = self

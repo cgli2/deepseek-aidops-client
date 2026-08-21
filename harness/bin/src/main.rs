@@ -170,7 +170,11 @@ async fn main() -> harness_core::error::Result<()> {
 
 /// 从命令行参数 / 配置推导运行 Profile。
 ///
-/// 优先级：命令行 flag（`--tui`/`--gui`/`--acp`）> `default.toml` 的 `[ui].profile` > 默认 Headless。
+/// 优先级：命令行 flag（`--tui`/`--gui`/`--acp`/`--headless`）>
+/// `default.toml` 的 `[ui].profile` > 编译形态默认值。
+///
+/// 带 `gui` feature 的 Windows 发布版使用 GUI subsystem，没有控制台。因此即使用户只把
+/// exe 拷到其它目录、旁边没有 `default.toml`，也必须默认启动 GUI，不能静默落入 Headless。
 fn parse_profile(cfg: &Config) -> Profile {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--tui") {
@@ -193,7 +197,15 @@ fn parse_profile(cfg: &Config) -> Profile {
             _ => {}
         }
     }
-    Profile::Headless
+    compiled_default_profile()
+}
+
+fn compiled_default_profile() -> Profile {
+    if cfg!(feature = "gui") {
+        Profile::Gui
+    } else {
+        Profile::Headless
+    }
 }
 
 /// 若以 GUI 形态运行，先隐藏并释放可能附带的 console 窗口，确保"打开即 GUI、无 CMD 黑窗"。
@@ -213,5 +225,16 @@ fn detach_console_if_gui(is_gui: bool) {
             ShowWindow(hwnd, SW_HIDE);
             let _ = FreeConsole();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "gui")]
+    fn gui_build_defaults_to_gui_without_distribution_config() {
+        assert!(matches!(compiled_default_profile(), Profile::Gui));
     }
 }

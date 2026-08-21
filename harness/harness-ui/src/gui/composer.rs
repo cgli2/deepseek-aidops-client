@@ -108,7 +108,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         egui::Stroke::NONE,
                     ));
                     if mresp.clicked() {
-                        state.settings_page = "模型设置".into();
+                        state.settings_page = "模型配置".into();
                         state.settings_open = true;
                     }
                     mresp.on_hover_text("切换模型 / API 设置");

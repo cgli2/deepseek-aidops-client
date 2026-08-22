@@ -11,11 +11,19 @@ use crate::registry::DynTool;
 /// Bash 工具（Consumer）：仅依赖 `Arc<dyn Shell>`，不知 Provider 是谁。
 pub struct BashTool {
     shell: Arc<dyn Shell>,
+    timeout_ms: u64,
 }
 
 impl BashTool {
     pub fn new(shell: Arc<dyn Shell>) -> Arc<dyn DynTool> {
-        Arc::new(Self { shell })
+        // 命令超时可配：此前硬编码 30s 总在外层工具门禁（默认 300s）之前触发，
+        // build/test 等长命令被误杀；默认 120s，可用 HARNESS_BASH_TIMEOUT_MS 覆盖。
+        let timeout_ms: u64 = std::env::var("HARNESS_BASH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120_000)
+            .clamp(1_000, 3_600_000);
+        Arc::new(Self { shell, timeout_ms })
     }
 }
 
@@ -45,7 +53,7 @@ impl DynTool for BashTool {
             .run(ShellRequest {
                 cmd,
                 cwd: None,
-                timeout_ms: 30_000,
+                timeout_ms: self.timeout_ms,
             })
             .await?;
         let mut content = out.stdout;

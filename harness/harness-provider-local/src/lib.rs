@@ -6,10 +6,12 @@ pub mod bash;
 pub mod editor;
 pub mod fs;
 pub mod lsp;
+pub mod search;
 pub mod watcher;
 
 pub use bash::LocalBash;
 pub use editor::LocalEditor;
 pub use fs::LocalFs;
 pub use lsp::LocalLsp;
+pub use search::LocalSearch;
 pub use watcher::PollingFileWatcher;

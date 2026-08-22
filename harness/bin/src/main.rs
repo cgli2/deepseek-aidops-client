@@ -101,8 +101,11 @@ async fn main() -> harness_core::error::Result<()> {
     // Trellis（spec 驱动开发插件，可开可关）：默认关闭（enabled=false 时零副作用）。
     // 注意：必须先于 HarnessPlugin 注册——HarnessPlugin::register 组装 GUI 时需要从
     // ctx 取出 TrellisControl 注入插件管理页（同一实例，勾选启停即热生效）。
+    // 约定路径自动装配：spec_file / tasks_file 为空时基于工作区根目录推导
+    // .harness/spec.md 与 .harness/tasks.json，无需手工录入。
     let trellis_cfg = config.trellis.clone();
-    let trellis_plugin = harness_provider_trellis::TrellisPlugin::new(trellis_cfg);
+    let trellis_ws = compose::workspace_root();
+    let trellis_plugin = harness_provider_trellis::TrellisPlugin::new(trellis_cfg, &trellis_ws.to_string_lossy());
     let plugins: Vec<Arc<dyn harness_core::plugin::Plugin>> = vec![
         trellis_plugin,
         Arc::new(HarnessPlugin {

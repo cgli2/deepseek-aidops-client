@@ -11,6 +11,7 @@ use harness_llm::{LlmProvider, Message};
 use harness_session::{SessionEvent, SessionLog};
 use harness_tool::ToolRegistry;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::AgentLoop;
 
@@ -53,14 +54,28 @@ impl Subagent for InProcessSubagent {
             text: task.to_string(),
             attachments: vec![],
         };
-        tokio::time::timeout(self.timeout, AgentLoop::new().run_turn(&child, input))
-            .await
-            .map_err(|_| {
-                Error::Subagent(format!(
+        // 超时结构化取消：仅 drop future 不足以终止子回合已派生的工作；
+        // 走可取消入口，到期后通知取消并给短宽限等待其刷日志/释放资源，
+        // 避免僵尸任务继续占用 LLM 连接与槽位。
+        let cancel = CancellationToken::new();
+        let agent = AgentLoop::new();
+        let run = agent.run_turn_cancellable(&child, input, cancel.clone());
+        tokio::pin!(run);
+        let outcome = tokio::select! {
+            r = &mut run => Some(r),
+            _ = tokio::time::sleep(self.timeout) => None,
+        };
+        match outcome {
+            Some(result) => result?,
+            None => {
+                cancel.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+                return Err(Error::Subagent(format!(
                     "child timed out after {} seconds",
                     self.timeout.as_secs()
-                ))
-            })??;
+                )));
+            }
+        }
         let answer = log
             .replay()
             .into_iter()

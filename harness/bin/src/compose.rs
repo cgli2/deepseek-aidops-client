@@ -15,6 +15,7 @@ use harness_capability::git::Git;
 use harness_capability::hook::Hook;
 use harness_capability::lsp::Lsp;
 use harness_capability::memory::Memory;
+use harness_capability::search::Search;
 use harness_capability::shell::Shell;
 use harness_capability::subagent::Subagent;
 use harness_capability::watcher::FileWatcher;
@@ -32,12 +33,12 @@ use harness_llm::LlmProvider;
 use harness_provider_aidops::AidopsBackend;
 use harness_provider_git::GitCli;
 use harness_provider_hook::ShellHook;
-use harness_provider_local::{LocalBash, LocalEditor, LocalFs, LocalLsp, PollingFileWatcher};
+use harness_provider_local::{LocalBash, LocalEditor, LocalFs, LocalLsp, LocalSearch, PollingFileWatcher};
 use harness_provider_memory::FileMemory;
 use harness_provider_sandbox::Sandbox;
 use harness_provider_wasm::WasmPluginRuntime;
 use harness_session::SessionLog;
-use harness_tool::{BashTool, DelegateTool, EditTool, FsTool, MemoryTool, PlanTool, ToolRegistry};
+use harness_tool::{BashTool, DelegateTool, EditTool, FsTool, MemoryTool, PlanTool, SearchTool, ToolRegistry};
 use harness_ui::Ui;
 
 use harness_runtime::{DeterministicCompaction, InProcessSubagent, SessionController};
@@ -96,6 +97,9 @@ impl Plugin for HarnessPlugin {
         regs.push(ctx.provide(fs.clone()));
         let editor: Arc<dyn Editor> = LocalEditor::with_workspace(workspace.clone());
         regs.push(ctx.provide(editor.clone()));
+        // 内容搜索 Provider：给模型专用的有界定位通道，替代 shell findstr + 临时扫描脚本。
+        let search: Arc<dyn Search> = LocalSearch::with_workspace(workspace.clone());
+        regs.push(ctx.provide(search.clone()));
 
         // LLM Provider（feature / 环境变量决定 DeepSeek / local / replay）。
         let initial: Arc<dyn LlmProvider> = make_llm(&self.config);
@@ -134,9 +138,16 @@ impl Plugin for HarnessPlugin {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(120);
+        // 并发槽位可配：默认 5 = Council 默认并行度(3) + 2 个余量，
+        // 避免专家团满载时 delegate 排队饥饿；clamp 防误配。
+        let subagent_max_parallel: usize = std::env::var("HARNESS_SUBAGENT_MAX_PARALLEL")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5)
+            .clamp(1, 16);
         let subagent: Arc<dyn Subagent> = InProcessSubagent::new(
             ctx.clone(),
-            4,
+            subagent_max_parallel,
             std::time::Duration::from_secs(subagent_timeout),
         );
         regs.push(ctx.provide(subagent.clone()));
@@ -147,6 +158,7 @@ impl Plugin for HarnessPlugin {
         tools.register(BashTool::new(shell.clone()));
         tools.register(FsTool::new(fs.clone()));
         tools.register(EditTool::new(editor.clone()));
+        tools.register(SearchTool::new(search.clone()));
         tools.register(PlanTool::new(log.clone()));
         tools.register(DelegateTool::new(subagent.clone()));
         regs.push(ctx.provide(tools.clone()));
@@ -425,7 +437,7 @@ fn make_ui(
     Arc::new(ConsoleUi)
 }
 
-fn workspace_root() -> PathBuf {
+pub fn workspace_root() -> PathBuf {
     if let Some(path) = std::env::var_os("HARNESS_WORKSPACE").map(PathBuf::from) {
         return path;
     }

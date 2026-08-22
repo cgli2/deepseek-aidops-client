@@ -1,4 +1,4 @@
-//! Trellis Provider：spec 驱动开发插件（可开可关）。
+﻿//! Trellis Provider：spec 驱动开发插件（可开可关）。
 //!
 //! 核心思想（源自 mindfold-ai/Trellis）：把"项目规格"当作第一类对象，
 //! 以 *任务状态机*（新任务 / 进行中 / 完成）驱动开发循环。
@@ -86,6 +86,21 @@ impl TrellisControl {
     }
 }
 
+/// 约定路径自动推导：用户未显式配置（空字符串）时，基于工作区根目录拼接约定相对路径。
+///
+/// 约定：
+/// - 规格文件 → `<workspace_root>/.harness/spec.md`
+/// - 任务文件 → `<workspace_root>/.harness/tasks.json`
+///
+/// 用户显式配置的路径（绝对或相对）原样保留，不做转换。
+fn resolve_default(configured: &str, workspace_root: &str, filename: &str) -> String {
+    if !configured.trim().is_empty() {
+        return configured.to_string();
+    }
+    let root = std::path::Path::new(workspace_root);
+    root.join(".harness").join(filename).to_string_lossy().into_owned()
+}
+
 /// Trellis 插件主体：持有配置与共享控制句柄，注册 PreStep 瀑布监听。
 pub struct TrellisPlugin {
     config: TrellisConfig,
@@ -93,12 +108,16 @@ pub struct TrellisPlugin {
 }
 
 impl TrellisPlugin {
-    pub fn new(config: TrellisConfig) -> Arc<Self> {
+    pub fn new(config: TrellisConfig, workspace_root: &str) -> Arc<Self> {
+        // 约定路径自动装配：spec_file / tasks_file 为空时，基于工作区根目录推导
+        // .harness/spec.md 与 .harness/tasks.json，无需手工录入。
+        let spec_file = resolve_default(&config.spec_file, workspace_root, "spec.md");
+        let tasks_file = resolve_default(&config.tasks_file, workspace_root, "tasks.json");
         Arc::new(Self {
             control: Arc::new(TrellisControl::new(
                 config.enabled,
-                config.spec_file.clone(),
-                config.tasks_file.clone(),
+                spec_file,
+                tasks_file,
             )),
             config,
         })

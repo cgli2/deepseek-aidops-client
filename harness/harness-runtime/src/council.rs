@@ -18,6 +18,12 @@ use uuid::Uuid;
 
 pub const COUNCIL_PREFIX: &str = "[HARNESS_EXPERT_COUNCIL]\n";
 
+/// 并行调度通道统一 future 类型：（任务 id，执行通道，结果）。
+/// 本地确定性校验与专家任务共用一条 FuturesUnordered，须统一为 trait object。
+type CouncilTaskFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (String, &'static str, Result<String>)> + Send>,
+>;
+
 #[derive(Clone)]
 struct TaskRuntime {
     spec: CouncilTaskSpec,
@@ -113,10 +119,13 @@ impl CouncilOrchestrator {
                 )
             })
             .collect();
-        let mut running: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut running: FuturesUnordered<CouncilTaskFuture> = FuturesUnordered::new();
         let mut running_ids = HashSet::new();
         let mut running_started: HashMap<String, Instant> = HashMap::new();
         let mut hard_failure: Option<String> = None;
+        // 本地通道（含异步完成的本地校验）推进了 DAG：跨循环体保持，
+        // 确保空 running 时先重算依赖图而不是误报 Blocked。
+        let mut made_local_progress = false;
 
         loop {
             if cancellation.is_cancelled() {
@@ -161,7 +170,6 @@ impl CouncilOrchestrator {
                 .map(|task| task.spec.id.clone())
                 .collect();
             candidates.sort();
-            let mut made_local_progress = false;
             for id in candidates {
                 if running.len() >= self.max_parallel {
                     break;
@@ -236,54 +244,29 @@ impl CouncilOrchestrator {
                             task,
                             "正在执行本地确定性校验 · 无 Token 消耗",
                         );
-                        let started = Instant::now();
-                        match run_local_validation(ctx).await {
-                            Some(Ok(summary)) => {
-                                let task = tasks.get_mut(&id).unwrap();
-                                task.state = CouncilTaskState::Done;
-                                task.summary = summary;
-                                task_event(
-                                    &log,
-                                    &council_id,
-                                    task,
-                                    &format!(
-                                        "已通过测试 · 本地命令通道 · {}ms",
-                                        started.elapsed().as_millis()
-                                    ),
-                                );
-                                emit(
-                                    &log,
-                                    CouncilEvent::ArtifactPublished {
-                                        council_id: council_id.clone(),
-                                        task_id: id.clone(),
-                                        summary: task.summary.clone(),
-                                        evidence: vec!["本地命令退出码为 0".into()],
-                                    },
-                                );
-                                made_local_progress = true;
-                                continue;
-                            }
-                            Some(Err(detail)) => {
-                                let task = tasks.get_mut(&id).unwrap();
-                                task.state = CouncilTaskState::Ready;
-                                task_event(
-                                    &log,
-                                    &council_id,
-                                    task,
-                                    &format!("本地校验未通过，升级测试专家诊断 · {detail}"),
-                                );
-                            }
-                            None => {
-                                let task = tasks.get_mut(&id).unwrap();
-                                task.state = CouncilTaskState::Ready;
-                                task_event(
-                                    &log,
-                                    &council_id,
-                                    task,
-                                    "未发现可用本地校验能力，升级测试专家",
-                                );
-                            }
-                        }
+                        // 本地校验并入并行调度通道：此前内联 await 会阻塞调度循环
+                        // （cargo check 最长 120s），期间其它就绪节点无法启动。
+                        let ctx = ctx.clone();
+                        let task_id = id.clone();
+                        running_ids.insert(id);
+                        running_started.insert(task_id.clone(), Instant::now());
+                        running.push(Box::pin(async move {
+                            let started = Instant::now();
+                            let result = match run_local_validation(&ctx).await {
+                                Some(Ok(summary)) => Ok(format!(
+                                    "GATE: PASS\n{summary}\n[本地校验用时 {}ms]",
+                                    started.elapsed().as_millis()
+                                )),
+                                Some(Err(detail)) => Err(Error::Subagent(format!(
+                                    "本地校验未通过：{detail}"
+                                ))),
+                                None => Err(Error::Subagent(
+                                    "未发现可用本地校验能力".into(),
+                                )),
+                            };
+                            (task_id, "本地确定性校验", result)
+                        }));
+                        continue;
                     }
                 }
                 let upstream = tasks
@@ -318,7 +301,7 @@ impl CouncilOrchestrator {
                 let sub = subagent.clone();
                 running_ids.insert(id);
                 running_started.insert(task_id.clone(), Instant::now());
-                running.push(async move {
+                running.push(Box::pin(async move {
                     let (channel, result) =
                         match tokio::time::timeout(Duration::from_secs(task_timeout_secs), async {
                             if brief {
@@ -352,13 +335,14 @@ impl CouncilOrchestrator {
                             ),
                         };
                     (task_id, channel, result)
-                });
+                }));
             }
 
             if running.is_empty() {
                 // 本地通道刚完成节点后，依赖它的下一层尚未出现在本轮 candidates 中；
                 // 立即重算 DAG，不能把正常推进误报成“无可运行节点”。
                 if made_local_progress {
+                    made_local_progress = false;
                     continue;
                 }
                 if tasks.values().all(|t| t.state == CouncilTaskState::Done) {
@@ -405,6 +389,33 @@ impl CouncilOrchestrator {
                     running_ids.remove(&id);
                     let elapsed_ms = running_started.remove(&id).map(|at| at.elapsed().as_millis()).unwrap_or(0);
                     let task = tasks.get_mut(&id).unwrap();
+                    if channel == "本地确定性校验" {
+                        // 本地通道结果不走 LLM 验收/重试链：成功即交付，
+                        // 失败回 Ready 升级测试专家（local_checked 已置位，不会再进本地分支）。
+                        match result {
+                            Ok(summary) => {
+                                task.state = CouncilTaskState::Done;
+                                task.summary = summary;
+                                task_event(&log, &council_id, task, &format!("已通过测试 · 本地命令通道 · {elapsed_ms}ms"));
+                                emit(&log, CouncilEvent::ArtifactPublished {
+                                    council_id: council_id.clone(), task_id: id,
+                                    summary: task.summary.clone(), evidence: vec!["本地命令退出码为 0".into()],
+                                });
+                                made_local_progress = true;
+                            }
+                            Err(detail) => {
+                                task.state = CouncilTaskState::Ready;
+                                let note = if detail.to_string().contains("未发现可用本地校验能力") {
+                                    "未发现可用本地校验能力，升级测试专家".to_string()
+                                } else {
+                                    format!("本地校验未通过，升级测试专家诊断 · {detail}")
+                                };
+                                task_event(&log, &council_id, task, &note);
+                                made_local_progress = true;
+                            }
+                        }
+                        continue;
+                    }
                     match result {
                         Ok(answer) if acceptable_result(&answer) => {
                             task.state = CouncilTaskState::Done;

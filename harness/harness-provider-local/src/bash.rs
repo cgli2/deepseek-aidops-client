@@ -1,5 +1,5 @@
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -14,6 +14,9 @@ use harness_provider_sandbox::Sandbox;
 pub struct LocalBash {
     sandbox: Arc<dyn Sandbox>,
     ws: Arc<Workspace>,
+    /// 工作区根 canonicalize 缓存（原始路径 → 规范化结果）：最常见 cwd 直接命中，
+    /// 避免每条命令两次文件系统往返；项目切换（root 变化）时自动失效。
+    root_cache: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
 }
 
 impl LocalBash {
@@ -23,7 +26,11 @@ impl LocalBash {
 
     /// 共享外部 Workspace（GUI 项目切换可动态换根）。
     pub fn with_workspace(sandbox: Arc<dyn Sandbox>, ws: Arc<Workspace>) -> Arc<dyn Shell> {
-        Arc::new(Self { sandbox, ws })
+        Arc::new(Self {
+            sandbox,
+            ws,
+            root_cache: Mutex::new(None),
+        })
     }
 }
 
@@ -40,6 +47,17 @@ impl Shell for LocalBash {
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：GUI 调用命令时不弹 CMD 窗口。
         let ws_root = self.ws.root();
+        let root = {
+            let mut cache = self.root_cache.lock().unwrap();
+            match cache.as_ref() {
+                Some((orig, canon)) if orig == &ws_root => canon.clone(),
+                _ => {
+                    let canon = ws_root.canonicalize().unwrap_or_else(|_| ws_root.clone());
+                    *cache = Some((ws_root.clone(), canon.clone()));
+                    canon
+                }
+            }
+        };
         let cwd = req
             .cwd
             .as_ref()
@@ -51,8 +69,12 @@ impl Shell for LocalBash {
                 }
             })
             .unwrap_or_else(|| ws_root.clone());
-        let cwd = cwd.canonicalize()?;
-        let root = ws_root.canonicalize().unwrap_or(ws_root);
+        // 未指定 cwd 时直接复用根的规范化结果，省一次文件系统往返。
+        let cwd = if cwd == ws_root {
+            root.clone()
+        } else {
+            cwd.canonicalize()?
+        };
         if !cwd.starts_with(&root) {
             return Err(harness_core::error::Error::SandboxDenied(format!(
                 "cwd is outside workspace: {}",

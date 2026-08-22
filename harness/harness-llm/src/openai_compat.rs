@@ -14,6 +14,38 @@ use serde_json::{Value, json};
 
 use crate::{Chunk, ChunkStream, Message, Role, ToolCall, ToolSchema, Usage};
 
+/// 进程级共享异步 HTTP client：连接池与 TLS 会话跨请求复用。
+/// 此前每次流式调用都 `Client::builder().build()`，每个回合重付一次
+/// TLS 握手 + 连接建立（首 token 延迟的主要网络开销之一）。
+pub(crate) fn shared_client() -> Result<&'static reqwest::Client, Error> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    let entry = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("reqwest init: {e}"))
+    });
+    match entry {
+        Ok(c) => Ok(c),
+        Err(e) => Err(Error::Llm(e.clone())),
+    }
+}
+
+/// 进程级共享 blocking client（模型列表等低频管理请求用）。
+fn shared_blocking_client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+        std::sync::OnceLock::new();
+    let entry = CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("reqwest init: {e}"))
+    });
+    entry.as_ref().map_err(|e| e.clone())
+}
+
 /// 发起一次 OpenAI 兼容 SSE 流式调用并返回 Chunk 流。
 ///
 /// `api_key` 为空时不携带 Authorization（llama.cpp 本地服务不需要鉴权）。
@@ -36,13 +68,10 @@ fn inner_stream_chat(
     body: Value,
 ) -> ChunkStream {
     Box::pin(stream! {
-        let client = match reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
+        let client = match shared_client() {
             Ok(c) => c,
             Err(e) => {
-                yield Err(Error::Llm(format!("reqwest init: {e}")));
+                yield Err(e);
                 return;
             }
         };
@@ -418,22 +447,36 @@ pub fn coding_tools() -> Vec<ToolSchema> {
     vec![
         ToolSchema {
             name: "fs".into(),
-            description: "Read, write, or list files inside the workspace".into(),
-            json_schema: json!({"type":"object","properties":{"op":{"type":"string","enum":["read","write","list"]},"path":{"type":"string"},"content":{"type":"string"}},"required":["op","path"]}),
+            // 明确告知相对路径以工作区根解析：避免模型在每条命令/路径里
+            // 重复拼完整绝对路径（取证：单回合 411 条命令携带 cd 全路径前缀）。
+            // 取证（UI 任务）：大文件整读会被上下文压缩截断，模型看不到目标
+            // 区域转而自造截取脚本；提供 start_line/end_line 区间读并引导按需读取。
+            description: "Read, write, or list files inside the workspace; relative paths resolve against the workspace root. For reads, large files return a head window with total line count: use start_line/end_line (1-based, inclusive) to fetch the exact range you need instead of writing temporary extraction scripts".into(),
+            json_schema: json!({"type":"object","properties":{"op":{"type":"string","enum":["read","write","list"]},"path":{"type":"string","description":"relative to workspace root (preferred) or absolute"},"content":{"type":"string"},"start_line":{"type":"integer","description":"read only: first line to return (1-based)"},"end_line":{"type":"integer","description":"read only: last line to return (inclusive)"}},"required":["op","path"]}),
         },
         ToolSchema {
             name: "edit".into(),
-            description: "Replace an exact text fragment in a workspace file".into(),
-            json_schema: json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}),
+            description: "Replace an exact text fragment in a workspace file; relative paths resolve against the workspace root".into(),
+            json_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"relative to workspace root (preferred) or absolute"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}),
         },
         ToolSchema {
             name: "shell".into(),
+            // 取证：模型因不确定工作目录，每条命令都重复拼 `cd /d <全路径> &&`，
+            // 既拉长命令又让每条命令签名唯一、绕过重复守卫。明确告知
+            // 命令已在工作区根执行、无需 cd，相对路径直接可用。
             description: if cfg!(windows) {
-                "Run a Windows cmd.exe command in the workspace".into()
+                "Run a Windows cmd.exe command. It already starts in the workspace root; never prepend 'cd' to the workspace path, use relative paths directly".into()
             } else {
-                "Run a POSIX shell command in the workspace".into()
+                "Run a POSIX shell command. It already starts in the workspace root; never prepend 'cd' to the workspace path, use relative paths directly".into()
             },
-            json_schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            json_schema: json!({"type":"object","properties":{"command":{"type":"string","description":"command body only; do not cd into the workspace first"}},"required":["command"]}),
+        },
+        ToolSchema {
+            name: "search".into(),
+            // 定位代码的首选工具：一次调用返回「文件:行号:内容」的有界结果。
+            // 明确禁止用临时脚本/全仓命令替代，切断“自造扫描脚本”的失控模式。
+            description: "Case-insensitive substring search across workspace files, returns bounded path:line:text hits. ALWAYS use this to locate code instead of findstr/dir/grep shell commands or writing temporary scan scripts".into(),
+            json_schema: json!({"type":"object","properties":{"pattern":{"type":"string","description":"substring to find (case-insensitive)"},"dir":{"type":"string","description":"optional relative subdirectory to narrow the scan"},"max_results":{"type":"integer","description":"max hits to return (default 60)"}},"required":["pattern"]}),
         },
         ToolSchema {
             name: "plan".into(),
@@ -454,11 +497,7 @@ pub fn coding_tools() -> Vec<ToolSchema> {
 /// 模型列表放在 `models[].id` 或 `data[].name`，这里做兼容解析。失败返回
 /// 友好错误（网络/认证/HTTP 状态均给出可读原因）。
 pub fn fetch_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("reqwest init: {e}"))?;
+    let client = shared_blocking_client()?;
 
     let mut req = client
         .get(format!("{}/models", base_url.trim_end_matches('/')))
@@ -558,7 +597,7 @@ mod tests {
     #[test]
     fn tools_json_wraps_function_schema() {
         let v = tools_json(&coding_tools());
-        assert_eq!(v.len(), 5);
+        assert_eq!(v.len(), 6);
         assert_eq!(v[0]["type"], "function");
         assert_eq!(v[0]["function"]["name"], "fs");
     }

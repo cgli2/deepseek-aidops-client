@@ -73,12 +73,14 @@ impl TaskContract {
                 constraints.push(format!("遵守用户包含“{marker}”的范围约束"));
             }
         }
-        let risk = if ["删除", "生产", "部署", "权限", "凭据", "数据库"]
+        // 风险分级（取证修正）：“删除”常作为功能描述出现（如“导入、删除、启用、
+        // 禁用”），单独出现不应升级为 High；High 仅限真正危险的变更面。
+        let risk = if ["生产", "部署", "权限", "凭据", "数据库"]
             .iter()
             .any(|word| input.contains(word))
         {
             RiskLevel::High
-        } else if ["修改", "修复", "重构", "实现", "安装"]
+        } else if ["删除", "修改", "修复", "重构", "实现", "安装", "改造", "调整"]
             .iter()
             .any(|word| input.contains(word))
         {
@@ -124,7 +126,7 @@ impl TaskContract {
             self.constraints.join("；")
         };
         format!(
-            "[本回合执行契约]\n目标：{}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期，不是任务终止线。每次调用都必须直接推进目标或降低阻塞验收的不确定性；已有充分证据时停止搜索，验收未完成时不得仅因达到检查点而收尾。",
+            "[本回合执行契约]\n目标：{}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期（最多续期 {} 次，用尽后必须基于现有证据收尾）。执行准则：最小路径优先——先直接定位与目标直接相关的最小文件集，禁止全仓库泛扫与重复读取已读文件；探索类调用不超过总调用三成，其余应为直接产出交付的写操作与验证；同一工具调用未带来新信息时立即换路或收尾；交付目标达成即停止，不做重复确认与打磨。",
             self.objective,
             strategy,
             self.acceptance_criteria
@@ -135,6 +137,7 @@ impl TaskContract {
             constraints,
             budget.max_steps,
             budget.max_tool_calls,
+            budget.max_renewals,
         )
     }
 }
@@ -162,6 +165,9 @@ pub struct ExecutionState {
     pub tool_calls: usize,
     pub successful_tool_results: usize,
     pub failed_tool_results: usize,
+    /// 成功的写入/编辑次数：区分“正在产出交付”与“空转探索”的关键信号，
+    /// 供续期耗尽后的交付延展判定使用。
+    pub write_operations: usize,
     pub evidence: HashMap<String, Evidence>,
     pub decisions: Vec<DecisionRecord>,
     pub satisfied_criteria: HashSet<String>,
@@ -169,6 +175,7 @@ pub struct ExecutionState {
     checkpoint_tool_calls: usize,
     checkpoint_evidence: usize,
     checkpoint_successes: usize,
+    checkpoint_writes: usize,
 }
 
 impl ExecutionState {
@@ -181,6 +188,7 @@ impl ExecutionState {
             tool_calls: 0,
             successful_tool_results: 0,
             failed_tool_results: 0,
+            write_operations: 0,
             evidence: HashMap::new(),
             decisions: Vec::new(),
             satisfied_criteria: HashSet::new(),
@@ -188,12 +196,19 @@ impl ExecutionState {
             checkpoint_tool_calls: 0,
             checkpoint_evidence: 0,
             checkpoint_successes: 0,
+            checkpoint_writes: 0,
         }
     }
 
     pub fn record_tool_result(&mut self, proposal: &ActionProposal, ok: bool, summary: &str) {
         if ok {
             self.successful_tool_results += 1;
+            // 归一化签名里 edit 工具以 "edit:" 开头；fs 写入的 JSON 参数含 "op":"write"。
+            if proposal.signature.starts_with("edit:")
+                || proposal.signature.contains("\"op\":\"write\"")
+            {
+                self.write_operations += 1;
+            }
         } else {
             self.failed_tool_results += 1;
         }
@@ -219,7 +234,7 @@ pub struct ActionProposal {
 impl ActionProposal {
     pub fn from_tool_call(call: &ToolCall, contract: &TaskContract) -> Self {
         Self {
-            signature: format!("{}:{}", call.name, call.args),
+            signature: normalized_signature(call),
             question: format!("执行工具 {} 以推进当前任务", call.name),
             supports: contract
                 .acceptance_criteria
@@ -231,12 +246,71 @@ impl ActionProposal {
     }
 }
 
+/// 归一化工具调用签名，让重复守卫按「语义相同」而非「字面相同」判定：
+/// - shell：剥离开头的 `cd [/d] <路径> &&` 前缀（取证：94% 命令携带全路径 cd，
+///   导致每条命令签名字面唯一、守卫完全失效）；
+/// - fs/edit：路径分隔符统一为正斜杠，绝对/相对写法的同一文件归为同一签名。
+fn normalized_signature(call: &ToolCall) -> String {
+    let mut args = call.args.clone();
+    if call.name == "shell" {
+        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+            let stripped = strip_cd_prefix(cmd);
+            if stripped != cmd {
+                if let Some(obj) = args.as_object_mut() {
+                    obj.insert("command".into(), serde_json::Value::String(stripped));
+                }
+            }
+        }
+    } else if call.name == "fs" || call.name == "edit" {
+        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+            let normalized = path.replace('\\', "/");
+            if normalized != path {
+                if let Some(obj) = args.as_object_mut() {
+                    obj.insert("path".into(), serde_json::Value::String(normalized));
+                }
+            }
+        }
+    }
+    format!("{}:{}", call.name, args)
+}
+
+/// 反复剥离开头的 `cd [/d] <任意路径>` 段（`&&` / `&` / `;` 分隔）。
+/// 若整条命令只有 cd，保留最后一段以免误删全部语义。
+fn strip_cd_prefix(cmd: &str) -> String {
+    let mut rest = cmd.trim().to_string();
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        if !lower.starts_with("cd ") && !lower.starts_with("cd/") {
+            break;
+        }
+        // 找第一个命令分隔符；没有分隔符说明整条就是 cd，不能删。
+        let split_at = ["&&", "&", ";"]
+            .iter()
+            .filter_map(|sep| rest.find(sep))
+            .min();
+        let Some(at) = split_at else { break };
+        let sep_len = if rest[at..].starts_with("&&") { 2 } else { 1 };
+        rest = rest[at + sep_len..].trim().to_string();
+        if rest.is_empty() {
+            return cmd.trim().to_string();
+        }
+    }
+    rest
+}
+
 #[derive(Debug, Clone)]
 pub struct Budget {
     pub max_steps: usize,
     pub max_tool_calls: usize,
     pub max_duration: Duration,
     pub convergence_ratio: f32,
+    /// 允许的自动续期次数上限：此前无限续期会让单回合步数无上限增长
+    /// （实测一个简单任务跑出 1000+ 步）；用尽后必须强制收尾。
+    pub max_renewals: u32,
+    pub renewals_used: u32,
+    /// 交付延展已用次数：常规续期耗尽后，若最近窗口有实际写入产出，
+    /// 额外按窗口延展，避免“刚进入编辑阶段就被截断、要用户手动接续”。
+    pub delivery_extensions: u32,
     step_window: usize,
     tool_window: usize,
     duration_window: Duration,
@@ -278,6 +352,13 @@ impl BudgetManager {
             max_tool_calls,
             max_duration,
             convergence_ratio: 0.75,
+            max_renewals: std::env::var("HARNESS_MAX_RENEWALS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2)
+                .clamp(0, 6),
+            renewals_used: 0,
+            delivery_extensions: 0,
             step_window: max_steps,
             tool_window: max_tool_calls,
             duration_window: max_duration,
@@ -309,7 +390,9 @@ impl BudgetManager {
 
     /// 到达软预算后评估这一阶段是否产生了新证据，并续发下一阶段预算。
     /// 停滞不会被误判为完成，而会得到更强的换路诊断提示。
-    pub fn diagnose_and_renew(state: &mut ExecutionState, budget: &mut Budget) -> String {
+    /// 续期次数超过 `max_renewals` 后返回 `None`：调用方必须强制收尾，
+    /// 否则预算会被无限续发（旧实现单回合可跑到数百步）。
+    pub fn diagnose_and_renew(state: &mut ExecutionState, budget: &mut Budget) -> Option<String> {
         let step_delta = state.steps.saturating_sub(state.checkpoint_steps);
         let call_delta = state.tool_calls.saturating_sub(state.checkpoint_tool_calls);
         let evidence_delta = state
@@ -319,6 +402,9 @@ impl BudgetManager {
         let success_delta = state
             .successful_tool_results
             .saturating_sub(state.checkpoint_successes);
+        let write_delta = state
+            .write_operations
+            .saturating_sub(state.checkpoint_writes);
         let repeated_or_low_value = call_delta.saturating_sub(evidence_delta);
         let stagnant = call_delta > 0 && (evidence_delta == 0 || success_delta == 0);
 
@@ -326,20 +412,71 @@ impl BudgetManager {
         state.checkpoint_tool_calls = state.tool_calls;
         state.checkpoint_evidence = state.evidence.len();
         state.checkpoint_successes = state.successful_tool_results;
+        state.checkpoint_writes = state.write_operations;
+
+        if budget.renewals_used >= budget.max_renewals {
+            // 交付延展：常规续期已用尽，但最近窗口有真实写入/编辑产出，说明任务
+            // 正在交付阶段（如前期探索耗尽预算、刚进入编辑），自动延展一个窗口，
+            // 不把半成品丢给用户手动接续。无写入的空转仍返回 None 走收尾。
+            if write_delta > 0 && budget.delivery_extensions < 2 {
+                budget.delivery_extensions += 1;
+                budget.max_steps = budget.max_steps.saturating_add(budget.step_window);
+                budget.max_tool_calls = budget.max_tool_calls.saturating_add(budget.tool_window);
+                budget.max_duration = budget.max_duration.saturating_add(budget.duration_window);
+                let left = 2 - budget.delivery_extensions;
+                return Some(format!(
+                    "[交付延展] 最近窗口检测到 {write_delta} 次成功的代码修改，任务正处于活跃交付阶段：预算已延展（剩余 {left} 次交付延展）。不要开启新的探索与扫描，尽快完成剩余修改与一次性验证，然后输出总结交付。{}",
+                    evidence_digest(state)
+                ));
+            }
+            return None;
+        }
+        budget.renewals_used += 1;
         budget.max_steps = budget.max_steps.saturating_add(budget.step_window);
         budget.max_tool_calls = budget.max_tool_calls.saturating_add(budget.tool_window);
         budget.max_duration = budget.max_duration.saturating_add(budget.duration_window);
+        let remaining = budget.max_renewals - budget.renewals_used;
 
-        if stagnant {
+        Some(if stagnant {
             format!(
-                "[执行检查点] 最近 {step_delta} 步、{call_delta} 次工具调用仅产生 {evidence_delta} 条新证据、{success_delta} 次成功结果，约 {repeated_or_low_value} 次调用没有增加独立证据。任务尚未完成，禁止直接收尾。先明确当前阻塞原因，放弃重复路径，更新计划，并选择最能推进未满足验收条件的下一步；预算已自动续期。"
+                "[执行检查点] 最近 {step_delta} 步、{call_delta} 次工具调用仅产生 {evidence_delta} 条新证据、{success_delta} 次成功结果，约 {repeated_or_low_value} 次调用没有增加独立证据。任务尚未完成，先明确阻塞原因、放弃重复路径，选择最能推进未满足验收条件的下一步；预算已续期（剩余 {remaining} 次，用尽后必须基于现有证据收尾交付）。{}",
+                evidence_digest(state)
             )
         } else {
             format!(
-                "[执行检查点] 最近 {step_delta} 步、{call_delta} 次工具调用产生 {evidence_delta} 条新证据、{success_delta} 次成功结果。任务尚未完成时继续推进，但只围绕未满足的验收条件；预算已自动续期。"
+                "[执行检查点] 最近 {step_delta} 步、{call_delta} 次工具调用产生 {evidence_delta} 条新证据、{success_delta} 次成功结果。任务尚未完成时继续推进，但只围绕未满足的验收条件；预算已续期（剩余 {remaining} 次，用尽后必须基于现有证据收尾交付）。{}",
+                evidence_digest(state)
             )
-        }
+        })
     }
+
+    /// 续期耗尽后的最终收尾窗口：给足步骤完成汇总交付，不再扩张。
+    pub fn arm_final_window(state: &ExecutionState, budget: &mut Budget) {
+        budget.max_steps = state.steps + 6;
+        budget.max_tool_calls = state.tool_calls + 4;
+        budget.max_duration = budget.max_duration + Duration::from_secs(300);
+    }
+}
+
+/// 把已获得的证据要点注入检查点提示：上下文被压缩后模型容易“忘记”自己
+/// 查过什么、重复读同一文件（取证：单文件最高被读 18 次）；把已有结论
+/// 直接放到提示里，减少重复探索、帮助聚焦未满足的验收条件。
+fn evidence_digest(state: &ExecutionState) -> String {
+    let mut items: Vec<String> = state
+        .evidence
+        .values()
+        .filter(|e| !e.summary.trim().is_empty())
+        .take(5)
+        .map(|e| {
+            let compact: String = e.summary.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("- {}", compact.chars().take(120).collect::<String>())
+        })
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    items.sort();
+    format!("\n[已有证据要点（不要重复获取）]\n{}", items.join("\n"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,7 +554,7 @@ impl DomainPolicy for GeneralDomainPolicy {
             .any(|word| text.contains(word))
         {
             StrategyKind::Verification
-        } else if ["修改", "修复", "重构", "更新", "改进", "实现"]
+        } else if ["修改", "修复", "重构", "更新", "改进", "实现", "改造", "调整", "拆分", "迁移"]
             .iter()
             .any(|word| text.contains(word))
         {
@@ -462,6 +599,56 @@ mod tests {
         assert_eq!(contract.acceptance_criteria[0].id, "item-1");
         assert_eq!(contract.acceptance_criteria[1].description, "增加预算");
         assert_eq!(contract.acceptance_criteria[2].description, "补充测试");
+    }
+
+    #[test]
+    fn classifies_ui_rework_as_transformative_not_direct() {
+        // 取证：纯 UI 改造任务（“界面排版重新改造一下，分成两个tab页”）旧实现
+        // 未命中任何关键词被归为 Direct（12 步），预算与任务规模不匹配。
+        let policy = GeneralDomainPolicy;
+        assert_eq!(
+            policy.select_strategy(&TaskContract::from_input(
+                "插件管理，界面排版重新改造一下，分成两个tab页"
+            )),
+            StrategyKind::Transformative
+        );
+    }
+
+    #[test]
+    fn feature_list_delete_does_not_escalate_risk_to_high() {
+        // 取证：任务里“导入、删除、启用、禁用”是功能枚举，不应被判为高风险；
+        // 真正危险面（生产/数据库）仍保持 High。
+        let ui = TaskContract::from_input("自定义插件可以导入、删除、启用、禁用");
+        assert_eq!(ui.risk, RiskLevel::Medium);
+        let danger = TaskContract::from_input("删除生产数据库配置");
+        assert_eq!(danger.risk, RiskLevel::High);
+    }
+
+    #[test]
+    fn delivery_extension_granted_only_when_writes_progress() {
+        let contract = TaskContract::from_input("修改界面布局");
+        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        budget.renewals_used = budget.max_renewals; // 常规续期耗尽
+
+        // 无写入的空转：不延展，交给收尾。
+        state.steps = 10;
+        assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
+
+        // 有写入的活跃交付：自动延展一个窗口。
+        let proposal = ActionProposal {
+            signature: "edit:harness-ui/src/gui/model.rs".into(),
+            question: "拆分枚举".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&proposal, true, "edit ok");
+        state.steps = 12;
+        let before = budget.max_steps;
+        let msg = BudgetManager::diagnose_and_renew(&mut state, &mut budget);
+        assert!(msg.unwrap().contains("交付延展"));
+        assert!(budget.max_steps > before);
+        assert_eq!(budget.delivery_extensions, 1);
     }
 
     #[test]
@@ -515,13 +702,87 @@ mod tests {
             BudgetManager::phase(&state, &budget),
             BudgetPhase::Exhausted
         );
-        let diagnosis = BudgetManager::diagnose_and_renew(&mut state, &mut budget);
+        let diagnosis = BudgetManager::diagnose_and_renew(&mut state, &mut budget).unwrap();
         assert!(diagnosis.contains("任务尚未完成"));
-        assert!(diagnosis.contains("预算已自动续期"));
+        assert!(diagnosis.contains("预算已续期"));
         assert!(budget.max_steps > original_limit);
         assert_ne!(
             BudgetManager::phase(&state, &budget),
             BudgetPhase::Exhausted
         );
+    }
+
+    /// 续期必须有上限（取证：无限续期让简单任务跑出 1000+ 步）；
+    /// 用尽后返回 None，调用方据此强制收尾。
+    #[test]
+    fn renewals_are_capped_and_final_window_is_bounded() {
+        let contract = TaskContract::from_input("完成一项多步骤任务");
+        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Direct);
+        let mut state = ExecutionState::new(contract, StrategyKind::Direct);
+        assert!(budget.max_renewals >= 1);
+        for _ in 0..budget.max_renewals {
+            state.steps = budget.max_steps;
+            assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_some());
+        }
+        state.steps = budget.max_steps;
+        assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
+
+        // 最终收尾窗口给足 6 步完成汇总交付，不再扩张。
+        BudgetManager::arm_final_window(&state, &mut budget);
+        assert_eq!(budget.max_steps, state.steps + 6);
+    }
+
+    /// 签名归一化：cd 全路径前缀与路径分隔符差异不应绕过重复守卫
+    /// （取证：94% 命令携带 cd 前缀，每条签名字面唯一，守卫全失效）。
+    #[test]
+    fn signature_normalization_neutralizes_cd_prefix_and_separators() {
+        let contract = TaskContract::from_input("完成任务");
+        let a = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "1".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cd /d F:\\ws\\proj && cargo check"}),
+            },
+            &contract,
+        );
+        let b = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "2".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cargo check"}),
+            },
+            &contract,
+        );
+        assert_eq!(a.signature, b.signature);
+
+        // 纯 cd 命令不被误删为空。
+        let only_cd = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "3".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cd F:\\ws"}),
+            },
+            &contract,
+        );
+        assert!(only_cd.signature.contains("cd"));
+
+        // 同一文件的反斜杠/正斜杠写法归为同一签名。
+        let p1 = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "4".into(),
+                name: "fs".into(),
+                args: serde_json::json!({"op": "read", "path": "src\\main.rs"}),
+            },
+            &contract,
+        );
+        let p2 = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "5".into(),
+                name: "fs".into(),
+                args: serde_json::json!({"op": "read", "path": "src/main.rs"}),
+            },
+            &contract,
+        );
+        assert_eq!(p1.signature, p2.signature);
     }
 }

@@ -30,9 +30,9 @@ pub use deepseek::DeepSeek;
 pub use local::LocalLlm;
 pub use openai::OpenAI;
 
-/// OpenAI 兼容服务的单次最大输出长度。默认 4096，足够完成常规交付且能防止
-/// 无约束的长回复；部署方可用 `HARNESS_MAX_TOKENS` 在 256..=32768 范围调整，
-/// GUI「参数配置」页的显式设置优先于环境变量。
+/// OpenAI 兼容服务的单次最大输出长度。默认 8192：旧默认 4096 在长交付/多工具宣告
+/// 场景容易被截断，触发空响应重试与重复往返，反而更慢；部署方可用
+/// `HARNESS_MAX_TOKENS` 在 256..=32768 范围调整，GUI「参数配置」页的显式设置优先于环境变量。
 pub(crate) fn max_output_tokens() -> u64 {
     harness_core::tuning::max_output_tokens()
         .or_else(|| {
@@ -40,7 +40,7 @@ pub(crate) fn max_output_tokens() -> u64 {
                 .ok()
                 .and_then(|value| value.parse().ok())
         })
-        .unwrap_or(4_096)
+        .unwrap_or(8_192)
         .clamp(256, 32_768)
 }
 pub use replay::ReplayLlm;

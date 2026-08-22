@@ -64,6 +64,8 @@ pub(super) struct AppState {
     pub(super) perm_menu_open: bool,
     /// 插件管理列表（内置核心项恒启用 + 用户导入的 WASM 插件）。
     pub(super) plugin_rows: Vec<PluginUiRow>,
+    /// 插件管理页当前 tab（"sys" = 系统插件，其余 = 自定义插件）。
+    pub(super) plugin_tab: String,
     /// 上一帧记录的模态面板矩形：外部点击关闭时的内部误触守卫。
     pub(super) modal_panel_rect: Option<egui::Rect>,
     /// 上一帧模态是否已打开：打开当帧的 press 是触发点击，不能当作“外部点击”关闭。
@@ -232,6 +234,7 @@ impl AppState {
             f_max_steps: settings.get("runtime.max_steps").unwrap_or_default(),
             f_max_tokens: settings.get("runtime.max_tokens").unwrap_or_default(),
             plugin_rows: Self::load_plugin_rows(settings, &host.wasm_plugins, &host.trellis),
+            plugin_tab: "sys".into(),
             modal_panel_rect: None,
             modal_open_last_frame: false,
             last_event: 0,

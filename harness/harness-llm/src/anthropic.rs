@@ -65,13 +65,10 @@ impl LlmProvider for Anthropic {
         let body = request_body(&model, &msgs, self.reasoning_effort.as_deref());
 
         Box::pin(stream! {
-            let client = match reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-            {
+            let client = match crate::openai_compat::shared_client() {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(Error::Llm(format!("reqwest init: {e}")));
+                    yield Err(e);
                     return;
                 }
             };

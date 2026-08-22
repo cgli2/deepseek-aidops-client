@@ -168,7 +168,23 @@ struct LogInner {
     events: Vec<SessionEvent>,
     next: EventId,
     path: Option<std::path::PathBuf>,
+    /// 常驻追加句柄：避免每事件 open/close 的文件系统开销（惰性打开，路径变更时重建）。
+    writer: Option<std::fs::File>,
+    /// 尚未 flush 的流式分片计数：Assistant/Thinking 高频事件延迟批量 flush，
+    /// 关键边界事件即时 flush，保持 TurnEnd 级别的崩溃恢复语义。
+    pending_flush: usize,
 }
+
+/// 流式高频事件：写入但延迟 flush；其余事件（回合/步骤边界、工具结果、用量等）即时 flush。
+fn is_stream_chunk(ev: &SessionEvent) -> bool {
+    matches!(
+        ev,
+        SessionEvent::Assistant { .. } | SessionEvent::Thinking { .. }
+    )
+}
+
+/// 延迟 flush 的批量上限：即使没有边界事件，累积到该数量也强制落盘。
+const FLUSH_BATCH: usize = 32;
 
 /// 会话追加日志（真相源）。仅追加写；fork/resume/replay 全从日志派生（原 §5.5）。
 pub struct SessionLog {
@@ -214,6 +230,8 @@ impl SessionLog {
                 events: Vec::new(),
                 next: 0,
                 path: None,
+                writer: None,
+                pending_flush: 0,
             }),
         })
     }
@@ -229,6 +247,8 @@ impl SessionLog {
                 events: Vec::new(),
                 next: 0,
                 path: Some(dir.join(format!("{id}.jsonl"))),
+                writer: None,
+                pending_flush: 0,
             }),
         })
     }
@@ -246,25 +266,47 @@ impl SessionLog {
     }
 
     /// 仅追加写一条会话事件。
+    ///
+    /// 性能：常驻追加句柄 + 分界 flush。流式文本/思考分片只写不刷（每 FLUSH_BATCH
+    /// 条批量落盘），回合/工具结果等边界事件即时 flush——此前每个 token 分片一次
+    /// 「open+write+flush」，一次中等回复数百次同步 syscall，是流式热路径的主要开销。
     pub fn append(&self, ev: SessionEvent) {
-        let path = {
-            let mut g = self.inner.lock().unwrap();
-            g.events.push(ev.clone());
-            g.path.clone()
-        };
-        if let Some(path) = path {
-            use std::io::Write;
-            if let (Ok(mut file), Ok(line)) = (
+        let mut g = self.inner.lock().unwrap();
+        let deferred = is_stream_chunk(&ev);
+        g.events.push(ev.clone());
+        if g.path.is_none() {
+            return;
+        }
+        if g.writer.is_none() {
+            g.writer = g.path.as_ref().and_then(|path| {
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(path),
-                serde_json::to_string(&ev),
-            ) {
-                let _ = writeln!(file, "{line}");
-                // 每条事件强制 flush：异常退出/断电也不丢已完成的 TurnEnd 与工具结果。
+                    .open(path)
+                    .ok()
+            });
+        }
+        let Ok(line) = serde_json::to_string(&ev) else {
+            return;
+        };
+        let force_flush = if deferred {
+            g.pending_flush += 1;
+            g.pending_flush >= FLUSH_BATCH
+        } else {
+            true
+        };
+        let Some(file) = g.writer.as_mut() else {
+            return;
+        };
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{line}");
+            if force_flush {
                 let _ = file.flush();
             }
+        }
+        if force_flush {
+            g.pending_flush = 0;
         }
     }
 
@@ -299,6 +341,9 @@ impl SessionLog {
             if let Ok(mut inner) = self.inner.lock() {
                 inner.events.clear();
                 inner.next = 0;
+                // 先关闭常驻句柄再截断，避免 Windows 上持有句柄时 truncate 失败。
+                inner.writer = None;
+                inner.pending_flush = 0;
                 inner.path.clone()
             } else {
                 None
@@ -322,6 +367,8 @@ impl SessionLog {
                 events: g.events.clone(),
                 next: g.next,
                 path: None,
+                writer: None,
+                pending_flush: 0,
             }),
         })
     }
@@ -342,6 +389,8 @@ impl SessionLog {
             g.events = events;
             g.next = next;
             g.path = path;
+            g.writer = None;
+            g.pending_flush = 0;
         }
         let needs_close = matches!(
             self.inner.lock().unwrap().events.last(),
@@ -366,7 +415,13 @@ impl SessionLog {
         }));
         let log = Arc::new(Self {
             id,
-            inner: Mutex::new(LogInner { events, next, path }),
+            inner: Mutex::new(LogInner {
+                events,
+                next,
+                path,
+                writer: None,
+                pending_flush: 0,
+            }),
         });
         let needs_close = matches!(
             log.inner.lock().unwrap().events.last(),
@@ -400,6 +455,8 @@ impl SessionLog {
             g.events.clear();
             g.next = 0;
             g.path = Some(file.clone());
+            g.writer = None;
+            g.pending_flush = 0;
         }
         prune_dir(dir, 50, file.file_name().and_then(|f| f.to_str()));
     }
@@ -417,6 +474,8 @@ impl SessionLog {
             g.events = events;
             g.next = next;
             g.path = Some(path);
+            g.writer = None;
+            g.pending_flush = 0;
         }
         let needs_close = matches!(
             self.inner.lock().unwrap().events.last(),

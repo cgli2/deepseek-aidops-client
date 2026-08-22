@@ -20,6 +20,7 @@ pub mod hook;
 pub mod index;
 pub mod lsp;
 pub mod memory;
+pub mod search;
 pub mod shell;
 pub mod subagent;
 pub mod watcher;

@@ -66,13 +66,9 @@ fn cjk_ngrams(s: &str, n: usize) -> Vec<String> {
     out
 }
 
-/// 词法打分：查询词在文本中的命中比例（0.0~1.0），命中越多分越高。
-///
-/// 中文无空格分词问题：整句被当成单个 token 几乎无法命中触发边界。
-/// 因此对中文连续段做 2/3-gram 滑动窗口拆解，让触发边界里的关键词
-/// （如「规划」「执行」「提交」）能与自然语言查询命中。
-fn lex_score(query: &str, text: &str) -> f32 {
-    // 直接按空白/标点分词 + 中文 n-gram 双通道。
+/// 查询侧分词（每个查询只需一次）：空白/标点分词 + 中文 n-gram 双通道。
+/// 同一查询要对 N 个条目打分时，避免在每个条目上重复 tokenize（热路径优化）。
+fn query_tokens(query: &str) -> (Vec<String>, usize) {
     let mut q: Vec<String> = Vec::new();
     for t in tokenize(query) {
         // 若该 token 是中文长句，补充 2/3-gram；短词直接保留。
@@ -85,6 +81,18 @@ fn lex_score(query: &str, text: &str) -> f32 {
         }
     }
     q.dedup();
+    // 分母用「非 n-gram 的基础词 + 命中的 n-gram 权重」：让整句匹配到关键词时
+    // 分数显著 >0，同时不因 n-gram 太多而稀释。
+    let base_tokens = tokenize(query)
+        .into_iter()
+        .filter(|t| t.chars().count() >= 2)
+        .count()
+        .max(1);
+    (q, base_tokens)
+}
+
+/// 用预分词的查询 token 对单个文本打分。
+fn lex_score_with(q: &[String], base_tokens: usize, text: &str) -> f32 {
     if q.is_empty() {
         return 0.0;
     }
@@ -94,13 +102,6 @@ fn lex_score(query: &str, text: &str) -> f32 {
         .iter()
         .filter(|tok| tok.chars().count() >= 2 && t.contains(tok.as_str()))
         .count();
-    // 分母用「非 n-gram 的基础词 + 命中的 n-gram 权重」：让整句匹配到关键词时
-    // 分数显著 >0，同时不因 n-gram 太多而稀释。
-    let base_tokens = tokenize(query)
-        .into_iter()
-        .filter(|t| t.chars().count() >= 2)
-        .count()
-        .max(1);
     let score = hits as f32 / (base_tokens * 2) as f32;
     // 归一化到 0.2~1.0，保证命中即被采纳。
     if score > 0.0 {
@@ -256,11 +257,12 @@ impl ConversationMemory for NativeConversationMemory {
     }
 
     async fn recall(&self, query: &str, min_layer: LifecycleLayer) -> Result<Vec<MemoryFact>> {
+        let (q, base) = query_tokens(query);
         let mut scored: Vec<(f32, MemoryFact)> = self
             .load_facts()
             .into_iter()
             .filter(|f| f.layer.at_least(min_layer))
-            .map(|f| (lex_score(query, &format!("{:?}", f)), f))
+            .map(|f| (lex_score_with(&q, base, &format!("{:?}", f)), f))
             .filter(|(s, _)| *s > 0.0)
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -301,13 +303,19 @@ impl ConversationMemory for NativeConversationMemory {
 
 pub struct NativeSkillLibrary {
     root: PathBuf,
+    /// 技能列表内存缓存：避免每回合 match_skills 都全目录扫描 + 逐文件反序列化。
+    /// 写路径（register/write/delete/set_enabled）统一置 None 失效。
+    cache: Mutex<Option<Vec<Skill>>>,
 }
 
 impl NativeSkillLibrary {
     pub fn new(cwd: impl AsRef<Path>) -> Arc<Self> {
         let root = asset_root(cwd.as_ref()).join("skills");
         let _ = ensure_dir(&root);
-        Arc::new(Self { root })
+        Arc::new(Self {
+            root,
+            cache: Mutex::new(None),
+        })
     }
 
     fn skill_path(&self, id: &str) -> PathBuf {
@@ -315,6 +323,9 @@ impl NativeSkillLibrary {
     }
 
     fn all_skills(&self) -> Vec<Skill> {
+        if let Some(cached) = self.cache.lock().unwrap().clone() {
+            return cached;
+        }
         let mut out = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for e in entries.flatten() {
@@ -325,6 +336,7 @@ impl NativeSkillLibrary {
                 }
             }
         }
+        *self.cache.lock().unwrap() = Some(out.clone());
         out
     }
 
@@ -336,7 +348,9 @@ impl NativeSkillLibrary {
     /// 写回某个技能的完整信息（启用状态变更时用）。
     fn write_skill(&self, skill: &Skill) -> harness_core::error::Result<()> {
         let body = serde_json::to_string_pretty(skill).map_err(harness_core::error::Error::Serde)?;
-        std::fs::write(self.skill_path(&skill.id), body).map_err(harness_core::error::Error::Io)
+        std::fs::write(self.skill_path(&skill.id), body).map_err(harness_core::error::Error::Io)?;
+        *self.cache.lock().unwrap() = None;
+        Ok(())
     }
 }
 
@@ -345,7 +359,9 @@ impl SkillLibrary for NativeSkillLibrary {
     async fn register_skill(&self, skill: Skill) -> Result<()> {
         ensure_dir(&self.root)?;
         let body = serde_json::to_string_pretty(&skill).map_err(Error::Serde)?;
-        std::fs::write(self.skill_path(&skill.id), body).map_err(Error::Io)
+        std::fs::write(self.skill_path(&skill.id), body).map_err(Error::Io)?;
+        *self.cache.lock().unwrap() = None;
+        Ok(())
     }
 
     async fn get_skill(&self, id: &str) -> Result<Option<Skill>> {
@@ -355,12 +371,14 @@ impl SkillLibrary for NativeSkillLibrary {
     }
 
     async fn match_skills(&self, context: &str) -> Result<Vec<Skill>> {
+        // 查询分词只做一次，不随技能数量重复。
+        let (q, base) = query_tokens(context);
         let mut scored: Vec<(f32, Skill)> = self
             .enabled_skills()
             .into_iter()
             .map(|sk| {
                 (
-                    lex_score(context, &format!("{} {}", sk.trigger_boundary, sk.name)),
+                    lex_score_with(&q, base, &format!("{} {}", sk.trigger_boundary, sk.name)),
                     sk,
                 )
             })
@@ -418,6 +436,7 @@ impl SkillLibrary for NativeSkillLibrary {
                 }
             }
         }
+        *self.cache.lock().unwrap() = None;
         Ok(removed)
     }
 
@@ -437,13 +456,18 @@ impl SkillLibrary for NativeSkillLibrary {
 
 pub struct NativeWikiStore {
     root: PathBuf,
+    /// 页面列表内存缓存：避免每次 query_pages/list_pages 全目录扫描；写时失效。
+    cache: Mutex<Option<Vec<WikiPage>>>,
 }
 
 impl NativeWikiStore {
     pub fn new(cwd: impl AsRef<Path>) -> Arc<Self> {
         let root = asset_root(cwd.as_ref()).join("wiki");
         let _ = ensure_dir(&root);
-        Arc::new(Self { root })
+        Arc::new(Self {
+            root,
+            cache: Mutex::new(None),
+        })
     }
 
     fn page_path(&self, id: &str) -> PathBuf {
@@ -451,6 +475,9 @@ impl NativeWikiStore {
     }
 
     fn all_pages(&self) -> Vec<WikiPage> {
+        if let Some(cached) = self.cache.lock().unwrap().clone() {
+            return cached;
+        }
         let mut out = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for e in entries.flatten() {
@@ -461,6 +488,7 @@ impl NativeWikiStore {
                 }
             }
         }
+        *self.cache.lock().unwrap() = Some(out.clone());
         out
     }
 }
@@ -470,7 +498,9 @@ impl WikiStore for NativeWikiStore {
     async fn upsert_page(&self, page: WikiPage) -> Result<()> {
         ensure_dir(&self.root)?;
         let body = serde_json::to_string_pretty(&page).map_err(Error::Serde)?;
-        std::fs::write(self.page_path(&page.id), body).map_err(Error::Io)
+        std::fs::write(self.page_path(&page.id), body).map_err(Error::Io)?;
+        *self.cache.lock().unwrap() = None;
+        Ok(())
     }
 
     async fn get_page(&self, id: &str) -> Result<Option<WikiPage>> {
@@ -496,12 +526,13 @@ impl WikiStore for NativeWikiStore {
     }
 
     async fn query_pages(&self, query: &str) -> Result<Vec<WikiPage>> {
+        let (q, base) = query_tokens(query);
         let mut scored: Vec<(f32, WikiPage)> = self
             .all_pages()
             .into_iter()
             .map(|p| {
                 let text = format!("{} {}", p.title, p.blocks.join(" "));
-                (lex_score(query, &text), p)
+                (lex_score_with(&q, base, &text), p)
             })
             .filter(|(s, _)| *s > 0.0)
             .collect();
@@ -637,13 +668,14 @@ impl CodeGraph for NativeCodeGraph {
     }
 
     async fn query_symbols(&self, query: &str) -> Result<Vec<CodeSymbol>> {
+        let (q, base) = query_tokens(query);
         let mut scored: Vec<(f32, CodeSymbol)> = self
             .load()
             .symbols
             .into_iter()
             .map(|x| {
                 let text = format!("{} {} {}", x.name, x.summary, x.file);
-                (lex_score(query, &text), x)
+                (lex_score_with(&q, base, &text), x)
             })
             .filter(|(s, _)| *s > 0.0)
             .collect();

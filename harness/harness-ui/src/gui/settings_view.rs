@@ -1,4 +1,4 @@
-//! Settings modal layout and page routing.
+﻿//! Settings modal layout and page routing.
 
 use super::model::PluginKind;
 use super::*;
@@ -314,125 +314,167 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         );
                                     }
                                     "插件管理" => {
-                                        field_label(ui, &pal, "系统插件（随应用发布，默认启用且不可移除）");
-                                        for i in 0..state.plugin_rows.len() {
-                                            if state.plugin_rows[i].kind == PluginKind::Core {
-                                                let _ = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
-                                            }
-                                        }
-                                        ui.add_space(6.0);
-                                        field_label(ui, &pal, "扩展插件（WASM · wasmtime 沙箱隔离，可自由启用 / 禁用或移除）");
-                                        let active_plugins = state.host.wasm_plugins.active_ids();
-                                        ui.label(
-                                            egui::RichText::new(if active_plugins.is_empty() {
-                                                "运行时：当前没有已加载的 WASM 插件".to_string()
-                                            } else {
-                                                format!("运行时：已加载 {}", active_plugins.join("、"))
-                                            })
-                                            .size(11.0)
-                                            .color(pal.dim),
-                                        );
-                                        ui.add_space(4.0);
-                                        let mut remove_ids: Vec<String> = Vec::new();
-                                        let mut wasm_count = 0;
-                                        for i in 0..state.plugin_rows.len() {
-                                            if state.plugin_rows[i].kind != PluginKind::Wasm {
-                                                continue;
-                                            }
-                                            wasm_count += 1;
-                                            let (remove, changed) = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
-                                            if changed {
-                                                let row = &mut state.plugin_rows[i];
-                                                let result = if row.enabled {
-                                                    state.host.wasm_plugins.activate(&row.id, std::path::Path::new(&row.desc))
-                                                } else {
-                                                    state.host.wasm_plugins.deactivate(&row.id)
-                                                };
-                                                match result {
-                                                    Ok(()) => {
-                                                        row.active = row.enabled;
-                                                        let _ = state.host.settings.set_plugin_enabled(&row.id, &row.name, row.enabled);
-                                                        state.note = format!("插件「{}」{}", row.name, if row.enabled { "已启用并开始运行" } else { "已禁用并卸载" });
-                                                    }
-                                                    Err(error) => {
-                                                        row.enabled = !row.enabled;
-                                                        state.note = format!("插件状态未变更: {error}");
-                                                    }
-                                                }
-                                            }
-                                            if remove {
-                                                remove_ids.push(state.plugin_rows[i].id.clone());
-                                            }
-                                        }
-                                        if wasm_count == 0 {
-                                            ui.label(
-                                                egui::RichText::new("尚未导入 WASM 插件，点下方「＋ 添加新插件」导入 .wasm / .wat 产物。")
-                                                    .size(12.0)
-                                                    .color(pal.dim),
-                                            );
-                                            ui.add_space(6.0);
-                                        }
-                                        if !remove_ids.is_empty() {
-                                            for id in &remove_ids {
-                                                let _ = state.host.wasm_plugins.deactivate(id);
-                                                let _ = state.host.settings.remove_plugin(id);
-                                            }
-                                            state.plugin_rows.retain(|r| !remove_ids.contains(&r.id));
-                                            state.note = format!("已移除 {} 个插件", remove_ids.len());
-                                        }
-                                        ui.add_space(12.0);
-                                        field_label(ui, &pal, "Trellis（spec 驱动开发 · 进程内 PreStep 注入，可启用 / 停用 / 配置）");
-                                        for i in 0..state.plugin_rows.len() {
-                                            if state.plugin_rows[i].kind != PluginKind::Trellis {
-                                                continue;
-                                            }
-                                            let (_, changed) = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
-                                            if changed {
-                                                let enabled = state.plugin_rows[i].enabled;
-                                                state.host.trellis.set_enabled(enabled);
-                                                state.plugin_rows[i].active = enabled;
-                                                state.note = format!(
-                                                    "Trellis 插件已{}",
-                                                    if enabled { "启用（每步 LLM 前注入规格与任务文件）" } else { "停用" }
-                                                );
-                                            }
-                                        }
-                                        if let Some(row) = state.plugin_rows.iter_mut().find(|r| r.kind == PluginKind::Trellis) {
-                                            ui.add_space(4.0);
-                                            ui.horizontal(|ui| {
-                                                field_label(ui, &pal, "规格文件");
-                                                let mut spec = row.spec_file.clone();
-                                                if ui.add(egui::TextEdit::singleline(&mut spec).desired_width(320.0)).changed() {
-                                                    row.spec_file = spec.clone();
-                                                    state.host.trellis.set_spec_file(spec);
-                                                }
-                                            });
-                                            ui.horizontal(|ui| {
-                                                field_label(ui, &pal, "任务文件");
-                                                let mut tasks = row.tasks_file.clone();
-                                                if ui.add(egui::TextEdit::singleline(&mut tasks).desired_width(320.0)).changed() {
-                                                    row.tasks_file = tasks.clone();
-                                                    state.host.trellis.set_tasks_file(tasks);
-                                                }
-                                            });
-                                        }
-                                        ui.add_space(8.0);
+                                        // 插件管理页：系统插件（随应用发布）/ 自定义插件（可导入、删除、启用、禁用）两个 tab。
                                         ui.horizontal(|ui| {
-                                            if accent_button(ui, &pal, "保存插件设置") {
-                                                state.save_preferences();
+                                            if ui.selectable_label(state.plugin_tab == "sys", "系统插件").clicked() {
+                                                state.plugin_tab = "sys".into();
                                             }
-                                            if ghost_button(ui, &pal, "＋ 添加新插件") {
-                                                state.import_wasm_plugin();
+                                            if ui.selectable_label(state.plugin_tab == "custom", "自定义插件").clicked() {
+                                                state.plugin_tab = "custom".into();
                                             }
                                         });
+                                        ui.add_space(4.0);
+                                        ui.separator();
+                                        ui.add_space(4.0);
+                                        if state.plugin_tab == "sys" {
+                                            // ── 系统插件：随应用发布的 Core（保留现状功能）──
+                                            field_label(ui, &pal, "系统插件（随应用发布，默认启用且不可移除）");
+                                            for i in 0..state.plugin_rows.len() {
+                                                if state.plugin_rows[i].kind == PluginKind::Core {
+                                                    let _ = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
+                                                }
+                                            }
+                                            ui.add_space(8.0);
+                                            ui.horizontal(|ui| {
+                                                if accent_button(ui, &pal, "保存插件设置") {
+                                                    state.save_preferences();
+                                                }
+                                            });
+                                        } else {
+                                            // ── 自定义插件：Trellis（spec 驱动开发）＋ WASM 沙箱插件，可导入 / 删除 / 启用 / 禁用 ──
+                                            field_label(ui, &pal, "Trellis（spec 驱动开发 · 进程内 PreStep 注入，可启用 / 停用 / 配置）");
+                                            for i in 0..state.plugin_rows.len() {
+                                                if state.plugin_rows[i].kind != PluginKind::Trellis {
+                                                    continue;
+                                                }
+                                                let (_, changed) = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
+                                                if changed {
+                                                    let enabled = state.plugin_rows[i].enabled;
+                                                    state.host.trellis.set_enabled(enabled);
+                                                    state.plugin_rows[i].active = enabled;
+                                                    state.note = format!(
+                                                        "Trellis 插件已{}",
+                                                        if enabled { "启用（每步 LLM 前注入规格与任务文件）" } else { "停用" }
+                                                    );
+                                                }
+                                            }
+                                            if let Some(row) = state.plugin_rows.iter_mut().find(|r| r.kind == PluginKind::Trellis) {
+                                                ui.add_space(4.0);
+                                                // 约定路径提示：基于工作区根目录自动推导
+                                                let ws = &state.host.workspace_root;
+                                                let default_spec = std::path::Path::new(ws).join(".harness").join("spec.md");
+                                                let default_tasks = std::path::Path::new(ws).join(".harness").join("tasks.json");
+                                                ui.horizontal(|ui| {
+                                                    field_label(ui, &pal, "规格文件");
+                                                    let mut spec = row.spec_file.clone();
+                                                    let te = egui::TextEdit::singleline(&mut spec)
+                                                        .desired_width(320.0)
+                                                        .hint_text(format!("留空则自动使用 {}", default_spec.display()));
+                                                    if ui.add(te).changed() {
+                                                        row.spec_file = spec.clone();
+                                                        state.host.trellis.set_spec_file(spec);
+                                                    }
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    field_label(ui, &pal, "任务文件");
+                                                    let mut tasks = row.tasks_file.clone();
+                                                    let te = egui::TextEdit::singleline(&mut tasks)
+                                                        .desired_width(320.0)
+                                                        .hint_text(format!("留空则自动使用 {}", default_tasks.display()));
+                                                    if ui.add(te).changed() {
+                                                        row.tasks_file = tasks.clone();
+                                                        state.host.trellis.set_tasks_file(tasks);
+                                                    }
+                                                });
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "规格文件与任务文件留空时自动按约定路径装配（.harness/spec.md 与 .harness/tasks.json），无需手工录入。"
+                                                    )
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                                );
+                                            }
+                                            ui.add_space(10.0);
+                                            ui.separator();
+                                            ui.add_space(6.0);
+                                            field_label(ui, &pal, "WASM 沙箱插件（可导入 / 删除 / 启用 / 禁用）");
+                                            let active_plugins = state.host.wasm_plugins.active_ids();
+                                            ui.label(
+                                                egui::RichText::new(if active_plugins.is_empty() {
+                                                    "运行时：当前没有已加载的 WASM 插件".to_string()
+                                                } else {
+                                                    format!("运行时：已加载 {}", active_plugins.join("、"))
+                                                })
+                                                .size(11.0)
+                                                .color(pal.dim),
+                                            );
+                                            ui.add_space(4.0);
+                                            let mut remove_ids: Vec<String> = Vec::new();
+                                            let mut wasm_count = 0;
+                                            for i in 0..state.plugin_rows.len() {
+                                                if state.plugin_rows[i].kind != PluginKind::Wasm {
+                                                    continue;
+                                                }
+                                                wasm_count += 1;
+                                                let (remove, changed) = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
+                                                if changed {
+                                                    let row = &mut state.plugin_rows[i];
+                                                    let result = if row.enabled {
+                                                        state.host.wasm_plugins.activate(&row.id, std::path::Path::new(&row.desc))
+                                                    } else {
+                                                        state.host.wasm_plugins.deactivate(&row.id)
+                                                    };
+                                                    match result {
+                                                        Ok(()) => {
+                                                            row.active = row.enabled;
+                                                            let _ = state.host.settings.set_plugin_enabled(&row.id, &row.name, row.enabled);
+                                                            state.note = format!("插件「{}」{}", row.name, if row.enabled { "已启用并开始运行" } else { "已禁用并卸载" });
+                                                        }
+                                                        Err(error) => {
+                                                            row.enabled = !row.enabled;
+                                                            state.note = format!("插件状态未变更: {error}");
+                                                        }
+                                                    }
+                                                }
+                                                if remove {
+                                                    remove_ids.push(state.plugin_rows[i].id.clone());
+                                                }
+                                            }
+                                            if wasm_count == 0 {
+                                                ui.label(
+                                                    egui::RichText::new("尚未导入 WASM 插件，点下方「＋ 添加新插件」导入 .wasm / .wat 产物。")
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                                );
+                                                ui.add_space(6.0);
+                                            }
+                                            if !remove_ids.is_empty() {
+                                                for id in &remove_ids {
+                                                    let _ = state.host.wasm_plugins.deactivate(id);
+                                                    let _ = state.host.settings.remove_plugin(id);
+                                                }
+                                                state.plugin_rows.retain(|r| !remove_ids.contains(&r.id));
+                                                state.note = format!("已移除 {} 个插件", remove_ids.len());
+                                            }
+                                            ui.add_space(12.0);
+                                            ui.horizontal(|ui| {
+                                                if accent_button(ui, &pal, "保存插件设置") {
+                                                    state.save_preferences();
+                                                }
+                                                if ghost_button(ui, &pal, "＋ 添加新插件") {
+                                                    state.import_wasm_plugin();
+                                                }
+                                            });
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "自定义插件可导入 .wasm/.wat；勾选即立即加载并执行可选 on_load，取消勾选即卸载。插件仅获得 host_log，默认没有 Shell、文件或网络权限；「移除」只删除登记，不删除你的原始文件。"
+                                                )
+                                                .size(11.0)
+                                                .color(pal.dim),
+                                            );
+                                        }
                                         ui.add_space(6.0);
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "系统插件包含基础工具和 Superpowers 工作流扩展。自定义插件可导入 .wasm/.wat；勾选即立即加载并执行可选 on_load，取消勾选即卸载。插件仅获得 host_log，默认没有 Shell、文件或网络权限；「移除」只删除登记，不删除你的原始文件。",
-                                            )
-                                            .size(11.0)
-                                            .color(pal.dim),
-                                        );
                                     }
                                     "技能管理" => {
                                         if state.skill_items.is_empty() {

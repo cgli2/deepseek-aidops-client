@@ -10,6 +10,7 @@ mod fs;
 mod memory;
 mod plan;
 pub mod registry;
+mod search;
 
 pub use bash::BashTool;
 pub use delegate::DelegateTool;
@@ -18,3 +19,4 @@ pub use fs::FsTool;
 pub use memory::MemoryTool;
 pub use plan::PlanTool;
 pub use registry::{DynTool, ToolRegistry};
+pub use search::SearchTool;

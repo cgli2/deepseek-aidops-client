@@ -3,6 +3,18 @@
 use super::model::PluginKind;
 use super::*;
 
+/// 厂商预置选项（名称 → 默认 API 地址）：下拉直选，也允许自定义输入其他厂商。
+const PROVIDER_PRESETS: &[(&str, &str)] = &[
+    ("deepseek", "https://api.deepseek.com/v1"),
+    ("openai", "https://api.openai.com/v1"),
+    ("anthropic", "https://api.anthropic.com"),
+    ("openrouter", "https://openrouter.ai/api/v1"),
+    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    ("moonshot", "https://api.moonshot.cn/v1"),
+    ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
+    ("ollama", "http://localhost:11434/v1"),
+];
+
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
     // ── 设置弹层 ─────────────────────────────────────────────
     // ── 设置模态：全屏半透明遮罩 + 居中圆角面板（替代默认 Window 标题栏样式）──
@@ -179,59 +191,209 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     ui.vertical(|ui| match page.as_str() {
                                     "模型配置" | "模型设置" => {
                                         ui.set_min_width(if system_page { panel_w - 220.0 } else { panel_w - 12.0 });
-                                        field_label(ui, &pal, "已保存的配置");
-                                        ui.horizontal(|ui| {
-                                            egui::ComboBox::from_id_salt("profiles")
-                                                .width(
-                                                    (panel_w
-                                                        - if system_page { 304.0 } else { 96.0 })
-                                                    .max(260.0),
-                                                )
-                                                .selected_text(if state.selected_profile.is_empty() {
-                                                    "选择已保存的配置…"
-                                                } else {
-                                                    state.selected_profile.as_str()
-                                                })
-                                                .show_ui(ui, |ui| {
-                                                    for name in state.profiles.clone() {
-                                                        if ui
-                                                            .selectable_value(&mut state.selected_profile, name.clone(), name.as_str())
-                                                            .clicked()
-                                                        {
-                                                            state.load_profile(&name);
-                                                        }
+                                        // 表单输入框统一几何：宽度以「模型名称」列为基准（预留右侧按钮位）；
+                                        // 高度 34px 与按钮等高，用对称上下边距撑高（而非 min_size）——
+                                        // egui 文本锚定在内框左上角，只有边距对称才能保证垂直居中。
+                                        let field_w = (ui.available_width() - 150.0).max(260.0);
+                                        let body_row_h = ui.fonts(|f| {
+                                            f.row_height(&egui::TextStyle::Body.resolve(ui.style()))
+                                        });
+                                        let field_pad_y = ((34.0 - body_row_h) / 2.0).max(2.0);
+                                        let field_margin = egui::Margin::symmetric(4.0, field_pad_y);
+                                        // desired_width 是内框宽：扣除左右边距后外宽恰好 = field_w，
+                                        // 否则「模型名称」行总宽溢出，右侧按钮会被压进输入框。
+                                        let field_inner_w = field_w - field_margin.sum().x;
+                                        // ── 模型列表管理区：启用 / 停用 · 编辑 · 删除 ──
+                                        field_label(ui, &pal, "已添加的模型");
+                                        let active_model = state
+                                            .host
+                                            .settings
+                                            .get("llm.model")
+                                            .unwrap_or_default();
+                                        if state.profiles.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("尚未添加模型配置，请在下方表单新增。")
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                            );
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("profile_list_scroll")
+                                                .max_height(190.0)
+                                                .show(ui, |ui| {
+                                                    for profile in state.profiles.clone() {
+                                                        let is_editing = state
+                                                            .editing_profile
+                                                            .as_deref()
+                                                            == Some(profile.name.as_str());
+                                                        ui.group(|ui| {
+                                                            ui.horizontal(|ui| {
+                                                                let mut enabled = profile.enabled;
+                                                                if ui
+                                                                    .checkbox(&mut enabled, "")
+                                                                    .on_hover_text(if profile.enabled {
+                                                                        "停用该模型（保留配置，不再参与快捷切换）"
+                                                                    } else {
+                                                                        "启用该模型"
+                                                                    })
+                                                                    .changed()
+                                                                {
+                                                                    let _ = state
+                                                                        .host
+                                                                        .settings
+                                                                        .set_model_profile_enabled(&profile.name, enabled);
+                                                                    state.refresh_profiles();
+                                                                    state.note = format!(
+                                                                        "模型「{}」已{}",
+                                                                        profile.name,
+                                                                        if enabled { "启用" } else { "停用" }
+                                                                    );
+                                                                }
+                                                                ui.vertical(|ui| {
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.label(
+                                                                            egui::RichText::new(&profile.name)
+                                                                                .size(13.0)
+                                                                                .strong()
+                                                                                .color(if profile.enabled { pal.text } else { pal.dim }),
+                                                                        );
+                                                                        if profile.enabled && profile.model == active_model {
+                                                                            ui.label(
+                                                                                egui::RichText::new("当前")
+                                                                                    .size(10.5)
+                                                                                    .color(pal.accent),
+                                                                            );
+                                                                        }
+                                                                        if is_editing {
+                                                                            ui.label(
+                                                                                egui::RichText::new("编辑中")
+                                                                                    .size(10.5)
+                                                                                    .color(pal.warn),
+                                                                            );
+                                                                        }
+                                                                    });
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!(
+                                                                            "{} · {}",
+                                                                            profile.provider, profile.base_url
+                                                                        ))
+                                                                        .size(11.0)
+                                                                        .color(pal.dim),
+                                                                    );
+                                                                });
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        if ghost_button(ui, &pal, "删除") {
+                                                                            let _ = state
+                                                                                .host
+                                                                                .settings
+                                                                                .delete_model_profile(&profile.name);
+                                                                            if is_editing {
+                                                                                state.editing_profile = None;
+                                                                            }
+                                                                            state.refresh_profiles();
+                                                                            state.note =
+                                                                                format!("已删除模型配置「{}」", profile.name);
+                                                                        }
+                                                                        if ghost_button(ui, &pal, "编辑") {
+                                                                            state.f_provider = profile.provider.clone();
+                                                                            state.f_base = profile.base_url.clone();
+                                                                            state.f_model = profile.model.clone();
+                                                                            state.f_key.clear();
+                                                                            state.editing_profile = Some(profile.name.clone());
+                                                                            state.note = format!(
+                                                                                "正在编辑「{}」，保存后覆写该条目（API Key 留空则沿用原 Key）",
+                                                                                profile.name
+                                                                            );
+                                                                        }
+                                                                    },
+                                                                );
+                                                            });
+                                                        });
+                                                        ui.add_space(4.0);
                                                     }
                                                 });
-                                            if !state.selected_profile.is_empty()
-                                                && ghost_button(ui, &pal, "删除")
-                                            {
-                                                let _ = state
-                                                    .host
-                                                    .settings
-                                                    .delete_model_profile(&state.selected_profile);
-                                                state.profiles = state
-                                                    .host
-                                                    .settings
-                                                    .model_profiles()
-                                                    .into_iter()
-                                                    .map(|p| p.name)
-                                                    .collect();
-                                                state.selected_profile.clear();
-                                            }
-                                        });
-                                        field_label(ui, &pal, "模型厂商");
-                                        ui.add(egui::TextEdit::singleline(&mut state.f_provider).desired_width(f32::INFINITY));
+                                        }
+                                        // ── 表单：新增 / 编辑模型 ──
+                                        let form_title = match &state.editing_profile {
+                                            Some(n) => format!("编辑模型：{n}"),
+                                            None => "新增模型".to_string(),
+                                        };
+                                        field_label(ui, &pal, &form_title);
+                                        field_label(ui, &pal, "模型厂商（下拉选择预置厂商，也可自定义输入）");
+                                        egui::ComboBox::from_id_salt("provider_preset")
+                                            .width(220.0)
+                                            .selected_text(if state.f_provider.trim().is_empty() {
+                                                "选择厂商…"
+                                            } else {
+                                                state.f_provider.as_str()
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                for (name, base) in PROVIDER_PRESETS {
+                                                    let resp = ui.selectable_label(
+                                                        state.f_provider == *name,
+                                                        egui::RichText::new(*name).size(12.0),
+                                                    );
+                                                    if resp.clicked() {
+                                                        state.f_provider = (*name).to_string();
+                                                        // 预置 API 地址自动回填：仅在当前为空或仍为某预置默认值时覆盖，
+                                                        // 不覆盖用户手填的自定义地址。
+                                                        let replaceable = state.f_base.trim().is_empty()
+                                                            || PROVIDER_PRESETS
+                                                                .iter()
+                                                                .any(|(_, b)| *b == state.f_base.trim());
+                                                        if replaceable {
+                                                            state.f_base = (*base).to_string();
+                                                        }
+                                                    }
+                                                }
+                                                ui.separator();
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("自定义")
+                                                            .size(11.5)
+                                                            .color(pal.dim),
+                                                    );
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut state.f_provider)
+                                                            .desired_width(140.0)
+                                                            .hint_text("输入其他厂商"),
+                                                    );
+                                                });
+                                            });
                                         field_label(ui, &pal, "API 地址");
-                                        ui.add(egui::TextEdit::singleline(&mut state.f_base).desired_width(f32::INFINITY));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_base)
+                                                .desired_width(field_inner_w)
+                                                .margin(field_margin),
+                                        );
                                         field_label(ui, &pal, "模型名称（可自由填写；留空则保存时取上游列表第一个）");
                                         ui.horizontal(|ui| {
-                                            ui.add(egui::TextEdit::singleline(&mut state.f_model).desired_width(ui.available_width() - 150.0));
-                                            if state.models_loading {
-                                                ui.spinner();
-                                                ui.label(egui::RichText::new("获取中…").size(11.0).color(pal.dim));
-                                            } else if ghost_button(ui, &pal, "获取上游模型列表") {
-                                                state.fetch_models_from_upstream();
-                                            }
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_model)
+                                                    .desired_width(field_inner_w)
+                                                    .margin(field_margin),
+                                            );
+                                            // 按钮用 right_to_left 子布局锚定在行右缘：
+                                            // 子布局宽度自动取剩余空间，不参与左→右流的宽度计算，
+                                            // 滚动条显隐引起的可用宽微小变化不会导致按钮位移 / 重叠。
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if state.models_loading {
+                                                        ui.spinner();
+                                                        ui.label(
+                                                            egui::RichText::new("获取中…")
+                                                                .size(11.0)
+                                                                .color(pal.dim),
+                                                        );
+                                                    } else if ghost_button(ui, &pal, "获取上游模型列表")
+                                                    {
+                                                        state.fetch_models_from_upstream();
+                                                    }
+                                                },
+                                            );
                                         });
                                         if !state.models_msg.is_empty() {
                                             ui.label(
@@ -276,17 +438,39 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                             }
                                         }
                                         field_label(ui, &pal, "API Key（AES-256-GCM 加密后保存至 SQLite，跨操作系统通用）");
-                                        ui.add(egui::TextEdit::singleline(&mut state.f_key).password(true).desired_width(f32::INFINITY));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_key)
+                                                .password(true)
+                                                .desired_width(field_inner_w)
+                                                .margin(field_margin),
+                                        );
                                         field_label(ui, &pal, "思考档位 reasoning_effort（可选：off/low/medium/high/xhigh/max/auto，留空=默认）");
-                                        ui.add(egui::TextEdit::singleline(&mut state.f_effort).desired_width(f32::INFINITY));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_effort)
+                                                .desired_width(field_inner_w)
+                                                .margin(field_margin),
+                                        );
                                         ui.add_space(14.0);
-                                        if accent_button(ui, &pal, "添加 / 更新并应用") {
-                                            state.apply_model();
-                                        }
+                                        ui.horizontal(|ui| {
+                                            let save_label = if state.editing_profile.is_some() {
+                                                "保存修改并应用"
+                                            } else {
+                                                "添加并应用"
+                                            };
+                                            if accent_button(ui, &pal, save_label) {
+                                                state.apply_model();
+                                            }
+                                            if state.editing_profile.is_some()
+                                                && ghost_button(ui, &pal, "取消编辑")
+                                            {
+                                                state.editing_profile = None;
+                                                state.note = "已取消编辑，可继续新增模型".into();
+                                            }
+                                        });
                                         ui.add_space(8.0);
                                         ui.label(
                                             egui::RichText::new(
-                                                "支持采用 OpenAI Chat Completions 协议的服务；保存时以“厂商 · 模型名”建立或更新配置。",
+                                                "支持采用 OpenAI Chat Completions 协议的服务；保存时以“厂商 · 模型名”建立或更新配置。停用的模型保留在列表中，不参与快捷切换。",
                                             )
                                             .size(11.0)
                                             .color(pal.dim),

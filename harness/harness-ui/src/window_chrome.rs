@@ -39,14 +39,14 @@ pub fn titlebar_height() -> f32 {
 fn theme_button(ui: &mut Ui, colors: ChromeColors, dark: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(60.0, 24.0), Sense::click());
     let border = if response.hovered() {
-        Stroke::new(1.0, colors.border)
+        Stroke::new(1.0_f32, colors.border)
     } else {
         Stroke::NONE
     };
     ui.painter().rect(rect, 6.0, Color32::TRANSPARENT, border);
     let c = egui::pos2(rect.left() + 13.0, rect.center().y);
     let stroke = Stroke::new(
-        1.25,
+        1.25_f32,
         if response.hovered() {
             colors.text
         } else {
@@ -95,7 +95,7 @@ fn window_button(ui: &mut Ui, colors: ChromeColors, kind: u8, maximized: bool) -
     } else {
         colors.text
     };
-    let stroke = Stroke::new(1.15, color);
+    let stroke = Stroke::new(1.15_f32, color);
     let c = rect.center();
     match kind {
         0 => {
@@ -145,7 +145,7 @@ fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response
     if response.hovered() {
         ui.painter().rect_filled(rect, 6.0, colors.border.gamma_multiply(0.35));
     }
-    let stroke = Stroke::new(1.35, if response.hovered() { colors.text } else { colors.dim });
+    let stroke = Stroke::new(1.35_f32, if response.hovered() { colors.text } else { colors.dim });
     let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 13.0));
     ui.painter().rect_stroke(icon, 2.0, stroke);
     ui.painter().vline(icon.left() + 4.5, icon.y_range(), stroke);
@@ -156,14 +156,14 @@ fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response
 fn tree_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
     let border = if response.hovered() {
-        Stroke::new(1.0, colors.border)
+        Stroke::new(1.0_f32, colors.border)
     } else {
         Stroke::NONE
     };
     ui.painter().rect(rect, 6.0, Color32::TRANSPARENT, border);
     let c = rect.center();
     let color = if open { colors.accent } else { colors.dim };
-    let s = Stroke::new(1.25, color);
+    let s = Stroke::new(1.25_f32, color);
     // 树形：根节点 + 子节点 + 连接线。
     ui.painter().rect_stroke(
         egui::Rect::from_center_size(c + egui::vec2(-4.0, -4.0), egui::vec2(6.0, 4.5)),
@@ -267,7 +267,7 @@ pub fn show(
             ui.painter().hline(
                 full_rect.x_range(),
                 full_rect.bottom(),
-                Stroke::new(1.0, colors.border),
+                Stroke::new(1.0_f32, colors.border),
             );
         });
     actions

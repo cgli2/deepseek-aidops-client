@@ -220,6 +220,15 @@ impl AgentLoop {
                 messages.insert(1, Message::system(&instructions));
             }
         }
+        // 项目事实注入：manifest 位置/工具链/打包入口等稳定环境信息一次告知，
+        // 避免模型每回合花十几次调用重新探索构建环境（取证：单回合 15 次 shell
+        // 花在发现 cargo 根与 GNU→MSVC 工具链切换上）。
+        if let Some(workspace) = ctx.try_get::<harness_core::Workspace>() {
+            let facts = crate::facts::project_facts(&workspace.root());
+            if !facts.is_empty() {
+                messages.insert(1, Message::system(&facts));
+            }
+        }
         // 工具超时一次读取：此前每个工具调用都重新 std::env::var。
         let tool_timeout_secs: u64 = std::env::var("HARNESS_TOOL_TIMEOUT_SECS")
             .ok()
@@ -988,6 +997,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 探索（读取/搜索/列目录）应尽快收敛到写操作与验证；交付目标达成后立即停止，不做重复确认与打磨。\n\
 - 步数预算有限且续期次数封顶：收到检查点/收尾提示时必须服从，基于现有证据交付总结，不要继续扩张探索。\n\
 - shell 命令已在工作区根目录执行：不要重复 cd 到工作区，直接用相对路径。\n\
+- 编译验证按 [项目事实] 给出的命令模板一次到位；命令失败后先读全量错误文本再换路一次，禁止用试错方式探索环境（manifest 位置、工具链、目录结构）。\n\
 \n\
 ## 安全\n\
 - 仅当用户明确要求检查/修改/构建/测试/操作工作区时才使用文件系统或 shell 工具。\n\

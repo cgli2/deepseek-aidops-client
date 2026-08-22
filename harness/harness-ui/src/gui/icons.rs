@@ -3,7 +3,9 @@
 use super::theme::Palette;
 
 /// 侧栏功能图标：矢量线条绘制（不依赖字体字形，CJK 字体缺字也不会变豆腐块）。
+// Chip/Menu/Update 为预留字形，当前侧栏未使用，保留绘制实现供后续启用。
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub(super) enum Icon {
     Chat,
     Folder,
@@ -342,6 +344,23 @@ pub(super) fn draw_paperclip_icon(painter: &egui::Painter, c: egui::Pos2, color:
         ],
         s,
     );
+}
+
+/// 气泡头部「复制本条」小图标：两个错位叠放圆角矩形（矢量，不依赖字体字形）。
+/// bg 为气泡填充色，用于前矩形遮挡后矩形线条。
+pub(super) fn draw_copy_icon(
+    painter: &egui::Painter,
+    c: egui::Pos2,
+    color: egui::Color32,
+    bg: egui::Color32,
+) {
+    let s = egui::Stroke::new(1.1_f32, color);
+    // 后矩形（右上偏移）
+    let back = egui::Rect::from_min_size(egui::pos2(c.x - 1.8, c.y - 5.0), egui::vec2(6.6, 7.2));
+    painter.rect(back, egui::Rounding::same(1.5), egui::Color32::TRANSPARENT, s);
+    // 前矩形（左下偏移，bg 填充遮掉后矩形被盖住的边线）
+    let front = egui::Rect::from_min_size(egui::pos2(c.x - 4.8, c.y - 2.2), egui::vec2(6.6, 7.2));
+    painter.rect(front, egui::Rounding::same(1.5), bg, s);
 }
 
 /// 侧栏品牌标：几何与 `bin/assets/aidops-logo.svg` 保持一致。

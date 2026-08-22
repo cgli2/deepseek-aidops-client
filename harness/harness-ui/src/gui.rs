@@ -79,6 +79,12 @@ fn trace(line: &str) {
     if let Some(dir) = crate::settings::app_data_dir() {
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("harness_gui_trace.log");
+        // 体积封顶：超过 4MB 把旧日志降级为 .old（覆盖上一次），防止无限增长。
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if meta.len() > 4 * 1024 * 1024 {
+                let _ = std::fs::rename(&p, dir.join("harness_gui_trace.log.old"));
+            }
+        }
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)

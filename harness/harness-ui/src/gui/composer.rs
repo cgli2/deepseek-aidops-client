@@ -78,17 +78,33 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     ui.add_space(6.0);
                 }
                 // 文本编辑区：去掉自身边框/背景，由卡片提供 chrome。
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut state.input)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(3)
-                        .font(egui::FontId::proportional(13.5))
-                        .frame(false)
-                        .margin(egui::Margin::same(0.0))
-                        .hint_text(
-                            egui::RichText::new("描述任务、粘贴代码或提出问题…").color(pal.dim),
-                        ),
-                );
+                // 限制最大高度：ScrollArea 包裹 TextEdit，内容超长时出现内置滚动条，
+                // 避免卡片无限长高撑到导航头顶部。
+                const COMPOSER_MAX_H: f32 = 150.0;
+                let response = {
+                    let mut resp = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(COMPOSER_MAX_H)
+                        .show(ui, |ui| {
+                            resp = Some(
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut state.input)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(3)
+                                        .font(egui::FontId::proportional(13.5))
+                                        .frame(false)
+                                        .margin(egui::Margin::same(0.0))
+                                        .hint_text(
+                                            egui::RichText::new(
+                                                "描述任务、粘贴代码或提出问题…",
+                                            )
+                                            .color(pal.dim),
+                                        ),
+                                ),
+                            );
+                        });
+                    resp.expect("composer text edit must render")
+                };
                 // Enter 发送 / Shift+Enter 换行：egui 会先插入换行，这里去掉尾随 \n 再提交。
                 let enter = response.has_focus()
                     && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -222,7 +238,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     }
                     let (mrect, mresp) =
                         ui.allocate_exact_size(egui::vec2(chip_w, 28.0), egui::Sense::click());
-                    let mfill = if mresp.hovered() {
+                    let mfill = if mresp.hovered() || state.model_menu_open {
                         pal.hover
                     } else {
                         pal.field
@@ -255,10 +271,17 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         egui::Stroke::NONE,
                     ));
                     if mresp.clicked() {
-                        state.settings_page = "模型配置".into();
-                        state.settings_open = true;
+                        // 直接下拉切换模型，不再跳转设置页；与权限菜单互斥。
+                        state.perm_menu_open = false;
+                        state.model_menu_open = !state.model_menu_open;
                     }
-                    mresp.on_hover_text("切换模型 / API 设置");
+                    mresp.on_hover_text("切换模型（下拉直接选择）");
+
+                    // 模型下拉菜单预估尺寸（列表 + 管理入口）：向上展开定位与外部点击判定。
+                    let menu_w = chip_w.max(210.0).min(260.0);
+                    let model_item_rows =
+                        state.profiles.len() + state.f_models.len() + 3;
+                    let model_menu_h = (model_item_rows as f32 * 26.0 + 30.0).min(340.0);
 
                     // ── 权限 chip（自定义 28px，与左侧模型 chip 同高/同 chrome；默认 ComboBox 不可控高度） ──
                     let label_max_w: f32 = ["只读", "工作区写入", "完全访问"]
@@ -317,6 +340,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         ));
                     }
                     if presp.clicked() {
+                        state.model_menu_open = false;
                         state.perm_menu_open = !state.perm_menu_open;
                     }
                     presp.on_hover_text("切换工具权限范围");
@@ -332,16 +356,25 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                 let menu_rect = egui::Rect::from_min_max(
                                     egui::pos2(prect.left(), prect.top() - 96.0),
                                     egui::pos2(prect.left() + perm_w, prect.top()),
-                                );
-                                if !prect.contains(pos) && !menu_rect.contains(pos) {
+                                );                                if !prect.contains(pos) && !menu_rect.contains(pos) {
                                     state.perm_menu_open = false;
                                 }
                             }
                         }
                     }
                     if state.perm_menu_open {
+                        // 直接锚定在下拉触点（权限 chip）的左下角：菜单底边紧贴 chip 顶边、
+                        // 左对齐 chip 左缘，向上展开。不再依赖固定高度估算，彻底消除
+                        // 「弹层离触点太远」的缝隙。
+                        let screen = ctx.screen_rect();
                         egui::Area::new(egui::Id::new("perm_menu_area"))
-                            .fixed_pos(egui::pos2(prect.left(), prect.top() - 96.0))
+                            .anchor(
+                                egui::Align2::LEFT_BOTTOM,
+                                egui::vec2(
+                                    prect.left() - screen.left(),
+                                    prect.top() - screen.bottom(),
+                                ),
+                            )
                             .movable(false)
                             .interactable(true)
                             .order(egui::Order::Foreground)
@@ -380,6 +413,153 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                                     .settings
                                                     .set("permission.mode", &state.permission);
                                             }
+                                        }
+                                    });
+                            });
+                    }
+
+                    // 模型下拉弹层：向上展开（与权限菜单同 chrome），
+                    // 列出「保存的配置」+「上游模型」+「管理配置」入口，点击直接切换。
+                    if state.model_menu_open {
+                        // 外部点击关闭（在渲染 Area 之前判定，避免一帧闪烁）
+                        let pressed = ctx.input(|i| i.pointer.any_pressed());
+                        let press_origin = ctx.input(|i| i.pointer.press_origin());
+                        if pressed {
+                            if let Some(pos) = press_origin {
+                                let menu_rect = egui::Rect::from_min_max(
+                                    egui::pos2(mrect.left(), mrect.top() - model_menu_h),
+                                    egui::pos2(mrect.right(), mrect.top()),
+                                );
+                                if !mrect.contains(pos) && !menu_rect.contains(pos) {
+                                    state.model_menu_open = false;
+                                }
+                            }
+                        }
+                    }
+                    if state.model_menu_open {
+                        // 直接锚定在下拉触点（chip）的左下角：菜单底边紧贴 chip 顶边、
+                        // 左对齐 chip 左缘，向上展开。不再依赖预估高度，彻底消除
+                        // 「弹层离触点太远」的缝隙（此前用固定预估高度定位导致大段留白）。
+                        let screen = ctx.screen_rect();
+                        egui::Area::new(egui::Id::new("model_menu_area"))
+                            .anchor(
+                                egui::Align2::LEFT_BOTTOM,
+                                egui::vec2(
+                                    mrect.left() - screen.left(),
+                                    mrect.top() - screen.bottom(),
+                                ),
+                            )
+                            .movable(false)
+                            .interactable(true)
+                            .order(egui::Order::Foreground)
+                            .show(ctx, |ui| {
+                                egui::Frame::none()
+                                    .fill(pal.panel)
+                                    .rounding(egui::Rounding::same(8.0))
+                                    .inner_margin(egui::Margin::same(4.0))
+                                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                                    .shadow(egui::epaint::Shadow {
+                                        offset: egui::vec2(0.0, 6.0),
+                                        blur: 18.0,
+                                        spread: 0.0,
+                                        color: egui::Color32::from_black_alpha(if state.dark {
+                                            0x44
+                                        } else {
+                                            0x14
+                                        }),
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(menu_w);
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        // 保存的配置分组：直接复用整套连接信息并立即生效。
+                                        // 仅列出已启用的条目（停用配置在「系统管理 · 模型配置」中管理）。
+                                        let profiles: Vec<_> = state
+                                            .host
+                                            .settings
+                                            .model_profiles()
+                                            .into_iter()
+                                            .filter(|p| p.enabled)
+                                            .collect();
+                                        if !profiles.is_empty() {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new("保存的配置")
+                                                    .size(10.5)
+                                                    .color(pal.dim),
+                                            );
+                                            for profile in profiles {
+                                                let selected = profile.model == state.f_model
+                                                    && profile.provider == state.f_provider;
+                                                let name = profile.name.clone();
+                                                let resp = ui.selectable_label(
+                                                    selected,
+                                                    egui::RichText::new(&name)
+                                                        .size(12.0)
+                                                        .color(pal.text),
+                                                );
+                                                if resp.clicked() {
+                                                    state.load_profile(&name);
+                                                    state.model_menu_open = false;
+                                                }
+                                            }
+                                        }
+                                        // 上游模型分组：该模型已存为配置则复用其连接信息，
+                                        // 否则仅切换模型名（提交时按 f_model 直接配置）。
+                                        if !state.f_models.is_empty() {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new("上游模型")
+                                                    .size(10.5)
+                                                    .color(pal.dim),
+                                            );
+                                            let models = state.f_models.clone();
+                                            for model in models {
+                                                let selected = model == state.f_model;
+                                                let resp = ui.selectable_label(
+                                                    selected,
+                                                    egui::RichText::new(&model)
+                                                        .size(12.0)
+                                                        .color(pal.text),
+                                                );
+                                                if resp.clicked() {
+                                                    // 优先匹配启用的配置；均停用时回退任意同名条目。
+                                                    let all = state.host.settings.model_profiles();
+                                                    let matched = all
+                                                        .iter()
+                                                        .find(|p| p.enabled && p.model == model)
+                                                        .or_else(|| {
+                                                            all.iter().find(|p| p.model == model)
+                                                        })
+                                                        .cloned();
+                                                    match matched {
+                                                        Some(p) => {
+                                                            let pname = p.name.clone();
+                                                            state.load_profile(&pname);
+                                                        }
+                                                        None => {
+                                                            state.f_model = model.clone();
+                                                            let _ = state.host.settings.set(
+                                                                "llm.model",
+                                                                &state.f_model,
+                                                            );
+                                                        }
+                                                    }
+                                                    state.model_menu_open = false;
+                                                }
+                                            }
+                                        }
+                                        ui.add_space(2.0);
+                                        ui.separator();
+                                        let manage = ui.selectable_label(
+                                            false,
+                                            egui::RichText::new("⚙ 管理模型配置")
+                                                .size(12.0)
+                                                .color(pal.accent),
+                                        );
+                                        if manage.clicked() {
+                                            state.settings_open = true;
+                                            state.settings_page = "模型配置".into();
+                                            state.model_menu_open = false;
                                         }
                                     });
                             });

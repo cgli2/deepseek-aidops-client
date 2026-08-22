@@ -14,6 +14,8 @@ pub struct ModelProfile {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// 是否启用：停用的条目不出现在快捷切换菜单，仅作为配置保留。
+    pub enabled: bool,
 }
 
 /// 侧栏项目列表行（projects 表投影）。
@@ -95,6 +97,9 @@ impl SettingsDb {
         // 旧库迁移：projects 表补 archived 列（已存在则忽略错误）。
         let _ = conn
             .execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
+        // 旧库迁移：model_profiles 表补 enabled 列（默认启用；已存在则忽略错误）。
+        let _ = conn
+            .execute_batch("ALTER TABLE model_profiles ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;");
         Ok(Self {
             conn: Mutex::new(conn),
             path,
@@ -230,8 +235,8 @@ impl SettingsDb {
     pub fn save_model_profile(&self, profile: &ModelProfile) -> Result<(), String> {
         let encrypted = self.protect(profile.api_key.as_bytes())?;
         self.conn.lock().map_err(|_| "SQLite 锁异常".to_string())?.execute(
-            "INSERT INTO model_profiles(name,provider,base_url,model,api_key,updated_at) VALUES(?1,?2,?3,?4,?5,CURRENT_TIMESTAMP) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,base_url=excluded.base_url,model=excluded.model,api_key=excluded.api_key,updated_at=CURRENT_TIMESTAMP",
-            params![profile.name, profile.provider, profile.base_url, profile.model, encrypted],
+            "INSERT INTO model_profiles(name,provider,base_url,model,api_key,enabled,updated_at) VALUES(?1,?2,?3,?4,?5,?6,CURRENT_TIMESTAMP) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,base_url=excluded.base_url,model=excluded.model,api_key=excluded.api_key,enabled=excluded.enabled,updated_at=CURRENT_TIMESTAMP",
+            params![profile.name, profile.provider, profile.base_url, profile.model, encrypted, profile.enabled],
         ).map_err(|e| format!("保存模型配置失败: {e}"))?;
         Ok(())
     }
@@ -239,7 +244,7 @@ impl SettingsDb {
         let Ok(conn) = self.conn.lock() else {
             return vec![];
         };
-        let Ok(mut stmt) = conn.prepare("SELECT name,provider,base_url,model,api_key FROM model_profiles ORDER BY updated_at DESC") else { return vec![] };
+        let Ok(mut stmt) = conn.prepare("SELECT name,provider,base_url,model,api_key,enabled FROM model_profiles ORDER BY updated_at DESC") else { return vec![] };
         let Ok(rows) = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -247,21 +252,35 @@ impl SettingsDb {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)? != 0,
             ))
         }) else {
             return vec![];
         };
         rows.filter_map(|r| r.ok())
-            .filter_map(|(name, provider, base_url, model, key)| {
+            .filter_map(|(name, provider, base_url, model, key, enabled)| {
                 Some(ModelProfile {
                     name,
                     provider,
                     base_url,
                     model,
                     api_key: String::from_utf8(self.unprotect(&key).ok()?).ok()?,
+                    enabled,
                 })
             })
             .collect()
+    }
+    /// 切换单个模型配置的启用 / 停用状态（停用条目不参与快捷切换）。
+    pub fn set_model_profile_enabled(&self, name: &str, enabled: bool) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "SQLite 锁异常".to_string())?
+            .execute(
+                "UPDATE model_profiles SET enabled=?1,updated_at=CURRENT_TIMESTAMP WHERE name=?2",
+                params![enabled as i64, name],
+            )
+            .map_err(|e| format!("更新模型配置状态失败: {e}"))?;
+        Ok(())
     }
     pub fn delete_model_profile(&self, name: &str) -> Result<(), String> {
         self.conn
@@ -412,6 +431,31 @@ mod tests {
         db.set_secret("key", "secret").unwrap();
         assert_eq!(db.get("model").as_deref(), Some("deepseek-chat"));
         assert_eq!(db.get("key").as_deref(), Some("secret"));
+        drop(db);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("key"));
+    }
+    #[test]
+    fn model_profile_enabled_roundtrip() {
+        let p = std::env::temp_dir().join(format!("harness-settings-mp-{}.db", std::process::id()));
+        let db = SettingsDb::open(p.clone()).unwrap();
+        db.save_model_profile(&ModelProfile {
+            name: "deepseek · deepseek-chat".into(),
+            provider: "deepseek".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            model: "deepseek-chat".into(),
+            api_key: "sk-test".into(),
+            enabled: true,
+        })
+        .unwrap();
+        assert!(db.model_profiles()[0].enabled);
+        // 停用后状态需持久化；重新保存不应丢失其余字段。
+        db.set_model_profile_enabled("deepseek · deepseek-chat", false).unwrap();
+        let row = &db.model_profiles()[0];
+        assert!(!row.enabled);
+        assert_eq!(row.api_key, "sk-test");
+        db.delete_model_profile("deepseek · deepseek-chat").unwrap();
+        assert!(db.model_profiles().is_empty());
         drop(db);
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("key"));

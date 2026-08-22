@@ -49,8 +49,10 @@ pub(super) struct AppState {
     pub(super) f_aidops_base: String,
     pub(super) f_aidops_key: String,
     pub(super) f_aidops_project: String,
-    pub(super) profiles: Vec<String>,
-    pub(super) selected_profile: String,
+    /// 已保存的模型配置列表缓存（避免每帧查库 + 解密 Key；增删改后调 refresh_profiles）。
+    pub(super) profiles: Vec<crate::ModelProfile>,
+    /// 正在编辑的配置名（None = 新增模式；保存时按此定位覆写 / 重命名迁移）。
+    pub(super) editing_profile: Option<String>,
     /// 当前待发送附件。可由文件选择或粘贴文件路径加入。
     pub(super) attachments: Vec<harness_core::Attachment>,
     pub(super) permission: String,
@@ -62,6 +64,8 @@ pub(super) struct AppState {
     /// 权限 chip 下拉菜单是否展开。用自定义 chip + Area 弹层代替默认 ComboBox，
     /// 保证与模型 chip 同 28px 高度 / 同圆角 / 同边框，水平基线对齐。
     pub(super) perm_menu_open: bool,
+    /// 模型 chip 下拉菜单是否展开：直接在下拉列表切换模型，不再跳转设置页。
+    pub(super) model_menu_open: bool,
     /// 插件管理列表（内置核心项恒启用 + 用户导入的 WASM 插件）。
     pub(super) plugin_rows: Vec<PluginUiRow>,
     /// 插件管理页当前 tab（"sys" = 系统插件，其余 = 自定义插件）。
@@ -150,6 +154,9 @@ pub(super) struct AppState {
     pub(super) preview_rx: Option<std::sync::mpsc::Receiver<crate::preview::PreviewLoadResult>>,
     /// 延迟打开预览（渲染期间收集点击，渲染后处理，避免同帧布局突变闪烁）。
     pub(super) pending_preview: Option<String>,
+    /// 延迟剪贴板写入：渲染闭包内点击复制时先暂存文本，帧末统一写入，
+    /// 避免布局期间触碰系统剪贴板产生副作用。
+    pub(super) pending_copy: Option<String>,
     /// 预览内容缓存（path → (content, truncated)）：同一文件重复点击零加载、无空窗。
     pub(super) preview_cache: std::collections::HashMap<String, (String, bool)>,
     /// 当前预览的语法高亮 LayoutJob（preview_content 就绪后一次性生成，渲染零成本）。
@@ -193,15 +200,12 @@ impl AppState {
                     base_url: host.base_url.clone(),
                     model: host.model.clone(),
                     api_key: key,
+                    enabled: true,
                 });
             }
         }
         let mut state = Self {
-            profiles: settings
-                .model_profiles()
-                .into_iter()
-                .map(|p| p.name)
-                .collect(),
+            profiles: settings.model_profiles(),
             f_provider: host.provider.clone(),
             f_base: host.base_url.clone(),
             f_model: host.model.clone(),
@@ -225,7 +229,7 @@ impl AppState {
                 .and_then(|c| c.aidops.project_id)
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
-            selected_profile: String::new(),
+            editing_profile: None,
             attachments: Vec::new(),
             permission: settings
                 .get("permission.mode")
@@ -269,6 +273,7 @@ impl AppState {
             renaming: None,
             rename_buf: String::new(),
             perm_menu_open: false,
+            model_menu_open: false,
             // 版本更新：节流 24h 的后台自动检查（manifest_url 为空时跳过）。
             update_status: {
                 let s = Arc::new(Mutex::new(UpdateStatus::Idle));
@@ -338,6 +343,7 @@ impl AppState {
             preview_truncated: false,
             preview_rx: None,
             pending_preview: None,
+            pending_copy: None,
             preview_cache: std::collections::HashMap::new(),
             preview_highlight: None,
             tree_open: false,
@@ -411,25 +417,38 @@ impl AppState {
         if events.is_empty() {
             return;
         }
+        // trace 摘要：类型分布 + 关键细节（回合边界/步号/工具名与参数/结果成败/
+        // token 用量），取代旧版无信息的「+N events processed」计数行。
+        let mut assistant_chunks = 0usize;
+        let mut assistant_chars = 0usize;
+        let mut thinking_chars = 0usize;
+        let mut prompt_tokens = 0u64;
+        let mut completion_tokens = 0u64;
+        let mut details: Vec<String> = Vec::new();
         for event in &events {
             match event {
                 SessionEvent::TurnStart { input, .. } => {
+                    details.push(format!("turn_start「{}」", brief(input, 40)));
                     self.push("user", "你", input);
                     // 队列中的任务真正开始执行时重新计时，不能沿用前一个任务的耗时。
                     self.turn_started = Some(std::time::Instant::now());
                     self.record_activity("正在准备上下文");
                 }
                 SessionEvent::StepStart { step, .. } => {
+                    details.push(format!("step {step}"));
                     self.record_activity(&format!("正在请求模型（第 {step} 步）"));
                 }
                 SessionEvent::Assistant { chunk, .. } => {
                     if let Some(text) = &chunk.text {
+                        assistant_chunks += 1;
+                        assistant_chars += text.chars().count();
                         self.finalize_thinking();
                         self.append_assistant(text);
                         self.record_activity("正在生成回复");
                     }
                 }
                 SessionEvent::Thinking { text, .. } => {
+                    thinking_chars += text.chars().count();
                     // 思考链增量：累积全文并实时覆盖尾部「思考」气泡（只展示最近几十字，
                     // 不刷屏），长推理期用户能看到内容在滚动，而不是只剩状态栏一个标志。
                     self.thinking = true;
@@ -443,6 +462,7 @@ impl AppState {
                     self.update_thinking_bubble();
                 }
                 SessionEvent::ToolCall { call, .. } => {
+                    details.push(format!("tool {} {}", call.name, args_brief(&call.args)));
                     self.finalize_thinking();
                     self.record_activity(&format!("正在执行工具：{}", call.name));
                     // 参数摘要（≤120 字）：agent 行为全程可见。
@@ -450,6 +470,11 @@ impl AppState {
                     self.push("tool", "工具", &format!("调用 {}: {}", call.name, summary));
                 }
                 SessionEvent::ToolResult { result, .. } => {
+                    details.push(if result.ok {
+                        format!("tool_result ok {}ch", result.content.chars().count())
+                    } else {
+                        format!("tool_result FAIL「{}」", brief(&result.content, 80))
+                    });
                     self.record_activity(if result.ok {
                         "已收到工具结果，继续分析"
                     } else {
@@ -463,6 +488,7 @@ impl AppState {
                     );
                 }
                 SessionEvent::PlanUpdate { items, .. } => {
+                    details.push(format!("plan {}项", items.len()));
                     let mut s = String::from("[计划]\n");
                     for (i, item) in items.iter().enumerate() {
                         let mark = match item.status.as_str() {
@@ -474,10 +500,16 @@ impl AppState {
                     }
                     self.push("plan", "计划", s.trim_end());
                 }
+                SessionEvent::Usage { usage, .. } => {
+                    prompt_tokens += usage.prompt_tokens;
+                    completion_tokens += usage.completion_tokens;
+                }
                 SessionEvent::Council { event, .. } => {
+                    details.push("council".into());
                     self.apply_council_event(event);
                 }
                 SessionEvent::TurnEnd { .. } => {
+                    details.push("turn_end".into());
                     self.finalize_thinking();
                     self.turn_started = None;
                     let queued = self.host.sink.queued_count();
@@ -494,7 +526,20 @@ impl AppState {
             }
         }
         self.last_event = next;
-        trace(&format!("[log] +{} events processed", events.len()));
+        let mut line = format!("[log] +{} events", events.len());
+        if assistant_chunks > 0 {
+            line.push_str(&format!(" | assistant×{assistant_chunks}({assistant_chars}ch)"));
+        }
+        if thinking_chars > 0 {
+            line.push_str(&format!(" | thinking({thinking_chars}ch)"));
+        }
+        for detail in &details {
+            line.push_str(&format!(" | {detail}"));
+        }
+        if prompt_tokens > 0 || completion_tokens > 0 {
+            line.push_str(&format!(" | tokens p{prompt_tokens}/c{completion_tokens}"));
+        }
+        trace(&brief(&line, 800));
     }
 
     fn apply_council_event(&mut self, event: &CouncilEvent) {
@@ -638,7 +683,7 @@ impl AppState {
         if self.thinking_text.is_empty() {
             return;
         }
-        let mut t = std::mem::take(&mut self.thinking_text);
+        let t = std::mem::take(&mut self.thinking_text);
         // 收拢：思考过程只保留一行简短摘要，不占对话屏。
         // 完整思考不属于对话正文；需要时可通过摘要引导上下文，不再铺满屏幕。
         let compact = t.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -663,9 +708,14 @@ impl AppState {
         let _ = settings.set("permission.mode", &self.permission);
         let _ = settings.set("llm.model", &self.f_model);
         let _ = settings.set("llm.provider", &self.f_provider);
-        // 级联路由不写死模型名：从用户保存且勾选的模型中选取。轻量问答优先
-        // flash/mini/lite/small 候选；涉及代码、工具、多步骤的请求优先其它候选。
-        let selected = self.select_profile_for(&text);
+        // 直接使用用户当前选择的模型：界面选哪个就用哪个，不做任何自动切换。
+        // 优先匹配启用的配置；当前模型被停用时回退任意同名条目，避免发送直接断链。
+        let all_profiles = self.host.settings.model_profiles();
+        let selected = all_profiles
+            .iter()
+            .find(|p| p.enabled && p.model == self.f_model)
+            .or_else(|| all_profiles.iter().find(|p| p.model == self.f_model))
+            .cloned();
         if let Some(profile) = selected {
             let _ = self.host.llm_control.configure_provider(
                 profile.provider.clone(),
@@ -706,76 +756,6 @@ impl AppState {
         sink.submit_with_attachments(text, attachments);
         if queued {
             self.note = format!("新任务已加入队列（当前待执行 {} 条）", sink.queued_count());
-        }
-    }
-
-    fn select_profile_for(&self, input: &str) -> Option<crate::ModelProfile> {
-        let selected: std::collections::HashSet<String> = self
-            .host
-            .settings
-            .get("llm.selected_models")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let mut profiles: Vec<_> = self
-            .host
-            .settings
-            .model_profiles()
-            .into_iter()
-            .filter(|profile| selected.is_empty() || selected.contains(&profile.model))
-            .collect();
-        if profiles.is_empty() {
-            return None;
-        }
-        let lower = input.to_lowercase();
-        let complex = input.chars().count() > 260
-            || [
-                "代码",
-                "修复",
-                "实现",
-                "重构",
-                "文件",
-                "测试",
-                "编译",
-                "专家团",
-                "架构",
-                "安全",
-                "database",
-                "refactor",
-                "implement",
-                "debug",
-            ]
-            .iter()
-            .any(|term| lower.contains(term));
-        let lightweight = |profile: &crate::ModelProfile| {
-            let name = profile.model.to_lowercase();
-            ["flash", "mini", "lite", "small", "fast"]
-                .iter()
-                .any(|term| name.contains(term))
-        };
-        profiles.sort_by_key(|profile| profile.model.len());
-        if complex {
-            profiles
-                .into_iter()
-                .find(|profile| !lightweight(profile))
-                .or_else(|| {
-                    self.host
-                        .settings
-                        .model_profiles()
-                        .into_iter()
-                        .find(|p| p.model == self.f_model)
-                })
-        } else {
-            profiles.into_iter().find(lightweight).or_else(|| {
-                self.host
-                    .settings
-                    .model_profiles()
-                    .into_iter()
-                    .find(|p| p.model == self.f_model)
-            })
         }
     }
 
@@ -1070,66 +1050,190 @@ impl AppState {
 
     pub(super) fn apply_model(&mut self) {
         let settings = &self.host.settings;
+        let editing = self.editing_profile.clone();
+        // Key 解析：未重填时编辑沿用该条目自身 Key，新增回退全局 Key。
         let key = if self.f_key.trim().is_empty() {
-            settings.get("llm.api_key").unwrap_or_default()
+            editing
+                .as_deref()
+                .and_then(|n| self.profiles.iter().find(|p| p.name == n))
+                .map(|p| p.api_key.clone())
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| settings.get("llm.api_key").unwrap_or_default())
         } else {
-            std::mem::take(&mut self.f_key)
+            self.f_key.trim().to_string()
         };
-        // 未填写模型名称但已获取上游列表 → 默认取第一个模型。
-        if self.f_model.trim().is_empty() {
-            if !self.f_models.is_empty() {
-                self.f_model = self.f_models[0].clone();
-            } else if !self.f_selected_models.is_empty() {
-                let first = self
-                    .f_selected_models
-                    .iter()
-                    .next()
-                    .cloned()
-                    .unwrap_or_default();
-                self.f_model = first;
+        let provider = self.f_provider.trim().to_string();
+        let base = self.f_base.trim().to_string();
+
+        if editing.is_some() {
+            // ── 编辑模式：单条覆写（含重命名迁移），保留原启用状态 ──
+            let enabled = editing
+                .as_deref()
+                .and_then(|n| self.profiles.iter().find(|p| p.name == n))
+                .map(|p| p.enabled)
+                .unwrap_or(true);
+            if self.f_model.trim().is_empty() {
+                self.note = "请填写模型名称".into();
+                return;
             }
-        }
-        let result = self.host.llm_control.configure_provider(
-            self.f_provider.clone(),
-            self.f_base.clone(),
-            self.f_model.clone(),
-            key.clone(),
-            self.effort(),
-        );
-        match result {
-            Ok(()) => {
-                let _ = settings.set("llm.base_url", &self.f_base);
-                let _ = settings.set("llm.model", &self.f_model);
-                let _ = settings.set("llm.provider", &self.f_provider);
-                let _ = settings.set_secret("llm.api_key", &key);
-                let _ = settings.set("llm.reasoning_effort", &self.f_effort);
-                // 持久化多选模型集合（逗号分隔），供下次打开恢复勾选。
-                let mut sel: Vec<&str> =
-                    self.f_selected_models.iter().map(|s| s.as_str()).collect();
-                sel.sort_unstable();
-                let _ = settings.set("llm.selected_models", &sel.join(","));
-                let name = format!("{} · {}", self.f_provider, self.f_model);
-                let _ = settings.save_model_profile(&crate::ModelProfile {
-                    name: name.clone(),
-                    provider: self.f_provider.clone(),
-                    base_url: self.f_base.clone(),
-                    model: self.f_model.clone(),
-                    api_key: key,
-                });
-                self.profiles = settings
-                    .model_profiles()
-                    .into_iter()
-                    .map(|p| p.name)
-                    .collect();
-                self.selected_profile = name;
-                self.note = "模型配置已保存并应用".into();
-                // 不自动关闭：note 在弹窗内可见，给用户明确的保存反馈。
-                trace("[config] model configuration applied");
-            }
-            Err(error) => {
+            let model = self.f_model.trim().to_string();
+            if let Err(error) = self.host.llm_control.configure_provider(
+                provider.clone(),
+                base.clone(),
+                model.clone(),
+                key.clone(),
+                self.effort(),
+            ) {
                 self.note = format!("配置错误: {error}");
                 trace(&format!("[config] rejected: {error}"));
+                return;
+            }
+            let _ = settings.set("llm.base_url", &base);
+            let _ = settings.set("llm.model", &model);
+            let _ = settings.set("llm.provider", &provider);
+            let _ = settings.set_secret("llm.api_key", &key);
+            let _ = settings.set("llm.reasoning_effort", &self.f_effort);
+            let name = format!("{provider} · {model}");
+            let _ = settings.save_model_profile(&crate::ModelProfile {
+                name: name.clone(),
+                provider,
+                base_url: base,
+                model,
+                api_key: key,
+                enabled,
+            });
+            // 编辑导致重命名（厂商 / 模型名变更）：删除旧条目避免残留重复配置。
+            if let Some(old) = editing {
+                if old != name {
+                    let _ = settings.delete_model_profile(&old);
+                }
+            }
+            self.refresh_profiles();
+            self.reset_model_form();
+            self.note = format!("模型配置「{name}」已保存并应用");
+            trace("[config] model profile updated");
+            return;
+        }
+
+        // ── 新增模式：批量写入勾选的模型（无勾选则取表单单个模型）──
+        // 按上游列表顺序稳定排序，保证「第一个为当前模型」可预期。
+        let mut targets: Vec<String> = self
+            .f_models
+            .iter()
+            .filter(|m| self.f_selected_models.contains(*m))
+            .cloned()
+            .collect();
+        // 勾选了但不在上游列表的条目（防御性兜底）。
+        for m in &self.f_selected_models {
+            if !targets.contains(m) {
+                targets.push(m.clone());
             }
         }
+        if targets.is_empty() && !self.f_model.trim().is_empty() {
+            targets.push(self.f_model.trim().to_string());
+        }
+        if targets.is_empty() {
+            self.note = "请填写模型名称，或获取上游模型列表后勾选".into();
+            return;
+        }
+        let primary = targets[0].clone();
+        if let Err(error) = self.host.llm_control.configure_provider(
+            provider.clone(),
+            base.clone(),
+            primary.clone(),
+            key.clone(),
+            self.effort(),
+        ) {
+            self.note = format!("配置错误: {error}");
+            trace(&format!("[config] rejected: {error}"));
+            return;
+        }
+        let _ = settings.set("llm.base_url", &base);
+        let _ = settings.set("llm.model", &primary);
+        let _ = settings.set("llm.provider", &provider);
+        let _ = settings.set_secret("llm.api_key", &key);
+        let _ = settings.set("llm.reasoning_effort", &self.f_effort);
+        // 持久化多选模型集合（逗号分隔），供下次打开恢复勾选。
+        let mut sel: Vec<&str> = self.f_selected_models.iter().map(|s| s.as_str()).collect();
+        sel.sort_unstable();
+        let _ = settings.set("llm.selected_models", &sel.join(","));
+        // 批量写入：逐条去重（同名 或 同 厂商+地址+模型 组合），仅插入新模型。
+        let existing = settings.model_profiles();
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for model in &targets {
+            let name = format!("{provider} · {model}");
+            let dup = existing.iter().any(|p| {
+                p.name == name
+                    || (p.provider == provider && p.base_url == base && p.model == *model)
+            });
+            if dup {
+                skipped += 1;
+                continue;
+            }
+            let _ = settings.save_model_profile(&crate::ModelProfile {
+                name,
+                provider: provider.clone(),
+                base_url: base.clone(),
+                model: model.clone(),
+                api_key: key.clone(),
+                enabled: true,
+            });
+            added += 1;
+        }
+        self.refresh_profiles();
+        self.reset_model_form();
+        self.note = if added > 0 && skipped > 0 {
+            format!("已新增 {added} 个模型（跳过 {skipped} 个重复），当前模型：{primary}")
+        } else if added > 0 {
+            format!("已新增 {added} 个模型配置并应用，当前模型：{primary}")
+        } else {
+            format!("所选模型均已存在，未新增；当前模型：{primary}")
+        };
+        trace(&format!(
+            "[config] batch save applied added={added} skipped={skipped}"
+        ));
     }
+
+    /// 保存成功后复位表单：清空输入与勾选、退出编辑模式（厂商 / 地址保留，便于连续添加）。
+    fn reset_model_form(&mut self) {
+        self.editing_profile = None;
+        self.f_model.clear();
+        self.f_key.clear();
+        self.f_selected_models.clear();
+        self.f_models.clear();
+        self.models_msg.clear();
+    }
+
+    /// 刷新模型配置列表缓存（增删 / 启停后调用，避免每帧查库解密）。
+    pub(super) fn refresh_profiles(&mut self) {
+        self.profiles = self.host.settings.model_profiles();
+    }
+}
+
+/// 折叠空白并截断到 n 字符（超长补 …），保证 trace 单行且长度可控。
+fn brief(s: &str, n: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = flat.chars().count();
+    if count <= n {
+        flat
+    } else {
+        let head: String = flat.chars().take(n).collect();
+        format!("{head}…")
+    }
+}
+
+/// 提取工具参数中最有诊断价值的字段（path/command/query），无命中回退原始 JSON。
+fn args_brief(args: &serde_json::Value) -> String {
+    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+    let raw = if !get("path").is_empty() {
+        format!("{} {}", get("op"), get("path")).trim().to_string()
+    } else if !get("command").is_empty() {
+        get("command").to_string()
+    } else if !get("query").is_empty() {
+        format!("query={}", get("query"))
+    } else {
+        args.to_string()
+    };
+    brief(&raw, 60)
 }

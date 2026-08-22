@@ -440,7 +440,6 @@ mod tests {
 
     #[test]
     fn find_by_filename_locates_file_in_deep_subdir() {
-        use std::path::PathBuf;
         let base = std::env::temp_dir().join(format!("harness-fbf-{}", std::process::id()));
         let deep = base.join("a").join("b").join("c");
         std::fs::create_dir_all(&deep).unwrap();
@@ -456,7 +455,6 @@ mod tests {
 
     #[test]
     fn find_by_filename_skips_ignored_dirs() {
-        use std::path::PathBuf;
         let base = std::env::temp_dir().join(format!("harness-fbf2-{}", std::process::id()));
         let ignored = base.join("node_modules").join("x");
         std::fs::create_dir_all(&ignored).unwrap();

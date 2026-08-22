@@ -233,14 +233,14 @@ pub(super) fn sidebar_icon_button(
         rect,
         egui::Rounding::same(6.0),
         fill,
-        egui::Stroke::new(1.0, pal.border),
+        egui::Stroke::new(1.0_f32, pal.border),
     );
     let color = if response.hovered() {
         pal.text
     } else {
         pal.dim
     };
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(1.4_f32, color);
     let c = rect.center();
     match icon {
         SidebarActionIcon::Add => {
@@ -301,7 +301,7 @@ pub(super) fn sidebar_text_button(
         rect,
         egui::Rounding::same(6.0),
         fill,
-        egui::Stroke::new(1.0, pal.border),
+        egui::Stroke::new(1.0_f32, pal.border),
     );
     ui.painter().text(
         rect.center(),
@@ -330,7 +330,7 @@ pub(super) fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut
     egui::Frame::default()
         .fill(pal.field)
         .rounding(egui::Rounding::same(7.0))
-        .stroke(egui::Stroke::new(1.0, stroke_color))
+        .stroke(egui::Stroke::new(1.0_f32, stroke_color))
         .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
             ui.set_min_height(sidebar_control_height() - 8.0);
@@ -339,7 +339,7 @@ pub(super) fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut
                 let (icon_rect, _) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 let center = icon_rect.center() + egui::vec2(-1.0, -1.0);
-                let stroke = egui::Stroke::new(1.25, pal.dim);
+                let stroke = egui::Stroke::new(1.25_f32, pal.dim);
                 ui.painter().circle_stroke(center, 4.0, stroke);
                 ui.painter().line_segment(
                     [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
@@ -361,7 +361,7 @@ pub(super) fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut
                             .circle_filled(clear_rect.center(), 7.0, pal.hover);
                     }
                     let c = clear_rect.center();
-                    let stroke = egui::Stroke::new(1.15, pal.dim);
+                    let stroke = egui::Stroke::new(1.15_f32, pal.dim);
                     ui.painter().line_segment(
                         [c + egui::vec2(-2.5, -2.5), c + egui::vec2(2.5, 2.5)],
                         stroke,

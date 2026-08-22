@@ -5,6 +5,7 @@ pub mod controller;
 pub mod council;
 pub mod events;
 pub mod execution;
+pub mod facts;
 pub mod scheduler;
 pub mod subagent;
 pub mod task;

@@ -127,6 +127,11 @@ impl TrellisPlugin {
     pub fn control(&self) -> Arc<TrellisControl> {
         self.control.clone()
     }
+
+    /// 暴露当前配置（供 UI 展示/调试），同时消除字段 dead_code 警告。
+    pub fn config(&self) -> &TrellisConfig {
+        &self.config
+    }
 }
 
 impl Plugin for TrellisPlugin {

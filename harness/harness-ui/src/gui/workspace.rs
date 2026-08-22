@@ -106,7 +106,14 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                     {
                                         index += 1;
                                     }
-                                    render_work_batch(ui, &messages[start..index], start, max_w, pal);
+                                    // live：agent 正在流式工作且该批之后还没有任何新消息，
+                                    // 即当前回合的进行中批次——折叠态也需要呈现动效。
+                                    let batch_live = state.busy
+                                        && messages
+                                            .iter()
+                                            .skip(index)
+                                            .all(|m| m.text.is_empty());
+                                    render_work_batch(ui, &messages[start..index], start, max_w, pal, batch_live);
                                     ui.add_space(6.0);
                                     continue;
                                 }
@@ -136,11 +143,72 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         } else {
                                             ui.set_max_width(max_w * 0.96);
                                         }
-                                        ui.label(
-                                            egui::RichText::new(&msg.label)
-                                                .size(10.5)
-                                                .color(pal.dim),
-                                        );
+                                        // 本轮起点：最近一条用户消息（含）；供一键复制整轮对话。
+                                        let turn_start = messages[..index]
+                                            .iter()
+                                            .rposition(|m| m.kind == "user" && !m.text.is_empty())
+                                            .unwrap_or(0);
+                                        // 头部行：右上角角色标签。用负边距把标签行上移贴近气泡
+                                        // 顶边（气泡顶部内边距为 12/10px），
+                                        // 并压缩后续间距，减少头部占用的高度。
+                                        ui.add_space(-9.0);
+                                        ui.horizontal(|ui| {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    // 复制小图标（矢量双矩形，不依赖字体字形、
+                                                    // 不会变豆腐块）：一键复制本条气泡，
+                                                    // pending_copy 帧末统一写剪贴板。
+                                                    let (copy_rect, copy_resp) = ui
+                                                        .allocate_exact_size(
+                                                            egui::vec2(12.0, 12.0),
+                                                            egui::Sense::click(),
+                                                        );
+                                                    let icon_color = if copy_resp.hovered() {
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::PointingHand,
+                                                        );
+                                                        pal.text
+                                                    } else {
+                                                        pal.dim
+                                                    };
+                                                    super::icons::draw_copy_icon(
+                                                        ui.painter(),
+                                                        copy_rect.center(),
+                                                        icon_color,
+                                                        fill,
+                                                    );
+                                                    if copy_resp.clicked() {
+                                                        state.pending_copy =
+                                                            Some(msg.text.clone());
+                                                    }
+                                                    copy_resp.on_hover_text("复制本条内容");
+                                                    ui.label(
+                                                        egui::RichText::new(&msg.label)
+                                                            .size(10.5)
+                                                            .color(pal.dim),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(0.0);
+                                        // 交付完成状态：回合已结束且这是最后一条非空消息时，
+                                        // 明确标注任务已完成，让用户一眼看到最终结果。
+                                        let is_final = !state.busy
+                                            && msg.kind == "assistant"
+                                            && messages
+                                                .iter()
+                                                .skip(index + 1)
+                                                .all(|m| m.text.is_empty());
+                                        if is_final {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new("✓ 已交付 · 任务完成")
+                                                    .size(10.5)
+                                                    .strong()
+                                                    .color(pal.accent),
+                                            );
+                                        }
                                         #[cfg(target_os = "macos")]
                                         ui.add_space(2.0);
                                         // selectable(true)：正文支持鼠标拖选，选中后 Ctrl+C 复制。
@@ -156,9 +224,11 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 code_bg: pal.field,
                                             };
                                             let job = crate::markdown::to_job(&msg.text, &theme, markdown_w);
-                                            let mut last_resp = Some(ui.add(
+                                            // 正文响应独立持有：右键菜单始终挂在 Markdown 正文上
+                                            // （此前挂在最后一个文件路径按钮上，右键正文不弹菜单）。
+                                            let md_resp = ui.add(
                                                 egui::Label::new(job).selectable(true),
-                                            ));
+                                            );
                                             // 文件路径识别：正文用完整 markdown 渲染，
                                             // 识别出的文件路径作为可点击 chip 追加在正文下方，
                                             // 不打断正文排版。
@@ -196,10 +266,9 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                     if rb.clicked() {
                                                         state.pending_preview = Some(path);
                                                     }
-                                                    last_resp = Some(rb);
                                                 }
                                             }
-                                            last_resp.unwrap_or_else(|| ui.label(""))
+                                            md_resp
                                         } else {
                                             ui.add(
                                                 egui::Label::new(
@@ -210,16 +279,21 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 .selectable(true),
                                             )
                                         };
-                                        // 右键菜单：一键复制整条消息内容。
+                                        // 右键菜单：复制单条内容，或一键复制整轮对话（含多个气泡）。
                                         resp.context_menu(|ui| {
-                                            if ui.button("📋 复制全部内容").clicked() {
+                                            if ui.button("📋 复制本条内容").clicked() {
                                                 ui.ctx().copy_text(msg.text.clone());
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("📋 复制整轮对话（含过程与回复）").clicked() {
+                                                ui.ctx()
+                                                    .copy_text(format_turn_text(&messages, turn_start));
                                                 ui.close_menu();
                                             }
                                         });
                                     });
                                 });
-                                ui.add_space(6.0);
+                                ui.add_space(10.0);
                                 index += 1;
                             }
                             // 标准模式只展示常规对话。保留专家团状态供用户切回团队模式
@@ -230,42 +304,13 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                     ui.add_space(8.0);
                                 }
                             }
-                            // 不依赖首个 SSE 分片：用户提交后的下一帧就显示在消息主区域。
-                            // API 首包慢时，用户无需在底部小字里寻找运行状态。
-                            if state.busy {
-                                let secs = state.turn_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                                let activity = if state.activity.is_empty() {
-                                    "正在启动任务"
-                                } else {
-                                    state.activity.as_str()
-                                };
-                                // 紧凑版 loading 气泡：缩小上下内边距与字号，降低单条占用高度。
-                                egui::Frame::default()
-                                    .fill(pal.ai_bubble)
-                                    .rounding(egui::Rounding::same(12.0))
-                                    .stroke(egui::Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.55)))
-                                    .inner_margin(egui::Margin::symmetric(12.0, 5.0))
-                                    .show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        ui.horizontal(|ui| {
-                                            ui.add(egui::Spinner::new().size(12.0));
-                                            ui.label(
-                                                egui::RichText::new(format!("{activity} · {secs} 秒"))
-                                                    .size(11.0)
-                                                    .color(pal.text),
-                                            );
-                                        });
-                                        if state.last_activity.map(|t| t.elapsed().as_secs() >= 10).unwrap_or(false) {
-                                            ui.add_space(2.0);
-                                            ui.label(
-                                                egui::RichText::new("仍在等待模型或工具返回；任务没有静默停止，可随时点击停止")
-                                                    .size(10.0)
-                                                    .color(pal.warn),
-                                            );
-                                        }
-                                    });
-                            }
+                            // 运行状态不再单独占一条计时气泡：进行中批次的「工作过程」
+                            // 折叠头自带旋转动效与实时流式文字，信息就地呈现。
                         });
+                    // 延迟剪贴板写入：渲染闭包内点击复制时先暂存，帧末统一写入。
+                    if let Some(text) = state.pending_copy.take() {
+                        ctx.copy_text(text);
+                    }
                 });
         });
 
@@ -526,51 +571,151 @@ pub(super) fn render_pending_queue(ui: &mut egui::Ui, state: &mut AppState, pal:
     ui.add_space(8.0);
 }
 
+/// 解析计划消息为待办列表：形如 "1. ✓ xxx" / "2. … xxx" / "3. · xxx"。
+/// 返回 (标记符号, 待办文本)。
+fn parse_plan_checklist(text: &str) -> Vec<(char, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let mut chars = line.chars();
+        if !chars.next().is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let rest = line
+            .strip_prefix(|c: char| c.is_ascii_digit())
+            .and_then(|r| r.strip_prefix(['.', '、', '）', ')']))
+            .map(str::trim_start);
+        let Some(rest) = rest else { continue };
+        let mut cs = rest.chars();
+        if let Some(mark) = cs.next() {
+            if matches!(mark, '✓' | '…' | '·' | '-' | 'x' | 'X') {
+                let item: String = cs.collect::<String>().trim().to_string();
+                if !item.is_empty() {
+                    out.push((mark, item));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 一次 agent 回合内连续的思考、调用和返回共用一个折叠容器；默认只占一行。
+/// 计划待办（重要内容）常显在容器顶部；思考/工具中间过程收拢进折叠区。
 /// `start_index` 是 append-only 消息序号，可作为 egui 折叠状态的稳定 id。
+/// `live` 表示该批次正被 agent 流式填充：折叠态也展示旋转动效与已用时，
+/// 让用户不展开也能感知 agent 正在工作。
 fn render_work_batch(
     ui: &mut egui::Ui,
     messages: &[ChatMsg],
     start_index: usize,
     max_w: f32,
     pal: Palette,
+    live: bool,
 ) {
     let tool_count = messages.iter().filter(|msg| msg.kind == "tool").count();
     let thinking_count = messages.iter().filter(|msg| msg.kind == "thinking").count();
-    let latest = messages
-        .last()
-        .map(|msg| one_line_summary(&msg.text, 54))
-        .unwrap_or_default();
-    let summary = match (thinking_count, tool_count) {
-        (0, 0) => format!("{} 条过程", messages.len()),
-        (0, tools) => format!("{tools} 次工具调用 · {latest}"),
-        (thoughts, 0) => format!("思考中 · {thoughts} 条 · {latest}"),
-        (thoughts, tools) => format!("思考 {thoughts} 条 · 工具 {tools} 次 · {latest}"),
+    // 计划待办常显：跨 plan 消息合并，按 ✓/…/· 区分完成、进行中、待办。
+    let plan_items: Vec<(char, String)> = messages
+        .iter()
+        .filter(|msg| msg.kind == "plan")
+        .flat_map(|msg| parse_plan_checklist(&msg.text))
+        .collect();
+    let (plan_done, plan_total) = plan_items.iter().fold(
+        (0usize, 0usize),
+        |(d, t), (mark, _)| (d + usize::from(*mark == '✓'), t + 1),
+    );
+    let mut parts: Vec<String> = Vec::new();
+    if thinking_count > 0 {
+        parts.push(format!("思考 {thinking_count} 条"));
+    }
+    if tool_count > 0 {
+        parts.push(format!("工具 {tool_count} 次"));
+    }
+    let summary = if parts.is_empty() {
+        format!("{} 条过程", messages.len())
+    } else {
+        parts.join(" · ")
     };
     egui::Frame::default()
         .fill(pal.field)
         .rounding(egui::Rounding::same(8.0))
         .stroke(egui::Stroke::new(1.0_f32, pal.border))
-        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
             ui.set_max_width(max_w * 0.96);
-            egui::CollapsingHeader::new(
+            // ── 计划待办：重要内容，常显不折叠 ──
+            if !plan_items.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("📋 任务计划 · {plan_done}/{plan_total} 完成"))
+                        .size(11.0)
+                        .strong()
+                        .color(if plan_done == plan_total {
+                            pal.accent
+                        } else {
+                            pal.text
+                        }),
+                );
+                ui.add_space(3.0);
+                for (mark, item) in &plan_items {
+                    let (sym, color) = match mark {
+                        '✓' => ("✓", pal.accent),
+                        '…' => ("…", pal.warn),
+                        _ => ("·", pal.dim),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(sym)
+                                .size(12.5)
+                                .strong()
+                                .color(color),
+                        );
+                        // egui 0.30 的 strikethrough() 不再接受 bool 参数，改为条件应用。
+                        let mut text = egui::RichText::new(item)
+                            .size(12.0)
+                            .color(if *mark == '✓' { pal.dim } else { pal.text });
+                        if *mark == '✓' {
+                            text = text.strikethrough();
+                        }
+                        ui.add(egui::Label::new(text).selectable(true));
+                    });
+                }
+                ui.add_space(4.0);
+                ui.separator();
+            }
+            // ── 思考/工具中间过程：默认折叠，只占一行 ──
+            // 进行中批次：把静态 ◌ 换成旋转字符帧 + 已用时，折叠态也能看到
+            // SSE 流式动效（与底部状态行/composer 用同一套 ◐◓◑◒ 帧序列）。
+            let header = if live {
+                let secs = ui.input(|i| i.time);
+                let glyph = ["◐", "◓", "◑", "◒"][((secs as u64) % 4) as usize];
+                // 按 500ms 推进重绘，驱动旋转帧与流式光标的闪烁。
+                let phase_ms = ((secs * 2.0) % 1.0 * 1000.0) as u64;
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(
+                    500 - phase_ms.min(499),
+                ));
+                egui::RichText::new(format!("{glyph} 工作过程 · {summary} · 进行中"))
+                    .size(11.5)
+                    .color(pal.accent)
+            } else {
                 egui::RichText::new(format!("◌ 工作过程 · {summary}"))
                     .size(11.5)
-                    .color(pal.dim),
-            )
+                    .color(pal.dim)
+            };
+            let collapsing = egui::CollapsingHeader::new(header)
             .id_salt(("work-batch", start_index))
             .default_open(false)
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 for (position, msg) in messages.iter().enumerate() {
+                    if msg.kind == "plan" {
+                        continue; // 计划已在折叠区外常显
+                    }
                     if position > 0 {
                         ui.separator();
                     }
                     let label = match msg.kind.as_str() {
                         "thinking" => "思考",
                         "tool" => "工具",
-                        "plan" => "计划",
                         _ => "过程",
                     };
                     // 收拢：每条过程只显示一行摘要，避免思考/工具内容占满屏幕。
@@ -594,7 +739,83 @@ fn render_work_batch(
                     });
                 }
             });
+            // 折叠头右键：一键复制整个工作过程卡（思考/工具/计划原文）。
+            collapsing.header_response.context_menu(|ui| {
+                if ui.button("📋 复制本批过程内容").clicked() {
+                    let text = messages
+                        .iter()
+                        .filter(|m| !m.text.is_empty())
+                        .map(|m| {
+                            let role = match m.kind.as_str() {
+                                "thinking" => "【思考】",
+                                "tool" => "【工具】",
+                                "plan" => "【计划】",
+                                _ => "【过程】",
+                            };
+                            format!("{role}\n{}", m.text.trim_end())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    ui.ctx().copy_text(text);
+                    ui.close_menu();
+                }
+            });
+            // 收起态的 SSE 流式文字：取批次内最后一条正在填充的消息尾部，
+            // 单行预览 + 闪烁光标，让用户不展开也能看到 agent 实时在写什么。
+            // body_returned 为 Some 表示折叠体已渲染（即展开态）。
+            if live && collapsing.body_returned.is_none() {
+                if let Some(last) = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.kind != "plan" && !m.text.is_empty())
+                {
+                    let secs = ui.input(|i| i.time);
+                    let cursor = if ((secs * 2.0) as u64) % 2 == 0 { "▌" } else { " " };
+                    let preview = one_line_summary(&last.text, 80);
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(cursor)
+                                .monospace()
+                                .size(11.0)
+                                .strong()
+                                .color(pal.accent),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&preview)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(pal.text),
+                            )
+                            .truncate(),
+                        );
+                    });
+                }
+            }
         });
+}
+
+/// 把整轮对话拼装为可直接复制的文本：从 `turn_start`（最近一条用户消息）起，
+/// 依次收录用户提问、思考/工具过程与最终回复，多个气泡之间用角色标记与空行分隔。
+fn format_turn_text(messages: &[ChatMsg], turn_start: usize) -> String {
+    let mut out = String::new();
+    for msg in &messages[turn_start..] {
+        if msg.text.is_empty() {
+            continue;
+        }
+        let role = match msg.kind.as_str() {
+            "user" => "【用户】",
+            "assistant" => "【助手回复】",
+            "thinking" => "【思考】",
+            "tool" => "【工具】",
+            "plan" => "【计划】",
+            "error" => "【错误】",
+            _ => "【过程】",
+        };
+        out.push_str(&format!("{role}\n{}\n\n", msg.text.trim_end()));
+    }
+    out.trim_end().to_string()
 }
 
 fn one_line_summary(text: &str, max_chars: usize) -> String {

@@ -224,6 +224,7 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
 #[derive(Clone)]
 pub enum MarkdownBlock {
     /// 普通富文本段（标题/段落/列表/代码块等）。
+    #[allow(dead_code)]
     Job(LayoutJob),
     /// 可点击的文件路径（行内代码或普通文本中识别出的路径）。
     FilePath(String),

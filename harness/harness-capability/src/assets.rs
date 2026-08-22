@@ -126,6 +126,12 @@ pub struct Skill {
     /// 默认启用；旧数据无此字段时视为启用。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 导入来源（内置技能为空）。约定目录包存**相对技能库根的路径**
+    ///（如 `包名/SKILL.md`，不写磁盘绝对路径，工作区搬迁后依然有效）；
+    /// 旧式导入记录为绝对路径，消费端需双格式兼容。
+    /// 用于删除时定位包子目录与存储位置可视化；旧数据无此字段时为空串。
+    #[serde(default)]
+    pub source_path: String,
 }
 
 fn default_true() -> bool {

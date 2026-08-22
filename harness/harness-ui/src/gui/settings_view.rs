@@ -440,24 +440,42 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         }
                                         ui.label(
                                             egui::RichText::new(
-                                                "技能是可导入的 SKILL.md 指令资产。启用的自定义技能会在每个回合按任务匹配后注入模型上下文；禁用或删除后立即停止注入。",
+                                                "技能以「技能包」子目录存放于约定目录，Agent 启动时自动扫描注册。新注册的技能包默认未启用，须勾选启用后才参与匹配并注入模型上下文；禁用或删除后下一回合立即停止注入。",
                                             )
                                             .size(12.0)
                                             .color(pal.dim),
                                         );
+                                        ui.add_space(4.0);
+                                        // 存储位置可视化：导入的技能落盘于此，提供一键打开目录。
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("存储位置").size(11.5).color(pal.dim));
+                                            ui.label(
+                                                egui::RichText::new(state.skills_storage_dir().display().to_string())
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(pal.text),
+                                            )
+                                            .on_hover_text("技能包子目录（含 SKILL.md）与 JSON 注册记录同目录存放；放入子目录即可在下次启动时自动加载");
+                                        });
                                         ui.add_space(8.0);
                                         ui.horizontal(|ui| {
-                                            if accent_button(ui, &pal, "导入 SKILL.md") {
+                                            if accent_button(ui, &pal, "导入技能包（文件夹）") {
+                                                state.import_skill_folder();
+                                            }
+                                            if ghost_button(ui, &pal, "导入 SKILL.md") {
                                                 state.import_skill_file();
                                             }
                                             if ghost_button(ui, &pal, "刷新") {
                                                 state.refresh_skill_items();
                                             }
+                                            if ghost_button(ui, &pal, "打开技能目录") {
+                                                state.open_skills_dir();
+                                            }
                                         });
                                         ui.add_space(8.0);
                                         egui::ScrollArea::vertical().show(ui, |ui| {
                                             if state.skill_items.is_empty() {
-                                                ui.label(egui::RichText::new("暂无自定义技能。导入一个 SKILL.md 即可开始管理。").size(12.0).color(pal.dim));
+                                                ui.label(egui::RichText::new("暂无自定义技能。选择一个含 SKILL.md 的文件夹批量导入，或直接在技能目录中放置技能包子目录（重启后自动加载）。").size(12.0).color(pal.dim));
                                             }
                                             for sk in state.skill_items.clone() {
                                                 let system_skill = sk.id.starts_with("sp-");
@@ -473,6 +491,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                             state.toggle_skill(&sk.id, enabled);
                                                         }
                                                         ui.label(egui::RichText::new(&sk.name).size(13.0).strong().color(pal.text));
+                                                        ui.label(egui::RichText::new(format!("v{}", sk.version)).size(10.5).color(pal.dim));
+                                                        if !sk.resource_files.is_empty() {
+                                                            ui.label(egui::RichText::new(format!("· {} 个资源文件", sk.resource_files.len())).size(10.5).color(pal.dim));
+                                                        }
                                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                             if system_skill {
                                                                 ui.label(egui::RichText::new("系统插件提供").size(10.5).color(pal.accent));
@@ -484,6 +506,22 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                     ui.label(egui::RichText::new(&sk.trigger_boundary).size(11.5).color(pal.dim));
                                                     if !sk.steps.is_empty() {
                                                         ui.label(egui::RichText::new(format!("步骤: {}", sk.steps.join(" → "))).size(11.0).color(pal.dim));
+                                                    }
+                                                    if !sk.source_path.is_empty() {
+                                                        // 约定包的来源存的是相对技能库根的路径，展示时解析为完整路径；
+                                                        // 旧式绝对路径记录原样展示。
+                                                        let src_path = std::path::Path::new(&sk.source_path);
+                                                        let shown = if src_path.is_absolute() {
+                                                            sk.source_path.clone()
+                                                        } else {
+                                                            state.skills_storage_dir().join(src_path).display().to_string()
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(format!("来源: {shown}"))
+                                                                .size(10.5)
+                                                                .color(pal.dim),
+                                                        )
+                                                        .on_hover_text("约定包以相对技能库根的路径登记，重复导入会更新此技能而非创建副本");
                                                     }
                                                 });
                                                 ui.add_space(6.0);

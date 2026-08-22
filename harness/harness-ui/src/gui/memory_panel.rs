@@ -262,10 +262,38 @@ impl AppState {
         self.mem_loaded = false;
     }
 
+    /// 技能库的物理存储目录（与 `NativeSkillLibrary` 落盘路径一致）。
+    /// 设置界面展示该路径并提供「打开目录」，解决“导入后看不到文件”的问题。
+    pub(super) fn skills_storage_dir(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.host.workspace_root)
+            .join(".harness-memory")
+            .join("skills")
+    }
+
+    /// 在系统文件管理器中打开技能存储目录（不存在则先创建）。
+    pub(super) fn open_skills_dir(&mut self) {
+        let dir = self.skills_storage_dir();
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.note = format!("无法创建技能目录: {error}");
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        let res = std::process::Command::new("explorer").arg(&dir).spawn();
+        #[cfg(target_os = "macos")]
+        let res = std::process::Command::new("open").arg(&dir).spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let res = std::process::Command::new("xdg-open").arg(&dir).spawn();
+        match res {
+            Ok(_) => self.note = format!("已在文件管理器中打开：{}", dir.display()),
+            Err(error) => self.note = format!("无法打开技能目录: {error}"),
+        }
+    }
+
     /// 导入用户选择的 `SKILL.md`（或普通 Markdown 技能文档）。
     ///
-    /// 解析规则与工作区自动索引完全一致；同一路径重复导入会更新同一技能，
-    /// 避免产生难以管理的重复资产。
+    /// 文件会被安置进约定目录 `<存储目录>/<文件名>/SKILL.md`，获得与其它技能包
+    /// 一致的生命周期（启动自动加载、重复导入为更新、删除即回收）。
+    /// 新注册的技能默认未启用，需勾选后才参与匹配。
     pub(super) fn import_skill_file(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("导入 SKILL.md")
@@ -274,31 +302,74 @@ impl AppState {
         else {
             return;
         };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) => {
-                self.note = format!("无法读取技能文件: {error}");
-                return;
-            }
+        let packs_root = self.skills_storage_dir();
+        match harness_capability::index::install_skill_file_into(&path, &packs_root) {
+            Ok(_) => self.finish_pack_import(),
+            Err(error) => self.note = format!("无法安置技能文件: {error}"),
+        }
+    }
+
+    /// 批量导入技能包：递归扫描所选文件夹（含子目录）下所有含 `SKILL.md`
+    /// 的目录，每个目录作为一个独立技能单元（含资源文件）**复制进约定目录**，
+    /// 之后由 `sync_skill_packs` 对账注册（与启动自动加载同一入口）。
+    /// 幂等：同名包重复导入 = 整体替换更新，不产生副本。
+    pub(super) fn import_skill_folder(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("选择技能包文件夹（递归扫描 SKILL.md）")
+            .pick_folder()
+        else {
+            return;
         };
-        // 以绝对来源路径生成稳定 id：多个项目里的同名 `SKILL.md` 可以并存，
-        // 重复导入同一个文件则更新原技能而非制造副本。
-        let source = path.to_string_lossy();
-        let skill_doc = harness_capability::index::skill_from_markdown(&source, &content);
-        let skill_name = skill_doc.name.clone();
-        let skill_lib = self.host.skill.clone();
-        let handle = self.host.rt.handle();
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
-        std::thread::spawn(move || {
-            let ok = handle.block_on(async move { skill_lib.register_skill(skill_doc).await.is_ok() });
-            let _ = tx.send(ok);
-        });
-        if rx.recv().unwrap_or(false) {
-            self.note = format!("已导入技能「{skill_name}」");
-        } else {
-            self.note = "导入技能失败".into();
+        let packs_root = self.skills_storage_dir();
+        match harness_capability::index::install_skill_packs_from(&dir, &packs_root) {
+            Ok(installed) if installed.is_empty() => {
+                self.note = "该文件夹下未找到任何含 SKILL.md 的技能包".into();
+            }
+            Ok(_) => self.finish_pack_import(),
+            Err(error) => self.note = format!("导入技能包失败: {error}"),
+        }
+    }
+
+    /// 文件安置完成后，对约定目录跑一次注册对账（与启动自动扫描同一入口），
+    /// 并提示用户：新技能默认未启用，需勾选后才参与匹配。
+    fn finish_pack_import(&mut self) {
+        match self.sync_local_skill_packs() {
+            Ok(rep) if rep.added + rep.updated > 0 => {
+                let names = if rep.names.len() > 4 {
+                    format!("{} 等 {} 个", rep.names[..4].join("、"), rep.names.len())
+                } else {
+                    rep.names.join("、")
+                };
+                self.note = format!(
+                    "已导入技能包：新增 {} 个、更新 {} 个（{}）——新增默认未启用，勾选启用后才参与匹配",
+                    rep.added, rep.updated, names
+                );
+            }
+            Ok(_) => self.note = "技能包已安置，但未解析出有效的 SKILL.md".into(),
+            Err(error) => self.note = format!("注册技能包失败: {error}"),
         }
         self.refresh_skill_items();
         self.mem_loaded = false;
+    }
+
+    /// 对约定存储目录执行一次「自动加载对账」（与 Agent 启动时的自动扫描
+    /// 同一入口），同步等待结果。
+    fn sync_local_skill_packs(
+        &mut self,
+    ) -> harness_core::error::Result<harness_capability::index::SkillImportReport> {
+        let skill_lib = self.host.skill.clone();
+        let packs_dir = self.skills_storage_dir();
+        let handle = self.host.rt.handle();
+        let (tx, rx) = std::sync::mpsc::channel::<
+            harness_core::error::Result<harness_capability::index::SkillImportReport>,
+        >();
+        std::thread::spawn(move || {
+            let res = handle.block_on(async move {
+                harness_capability::index::sync_skill_packs(&*skill_lib, &packs_dir).await
+            });
+            let _ = tx.send(res);
+        });
+        rx.recv()
+            .unwrap_or_else(|_| Err(harness_core::error::Error::Runtime("后台任务异常退出".into())))
     }
 }

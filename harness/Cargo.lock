@@ -1761,6 +1761,7 @@ dependencies = [
  "harness-session",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1896,6 +1897,7 @@ dependencies = [
  "harness-core",
  "harness-llm",
  "harness-provider-hook",
+ "harness-provider-memory",
  "harness-session",
  "harness-tool",
  "serde_json",

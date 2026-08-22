@@ -895,12 +895,95 @@ mod tests {
             resource_files: vec![],
             confidence: 1.0,
             enabled: true,
+            source_path: String::new(),
         }];
         let rendered = render_skill_instructions(&skills).expect("matched skill should render");
         assert!(rendered.contains("Code review"));
         assert!(rendered.contains("inspect diff；run tests"));
         assert!(rendered.contains("findings recorded"));
         assert!(render_skill_instructions(&[]).is_none());
+    }
+
+    /// 全链路 Demo 回归（约定目录 + 自动加载）：外部技能包落盘进约定目录 →
+    /// `sync_skill_packs` 自动注册但**默认未启用** → 用户勾选启用后中文语境
+    /// match_skills 命中 → render_skill_instructions 产出含触发边界/步骤/验证的系统
+    /// 指令（AgentLoop 每回合写入模型上下文的内容）→ 禁用后立即不再命中，
+    /// 重复同步更新内容且不产生副本（全局开关即时生效）。
+    #[tokio::test]
+    async fn imported_skill_pack_flows_into_agent_context() {
+        use harness_capability::index;
+        use harness_provider_memory::NativeSkillLibrary;
+
+        // 1) 构造外部来源技能包（SKILL.md + 资源文件），等价于 extensions/skill-packs 示例。
+        let dir = std::env::temp_dir().join(format!(
+            "harness-skill-e2e-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = dir.join("src");
+        let pack = src.join("release-checklist");
+        std::fs::create_dir_all(pack.join("resources")).unwrap();
+        std::fs::write(
+            pack.join("SKILL.md"),
+            "# 发布检查清单\n\nversion: 1.1\n\n## 触发边界\n发布新版本、上线前需要检查清单\n\n## 执行步骤\n- 跑全量测试\n- 核对版本号\n\n## 验证规则\n- 测试全部通过\n",
+        )
+        .unwrap();
+        std::fs::write(pack.join("resources").join("checklist.txt"), "ok").unwrap();
+
+        // 2) 落盘进约定目录 + 自动加载对账（与 GUI 导入/启动扫描同一入口）。
+        let lib = NativeSkillLibrary::new(&dir);
+        let packs_dir = dir.join(".harness-memory").join("skills");
+        let installed = index::install_skill_packs_from(&src, &packs_dir).unwrap();
+        assert_eq!(installed.len(), 1);
+        let report = index::sync_skill_packs(&*lib, &packs_dir).await.unwrap();
+        assert_eq!(report.added, 1);
+
+        // 3) 默认未启用：勾选前不得参与匹配（新安全语义）。
+        assert!(
+            lib.match_skills("发布新版本").await.unwrap().is_empty(),
+            "自动加载的技能默认不得参与匹配"
+        );
+
+        // 4) 用户在面板勾选启用后，中文自然语言输入必须命中
+        //（CJK n-gram 匹配，回归「占坑不拉」缺陷）。
+        let id = format!("{}release-checklist", index::SKILL_PACK_ID_PREFIX);
+        lib.set_skill_enabled(&id, true).await.unwrap();
+        let matched = lib
+            .match_skills("明天要发布新版本，帮我过一遍检查")
+            .await
+            .unwrap();
+        assert!(!matched.is_empty(), "发布场景中文输入未命中任何技能");
+        let sk = matched
+            .iter()
+            .find(|s| s.name.contains("发布检查清单"))
+            .expect("应命中发布检查清单技能");
+        assert_eq!(sk.version, "1.1");
+        assert_eq!(sk.resource_files, vec!["resources/checklist.txt".to_string()]);
+
+        // 5) AgentLoop 每回合注入模型上下文的即此渲染结果：
+        // 触发边界与执行步骤、验证规则都必须在场。
+        let instructions =
+            render_skill_instructions(&matched).expect("命中技能应渲染出上下文指令");
+        assert!(instructions.contains("发布检查清单"));
+        assert!(instructions.contains("发布新版本"));
+        assert!(instructions.contains("跑全量测试"));
+        assert!(instructions.contains("测试全部通过"));
+
+        // 6) 禁用 → 立即不再命中：GUI 开关经同一 SkillLibrary 全局同步。
+        lib.set_skill_enabled(&id, false).await.unwrap();
+        assert!(lib.match_skills("发布新版本").await.unwrap().is_empty());
+
+        // 7) 重复同步（更新内容）：不产生副本，禁用状态不被静默打开。
+        let rep2 = index::sync_skill_packs(&*lib, &packs_dir).await.unwrap();
+        assert_eq!(rep2.added, 0);
+        assert_eq!(rep2.updated, 1);
+        let all = lib.list_skills().await.unwrap();
+        assert_eq!(all.len(), 1, "重复导入不得创建副本");
+        assert!(!all[0].enabled, "重新同步不得覆盖用户的禁用状态");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

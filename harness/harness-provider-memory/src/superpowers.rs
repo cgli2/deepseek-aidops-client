@@ -24,6 +24,7 @@ pub fn builtin_superpowers() -> Vec<Skill> {
             resource_files: vec![],
             confidence: 0.9,
             enabled: true,
+            source_path: String::new(),
         },
         Skill {
             id: "sp-plan".into(),
@@ -39,6 +40,7 @@ pub fn builtin_superpowers() -> Vec<Skill> {
             resource_files: vec![],
             confidence: 0.9,
             enabled: true,
+            source_path: String::new(),
         },
         Skill {
             id: "sp-execute".into(),
@@ -54,6 +56,7 @@ pub fn builtin_superpowers() -> Vec<Skill> {
             resource_files: vec![],
             confidence: 0.85,
             enabled: true,
+            source_path: String::new(),
         },
         Skill {
             id: "sp-test".into(),
@@ -69,6 +72,7 @@ pub fn builtin_superpowers() -> Vec<Skill> {
             resource_files: vec![],
             confidence: 0.85,
             enabled: true,
+            source_path: String::new(),
         },
         Skill {
             id: "sp-commit".into(),
@@ -84,6 +88,7 @@ pub fn builtin_superpowers() -> Vec<Skill> {
             resource_files: vec![],
             confidence: 0.8,
             enabled: true,
+            source_path: String::new(),
         },
         Skill {
             id: "sp-research".into(),
@@ -99,6 +104,7 @@ pub fn builtin_superpowers() -> Vec<Skill> {
             resource_files: vec![],
             confidence: 0.8,
             enabled: true,
+            source_path: String::new(),
         },
     ]
 }

@@ -20,3 +20,5 @@ async-trait = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 harness-provider-hook = { path = "../harness-provider-hook" }
+# 技能全链路 e2e：文件夹导入 → 原生技能库 → match_skills → 注入模型上下文。
+harness-provider-memory = { path = "../harness-provider-memory" }

@@ -391,12 +391,34 @@ impl SkillLibrary for NativeSkillLibrary {
     }
 
     async fn delete_skill(&self, id: &str) -> Result<bool> {
+        // 先取记录：若技能是约定目录包（source_path 落在技能库目录内），
+        // 连带回收其包子目录——否则启动自动扫描会把它再次注册回来。
+        let record = self.get_skill(id).await?;
         let p = self.skill_path(id);
-        match std::fs::remove_file(&p) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(harness_core::error::Error::Io(e)),
+        let removed = match std::fs::remove_file(&p) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(harness_core::error::Error::Io(e)),
+        };
+        if let Some(sk) = record {
+            if !sk.source_path.is_empty() {
+                // 约定包的 source_path 是相对技能库根的路径（新），旧式导入是绝对路径：
+                // 相对路径解析到库根，绝对路径原样使用。
+                let src = std::path::Path::new(&sk.source_path);
+                let src_abs = if src.is_absolute() {
+                    src.to_path_buf()
+                } else {
+                    self.root.join(src)
+                };
+                if let Some(pack_dir) = src_abs.parent() {
+                    // 只回收库目录内的包子目录；外部来源（旧式绝对路径导入）不动。
+                    if pack_dir != self.root && pack_dir.starts_with(&self.root) {
+                        let _ = std::fs::remove_dir_all(pack_dir);
+                    }
+                }
+            }
         }
+        Ok(removed)
     }
 
     async fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<()> {
@@ -689,6 +711,69 @@ mod tests {
         // 幂等：重复合并不产生重复事实（按 id 去重）。
         let _ = conv.consolidate(sid).await.unwrap();
         assert_eq!(conv.list_facts().await.unwrap().len(), facts.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 约定目录包删除语义：delete_skill 既删 JSON 记录，也回收库内的包子目录
+    ///（相对路径登记的新约定与绝对路径的旧式记录都支持），避免启动自动扫描
+    /// 把已删技能再注册回来；外部来源不受影响。
+    #[tokio::test]
+    async fn delete_skill_removes_convention_pack_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-skill-del-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lib = NativeSkillLibrary::new(&dir);
+        let root = asset_root(&dir).join("skills");
+
+        // 库内包：source_path 以相对技能库根的路径登记（新约定）。
+        let pack_dir = root.join("my-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("SKILL.md"), "# 包内技能\n").unwrap();
+        let inside = Skill {
+            id: "pack:my-pack".into(),
+            name: "包内技能".into(),
+            version: "1.0".into(),
+            trigger_boundary: "测试用".into(),
+            steps: Vec::new(),
+            verification_rules: Vec::new(),
+            resource_files: Vec::new(),
+            confidence: 0.8,
+            enabled: true,
+            source_path: "my-pack/SKILL.md".into(),
+        };
+        lib.register_skill(inside).await.unwrap();
+
+        // 外部来源：绝对路径（旧式记录），删除时不得触碰。
+        let external_dir = dir.join("external-src");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        std::fs::write(external_dir.join("SKILL.md"), "# 外部技能\n").unwrap();
+        let external = Skill {
+            id: "legacy-ext".into(),
+            name: "外部技能".into(),
+            version: "1.0".into(),
+            trigger_boundary: "测试用".into(),
+            steps: Vec::new(),
+            verification_rules: Vec::new(),
+            resource_files: Vec::new(),
+            confidence: 0.8,
+            enabled: true,
+            source_path: external_dir.join("SKILL.md").to_string_lossy().to_string(),
+        };
+        lib.register_skill(external).await.unwrap();
+
+        assert!(lib.delete_skill("pack:my-pack").await.unwrap());
+        assert!(!pack_dir.exists(), "库内包子目录应被连带回收");
+
+        assert!(lib.delete_skill("legacy-ext").await.unwrap());
+        assert!(
+            external_dir.join("SKILL.md").exists(),
+            "外部来源文件不得被误删"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

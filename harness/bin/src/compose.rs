@@ -234,11 +234,25 @@ impl Plugin for HarnessPlugin {
         // Superpowers 是随应用发布的系统插件，而不是用户手工导入的一组技能。
         // 其工作流技能异步、幂等地注册到同一 SkillLibrary；GUI 中会在“插件管理”
         // 显示该系统插件，在“技能管理”只展示其提供的只读技能资产。
+        //
+        // 约定目录自动加载：`.harness-memory/skills/` 下每个含 SKILL.md 的子目录
+        // 都是一个技能包，启动时对账注册（首注册默认未启用，需用户在面板勾选；
+        // 已注册的包更新内容但保留启用状态；目录被删则回收对应记录）。
         let superpower_skill = skill.clone();
+        let packs_dir = cwd.join(".harness-memory").join("skills");
         tokio::runtime::Handle::current().spawn(async move {
             let added = harness_provider_memory::ensure_builtin_skills(&*superpower_skill).await;
             if added > 0 {
                 eprintln!("[harness] Superpowers 系统插件已注册 {added} 个技能");
+            }
+            match harness_capability::index::sync_skill_packs(&*superpower_skill, &packs_dir).await
+            {
+                Ok(rep) if rep.added + rep.updated > 0 => eprintln!(
+                    "[harness] 自动加载技能包：新增 {} 个、更新 {} 个（新增默认未启用，需在「技能管理」勾选启用）",
+                    rep.added, rep.updated
+                ),
+                Err(e) => eprintln!("[harness] 技能包自动加载失败: {e}"),
+                _ => {}
             }
         });
 

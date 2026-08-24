@@ -176,8 +176,28 @@ pub(super) struct AppState {
     pub(super) git_branch: String,
     /// Git 变更是否已加载过（避免重复刷新）。
     pub(super) git_loaded: bool,
+    /// Git 查询错误。错误与“干净”必须是不同状态，绝不能静默降级为空列表。
+    pub(super) git_error: Option<String>,
+    /// 发起本次刷新时的工作区；用于拒绝项目切换后的旧异步结果。
+    pub(super) git_workspace: String,
+    /// 单调刷新代次，防止慢请求覆盖新项目/新请求的状态。
+    pub(super) git_generation: u64,
+    /// Git 刷新的非阻塞回传通道。
+    pub(super) git_rx: Option<std::sync::mpsc::Receiver<GitRefreshResult>>,
     /// 文件树区域当前视图：true = Git 变更列表，false = 文件树。
     pub(super) tree_show_git: bool,
+}
+
+pub(super) struct GitRefreshResult {
+    pub(super) generation: u64,
+    pub(super) workspace: String,
+    pub(super) result: std::result::Result<GitRefreshData, String>,
+}
+
+pub(super) struct GitRefreshData {
+    pub(super) repo_root: String,
+    pub(super) branch: String,
+    pub(super) changes: Vec<harness_capability::git::GitChange>,
 }
 
 impl AppState {
@@ -354,6 +374,10 @@ impl AppState {
             git_changes: Vec::new(),
             git_branch: String::new(),
             git_loaded: false,
+            git_error: None,
+            git_workspace: String::new(),
+            git_generation: 0,
+            git_rx: None,
             tree_show_git: false,
             // host/log 放最后：上方字段仍需借用 host.settings，提前移入会报 E0505。
             host,
@@ -979,6 +1003,14 @@ impl AppState {
         self.tree_root = None;
         self.tree_expanded.clear();
         self.tree_show_git = false;
+        // 旧 Git 请求结果不能在切换后覆盖新项目；下一次打开面板会按新根刷新。
+        self.git_generation = self.git_generation.wrapping_add(1);
+        self.git_rx = None;
+        self.git_loaded = false;
+        self.git_error = None;
+        self.git_changes.clear();
+        self.git_branch.clear();
+        self.git_workspace.clear();
         self.active_project = path.to_string();
         self.projects = self.host.settings.projects();
         // 视图复位：poll_log 下帧从 0 重放，右侧消息流刷新为该项目历史。

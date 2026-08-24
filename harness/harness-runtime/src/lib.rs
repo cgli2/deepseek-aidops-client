@@ -15,7 +15,7 @@ pub use controller::SessionController;
 pub use events::{PreStep, TurnStopping};
 pub use execution::{
     ActionGate, ActionProposal, Budget, BudgetManager, Completion, CompletionJudge, DomainPolicy,
-    ExecutionState, GeneralDomainPolicy, StrategyKind, TaskContract,
+    ExecutionState, GeneralDomainPolicy, SolveMode, SolvePlan, StrategyKind, TaskContract,
 };
 pub use scheduler::Scheduler;
 pub use subagent::InProcessSubagent;

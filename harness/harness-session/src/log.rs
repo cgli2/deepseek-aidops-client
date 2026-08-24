@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -100,8 +100,15 @@ pub struct CouncilGateResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CouncilEvent {
-    Started { council_id: String, goal: String, max_parallel: usize },
-    PlanCreated { council_id: String, tasks: Vec<CouncilTaskSpec> },
+    Started {
+        council_id: String,
+        goal: String,
+        max_parallel: usize,
+    },
+    PlanCreated {
+        council_id: String,
+        tasks: Vec<CouncilTaskSpec>,
+    },
     TaskStateChanged {
         council_id: String,
         task_id: String,
@@ -115,10 +122,22 @@ pub enum CouncilEvent {
         summary: String,
         evidence: Vec<String>,
     },
-    GateEvaluated { council_id: String, gate: CouncilGateResult },
-    Blocked { council_id: String, reason: String },
-    Completed { council_id: String, summary: String },
-    Cancelled { council_id: String, reason: String },
+    GateEvaluated {
+        council_id: String,
+        gate: CouncilGateResult,
+    },
+    Blocked {
+        council_id: String,
+        reason: String,
+    },
+    Completed {
+        council_id: String,
+        summary: String,
+    },
+    Cancelled {
+        council_id: String,
+        reason: String,
+    },
 }
 
 /// 计划条目（status ∈ pending / doing / done）。
@@ -187,9 +206,39 @@ fn is_stream_chunk(ev: &SessionEvent) -> bool {
 const FLUSH_BATCH: usize = 32;
 
 /// 会话追加日志（真相源）。仅追加写；fork/resume/replay 全从日志派生（原 §5.5）。
-pub struct SessionLog {
+struct SessionState {
     id: SessionId,
     inner: Mutex<LogInner>,
+}
+
+/// 会话日志的可切换视图。UI 持有的根视图可以切换到另一条会话；正在执行的
+/// 回合必须先调用 [`SessionLog::pin`]，得到固定到当时状态的句柄，因而不会把
+/// 流式输出串写进用户后来打开的新会话。
+pub struct SessionLog {
+    state: RwLock<Arc<SessionState>>,
+}
+
+impl SessionLog {
+    fn from_state(state: SessionState) -> Arc<Self> {
+        Arc::new(Self {
+            state: RwLock::new(Arc::new(state)),
+        })
+    }
+
+    fn state(&self) -> Arc<SessionState> {
+        self.state.read().unwrap().clone()
+    }
+
+    fn replace_state(&self, state: SessionState) {
+        *self.state.write().unwrap() = Arc::new(state);
+    }
+
+    /// 固定当前会话状态，供后台执行持有。随后 UI 切换/新建会话不会影响它。
+    pub fn pin(&self) -> Arc<Self> {
+        Arc::new(Self {
+            state: RwLock::new(self.state()),
+        })
+    }
 }
 
 impl SessionLog {
@@ -199,9 +248,19 @@ impl SessionLog {
         let mut active_council = None;
         for event in self.replay() {
             match event {
-                SessionEvent::Council { event: CouncilEvent::Started { council_id, .. }, .. } => active_council = Some(council_id),
-                SessionEvent::Council { event: CouncilEvent::Completed { council_id, .. } | CouncilEvent::Cancelled { council_id, .. } | CouncilEvent::Blocked { council_id, .. }, .. }
-                    if active_council.as_deref() == Some(council_id.as_str()) => active_council = None,
+                SessionEvent::Council {
+                    event: CouncilEvent::Started { council_id, .. },
+                    ..
+                } => active_council = Some(council_id),
+                SessionEvent::Council {
+                    event:
+                        CouncilEvent::Completed { council_id, .. }
+                        | CouncilEvent::Cancelled { council_id, .. }
+                        | CouncilEvent::Blocked { council_id, .. },
+                    ..
+                } if active_council.as_deref() == Some(council_id.as_str()) => {
+                    active_council = None
+                }
                 _ => {}
             }
         }
@@ -224,7 +283,7 @@ impl SessionLog {
         self.append(SessionEvent::TurnEnd { id: self.gen_id() });
     }
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        Self::from_state(SessionState {
             id: Uuid::new_v4(),
             inner: Mutex::new(LogInner {
                 events: Vec::new(),
@@ -241,7 +300,7 @@ impl SessionLog {
         let id = Uuid::new_v4();
         let dir = dir.as_ref();
         let _ = std::fs::create_dir_all(dir);
-        Arc::new(Self {
+        Self::from_state(SessionState {
             id,
             inner: Mutex::new(LogInner {
                 events: Vec::new(),
@@ -254,12 +313,13 @@ impl SessionLog {
     }
 
     pub fn id(&self) -> SessionId {
-        self.id
+        self.state().id
     }
 
     /// 单调自增事件 id（全局唯一，跨 turn/step）。
     pub fn gen_id(&self) -> EventId {
-        let mut g = self.inner.lock().unwrap();
+        let state = self.state();
+        let mut g = state.inner.lock().unwrap();
         let id = g.next;
         g.next += 1;
         id
@@ -271,7 +331,8 @@ impl SessionLog {
     /// 条批量落盘），回合/工具结果等边界事件即时 flush——此前每个 token 分片一次
     /// 「open+write+flush」，一次中等回复数百次同步 syscall，是流式热路径的主要开销。
     pub fn append(&self, ev: SessionEvent) {
-        let mut g = self.inner.lock().unwrap();
+        let state = self.state();
+        let mut g = state.inner.lock().unwrap();
         let deferred = is_stream_chunk(&ev);
         g.events.push(ev.clone());
         if g.path.is_none() {
@@ -312,12 +373,13 @@ impl SessionLog {
 
     /// 重放全部事件（模型可见状态只能从此重建，完成文档 §8 不变量 1）。
     pub fn replay(&self) -> Vec<SessionEvent> {
-        self.inner.lock().unwrap().events.clone()
+        self.state().inner.lock().unwrap().events.clone()
     }
 
     /// 仅复制指定下标之后的新事件，避免 GUI 高频刷新反复克隆完整会话。
     pub fn replay_from(&self, start: usize) -> (usize, Vec<SessionEvent>) {
-        let inner = self.inner.lock().unwrap();
+        let state = self.state();
+        let inner = state.inner.lock().unwrap();
         let start = start.min(inner.events.len());
         (inner.events.len(), inner.events[start..].to_vec())
     }
@@ -326,7 +388,8 @@ impl SessionLog {
     /// 不影响模型上下文重建。
     pub fn usage_total(&self) -> Usage {
         let mut total = Usage::default();
-        for ev in self.inner.lock().unwrap().events.iter() {
+        let state = self.state();
+        for ev in state.inner.lock().unwrap().events.iter() {
             if let SessionEvent::Usage { usage, .. } = ev {
                 total = total.saturating_add(*usage);
             }
@@ -338,7 +401,8 @@ impl SessionLog {
     /// 历史浏览请用 [`SessionLog::fresh`]（新建文件、旧会话保留可回看）。
     pub fn clear(&self) {
         let path = {
-            if let Ok(mut inner) = self.inner.lock() {
+            let state = self.state();
+            if let Ok(mut inner) = state.inner.lock() {
                 inner.events.clear();
                 inner.next = 0;
                 // 先关闭常驻句柄再截断，避免 Windows 上持有句柄时 truncate 失败。
@@ -360,8 +424,9 @@ impl SessionLog {
 
     /// 派生新会话：复制当前前缀，后续独立追加（fork/resume，原 §5.5）。
     pub fn fork(&self) -> Arc<Self> {
-        let g = self.inner.lock().unwrap();
-        Arc::new(Self {
+        let state = self.state();
+        let g = state.inner.lock().unwrap();
+        Self::from_state(SessionState {
             id: Uuid::new_v4(),
             inner: Mutex::new(LogInner {
                 events: g.events.clone(),
@@ -384,16 +449,18 @@ impl SessionLog {
             let _ = std::fs::create_dir_all(dir);
             dir.join(format!("{}.jsonl", Uuid::new_v4()))
         }));
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.events = events;
-            g.next = next;
-            g.path = path;
-            g.writer = None;
-            g.pending_flush = 0;
-        }
+        self.replace_state(SessionState {
+            id: Uuid::new_v4(),
+            inner: Mutex::new(LogInner {
+                events,
+                next,
+                path,
+                writer: None,
+                pending_flush: 0,
+            }),
+        });
         let needs_close = matches!(
-            self.inner.lock().unwrap().events.last(),
+            self.state().inner.lock().unwrap().events.last(),
             Some(ev) if !matches!(ev, SessionEvent::TurnEnd { .. })
         );
         if needs_close {
@@ -413,7 +480,7 @@ impl SessionLog {
             let _ = std::fs::create_dir_all(dir);
             dir.join(format!("{id}.jsonl"))
         }));
-        let log = Arc::new(Self {
+        let log = Self::from_state(SessionState {
             id,
             inner: Mutex::new(LogInner {
                 events,
@@ -424,7 +491,7 @@ impl SessionLog {
             }),
         });
         let needs_close = matches!(
-            log.inner.lock().unwrap().events.last(),
+            log.state().inner.lock().unwrap().events.last(),
             Some(ev) if !matches!(ev, SessionEvent::TurnEnd { .. })
         );
         if needs_close {
@@ -435,7 +502,7 @@ impl SessionLog {
 
     /// 当前持久化文件路径（历史面板高亮当前会话用）。
     pub fn path(&self) -> Option<std::path::PathBuf> {
-        self.inner.lock().unwrap().path.clone()
+        self.state().inner.lock().unwrap().path.clone()
     }
 
     /// 持久化目录（历史列表扫描用）。
@@ -450,14 +517,16 @@ impl SessionLog {
         let dir = dir.as_ref();
         let _ = std::fs::create_dir_all(dir);
         let file = dir.join(format!("{}.jsonl", Uuid::new_v4()));
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.events.clear();
-            g.next = 0;
-            g.path = Some(file.clone());
-            g.writer = None;
-            g.pending_flush = 0;
-        }
+        self.replace_state(SessionState {
+            id: Uuid::new_v4(),
+            inner: Mutex::new(LogInner {
+                events: Vec::new(),
+                next: 0,
+                path: Some(file.clone()),
+                writer: None,
+                pending_flush: 0,
+            }),
+        });
         prune_dir(dir, 50, file.file_name().and_then(|f| f.to_str()));
     }
 
@@ -469,16 +538,18 @@ impl SessionLog {
             return false;
         }
         let (events, next) = load_file(&path);
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.events = events;
-            g.next = next;
-            g.path = Some(path);
-            g.writer = None;
-            g.pending_flush = 0;
-        }
+        self.replace_state(SessionState {
+            id: Uuid::new_v4(),
+            inner: Mutex::new(LogInner {
+                events,
+                next,
+                path: Some(path),
+                writer: None,
+                pending_flush: 0,
+            }),
+        });
         let needs_close = matches!(
-            self.inner.lock().unwrap().events.last(),
+            self.state().inner.lock().unwrap().events.last(),
             Some(ev) if !matches!(ev, SessionEvent::TurnEnd { .. })
         );
         if needs_close {
@@ -606,9 +677,8 @@ fn summarize_title(input: &str) -> String {
         head.to_string()
     } else {
         // 去掉收尾的轻标点再补省略号，避免“xxx，”这类残缺样式。
-        let trimmed = head.trim_end_matches(|c: char| {
-            matches!(c, '，' | '；' | '、' | ',' | ';' | ' ')
-        });
+        let trimmed =
+            head.trim_end_matches(|c: char| matches!(c, '，' | '；' | '、' | ',' | ';' | ' '));
         format!("{trimmed}…")
     }
 }
@@ -689,7 +759,10 @@ mod tests {
         // 折叠空白（含换行）。
         assert_eq!(summarize_title("  多  行\n输入  "), "多 行 输入");
         // 剥离流程控制前缀。
-        assert_eq!(summarize_title("[HARNESS_MULTI_AGENT] 开始协作"), "开始协作");
+        assert_eq!(
+            summarize_title("[HARNESS_MULTI_AGENT] 开始协作"),
+            "开始协作"
+        );
         // 长标题按句读边界截断并补省略号，长度受限。
         let long = "请帮我分析一下这个项目的整体架构，然后给出优化建议";
         let t = summarize_title(long);
@@ -807,6 +880,36 @@ mod tests {
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].file, name_a);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pinned_log_remains_isolated_when_ui_starts_a_new_session() {
+        let dir =
+            std::env::temp_dir().join(format!("harness-pinned-session-test-{}", Uuid::new_v4()));
+        let log = SessionLog::persistent(&dir);
+        let old_file = log.path().unwrap();
+        let running = log.pin();
+
+        // 模拟 A 正在流式执行时，UI 新建 B。
+        log.fresh(&dir);
+        let new_file = log.path().unwrap();
+        running.append(SessionEvent::Assistant {
+            id: running.gen_id(),
+            chunk: Chunk {
+                text: Some("only A receives this".into()),
+                ..Default::default()
+            },
+        });
+
+        assert_ne!(old_file, new_file);
+        assert!(running.replay().iter().any(|event| matches!(event,
+            SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("only A receives this")
+        )));
+        assert!(
+            log.replay().is_empty(),
+            "new session must not receive old stream output"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

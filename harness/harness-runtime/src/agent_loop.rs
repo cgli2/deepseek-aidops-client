@@ -6,7 +6,7 @@ use futures::StreamExt;
 use harness_capability::assets::{ChatTurn, ConversationMemory, Skill, SkillLibrary};
 use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
-use harness_core::{AppContext, error::Result, types::UserInput};
+use harness_core::{error::Result, types::UserInput, AppContext};
 use harness_llm::{Chunk, LlmProvider, Message, Role, ToolCall, ToolResult, Usage};
 use harness_session::{SessionEvent, SessionLog};
 use harness_tool::ToolRegistry;
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::events::{PreStep, TurnStopping};
 use crate::execution::{
     ActionGate, ActionProposal, BudgetManager, Completion, CompletionJudge, DomainPolicy,
-    ExecutionState, GateDecision, GeneralDomainPolicy, TaskContract,
+    ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
 
 /// Agent 循环 / Turn-Step 生命周期（原 §5.6）。
@@ -146,6 +146,9 @@ impl AgentLoop {
         }
         // 现有 UI/env 步数设置继续作为管理员硬上限；动态预算只会进一步收紧。
         BudgetManager::cap_initial_step_window(&mut budget, max_steps_limit());
+        let solve_plan = SolvePlan::for_contract(&contract, strategy);
+        BudgetManager::cap_initial_step_window(&mut budget, solve_plan.initial_steps);
+        BudgetManager::cap_initial_tool_window(&mut budget, solve_plan.initial_tool_calls);
         let mut execution = ExecutionState::new(contract, strategy);
 
         // 从追加日志重建多轮上下文；不能每个 turn 都只发送当前一句，否则 GUI 看似能聊天，
@@ -212,6 +215,7 @@ impl AgentLoop {
                     .render_for_model(execution.strategy, &budget),
             ),
         );
+        messages.insert(1, Message::system(solve_plan.instructions.clone()));
         // 技能注入点：只匹配启用的 SKILL.md 资产，并在本回合的系统上下文中
         // 提供可执行步骤与验收条件。禁用或删除后，SkillLibrary 不会返回它们，
         // 因而从下一回合起立即不再影响模型行为。匹配已在预处理阶段与压缩并行完成。
@@ -248,6 +252,10 @@ impl AgentLoop {
         // 上游可能正常结束却没有正文/工具调用（例如网关截断、reasoning-only 帧）。
         // 这不是完成；允许有限恢复重试，避免把占位文本污染会话上下文。
         const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
+
+        /// 连续多少个“预算耗尽且无写入”窗口后才判定卡死/死循环并中断；
+        /// 未达上限一律自动续期换路继续，不让用户手动发“继续”。
+        const MAX_STAGNANT_WINDOWS: u32 = 3;
         let mut empty_response_retries = 0usize;
         while debt > 0 {
             steps += 1;
@@ -559,11 +567,19 @@ impl AgentLoop {
             // tool_call 缺对应 tool 消息，续跑必 400。
             if should_recover_empty && !hard_stop {
                 let reason = empty_response_reason.as_deref().unwrap_or("unknown");
-                if empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES {
+                // `length` 不是普通空响应：完整历史重试只会进一步扩大请求。改为
+                // 紧凑检查点 + 一次短恢复，让模型直接收敛到下一步或最终结论。
+                let retry_limit = if reason == "length" { 1 } else { MAX_EMPTY_RESPONSE_RETRIES };
+                if empty_response_retries < retry_limit {
                     empty_response_retries += 1;
                     debt += 1;
+                    if reason == "length" {
+                        messages.retain(|message| message.role == Role::System);
+                        messages.push(Message::system(execution.compact_checkpoint()));
+                        messages.push(Message::user(&input_text));
+                    }
                     messages.push(Message::user(format!(
-                        "[恢复请求] 上一次模型响应为空（finish_reason={reason}），没有生成正文或工具调用；这不代表任务完成。请基于现有上下文继续：若需要信息或执行操作，调用恰当工具；否则给出可验证的完整答复。不要只输出思考过程。自动重试第 {empty_response_retries}/{MAX_EMPTY_RESPONSE_RETRIES} 次。"
+                        "[恢复请求] 上一次模型响应为空（finish_reason={reason}），没有生成正文或工具调用；这不代表任务完成。请基于现有上下文继续：若需要信息或执行操作，调用恰当工具；否则给出可验证的完整答复。不要只输出思考过程。自动重试第 {empty_response_retries}/{retry_limit} 次。"
                     )));
                 } else {
                     log.append(SessionEvent::Assistant {
@@ -616,23 +632,27 @@ impl AgentLoop {
                         final_window_armed = true;
                         BudgetManager::arm_final_window(&execution, &mut budget);
                         messages.push(Message::user(
-                            "[收尾阶段] 预算续期已用完，请在接下来 6 步内完成交付：停止新的探索与扫描，把已完成的改动固化（必要的写入/构建验证），然后输出结构化总结：1) 已完成的交付物与验证结果；2) 未完成部分及原因；3) 建议的后续步骤。请先自评：若剩余工作能在窗口内完成，就集中精力做完；若判断无法完成，立即停止新的工具调用，直接输出上述总结，不要浪费收尾窗口。若确需继续，用户可基于当前进展另起指令接续。",
+                            "[收尾阶段] 预算续期已用完，请在接下来 6 步内完成交付：停止新的探索与扫描，把已完成的改动固化（必要的写入/构建验证），然后输出结构化总结：1) 已完成的交付物与验证结果；2) 未完成部分及原因；3) 建议的后续步骤。请先自评：若剩余工作能在窗口内完成，就集中精力做完；若判断无法完成，立即停止新的工具调用，直接输出上述总结，不要浪费收尾窗口。",
+                        ));
+                    }
+                    None if budget.stagnant_windows >= MAX_STAGNANT_WINDOWS => {
+                        // 预算窗口只是进展检查点，不能以“没有代码修改”中断尚未完成的
+                        // 排障、测试或只读任务。真正的重复工具调用仍由专门守卫处理；
+                        // 此处只加强收尾约束并自动接续，模型可据现有证据交付结果。
+                        convergence_notified = false;
+                        BudgetManager::extend_window(&mut budget);
+                        messages.push(Message::user(
+                            "[强制收敛，不中断任务] 连续多个检查窗口未得到可验证的新进展。不要重复已执行的工具调用，也不要继续泛扫；请立刻基于已有证据选择其一：1) 执行一项能直接验证或完成未满足验收条件的不同动作；2) 若已无法继续，停止工具调用并输出完整交付总结（已完成、证据、未完成原因、下一步）。任务仍在继续，除非用户取消或发生明确错误。",
                         ));
                     }
                     None => {
-                        // 收尾窗口也已耗尽：暂停回合并结构化交接，不粗暴丢弃进展；
-                        // 上下文保留在会话里，用户可另起指令从断点接续。
-                        log.append(SessionEvent::Assistant {
-                            id: log.gen_id(),
-                            chunk: Chunk {
-                                text: Some(
-                                    "[预算耗尽通知] 本回合的步数与续期预算已全部用尽，执行已暂停以避免低效空转。\n以上过程保留了全部进展与上下文：可另起一条指令（如“继续完成上述未完成部分”）从断点接续，无需从头开始；也可在设置中调高步数上限后重试。".into(),
-                                ),
-                                ..Default::default()
-                            },
-                        });
-                        debt = 0;
-                        hard_stop = true;
+                        // 收尾窗口也已耗尽但未达卡死阈值：任务未完成，自动延展一个窗口
+                        // 并强制换路继续，无需用户手动发“继续”（仅死循环才中断）。
+                        convergence_notified = false;
+                        BudgetManager::extend_window(&mut budget);
+                        messages.push(Message::user(
+                            "[自动接续] 任务尚未完成，预算已自动延展，无需人工介入。请立即改变策略：停止重复的探索与读取，基于现有证据直接进行写入修改与交付，完成后做一次构建验证并输出总结；若判断已陷入循环无法推进，停止工具调用，直接输出当前进展总结与阻塞原因。",
+                        ));
                     }
                 }
             } else {
@@ -1100,12 +1120,14 @@ mod tests {
             .find(|s| s.name.contains("发布检查清单"))
             .expect("应命中发布检查清单技能");
         assert_eq!(sk.version, "1.1");
-        assert_eq!(sk.resource_files, vec!["resources/checklist.txt".to_string()]);
+        assert_eq!(
+            sk.resource_files,
+            vec!["resources/checklist.txt".to_string()]
+        );
 
         // 5) AgentLoop 每回合注入模型上下文的即此渲染结果：
         // 触发边界与执行步骤、验证规则都必须在场。
-        let instructions =
-            render_skill_instructions(&matched).expect("命中技能应渲染出上下文指令");
+        let instructions = render_skill_instructions(&matched).expect("命中技能应渲染出上下文指令");
         assert!(instructions.contains("发布检查清单"));
         assert!(instructions.contains("发布新版本"));
         assert!(instructions.contains("跑全量测试"));
@@ -1240,11 +1262,9 @@ mod tests {
         }
         messages.push(Message::user("LATEST-QUESTION"));
         let compacted = apply_context_budget(messages);
-        assert!(
-            compacted
-                .iter()
-                .any(|m| m.content.contains("较早会话已按上下文预算压缩"))
-        );
+        assert!(compacted
+            .iter()
+            .any(|m| m.content.contains("较早会话已按上下文预算压缩")));
         assert!(compacted.iter().any(|m| m.content == "LATEST-QUESTION"));
         assert!(compacted.iter().map(message_chars).sum::<usize>() < 105_000);
     }

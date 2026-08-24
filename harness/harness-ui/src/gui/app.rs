@@ -6,6 +6,7 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_log();
         self.poll_preview();
+        self.poll_git_changes();
         self.poll_mem();
         self.poll_models();
         self.busy = self.host.sink.busy();

@@ -49,6 +49,9 @@ impl GitChange {
 /// Git 能力（Definition）。借鉴 Codex 的 git 集成：
 /// 代理可读仓库状态、生成 diff、提交，并在隔离 worktree 中并行工作。
 pub trait Git: Any + Send + Sync + 'static {
+    /// 当前实际查询的仓库根。UI 必须把它与当前项目路径一并展示，避免错误仓库
+    /// 或 Git 查询失败被伪装成“工作区干净”。
+    fn repository_root(&self) -> Result<PathBuf>;
     fn status(&self) -> Result<GitStatus>;
     fn diff(&self) -> Result<String>;
     /// 指定文件的未暂存 diff（unified 格式）。无修改返回空串。

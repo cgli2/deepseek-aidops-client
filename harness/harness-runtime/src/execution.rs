@@ -18,6 +18,60 @@ pub enum StrategyKind {
     Monitoring,
 }
 
+/// 求解模式决定默认的探索强度，而非业务领域。明确、可比较的异常优先走短闭环，
+/// 防止被通用 Agent 当成开放式研究题而全仓泛搜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolveMode {
+    FastDiagnosis,
+    ScopedDelivery,
+    OpenEnded,
+}
+
+#[derive(Debug, Clone)]
+pub struct SolvePlan {
+    pub mode: SolveMode,
+    pub initial_steps: usize,
+    pub initial_tool_calls: usize,
+    pub instructions: String,
+}
+
+impl SolvePlan {
+    pub fn for_contract(contract: &TaskContract, strategy: StrategyKind) -> Self {
+        let text = contract.objective.as_str();
+        let mentions_surface = ["界面", "面板", "UI", "显示", "结果"]
+            .iter()
+            .any(|word| text.contains(word));
+        let mentions_source = ["命令", "终端", "接口", "API", "数据库", "文件"]
+            .iter()
+            .any(|word| text.contains(word));
+        let mentions_mismatch = ["不一致", "不对", "为空", "没有", "但", "而"]
+            .iter()
+            .any(|word| text.contains(word));
+        if mentions_surface && mentions_source && mentions_mismatch {
+            return Self {
+                mode: SolveMode::FastDiagnosis,
+                initial_steps: 8,
+                initial_tool_calls: 10,
+                instructions: "[快速诊断模式] 这是一个可比较的数据/界面不一致问题。严格按 Observe → Compare → Locate → Fix/Report 执行：先确认两端资源身份（路径、项目、环境、配置），再比较原始数据与 Provider/UI 数据。每次工具调用必须用于区分具体假设；先执行最多 3 个确定性探针，再只读取最短依赖链中的文件。禁止全仓泛搜、重复读取或为了理解而扩展范围；证据足够时立即修复并验证，若无需修改则直接给出根因与证据。".into(),
+            };
+        }
+        if matches!(strategy, StrategyKind::Transformative | StrategyKind::Verification) {
+            return Self {
+                mode: SolveMode::ScopedDelivery,
+                initial_steps: 16,
+                initial_tool_calls: 20,
+                instructions: "[范围受限交付模式] 先定位与验收条件直接相关的最小文件集；每轮操作都必须推进定位、修改或验证之一。没有新证据时换假设，不做全仓扫描；先完成最小修改，再执行针对性验证。".into(),
+            };
+        }
+        Self {
+            mode: SolveMode::OpenEnded,
+            initial_steps: 24,
+            initial_tool_calls: 32,
+            instructions: "[探索模式] 先列出可验证假设并按信息增益选择下一步；每个阶段结束时压缩已确认事实，避免重复探索。".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RiskLevel {
     Low,
@@ -80,9 +134,11 @@ impl TaskContract {
             .any(|word| input.contains(word))
         {
             RiskLevel::High
-        } else if ["删除", "修改", "修复", "重构", "实现", "安装", "改造", "调整"]
-            .iter()
-            .any(|word| input.contains(word))
+        } else if [
+            "删除", "修改", "修复", "重构", "实现", "安装", "改造", "调整",
+        ]
+        .iter()
+        .any(|word| input.contains(word))
         {
             RiskLevel::Medium
         } else {
@@ -221,6 +277,31 @@ impl ExecutionState {
             },
         );
     }
+
+    /// 上游因输出/上下文长度而未返回可用内容时，Runtime 仅携带此紧凑检查点重试，
+    /// 不把数十轮工具原文再次塞回请求导致“越重试越长”。
+    pub fn compact_checkpoint(&self) -> String {
+        let evidence = self
+            .evidence
+            .values()
+            .filter(|item| !item.summary.trim().is_empty())
+            .take(4)
+            .map(|item| {
+                let summary: String = item.summary.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!("- {}", summary.chars().take(160).collect::<String>())
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "[长度恢复检查点]\n目标：{}\n已执行：{} 步、{} 次工具调用（成功 {}、失败 {}）\n已满足验收：{}\n关键证据：{}\n下一步：只执行一个最能完成未满足验收条件的动作，或直接给出结构化结论；不要复述全过程。",
+            self.contract.objective,
+            self.steps,
+            self.tool_calls,
+            self.successful_tool_results,
+            self.failed_tool_results,
+            if self.satisfied_criteria.is_empty() { "暂无".into() } else { self.satisfied_criteria.iter().cloned().collect::<Vec<_>>().join("、") },
+            if evidence.is_empty() { "暂无可复用证据".into() } else { evidence.join("\n") },
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -308,9 +389,12 @@ pub struct Budget {
     /// （实测一个简单任务跑出 1000+ 步）；用尽后必须强制收尾。
     pub max_renewals: u32,
     pub renewals_used: u32,
-    /// 交付延展已用次数：常规续期耗尽后，若最近窗口有实际写入产出，
-    /// 额外按窗口延展，避免“刚进入编辑阶段就被截断、要用户手动接续”。
+    /// 进展延展已用次数：常规续期耗尽后，最近窗口只要产生可验证的写入或新证据，
+    /// 就继续按窗口延展。排障、测试、审查本来就未必会修改代码，不能把它们误杀。
     pub delivery_extensions: u32,
+    /// 连续“预算耗尽且没有可验证进展”的窗口数：用于增强换路提示，
+    /// 不作为中断未完成任务的依据。
+    pub stagnant_windows: u32,
     step_window: usize,
     tool_window: usize,
     duration_window: Duration,
@@ -359,6 +443,7 @@ impl BudgetManager {
                 .clamp(0, 6),
             renewals_used: 0,
             delivery_extensions: 0,
+            stagnant_windows: 0,
             step_window: max_steps,
             tool_window: max_tool_calls,
             duration_window: max_duration,
@@ -370,6 +455,13 @@ impl BudgetManager {
         let steps = steps.max(1);
         budget.max_steps = budget.max_steps.min(steps);
         budget.step_window = budget.max_steps;
+    }
+
+    /// 与步数同理，初始工具调用上限是阶段检查点，不是未完成任务的终止线。
+    pub fn cap_initial_tool_window(budget: &mut Budget, calls: usize) {
+        let calls = calls.max(1);
+        budget.max_tool_calls = budget.max_tool_calls.min(calls);
+        budget.tool_window = budget.max_tool_calls;
     }
 
     pub fn phase(state: &ExecutionState, budget: &Budget) -> BudgetPhase {
@@ -406,7 +498,10 @@ impl BudgetManager {
             .write_operations
             .saturating_sub(state.checkpoint_writes);
         let repeated_or_low_value = call_delta.saturating_sub(evidence_delta);
-        let stagnant = call_delta > 0 && (evidence_delta == 0 || success_delta == 0);
+        let stagnant = evidence_delta == 0 || success_delta == 0;
+        // “进展”不等同于“写了代码”：成功测试、定位到新根因、得到新的只读证据
+        // 都能实质推进任务。仅在没有任何可验证进展时才记为停滞。
+        let meaningful_progress = write_delta > 0 || (evidence_delta > 0 && success_delta > 0);
 
         state.checkpoint_steps = state.steps;
         state.checkpoint_tool_calls = state.tool_calls;
@@ -415,26 +510,28 @@ impl BudgetManager {
         state.checkpoint_writes = state.write_operations;
 
         if budget.renewals_used >= budget.max_renewals {
-            // 交付延展：常规续期已用尽，但最近窗口有真实写入/编辑产出，说明任务
-            // 正在交付阶段（如前期探索耗尽预算、刚进入编辑），自动延展一个窗口，
-            // 不把半成品丢给用户手动接续。无写入的空转仍返回 None 走收尾。
-            if write_delta > 0 && budget.delivery_extensions < 2 {
+            // 进展延展：常规续期已用尽，但窗口内仍有可验证进展就继续。
+            // 不能只认代码写入，否则排障/测试/审查等任务会在完成前被错误中断。
+            if meaningful_progress {
                 budget.delivery_extensions += 1;
-                budget.max_steps = budget.max_steps.saturating_add(budget.step_window);
-                budget.max_tool_calls = budget.max_tool_calls.saturating_add(budget.tool_window);
-                budget.max_duration = budget.max_duration.saturating_add(budget.duration_window);
-                let left = 2 - budget.delivery_extensions;
+                budget.stagnant_windows = 0;
+                Self::extend_window(budget);
+                let progress = if write_delta > 0 {
+                    format!("{write_delta} 次成功的代码修改")
+                } else {
+                    format!("{evidence_delta} 条新证据和 {success_delta} 次成功结果")
+                };
                 return Some(format!(
-                    "[交付延展] 最近窗口检测到 {write_delta} 次成功的代码修改，任务正处于活跃交付阶段：预算已延展（剩余 {left} 次交付延展）。不要开启新的探索与扫描，尽快完成剩余修改与一次性验证，然后输出总结交付。{}",
+                    "[进展延展·第{}次] 最近窗口检测到 {progress}，任务仍在有效推进：预算已自动延展。围绕未满足验收条件继续，完成后进行必要验证并输出总结。{}",
+                    budget.delivery_extensions,
                     evidence_digest(state)
                 ));
             }
+            budget.stagnant_windows += 1;
             return None;
         }
         budget.renewals_used += 1;
-        budget.max_steps = budget.max_steps.saturating_add(budget.step_window);
-        budget.max_tool_calls = budget.max_tool_calls.saturating_add(budget.tool_window);
-        budget.max_duration = budget.max_duration.saturating_add(budget.duration_window);
+        Self::extend_window(budget);
         let remaining = budget.max_renewals - budget.renewals_used;
 
         Some(if stagnant {
@@ -448,6 +545,13 @@ impl BudgetManager {
                 evidence_digest(state)
             )
         })
+    }
+
+    /// 按一个窗口延展步数/工具/时长预算（续期、交付延展、自动接续共用）。
+    pub fn extend_window(budget: &mut Budget) {
+        budget.max_steps = budget.max_steps.saturating_add(budget.step_window);
+        budget.max_tool_calls = budget.max_tool_calls.saturating_add(budget.tool_window);
+        budget.max_duration = budget.max_duration.saturating_add(budget.duration_window);
     }
 
     /// 续期耗尽后的最终收尾窗口：给足步骤完成汇总交付，不再扩张。
@@ -554,9 +658,11 @@ impl DomainPolicy for GeneralDomainPolicy {
             .any(|word| text.contains(word))
         {
             StrategyKind::Verification
-        } else if ["修改", "修复", "重构", "更新", "改进", "实现", "改造", "调整", "拆分", "迁移"]
-            .iter()
-            .any(|word| text.contains(word))
+        } else if [
+            "修改", "修复", "重构", "更新", "改进", "实现", "改造", "调整", "拆分", "迁移",
+        ]
+        .iter()
+        .any(|word| text.contains(word))
         {
             StrategyKind::Transformative
         } else if ["创建", "生成", "编写", "设计"]
@@ -590,6 +696,17 @@ mod tests {
             policy.select_strategy(&TaskContract::from_input("排查服务变慢的根因")),
             StrategyKind::Investigative
         );
+    }
+
+    #[test]
+    fn routes_surface_source_mismatches_to_fast_diagnosis() {
+        let contract = TaskContract::from_input(
+            "终端 git 命令能看到变更，但界面 Git 面板显示为空，为什么不一致？",
+        );
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Investigative);
+        assert_eq!(plan.mode, SolveMode::FastDiagnosis);
+        assert!(plan.initial_tool_calls <= 10);
+        assert!(plan.instructions.contains("Observe"));
     }
 
     #[test]
@@ -631,9 +748,10 @@ mod tests {
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         budget.renewals_used = budget.max_renewals; // 常规续期耗尽
 
-        // 无写入的空转：不延展，交给收尾。
+        // 无写入的空转：不延展，交给收尾；空转窗口开始计数。
         state.steps = 10;
         assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
+        assert_eq!(budget.stagnant_windows, 1);
 
         // 有写入的活跃交付：自动延展一个窗口。
         let proposal = ActionProposal {
@@ -646,9 +764,44 @@ mod tests {
         state.steps = 12;
         let before = budget.max_steps;
         let msg = BudgetManager::diagnose_and_renew(&mut state, &mut budget);
-        assert!(msg.unwrap().contains("交付延展"));
+        assert!(msg.unwrap().contains("进展延展"));
         assert!(budget.max_steps > before);
         assert_eq!(budget.delivery_extensions, 1);
+        // 有真实产出后空转计数清零：不会被误判为卡死。
+        assert_eq!(budget.stagnant_windows, 0);
+
+        // 持续写入 → 持续延展（不设上限）：未完成但正在产出的任务不被截断。
+        state.record_tool_result(&proposal, true, "edit ok");
+        state.steps = 14;
+        let msg2 = BudgetManager::diagnose_and_renew(&mut state, &mut budget);
+        assert!(msg2.unwrap().contains("进展延展"));
+        assert_eq!(budget.delivery_extensions, 2);
+
+        // 写入停止（空转）→ 不再延展，交给收尾；空转计数重新累计。
+        state.steps = 16;
+        assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
+        assert_eq!(budget.stagnant_windows, 1);
+    }
+
+    #[test]
+    fn evidence_progress_extends_without_code_changes() {
+        let contract = TaskContract::from_input("排查服务延迟的根因");
+        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Investigative);
+        budget.renewals_used = budget.max_renewals;
+        let mut state = ExecutionState::new(contract, StrategyKind::Investigative);
+        let proposal = ActionProposal {
+            signature: "shell:{\"command\":\"collect latency metrics\"}".into(),
+            question: "收集延迟指标".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&proposal, true, "发现数据库连接池等待是主要耗时");
+        state.steps = 10;
+
+        let message = BudgetManager::diagnose_and_renew(&mut state, &mut budget).unwrap();
+        assert!(message.contains("进展延展"));
+        assert_eq!(state.write_operations, 0);
+        assert_eq!(budget.stagnant_windows, 0);
     }
 
     #[test]

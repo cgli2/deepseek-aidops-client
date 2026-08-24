@@ -9,23 +9,44 @@ use std::sync::Arc;
 
 use harness_capability::git::{Git, GitChange, GitStatus, Worktree};
 use harness_core::error::{Error, Result};
+use harness_core::Workspace;
 
 /// git CLI Provider。
 pub struct GitCli {
-    repo: PathBuf,
+    root: GitRoot,
+}
+
+enum GitRoot {
+    Fixed(PathBuf),
+    Workspace(Arc<Workspace>),
 }
 
 impl GitCli {
     pub fn new(repo: impl AsRef<Path>) -> Arc<dyn Git> {
         Arc::new(Self {
-            repo: repo.as_ref().to_path_buf(),
+            root: GitRoot::Fixed(repo.as_ref().to_path_buf()),
         })
+    }
+
+    /// 与文件/搜索/编辑 Provider 共用可切换的 Workspace，项目切换后每次 Git
+    /// 命令都会读取新根目录，不能保留启动时的旧仓库路径。
+    pub fn with_workspace(workspace: Arc<Workspace>) -> Arc<dyn Git> {
+        Arc::new(Self {
+            root: GitRoot::Workspace(workspace),
+        })
+    }
+
+    fn repo(&self) -> PathBuf {
+        match &self.root {
+            GitRoot::Fixed(path) => path.clone(),
+            GitRoot::Workspace(workspace) => workspace.root(),
+        }
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
         let out = Command::new("git")
             .arg("-C")
-            .arg(&self.repo)
+            .arg(self.repo())
             .args(args)
             .output()
             .map_err(Error::Io)?;
@@ -41,6 +62,11 @@ impl GitCli {
 }
 
 impl Git for GitCli {
+    fn repository_root(&self) -> Result<PathBuf> {
+        let root = self.run(&["rev-parse", "--show-toplevel"])?;
+        Ok(PathBuf::from(root.trim()))
+    }
+
     fn status(&self) -> Result<GitStatus> {
         let branch = self
             .run(&["rev-parse", "--abbrev-ref", "HEAD"])?
@@ -82,13 +108,16 @@ impl Git for GitCli {
         // 吃掉，导致 bytes[2] 不再是分隔空格而误判跳过，只有 ?? 未跟踪能通过）。
         let out = Command::new("git")
             .arg("-C")
-            .arg(&self.repo)
+            .arg(self.repo())
             .args(["status", "--porcelain", "-z"])
             .output()
             .map_err(Error::Io)?;
         if !out.status.success() {
-            // 非 git 仓库 / 错误：返回空列表（UI 不崩溃，只是无标记）。
-            return Ok(Vec::new());
+            return Err(Error::Git(format!(
+                "git status --porcelain failed in {}: {}",
+                self.repo().display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
         }
         let raw = String::from_utf8_lossy(&out.stdout).to_string();
         let mut files = Vec::new();
@@ -125,7 +154,8 @@ impl Git for GitCli {
     }
 
     fn create_worktree(&self, name: &str, base: &str) -> Result<Worktree> {
-        let parent = self.repo.parent().unwrap_or(&self.repo).to_path_buf();
+        let repo = self.repo();
+        let parent = repo.parent().unwrap_or(&repo).to_path_buf();
         let path = parent.join(format!(".wt-{}", name));
         self.run(&["worktree", "add", path.to_str().unwrap_or(""), base])?;
         Ok(Worktree {
@@ -176,5 +206,72 @@ impl WorktreeGuard {
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         let _ = self.git.remove_worktree(&self.wt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let output = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn workspace_backed_git_follows_project_switches() {
+        let root = std::env::temp_dir().join(format!("harness-git-workspace-{}", uuid()));
+        let project_a = root.join("a");
+        let project_b = root.join("b");
+        init_repo(&project_a);
+        init_repo(&project_b);
+        std::fs::write(project_b.join("uncommitted.txt"), "pending").unwrap();
+
+        let workspace = Workspace::new(project_a.clone());
+        let git = GitCli::with_workspace(workspace.clone());
+        assert!(git.changed_files().unwrap().is_empty());
+        assert_eq!(
+            git.repository_root()
+                .unwrap()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("a")
+        );
+
+        workspace.set_root(project_b.clone());
+        let changes = git.changed_files().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "uncommitted.txt");
+        assert_eq!(
+            git.repository_root()
+                .unwrap()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("b")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_repository_is_an_error_not_an_empty_change_list() {
+        let path = std::env::temp_dir().join(format!("harness-git-nonrepo-{}", uuid()));
+        std::fs::create_dir_all(&path).unwrap();
+        let git = GitCli::new(&path);
+        assert!(git.changed_files().is_err());
+        assert!(git.repository_root().is_err());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn uuid() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string()
     }
 }

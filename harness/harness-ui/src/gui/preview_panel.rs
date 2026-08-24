@@ -493,21 +493,66 @@ impl AppState {
     /// 异步刷新 Git 变更（分支名 + 变更文件列表，含状态码）。
     pub(super) fn refresh_git_changes(&mut self) {
         let git = self.host.git.clone();
-        let handle = self.host.rt.handle();
-        let (tx, rx) =
-            std::sync::mpsc::channel::<(String, Vec<harness_capability::git::GitChange>)>();
+        let workspace = self
+            .host
+            .settings
+            .get("workspace.root")
+            .filter(|path| std::path::Path::new(path).is_dir())
+            .unwrap_or_else(|| self.host.workspace_root.clone());
+        self.git_generation = self.git_generation.wrapping_add(1);
+        let generation = self.git_generation;
+        self.git_workspace = workspace.clone();
+        self.git_loaded = false;
+        self.git_error = None;
+        let (tx, rx) = std::sync::mpsc::channel::<super::app_state::GitRefreshResult>();
+        self.git_rx = Some(rx);
         std::thread::spawn(move || {
-            let res = handle.block_on(async move {
-                let branch = git.current_branch().unwrap_or_default();
-                let changes = git.changed_files().unwrap_or_default();
-                (branch, changes)
+            let result = (|| {
+                let repo_root = git.repository_root().map_err(|error| error.to_string())?;
+                let branch = git.current_branch().map_err(|error| error.to_string())?;
+                let changes = git.changed_files().map_err(|error| error.to_string())?;
+                Ok(super::app_state::GitRefreshData {
+                    repo_root: repo_root.display().to_string(),
+                    branch,
+                    changes,
+                })
+            })();
+            let _ = tx.send(super::app_state::GitRefreshResult {
+                generation,
+                workspace,
+                result,
             });
-            let _ = tx.send(res);
         });
-        if let Ok((branch, changes)) = rx.recv() {
-            self.git_branch = branch;
-            self.git_changes = changes;
-            self.git_loaded = true;
+    }
+
+    /// GUI 帧中非阻塞消费 Git 查询结果。回包必须同时匹配刷新代次和当前工作区，
+    /// 否则是切项目前的旧结果，直接丢弃。
+    pub(super) fn poll_git_changes(&mut self) {
+        let Some(rx) = self.git_rx.as_ref() else { return };
+        let Ok(update) = rx.try_recv() else { return };
+        self.git_rx = None;
+        let current_workspace = self
+            .host
+            .settings
+            .get("workspace.root")
+            .filter(|path| std::path::Path::new(path).is_dir())
+            .unwrap_or_else(|| self.host.workspace_root.clone());
+        if update.generation != self.git_generation || update.workspace != current_workspace {
+            return;
+        }
+        self.git_loaded = true;
+        match update.result {
+            Ok(data) => {
+                self.git_branch = data.branch;
+                self.git_workspace = data.repo_root;
+                self.git_changes = data.changes;
+                self.git_error = None;
+            }
+            Err(error) => {
+                self.git_branch.clear();
+                self.git_changes.clear();
+                self.git_error = Some(error);
+            }
         }
     }
 
@@ -681,9 +726,26 @@ impl AppState {
             return;
         }
         if self.git_changes.is_empty() {
+            if let Some(error) = &self.git_error {
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new(format!("无法读取 Git 状态：{error}"))
+                        .size(12.0)
+                        .color(pal.err_text),
+                );
+                ui.label(
+                    egui::RichText::new(format!("查询工作区：{}", self.git_workspace))
+                        .size(10.5)
+                        .color(pal.dim),
+                );
+                return;
+            }
             ui.add_space(16.0);
             ui.label(
-                egui::RichText::new("✨ 工作区干净，无未提交变更")
+                egui::RichText::new(format!(
+                    "✨ 工作区干净，无未提交变更 · {}",
+                    self.git_workspace
+                ))
                     .size(12.0)
                     .color(pal.accent),
             );

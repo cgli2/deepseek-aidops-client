@@ -178,7 +178,9 @@ impl Plugin for HarnessPlugin {
         regs.push(ctx.provide(memory.clone()));
         let hook: Arc<dyn Hook> = ShellHook::from_config(&self.config.hooks);
         regs.push(ctx.provide(hook.clone()));
-        let git: Arc<dyn Git> = GitCli::new(cwd.clone());
+        // Git 必须与 fs/search/editor 共用 Workspace；否则切换项目后 UI 的 Git
+        // 面板仍会查询启动时的旧仓库，造成“终端有变更、面板却干净”。
+        let git: Arc<dyn Git> = GitCli::with_workspace(workspace.clone());
         regs.push(ctx.provide(git.clone()));
 
         // ---- 四类记忆资产（ChatMemory L0~L3 / Skill / Wiki / CodeGraph）----

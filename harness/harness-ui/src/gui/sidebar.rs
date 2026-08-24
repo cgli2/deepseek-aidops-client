@@ -22,7 +22,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                 Icon::Chat,
                 "新建对话",
                 state.sidebar_expanded,
-                !state.busy,
+                true,
                 true,
             ) {
                 state.new_session();

@@ -1,18 +1,20 @@
-//! 会话控制器：把 UI 输入变成按 FIFO 串行执行的后台 agent turn。
+//! 会话控制器：每条会话独立 FIFO、独立执行上下文；不同会话可并行运行。
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use futures::FutureExt;
-use harness_core::AppContext;
 use harness_core::types::UserInput;
 use harness_core::ui_input::{QueuedInput, UiInputSink};
+use harness_core::{AppContext, Registration};
+use harness_session::{SessionId, SessionLog};
+use harness_tool::{PlanTool, ToolRegistry};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::AgentLoop;
-use crate::council::{COUNCIL_PREFIX, CouncilOrchestrator};
+use crate::council::{CouncilOrchestrator, COUNCIL_PREFIX};
 
 #[derive(Clone)]
 pub struct SessionController {
@@ -22,16 +24,22 @@ pub struct SessionController {
 struct Inner {
     ctx: AppContext,
     rt: Handle,
-    queue: std::sync::Mutex<TurnQueue>,
+    queues: std::sync::Mutex<HashMap<SessionId, TurnQueue>>,
     next_queue_id: AtomicU64,
-    cancellation: std::sync::Mutex<Option<CancellationToken>>,
 }
 
-/// 单消费者 FIFO 队列。`running` 与 `pending` 共用同一把锁，避免消费者退出与
-/// 新输入入队交错时遗留无人执行的任务。
+/// 每条会话最多一个消费者；不同会话各自有消费者，因此可并行。
 struct TurnQueue {
     pending: VecDeque<QueuedInput>,
     running: bool,
+    cancellation: Option<CancellationToken>,
+}
+
+/// 会话 fork 的服务覆盖必须和执行生命周期一致；保存 Registration 避免其提前 Drop
+/// 把固定日志/会话级 PlanTool 从子上下文移除。
+struct SessionScope {
+    ctx: AppContext,
+    _registrations: Vec<Registration>,
 }
 
 impl SessionController {
@@ -40,14 +48,43 @@ impl SessionController {
             inner: Arc::new(Inner {
                 ctx,
                 rt,
-                queue: std::sync::Mutex::new(TurnQueue {
-                    pending: VecDeque::new(),
-                    running: false,
-                }),
+                queues: std::sync::Mutex::new(HashMap::new()),
                 next_queue_id: AtomicU64::new(1),
-                cancellation: std::sync::Mutex::new(None),
             }),
         }
+    }
+
+    /// UI 日志是可切换视图；执行前 pin 成固定句柄，并在 fork 的上下文内覆盖。
+    fn current_session_context(&self) -> (SessionId, SessionScope) {
+        let log = self.inner.ctx.get::<SessionLog>().pin();
+        let id = log.id();
+        let child = self.inner.ctx.fork();
+        let log_registration = child.provide(log.clone());
+        let tools = self
+            .inner
+            .ctx
+            .get::<ToolRegistry>()
+            .snapshot_excluding(&["plan"]);
+        tools.register(PlanTool::new(log));
+        let tools_registration = child.provide(tools);
+        (
+            id,
+            SessionScope {
+                ctx: child,
+                _registrations: vec![log_registration, tools_registration],
+            },
+        )
+    }
+
+    fn current_id(&self) -> SessionId {
+        self.inner.ctx.get::<SessionLog>().id()
+    }
+    fn any_busy(&self) -> bool {
+        self.inner
+            .queues
+            .lock()
+            .map(|q| q.values().any(|v| v.running))
+            .unwrap_or(false)
     }
 }
 
@@ -60,8 +97,14 @@ impl UiInputSink for SessionController {
         if text.trim().is_empty() {
             return;
         }
-        let should_start = match self.inner.queue.lock() {
-            Ok(mut queue) => {
+        let (id, session_ctx) = self.current_session_context();
+        let should_start = match self.inner.queues.lock() {
+            Ok(mut queues) => {
+                let queue = queues.entry(id).or_insert_with(|| TurnQueue {
+                    pending: VecDeque::new(),
+                    running: false,
+                    cancellation: None,
+                });
                 queue.pending.push_back(QueuedInput {
                     id: self.inner.next_queue_id.fetch_add(1, Ordering::Relaxed),
                     text,
@@ -79,126 +122,132 @@ impl UiInputSink for SessionController {
         if should_start {
             let inner = self.inner.clone();
             let rt = inner.rt.clone();
-            rt.spawn(async move { run_turn_queue(inner).await });
+            rt.spawn(async move { run_turn_queue(inner, id, session_ctx).await });
         }
     }
 
     fn busy(&self) -> bool {
         self.inner
-            .queue
+            .queues
             .lock()
-            .map(|queue| queue.running)
+            .ok()
+            .and_then(|q| q.get(&self.current_id()).map(|v| v.running))
             .unwrap_or(false)
     }
-
     fn queued_count(&self) -> usize {
         self.inner
-            .queue
+            .queues
             .lock()
-            .map(|queue| queue.pending.len())
+            .ok()
+            .and_then(|q| q.get(&self.current_id()).map(|v| v.pending.len()))
             .unwrap_or(0)
     }
-
     fn queued_inputs(&self) -> Vec<QueuedInput> {
         self.inner
-            .queue
+            .queues
             .lock()
-            .map(|queue| queue.pending.iter().cloned().collect())
+            .ok()
+            .and_then(|q| {
+                q.get(&self.current_id())
+                    .map(|v| v.pending.iter().cloned().collect())
+            })
             .unwrap_or_default()
     }
-
-    fn remove_queued(&self, id: u64) -> bool {
-        let Ok(mut queue) = self.inner.queue.lock() else {
+    fn remove_queued(&self, item_id: u64) -> bool {
+        let Ok(mut queues) = self.inner.queues.lock() else {
             return false;
         };
-        let Some(position) = queue.pending.iter().position(|item| item.id == id) else {
+        let Some(queue) = queues.get_mut(&self.current_id()) else {
+            return false;
+        };
+        let Some(position) = queue.pending.iter().position(|item| item.id == item_id) else {
             return false;
         };
         queue.pending.remove(position);
         true
     }
-
     fn cancel(&self) {
-        if let Ok(active) = self.inner.cancellation.lock() {
-            if let Some(token) = active.as_ref() {
+        if let Ok(queues) = self.inner.queues.lock() {
+            if let Some(Some(token)) = queues
+                .get(&self.current_id())
+                .map(|q| q.cancellation.as_ref())
+            {
                 token.cancel();
             }
         }
     }
-
     fn new_session(&self) {
-        if self.busy() {
-            return;
-        }
-        let log = self.inner.ctx.get::<harness_session::SessionLog>();
+        let log = self.inner.ctx.get::<SessionLog>();
         if let Some(ws) = self.inner.ctx.try_get::<harness_core::Workspace>() {
             log.fresh(ws.root().join(".harness").join("sessions"));
         } else {
             log.clear();
         }
     }
-
     fn set_permission(&self, mode: String) {
         if let Some(policy) = self.inner.ctx.try_get::<harness_core::AccessPolicy>() {
             policy.set(mode);
         }
     }
-
     fn switch_workspace(&self, path: &std::path::Path) {
-        if self.busy() {
+        // 工作区是工具的共享资源；运行中仍不可换项目，避免文件工具跨根。
+        if self.any_busy() {
             return;
         }
         if let Some(ws) = self.inner.ctx.try_get::<harness_core::Workspace>() {
             ws.set_root(path.to_path_buf());
         }
-        let log = self.inner.ctx.get::<harness_session::SessionLog>();
-        log.switch_dir(path.join(".harness").join("sessions"));
+        self.inner
+            .ctx
+            .get::<SessionLog>()
+            .switch_dir(path.join(".harness").join("sessions"));
     }
 }
 
-async fn run_turn_queue(inner: Arc<Inner>) {
+async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
+    let ctx = &scope.ctx;
     loop {
-        let input = match inner.queue.lock() {
-            Ok(mut queue) => match queue.pending.pop_front() {
+        let input = match inner.queues.lock() {
+            Ok(mut queues) => match queues.get_mut(&id).and_then(|q| q.pending.pop_front()) {
                 Some(item) => item,
                 None => {
-                    queue.running = false;
+                    queues.remove(&id);
                     break;
                 }
             },
             Err(_) => break,
         };
-        let text = input.text;
-        let attachments = input.attachments;
-
         let cancellation = CancellationToken::new();
-        if let Ok(mut active) = inner.cancellation.lock() {
-            *active = Some(cancellation.clone());
+        if let Ok(mut queues) = inner.queues.lock() {
+            if let Some(queue) = queues.get_mut(&id) {
+                queue.cancellation = Some(cancellation.clone());
+            }
         }
-        let turn_timeout_secs: u64 = std::env::var("HARNESS_TURN_TIMEOUT_SECS")
+        let timeout_secs = std::env::var("HARNESS_TURN_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1800);
-        let is_council = text.starts_with(COUNCIL_PREFIX);
-        let clean_text = text
+        let is_council = input.text.starts_with(COUNCIL_PREFIX);
+        let clean_text = input
+            .text
             .strip_prefix(COUNCIL_PREFIX)
-            .unwrap_or(&text)
+            .unwrap_or(&input.text)
             .to_string();
+        let attachments = input.attachments;
         let outcome = std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(std::time::Duration::from_secs(turn_timeout_secs), async {
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
                 if is_council {
-                    let attachment_note = attachment_note(&attachments);
                     CouncilOrchestrator::default()
                         .run(
-                            &inner.ctx,
-                            format!("{clean_text}{attachment_note}"),
+                            &ctx,
+                            format!("{clean_text}{}", attachment_note(&attachments)),
                             cancellation,
                         )
                         .await
                 } else {
                     AgentLoop::new()
                         .run_turn_cancellable(
-                            &inner.ctx,
+                            &ctx,
                             UserInput {
                                 text: clean_text,
                                 attachments,
@@ -211,7 +260,7 @@ async fn run_turn_queue(inner: Arc<Inner>) {
             .await
             .map_err(|_| {
                 harness_core::error::Error::Runtime(format!(
-                    "回合超过 {turn_timeout_secs} 秒未完成，已强制中止以避免无限等待"
+                    "回合超过 {timeout_secs} 秒未完成，已强制中止以避免无限等待"
                 ))
             })?
         })
@@ -219,10 +268,10 @@ async fn run_turn_queue(inner: Arc<Inner>) {
         .await;
         if let Some(error) = match outcome {
             Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.to_string()),
-            Err(_) => Some("后台回合发生异常，已自动恢复界面".to_string()),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some("后台回合发生异常，已自动恢复界面".into()),
         } {
-            let log = inner.ctx.get::<harness_session::SessionLog>();
+            let log = ctx.get::<SessionLog>();
             log.append(harness_session::SessionEvent::Assistant {
                 id: log.gen_id(),
                 chunk: harness_llm::Chunk {
@@ -232,8 +281,10 @@ async fn run_turn_queue(inner: Arc<Inner>) {
             });
             log.append(harness_session::SessionEvent::TurnEnd { id: log.gen_id() });
         }
-        if let Ok(mut active) = inner.cancellation.lock() {
-            *active = None;
+        if let Ok(mut queues) = inner.queues.lock() {
+            if let Some(queue) = queues.get_mut(&id) {
+                queue.cancellation = None;
+            }
         }
     }
 }
@@ -244,16 +295,15 @@ fn attachment_note(attachments: &[harness_core::Attachment]) -> String {
     }
     let files = attachments
         .iter()
-        .map(|attachment| {
+        .map(|a| {
             format!(
                 "{}（{}，{}）",
-                attachment
-                    .path
+                a.path
                     .file_name()
-                    .and_then(|name| name.to_str())
+                    .and_then(|n| n.to_str())
                     .unwrap_or("附件"),
-                attachment.mime,
-                attachment.path.display(),
+                a.mime,
+                a.path.display()
             )
         })
         .collect::<Vec<_>>()

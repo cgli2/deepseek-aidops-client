@@ -55,24 +55,58 @@ impl DynTool for PlanTool {
     }
 }
 
-/// 从工具参数解析计划条目；status 归一化为 pending/doing/done。
+/// 从工具参数解析计划条目。模型的 `done` 必须降级为 `claimed_done`；真实
+/// `verified` 仅能由 Runtime 在 Delivery 事件中给出，不能经 tool 参数伪造。
 fn parse_items(call: &ToolCall) -> Vec<PlanItem> {
     let Some(arr) = call.args.get("items").and_then(|v| v.as_array()) else {
         return vec![];
     };
     arr.iter()
-        .filter_map(|v| {
+        .enumerate()
+        .filter_map(|(index, v)| {
             let text = v.get("text").and_then(|t| t.as_str())?.trim().to_string();
             if text.is_empty() {
                 return None;
             }
             let status = match v.get("status").and_then(|s| s.as_str()) {
                 Some("doing") => "doing",
-                Some("done") => "done",
+                Some("done") | Some("verified") => "claimed_done",
+                Some("blocked") => "blocked",
                 _ => "pending",
             }
             .to_string();
-            Some(PlanItem { text, status })
+            let id = v
+                .get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("plan-{}", index + 1));
+            let criterion_ids = v
+                .get("criterion_ids")
+                .or_else(|| v.get("criteria"))
+                .and_then(|items| items.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .filter(|item| !item.trim().is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let evidence = v
+                .get("evidence")
+                .and_then(|items| items.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .filter(|item| !item.trim().is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(PlanItem { id, text, status, criterion_ids, evidence })
         })
         .collect()
 }
@@ -111,5 +145,30 @@ mod tests {
             args: json!({"items":[]}),
         };
         assert!(!tool.call(&call).await.unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn model_done_is_recorded_as_claim_not_verified() {
+        let log = SessionLog::new();
+        let tool = PlanTool::new(log.clone());
+        let call = ToolCall {
+            id: "c3".into(),
+            name: "plan".into(),
+            args: json!({"items":[{
+                "id":"fix",
+                "text":"修复问题",
+                "status":"done",
+                "criterion_ids":["item-1"],
+                "evidence":["模型声明已修改"]
+            }]}),
+        };
+        assert!(tool.call(&call).await.unwrap().ok);
+        assert!(matches!(
+            log.replay().last(),
+            Some(SessionEvent::PlanUpdate { items, .. })
+                if items[0].id == "fix"
+                    && items[0].status == "claimed_done"
+                    && items[0].criterion_ids == ["item-1"]
+        ));
     }
 }

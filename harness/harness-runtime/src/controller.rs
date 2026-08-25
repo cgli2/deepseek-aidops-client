@@ -134,6 +134,9 @@ impl UiInputSink for SessionController {
             .and_then(|q| q.get(&self.current_id()).map(|v| v.running))
             .unwrap_or(false)
     }
+    fn any_busy(&self) -> bool {
+        self.any_busy()
+    }
     fn queued_count(&self) -> usize {
         self.inner
             .queues

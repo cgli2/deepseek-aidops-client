@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, RwLock, Weak},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -48,6 +51,12 @@ pub enum SessionEvent {
     PlanUpdate {
         id: EventId,
         items: Vec<PlanItem>,
+    },
+    /// Runtime 生成的交付判定。与模型的计划文本、最终总结分离，是 UI 显示
+    /// “已交付”或“未完成”的唯一真相源。
+    Delivery {
+        id: EventId,
+        report: DeliveryReport,
     },
     TurnStopping {
         id: EventId,
@@ -140,12 +149,46 @@ pub enum CouncilEvent {
     },
 }
 
-/// 计划条目（status ∈ pending / doing / done）。
+/// 计划条目。`claimed_done` 只表示模型自报完成；只有 Runtime 的 Delivery
+/// 验收报告可将其视为 verified，避免计划文本直接伪造交付状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanItem {
+    #[serde(default)]
+    pub id: String,
     pub text: String,
     #[serde(default = "default_status")]
     pub status: String,
+    /// 此计划项声明要覆盖的验收 ID，仅作运行时追踪，不接受模型自报作为证据。
+    #[serde(default)]
+    pub criterion_ids: Vec<String>,
+    /// 模型声明的证据说明；UI 会标为“待运行时验收”。
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+/// 回合的最终交付状态。`TurnEnd` 只表示日志完整，不能推导交付成功。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Verified,
+    Blocked,
+    Interrupted,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryCriterion {
+    pub id: String,
+    pub description: String,
+    pub satisfied: bool,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryReport {
+    pub outcome: DeliveryOutcome,
+    pub criteria: Vec<DeliveryCriterion>,
+    pub verification: Vec<String>,
+    pub reason: Option<String>,
 }
 
 /// 会话历史列表条目（侧栏「历史记录」面板展示用）。
@@ -176,6 +219,7 @@ fn event_id(ev: &SessionEvent) -> EventId {
         | SessionEvent::ToolCall { id, .. }
         | SessionEvent::ToolResult { id, .. }
         | SessionEvent::PlanUpdate { id, .. }
+        | SessionEvent::Delivery { id, .. }
         | SessionEvent::TurnStopping { id, .. }
         | SessionEvent::TurnEnd { id }
         | SessionEvent::Usage { id, .. }
@@ -216,13 +260,20 @@ struct SessionState {
 /// 流式输出串写进用户后来打开的新会话。
 pub struct SessionLog {
     state: RwLock<Arc<SessionState>>,
+    /// 已被后台回合 pin 住的会话状态。UI 从历史切回该文件时复用同一状态，
+    /// 既能继续看到流式输出，也能保持控制器的会话队列身份不变。
+    state_cache: Arc<Mutex<HashMap<std::path::PathBuf, Weak<SessionState>>>>,
 }
 
 impl SessionLog {
     fn from_state(state: SessionState) -> Arc<Self> {
-        Arc::new(Self {
-            state: RwLock::new(Arc::new(state)),
-        })
+        let state = Arc::new(state);
+        let log = Arc::new(Self {
+            state: RwLock::new(state.clone()),
+            state_cache: Arc::new(Mutex::new(HashMap::new())),
+        });
+        log.remember_state(&state);
+        log
     }
 
     fn state(&self) -> Arc<SessionState> {
@@ -230,14 +281,48 @@ impl SessionLog {
     }
 
     fn replace_state(&self, state: SessionState) {
-        *self.state.write().unwrap() = Arc::new(state);
+        let state = Arc::new(state);
+        self.remember_state(&state);
+        *self.state.write().unwrap() = state;
     }
 
     /// 固定当前会话状态，供后台执行持有。随后 UI 切换/新建会话不会影响它。
     pub fn pin(&self) -> Arc<Self> {
         Arc::new(Self {
             state: RwLock::new(self.state()),
+            state_cache: self.state_cache.clone(),
         })
+    }
+
+    fn session_path_key(path: &std::path::Path) -> std::path::PathBuf {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(path.file_name())
+            .map(|(parent, name)| parent.join(name))
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    fn remember_state(&self, state: &Arc<SessionState>) {
+        let path = state.inner.lock().ok().and_then(|inner| inner.path.clone());
+        let Some(path) = path else {
+            return;
+        };
+        if let Ok(mut cache) = self.state_cache.lock() {
+            cache.retain(|_, cached| cached.strong_count() > 0);
+            cache.insert(Self::session_path_key(&path), Arc::downgrade(state));
+        }
+    }
+
+    fn cached_state(&self, path: &std::path::Path) -> Option<Arc<SessionState>> {
+        let key = Self::session_path_key(path);
+        let Ok(mut cache) = self.state_cache.lock() else {
+            return None;
+        };
+        let state = cache.get(&key).and_then(Weak::upgrade);
+        if state.is_none() {
+            cache.remove(&key);
+        }
+        state
     }
 }
 
@@ -246,8 +331,11 @@ impl SessionLog {
     /// 避免历史记录看起来像助手无缘无故写到一半便消失。
     fn close_interrupted_turn(&self) {
         let mut active_council = None;
+        let mut delivery_reported = false;
         for event in self.replay() {
             match event {
+                SessionEvent::TurnStart { .. } => delivery_reported = false,
+                SessionEvent::Delivery { .. } => delivery_reported = true,
                 SessionEvent::Council {
                     event: CouncilEvent::Started { council_id, .. },
                     ..
@@ -270,6 +358,19 @@ impl SessionLog {
                 event: CouncilEvent::Cancelled {
                     council_id,
                     reason: "程序退出或意外中断；恢复后未自动重启可能产生副作用的专家任务".into(),
+                },
+            });
+        }
+        if !delivery_reported {
+            self.append(SessionEvent::Delivery {
+                id: self.gen_id(),
+                report: DeliveryReport {
+                    outcome: DeliveryOutcome::Interrupted,
+                    criteria: Vec::new(),
+                    verification: Vec::new(),
+                    reason: Some(
+                        "程序退出或意外中断；本回合没有生成完整的验收报告".into(),
+                    ),
                 },
             });
         }
@@ -537,6 +638,10 @@ impl SessionLog {
         if !path.is_file() {
             return false;
         }
+        if let Some(state) = self.cached_state(&path) {
+            *self.state.write().unwrap() = state;
+            return true;
+        }
         let (events, next) = load_file(&path);
         self.replace_state(SessionState {
             id: Uuid::new_v4(),
@@ -794,6 +899,11 @@ mod tests {
         let resumed = SessionLog::open_latest(&dir);
         let events = resumed.replay();
         assert!(matches!(events.last(), Some(SessionEvent::TurnEnd { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Delivery { report, .. }
+                if report.outcome == DeliveryOutcome::Interrupted
+        )));
         assert!(events
             .iter()
             .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "hi")));
@@ -910,6 +1020,72 @@ mod tests {
             log.replay().is_empty(),
             "new session must not receive old stream output"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delivery_report_is_persisted_and_replayed() {
+        let dir = std::env::temp_dir().join(format!("harness-delivery-test-{}", Uuid::new_v4()));
+        let log = SessionLog::persistent(&dir);
+        log.append(SessionEvent::Delivery {
+            id: log.gen_id(),
+            report: DeliveryReport {
+                outcome: DeliveryOutcome::Blocked,
+                criteria: vec![DeliveryCriterion {
+                    id: "user-objective".into(),
+                    description: "完成变更并验证".into(),
+                    satisfied: false,
+                    evidence: vec![],
+                }],
+                verification: vec![],
+                reason: Some("验证未执行".into()),
+            },
+        });
+        drop(log);
+
+        let replayed = SessionLog::open_latest(&dir).replay();
+        assert!(matches!(
+            replayed.first(),
+            Some(SessionEvent::Delivery { report, .. })
+                if report.outcome == DeliveryOutcome::Blocked
+                    && report.criteria.len() == 1
+                    && report.reason.as_deref() == Some("验证未执行")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn switching_back_reuses_a_running_session_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-switch-running-session-test-{}",
+            Uuid::new_v4()
+        ));
+        let log = SessionLog::persistent(&dir);
+        log.append(SessionEvent::TurnStart {
+            id: log.gen_id(),
+            input: "会话 A".into(),
+        });
+        let file_a = log
+            .path()
+            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+            .unwrap();
+        let running = log.pin();
+
+        // UI 切往另一个会话，再回到仍在流式输出的 A。
+        log.fresh(&dir);
+        assert!(log.switch_to_file(&dir, &file_a));
+        assert_eq!(log.id(), running.id());
+
+        running.append(SessionEvent::Assistant {
+            id: running.gen_id(),
+            chunk: Chunk {
+                text: Some("A 的实时输出".into()),
+                ..Default::default()
+            },
+        });
+        assert!(log.replay().iter().any(|event| matches!(event,
+            SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("A 的实时输出")
+        )));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

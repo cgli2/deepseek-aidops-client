@@ -334,7 +334,8 @@ impl harness_core::LlmControl for ManagedLlm {
         if key.is_empty() {
             return Err("运行时无可用 API Key；请先在设置页配置密钥再热重载".into());
         }
-        self.configure_deepseek(
+        self.configure_provider(
+            llm.provider.clone(),
             llm.base_url.clone(),
             llm.model.clone(),
             key,

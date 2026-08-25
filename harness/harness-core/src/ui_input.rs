@@ -56,6 +56,10 @@ pub trait UiInputSink: Any + Send + Sync + 'static {
     }
     /// 是否正在跑回合或有待执行任务。
     fn busy(&self) -> bool;
+    /// 是否有任意会话仍在执行。默认与当前会话状态一致；多会话控制器可覆盖为全局状态。
+    fn any_busy(&self) -> bool {
+        self.busy()
+    }
     /// 正在等待前序任务完成的输入数（不含当前运行回合）。
     fn queued_count(&self) -> usize {
         0

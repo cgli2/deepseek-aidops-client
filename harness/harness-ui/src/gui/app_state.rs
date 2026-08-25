@@ -7,6 +7,8 @@ pub(super) struct AppState {
     pub(super) log: Arc<SessionLog>,
     pub(super) last_event: usize,
     pub(super) messages: Vec<ChatMsg>,
+    /// 唯一由 Runtime Delivery 事件更新；不能由模型文本或 TurnEnd 推导成功。
+    pub(super) delivery: Option<DeliveryUi>,
     /// 专家团结构化投影（由持久化 CouncilEvent 重建）。
     pub(super) councils: std::collections::BTreeMap<String, CouncilUi>,
     pub(super) input: String,
@@ -276,6 +278,7 @@ impl AppState {
                 text: READY.into(),
                 raw: String::new(),
             }],
+            delivery: None,
             councils: std::collections::BTreeMap::new(),
             input: String::new(),
             busy: false,
@@ -465,6 +468,7 @@ impl AppState {
                 SessionEvent::TurnStart { input, .. } => {
                     details.push(format!("turn_start「{}」", brief(input, 40)));
                     self.push("user", "你", input);
+                    self.delivery = None;
                     // 队列中的任务真正开始执行时重新计时，不能沿用前一个任务的耗时。
                     self.turn_started = Some(std::time::Instant::now());
                     self.record_activity("正在准备上下文");
@@ -527,13 +531,27 @@ impl AppState {
                     let mut s = String::from("[计划]\n");
                     for (i, item) in items.iter().enumerate() {
                         let mark = match item.status.as_str() {
-                            "done" => "✓",
+                            "claimed_done" => "!",
                             "doing" => "…",
+                            "blocked" => "×",
                             _ => "·",
                         };
                         s.push_str(&format!("{}. {} {}\n", i + 1, mark, item.text));
                     }
                     self.push("plan", "计划", s.trim_end());
+                }
+                SessionEvent::Delivery { report, .. } => {
+                    let remaining = report.criteria.iter().filter(|item| !item.satisfied).count();
+                    details.push(format!(
+                        "delivery {:?} remaining={remaining}",
+                        report.outcome
+                    ));
+                    self.delivery = Some(DeliveryUi {
+                        outcome: report.outcome.clone(),
+                        remaining,
+                        verification_count: report.verification.len(),
+                        reason: report.reason.clone(),
+                    });
                 }
                 SessionEvent::Usage { usage, .. } => {
                     prompt_tokens += usage.prompt_tokens;
@@ -733,7 +751,8 @@ impl AppState {
     }
     pub(super) fn submit(&mut self) {
         let mut text = self.input.trim().to_string();
-        if text.is_empty() {
+        // 允许仅发送附件：粘贴图片与通过上传按钮选中的图片共用同一发送链路。
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
         let attachments = std::mem::take(&mut self.attachments);
@@ -865,21 +884,26 @@ impl AppState {
 
     /// 点击恢复历史会话：支持跨项目——目标会话属于其他项目时先切工作区根
     /// （对齐侧栏项目切换），再 SessionLog 切到该文件继续追加；
-    /// poll_log 下帧从 0 重放全部消息流。忙碌时拒绝避免回合穿插。
+    /// poll_log 下帧从 0 重放全部消息流。运行中的回合已持有 pin 后的固定日志，
+    /// 因而切换 UI 视图不会串写，可让不同会话并行执行。
     pub(super) fn switch_session(&mut self, file: &str) {
         trace(&format!(
             "[session] restore attempt {file} busy={}",
             self.busy
         ));
-        if self.busy {
-            return;
-        }
         let Some(dir) = self.history_dirs.get(file).cloned() else {
             return;
         };
         // 跨项目会话：先切工作区根（工具上下文与项目列表同步），
         // switch_workspace 会重载该目录最近会话，随后再精确定位到目标文件。
         if self.log.dir().as_ref() != Some(&dir) {
+            // 文件工具共享同一工作区根；不同项目之间不能在任一后台回合执行时切换，
+            // 否则运行中的工具调用可能落到错误项目。同项目内的历史会话不受此限制。
+            if self.host.sink.any_busy() {
+                self.note = "当前有后台任务运行：可并行切换同项目会话，跨项目切换请等待任务结束"
+                    .into();
+                return;
+            }
             if let Some(root) = dir.parent().and_then(|p| p.parent()) {
                 let path = root.display().to_string();
                 let _ = self.host.settings.set("workspace.root", &path);

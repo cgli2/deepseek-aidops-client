@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use harness_llm::ToolCall;
+use harness_session::{DeliveryCriterion, DeliveryOutcome, DeliveryReport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyKind {
@@ -210,7 +211,7 @@ impl TaskContract {
             self.constraints.join("；")
         };
         format!(
-            "[本回合执行契约]\n目标：{}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期（最多续期 {} 次，用尽后必须基于现有证据收尾）。执行准则：最小路径优先——先直接定位与目标直接相关的最小文件集，禁止全仓库泛扫与重复读取已读文件；每次探索必须消除具体不确定性或决定下一步，范围明确的小任务在首次定位后转入修改与验证，范围未知或调查型任务可保留必要取证；同一工具调用未带来新信息时立即换路或收尾；交付目标达成即停止，不做重复确认与打磨。",
+            "[本回合执行契约]\n目标：{}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期（最多续期 {} 次，用尽后必须基于现有证据收尾）。执行准则：最小路径优先——先直接定位与目标直接相关的最小文件集，禁止全仓库泛扫与重复读取已读文件；每次探索必须消除具体不确定性或决定下一步，范围明确的小任务在首次定位后转入修改与验证，范围未知或调查型任务可保留必要取证；多项任务中每次工具调用只推进当前未满足的一项验收，验证证据也只计入该项；同一工具调用未带来新信息时立即换路或收尾；交付目标达成即停止，不做重复确认与打磨。",
             self.objective,
             strategy,
             self.acceptance_criteria
@@ -256,6 +257,8 @@ pub struct ExecutionState {
     pub evidence: HashMap<String, Evidence>,
     pub decisions: Vec<DecisionRecord>,
     pub satisfied_criteria: HashSet<String>,
+    /// 验收项 → 成功验证证据。读取、搜索和模型自述都不能作为“已交付”的证据。
+    pub verification_evidence: HashMap<String, Vec<String>>,
     checkpoint_steps: usize,
     checkpoint_tool_calls: usize,
     checkpoint_evidence: usize,
@@ -279,6 +282,7 @@ impl ExecutionState {
             evidence: HashMap::new(),
             decisions: Vec::new(),
             satisfied_criteria: HashSet::new(),
+            verification_evidence: HashMap::new(),
             checkpoint_steps: 0,
             checkpoint_tool_calls: 0,
             checkpoint_evidence: 0,
@@ -296,6 +300,23 @@ impl ExecutionState {
             {
                 self.write_operations += 1;
             }
+            if self.is_verification(proposal)
+                && (self.write_operations > 0 || self.strategy == StrategyKind::Verification)
+            {
+                let evidence = format!(
+                    "{} => {}",
+                    proposal.signature,
+                    summary.chars().take(480).collect::<String>()
+                );
+                for criterion_id in &proposal.supports {
+                    self.verification_evidence
+                        .entry(criterion_id.clone())
+                        .or_default()
+                        .push(evidence.clone());
+                }
+                self.satisfied_criteria
+                    .extend(proposal.supports.iter().cloned());
+            }
         } else {
             self.failed_tool_results += 1;
         }
@@ -307,6 +328,71 @@ impl ExecutionState {
                 summary: summary.chars().take(600).collect(),
             },
         );
+    }
+
+    fn is_verification(&self, proposal: &ActionProposal) -> bool {
+        if !proposal.signature.starts_with("shell:") {
+            return false;
+        }
+        let signature = proposal.signature.to_ascii_lowercase();
+        [
+            "cargo test", "cargo check", "cargo build", "npm test", "npm run test",
+            "npm run build", "pnpm test", "yarn test", "pytest", "python -m pytest",
+            "py_compile", "go test", "mvn test", "gradle test", "tsc ",
+            "git diff --check",
+        ]
+        .iter()
+        .any(|marker| signature.contains(marker))
+    }
+
+    /// 对需要实际变更或核验的任务，最终回复前必须有成功验证，且每个验收项均被
+    /// 该验证覆盖。这样“模型停止调用工具”不再能伪造成成功交付。
+    pub fn can_complete(&self) -> bool {
+        let needs_verification = matches!(
+            self.strategy,
+            StrategyKind::Transformative | StrategyKind::Verification
+        ) || self.solve_mode == SolveMode::AtomicDelivery;
+        !needs_verification
+            || (!self.verification_evidence.is_empty()
+                && self
+                    .contract
+                    .acceptance_criteria
+                    .iter()
+                    .all(|criterion| self.satisfied_criteria.contains(&criterion.id)))
+    }
+
+    pub fn delivery_report(
+        &self,
+        outcome: DeliveryOutcome,
+        reason: Option<String>,
+    ) -> DeliveryReport {
+        let verification = self
+            .verification_evidence
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let criteria = self
+            .contract
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| DeliveryCriterion {
+                id: criterion.id.clone(),
+                description: criterion.description.clone(),
+                satisfied: self.satisfied_criteria.contains(&criterion.id),
+                evidence: self
+                    .verification_evidence
+                    .get(&criterion.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        DeliveryReport {
+            outcome,
+            criteria,
+            verification,
+            reason,
+        }
     }
 
     /// 上游因输出/上下文长度而未返回可用内容时，Runtime 仅携带此紧凑检查点重试，
@@ -344,15 +430,50 @@ pub struct ActionProposal {
 }
 
 impl ActionProposal {
-    pub fn from_tool_call(call: &ToolCall, contract: &TaskContract) -> Self {
+    pub fn from_tool_call(call: &ToolCall, state: &ExecutionState) -> Self {
+        let explicit = call
+            .args
+            .get("criterion_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .filter(|id| {
+                        state
+                            .contract
+                            .acceptance_criteria
+                            .iter()
+                            .any(|criterion| criterion.id == *id)
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // 旧工具 schema 不要求 criterion_ids。缺省时只绑定到首个未验收项，
+        // 而不是错误地把一次搜索/测试同时计作所有任务的完成。
+        let supports = if explicit.is_empty() {
+            state
+                .contract
+                .acceptance_criteria
+                .iter()
+                .find(|criterion| !state.satisfied_criteria.contains(&criterion.id))
+                .map(|criterion| vec![criterion.id.clone()])
+                .unwrap_or_else(|| {
+                    state
+                        .contract
+                        .acceptance_criteria
+                        .first()
+                        .map(|criterion| vec![criterion.id.clone()])
+                        .unwrap_or_default()
+                })
+        } else {
+            explicit
+        };
         Self {
             signature: normalized_signature(call),
             question: format!("执行工具 {} 以推进当前任务", call.name),
-            supports: contract
-                .acceptance_criteria
-                .iter()
-                .map(|criterion| criterion.id.clone())
-                .collect(),
+            supports,
             estimated_cost: 1,
         }
     }
@@ -694,7 +815,10 @@ impl CompletionJudge {
             BudgetPhase::Converge if model_requested_tools => Completion::Converge(
                 "已进入收敛阶段；仅执行完成当前交付所必需的动作，禁止扩大范围".into(),
             ),
-            _ if !model_requested_tools => Completion::Complete,
+            _ if !model_requested_tools && state.can_complete() => Completion::Complete,
+            _ if !model_requested_tools => Completion::Converge(
+                "模型已停止调用工具，但变更任务还没有成功验证的验收证据；请执行最小的相关验证，或明确报告阻塞原因，不得宣称已交付".into(),
+            ),
             _ => Completion::Continue,
         }
     }
@@ -954,6 +1078,102 @@ mod tests {
     }
 
     #[test]
+    fn unverified_change_cannot_complete_when_model_stops() {
+        let contract = TaskContract::from_input("修复一个确定的界面回归");
+        let budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
+        let state = ExecutionState::new(contract, StrategyKind::Transformative);
+
+        assert!(matches!(
+            CompletionJudge::evaluate(&state, &budget, false),
+            Completion::Converge(_)
+        ));
+        assert!(!state.can_complete());
+    }
+
+    #[test]
+    fn successful_verification_unlocks_change_delivery() {
+        let contract = TaskContract::from_input("修复一个确定的界面回归");
+        let budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"ui.rs\"}".into(),
+            question: "最小修复".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let verify = ActionProposal {
+            signature: "shell:{\"command\":\"cargo test -p harness-ui\"}".into(),
+            question: "运行相关测试".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        state.record_tool_result(&edit, true, "updated ui.rs");
+        state.record_tool_result(&verify, true, "test result: ok");
+
+        assert!(state.can_complete());
+        assert_eq!(
+            state.verification_evidence.get("user-objective"),
+            Some(&vec![
+                "shell:{\"command\":\"cargo test -p harness-ui\"} => test result: ok".into()
+            ])
+        );
+        assert_eq!(
+            CompletionJudge::evaluate(&state, &budget, false),
+            Completion::Complete
+        );
+    }
+
+    #[test]
+    fn each_criterion_requires_its_own_recognized_validation() {
+        let contract = TaskContract::from_input("实现两项改动\n- 第一项\n- 第二项");
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"ui.rs\"}".into(),
+            question: "第一项改动".into(),
+            supports: vec!["item-1".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&edit, true, "updated");
+
+        // “echo test” 不能冒充验证命令，也不能覆盖第二项验收。
+        let fake_check = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "fake".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"command": "echo test"}),
+            },
+            &state,
+        );
+        assert_eq!(fake_check.supports, vec!["item-1"]);
+        state.record_tool_result(&fake_check, true, "test");
+        assert!(state.satisfied_criteria.is_empty());
+
+        let first_check = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "check-1".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cargo test -p ui"}),
+            },
+            &state,
+        );
+        state.record_tool_result(&first_check, true, "ok");
+        assert!(state.satisfied_criteria.contains("item-1"));
+        assert!(!state.satisfied_criteria.contains("item-2"));
+
+        let second_action = ActionProposal::from_tool_call(
+            &ToolCall {
+                id: "edit-2".into(),
+                name: "edit".into(),
+                args: serde_json::json!({"path": "other.rs"}),
+            },
+            &state,
+        );
+        assert_eq!(second_action.supports, vec!["item-2"]);
+        assert!(!state.can_complete());
+    }
+
+    #[test]
     fn atomic_gate_blocks_broad_second_search_and_pre_change_verification() {
         let contract = TaskContract::from_input(
             "输入优化加了 loading 之后，结果没有变化，修复这个单点回归",
@@ -1058,13 +1278,14 @@ mod tests {
     #[test]
     fn signature_normalization_neutralizes_cd_prefix_and_separators() {
         let contract = TaskContract::from_input("完成任务");
+        let state = ExecutionState::new(contract.clone(), StrategyKind::Direct);
         let a = ActionProposal::from_tool_call(
             &ToolCall {
                 id: "1".into(),
                 name: "shell".into(),
                 args: serde_json::json!({"command": "cd /d F:\\ws\\proj && cargo check"}),
             },
-            &contract,
+            &state,
         );
         let b = ActionProposal::from_tool_call(
             &ToolCall {
@@ -1072,7 +1293,7 @@ mod tests {
                 name: "shell".into(),
                 args: serde_json::json!({"command": "cargo check"}),
             },
-            &contract,
+            &state,
         );
         assert_eq!(a.signature, b.signature);
 
@@ -1083,7 +1304,7 @@ mod tests {
                 name: "shell".into(),
                 args: serde_json::json!({"command": "cd F:\\ws"}),
             },
-            &contract,
+            &state,
         );
         assert!(only_cd.signature.contains("cd"));
 
@@ -1094,7 +1315,7 @@ mod tests {
                 name: "fs".into(),
                 args: serde_json::json!({"op": "read", "path": "src\\main.rs"}),
             },
-            &contract,
+            &state,
         );
         let p2 = ActionProposal::from_tool_call(
             &ToolCall {
@@ -1102,7 +1323,7 @@ mod tests {
                 name: "fs".into(),
                 args: serde_json::json!({"op": "read", "path": "src/main.rs"}),
             },
-            &contract,
+            &state,
         );
         assert_eq!(p1.signature, p2.signature);
     }

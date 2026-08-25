@@ -11,7 +11,8 @@ use harness_core::error::{Error, Result};
 use harness_core::{AppContext, Workspace};
 use harness_llm::Chunk;
 use harness_session::{
-    CouncilEvent, CouncilGateResult, CouncilTaskSpec, CouncilTaskState, SessionEvent, SessionLog,
+    CouncilEvent, CouncilGateResult, CouncilTaskSpec, CouncilTaskState, DeliveryCriterion,
+    DeliveryOutcome, DeliveryReport, SessionEvent, SessionLog,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -147,6 +148,14 @@ impl CouncilOrchestrator {
                     &log,
                     "[已停止] 专家团任务已取消；未开始的专家任务不会继续启动。".into(),
                 );
+                log.append(SessionEvent::Delivery {
+                    id: log.gen_id(),
+                    report: council_delivery_report(
+                        &tasks,
+                        DeliveryOutcome::Cancelled,
+                        Some("用户取消专家团任务；未完成节点已标记取消".into()),
+                    ),
+                });
                 log.append(SessionEvent::TurnEnd { id: log.gen_id() });
                 return Ok(());
             }
@@ -429,17 +438,10 @@ impl CouncilOrchestrator {
                         outcome => {
                             let detail = match outcome { Ok(answer) => format!("输出未达到验收要求：{}", compact(&answer, 240)), Err(error) => error.to_string() };
                             let timed_out = detail.to_ascii_lowercase().contains("timed out");
-                            // 前置调查是辅助上下文，不应因为单个上游接口慢而让整团在重复
-                            // 等待数分钟后失败。透明记录降级证据，并让设计专家继续核实。
-                            if timed_out && matches!(task.spec.id.as_str(), "requirements" | "risk" | "design" | "delivery") {
-                                task.state = CouncilTaskState::Done;
-                                task.summary = format!("[降级] {}超时，协调器已采用目标与现有上游证据继续；后续专家必须自行补充核实。{}", task.spec.title, detail);
-                                task_event(&log, &council_id, task, "专家超时，已降级继续（下游需补充核实）");
-                                emit(&log, CouncilEvent::ArtifactPublished {
-                                    council_id: council_id.clone(), task_id: id,
-                                    summary: task.summary.clone(), evidence: vec!["超时已显式记录，未伪造调查结论".into()],
-                                });
-                            } else if task.attempt < self.max_attempts {
+                            // 超时是可恢复错误，不是已通过验收。旧逻辑把部分上游节点改为
+                            // Done，致使后续可能在缺证据情况下交付 PASS；现在统一进入
+                            // 有限重试/续跑，最终作为 Failed 进入 Blocked 交付报告。
+                            if task.attempt < self.max_attempts {
                                 task.state = CouncilTaskState::Ready;
                                 let route = if timed_out {
                                     "首轮等待超时，已切换精简上下文重试"
@@ -497,6 +499,10 @@ impl CouncilOrchestrator {
                 &log,
                 format!("专家团已完成全部 DAG 节点并通过质量门禁。\n\n{summary}"),
             );
+            log.append(SessionEvent::Delivery {
+                id: log.gen_id(),
+                report: council_delivery_report(&tasks, DeliveryOutcome::Verified, None),
+            });
         } else {
             let failed = gates
                 .iter()
@@ -515,6 +521,14 @@ impl CouncilOrchestrator {
                 &log,
                 format!("[error] 专家团任务已执行完，但质量门禁未通过：{failed}"),
             );
+            log.append(SessionEvent::Delivery {
+                id: log.gen_id(),
+                report: council_delivery_report(
+                    &tasks,
+                    DeliveryOutcome::Blocked,
+                    Some(failed),
+                ),
+            });
         }
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });
         Ok(())
@@ -787,7 +801,7 @@ pub fn validate_dag(tasks: &[CouncilTaskSpec]) -> Result<()> {
 }
 
 fn evaluate_gates(tasks: &HashMap<String, TaskRuntime>) -> Vec<CouncilGateResult> {
-    let complete = tasks.values().all(|t| t.state == CouncilTaskState::Done);
+    let complete = tasks.values().all(task_has_passed);
     let test = tasks.get("testing").is_none_or(|t| {
         t.state == CouncilTaskState::Done
             && t.summary.contains("GATE: PASS")
@@ -798,9 +812,11 @@ fn evaluate_gates(tasks: &HashMap<String, TaskRuntime>) -> Vec<CouncilGateResult
             && t.summary.contains("GATE: PASS")
             && !has_blocker(&t.summary)
     });
-    let evidence = tasks
-        .values()
-        .all(|t| !t.summary.trim().is_empty() && !t.spec.acceptance_criteria.is_empty());
+    let evidence = tasks.values().all(|t| {
+        !t.summary.trim().is_empty()
+            && !t.spec.acceptance_criteria.is_empty()
+            && task_has_passed(t)
+    });
     vec![
         CouncilGateResult {
             name: "任务完整性".into(),
@@ -849,6 +865,55 @@ fn evaluate_gates(tasks: &HashMap<String, TaskRuntime>) -> Vec<CouncilGateResult
             .into(),
         },
     ]
+}
+
+/// `Done` 仅代表调度器停止该节点，不能等价于验收通过。所有完成门禁和最终
+/// Delivery 都共用此规则，避免超时降级、空摘要或带阻断项的节点混入成功交付。
+fn task_has_passed(task: &TaskRuntime) -> bool {
+    if task.state != CouncilTaskState::Done || task.summary.trim().is_empty() || has_blocker(&task.summary) {
+        return false;
+    }
+    if matches!(task.spec.id.as_str(), "testing" | "review") {
+        task.summary.contains("GATE: PASS")
+    } else {
+        task.summary.contains("STATUS: PASS")
+    }
+}
+
+fn council_delivery_report(
+    tasks: &HashMap<String, TaskRuntime>,
+    outcome: DeliveryOutcome,
+    reason: Option<String>,
+) -> DeliveryReport {
+    let mut ordered = tasks.values().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.spec.id.cmp(&right.spec.id));
+    let criteria = ordered
+        .into_iter()
+        .map(|task| DeliveryCriterion {
+            id: task.spec.id.clone(),
+            description: format!(
+                "{}：{}",
+                task.spec.title,
+                task.spec.acceptance_criteria.join("；")
+            ),
+            satisfied: task_has_passed(task),
+            evidence: if task_has_passed(task) {
+                vec![compact(&task.summary, 600)]
+            } else {
+                Vec::new()
+            },
+        })
+        .collect::<Vec<_>>();
+    let verification = criteria
+        .iter()
+        .flat_map(|criterion| criterion.evidence.clone())
+        .collect();
+    DeliveryReport {
+        outcome,
+        criteria,
+        verification,
+        reason,
+    }
 }
 
 fn task_prompt(
@@ -958,9 +1023,17 @@ fn local_delivery_summary(tasks: &HashMap<String, TaskRuntime>) -> String {
         .get("testing")
         .map(|task| compact(&task.summary, 400))
         .unwrap_or_else(|| "当前任务无需测试节点".into());
-    format!(
-        "STATUS: PASS\nSUMMARY: 已基于开发节点和质量门禁生成交付。\nFILES: 见实现证据。\nCHECKS: {testing}\nRISKS: 无新增阻断。\n\n实现证据：\n{implementation}"
-    )
+    let upstream_passed = tasks
+        .iter()
+        .filter(|(id, _)| id.as_str() != "delivery")
+        .all(|(_, task)| task_has_passed(task));
+    if upstream_passed {
+        format!(
+            "STATUS: PASS\nSUMMARY: 已基于开发节点和质量门禁生成交付。\nFILES: 见实现证据。\nCHECKS: {testing}\nRISKS: 无新增阻断。\n\n实现证据：\n{implementation}"
+        )
+    } else {
+        "STATUS: FAIL\nSUMMARY: 上游节点尚未提交可验收的 PASS 证据，不能生成成功交付。\nFILES: 无\nCHECKS: 无\nRISKS: 请修复或重新验证失败/降级的上游节点。".into()
+    }
 }
 
 /// 低风险、小范围的真实 Git 差异无需再等待一个审查模型；不确定时返回 None，
@@ -1181,7 +1254,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(15)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(format!(
-                "任务已经完成并验证。完成摘要：{}；证据：检查通过；风险：无阻断。 GATE: PASS",
+                "STATUS: PASS\nSUMMARY: 任务已经完成并验证：{}\nFILES: 无\nCHECKS: 检查通过\nRISKS: 无\nGATE: PASS",
                 task.chars().take(30).collect::<String>()
             ))
         }
@@ -1222,13 +1295,18 @@ mod tests {
         let mut tasks = HashMap::new();
         for spec in dynamic_plan("修复消息处理错误并增加测试") {
             let id = spec.id.clone();
+            let summary = if matches!(id.as_str(), "testing" | "review") {
+                "GATE: PASS\nSUMMARY: evidence".into()
+            } else {
+                "STATUS: PASS\nSUMMARY: evidence".into()
+            };
             tasks.insert(
                 id,
                 TaskRuntime {
                     spec,
                     state: CouncilTaskState::Done,
                     attempt: 1,
-                    summary: "STATUS: PASS\nSUMMARY: evidence".into(),
+                    summary,
                     local_checked: false,
                     resume_attempted: false,
                 },
@@ -1285,7 +1363,8 @@ mod tests {
         .await
         .unwrap();
         assert!(tracker.peak.load(Ordering::SeqCst) >= 2);
-        assert!(log.replay().iter().any(|event| matches!(
+        let events = log.replay();
+        assert!(events.iter().any(|event| matches!(
             event,
             SessionEvent::Council {
                 event: CouncilEvent::Completed { .. },
@@ -1305,6 +1384,12 @@ mod tests {
                 .count()
                 >= 4
         );
+        assert!(log.replay().iter().any(|event| matches!(
+            event,
+            SessionEvent::Delivery { report, .. }
+                if report.outcome == DeliveryOutcome::Verified
+                    && report.criteria.iter().all(|criterion| criterion.satisfied)
+        )));
     }
 
     #[tokio::test]

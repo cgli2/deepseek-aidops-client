@@ -266,6 +266,9 @@ impl AgentLoop {
         // 硬终止标记（取消/流错误/反复无视循环恢复）：阻止步末的 debt 记账复活回合，
         // 否则带着「已宣告未执行」的 tool_call 续跑会直接 400。
         let mut hard_stop = false;
+        let mut cancelled = false;
+        let mut delivery_verified = false;
+        let mut budget_exhausted = false;
         let mut convergence_notified = false;
         // 预算续期耗尽后只给一次最终收尾窗口（2 步）；窗口也用尽则强制停止。
         let mut final_window_armed = false;
@@ -334,6 +337,7 @@ impl AgentLoop {
                 let item = tokio::select! {
                     _ = cancellation.cancelled() => {
                         log.append(SessionEvent::Assistant { id: log.gen_id(), chunk: Chunk { text: Some("[已停止]".into()), ..Default::default() } });
+                        cancelled = true;
                         debt = 0;
                         hard_stop = true;
                         break;
@@ -399,7 +403,7 @@ impl AgentLoop {
                 for tc in &chunk.tool_calls {
                     // 守卫与行动门禁共用归一化签名，避免仅因路径分隔符或 `cd` 前缀
                     // 不同就绕过重复判定。
-                    let proposal = ActionProposal::from_tool_call(tc, &execution.contract);
+                    let proposal = ActionProposal::from_tool_call(tc, &execution);
                     let sig = proposal.signature.clone();
                     log.append(SessionEvent::ToolCall {
                         id: log.gen_id(),
@@ -611,6 +615,7 @@ impl AgentLoop {
                                 ));
                             }
                             step_had_tools = true;
+                            cancelled = true;
                             debt = 0;
                             hard_stop = true;
                             break;
@@ -700,6 +705,7 @@ impl AgentLoop {
             } else if BudgetManager::phase(&execution, &budget)
                 == crate::execution::BudgetPhase::Exhausted
             {
+                budget_exhausted = true;
                 match BudgetManager::diagnose_and_renew(&mut execution, &mut budget) {
                     Some(diagnosis) => {
                         convergence_notified = false;
@@ -741,7 +747,10 @@ impl AgentLoop {
                         convergence_notified = true;
                         messages.push(Message::user(&format!("[系统提示] {reason}")));
                     }
-                    Completion::Complete => debt = 0,
+                    Completion::Complete => {
+                        delivery_verified = true;
+                        debt = 0;
+                    }
                     _ => {}
                 }
             }
@@ -771,6 +780,33 @@ impl AgentLoop {
             }
         }
 
+        let (outcome, reason) = if delivery_verified {
+            (harness_session::DeliveryOutcome::Verified, None)
+        } else if cancelled {
+            (
+                harness_session::DeliveryOutcome::Cancelled,
+                Some("用户取消了回合；未获得完整验收证据".into()),
+            )
+        } else if hard_stop {
+            (
+                harness_session::DeliveryOutcome::Interrupted,
+                Some("回合因取消、模型异常或重复调用保护而中断；未获得完整验收证据".into()),
+            )
+        } else if budget_exhausted {
+            (
+                harness_session::DeliveryOutcome::Blocked,
+                Some("执行曾进入预算收敛/延展阶段，但回合结束前未获得完整验收证据".into()),
+            )
+        } else {
+            (
+                harness_session::DeliveryOutcome::Blocked,
+                Some("回合结束前未获得完整验收证据；结果不能标记为已交付".into()),
+            )
+        };
+        log.append(SessionEvent::Delivery {
+            id: log.gen_id(),
+            report: execution.delivery_report(outcome, reason),
+        });
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });
         Ok(())
     }

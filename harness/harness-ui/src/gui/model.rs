@@ -9,6 +9,15 @@ pub(super) struct ChatMsg {
     pub(super) raw: String,
 }
 
+/// Runtime 持久化的交付判定投影。模型文本中的“已完成”不写入这里。
+#[derive(Clone)]
+pub(super) struct DeliveryUi {
+    pub(super) outcome: harness_session::DeliveryOutcome,
+    pub(super) remaining: usize,
+    pub(super) verification_count: usize,
+    pub(super) reason: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct CouncilUi {
     pub(super) id: String,

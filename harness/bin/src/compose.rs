@@ -114,7 +114,7 @@ impl Plugin for HarnessPlugin {
                 .map(str::trim)
                 .is_some_and(|v| !v.is_empty());
         let initial_status = if key_configured {
-            format!("DeepSeek / {} / 已配置 Key", self.config.llm.model)
+            format!("{} / {} / 已配置 Key", self.config.llm.provider, self.config.llm.model)
         } else {
             format!("演示模式 / 未配置 API Key（当前不会调用真实模型）")
         };
@@ -369,12 +369,23 @@ fn make_llm(cfg: &Config) -> Arc<dyn LlmProvider> {
                 ..Default::default()
             }]);
         }
-        return harness_llm::DeepSeek::new(
-            cfg.llm.base_url.clone(),
-            key,
-            cfg.llm.model.clone(),
-            None,
-        );
+        // 遵循配置文件声明的厂商：仅 provider=deepseek 时走 DeepSeek 实现，
+        // 其他厂商走通用 OpenAI 兼容实现——避免用户选了非 deepseek 模型，
+        // 启动初始请求与报错却仍挂在 "DeepSeek" provider 上。
+        return if cfg.llm.provider.trim() == "deepseek" {
+            harness_llm::DeepSeek::new(
+                cfg.llm.base_url.clone(),
+                key,
+                cfg.llm.model.clone(),
+                None,
+            )
+        } else {
+            harness_llm::OpenAI::with_endpoint(
+                cfg.llm.base_url.clone(),
+                key,
+                cfg.llm.model.clone(),
+            )
+        };
     }
     if cfg!(feature = "local-llm") {
         return harness_llm::LocalLlm::new(cfg.llm.base_url.clone());

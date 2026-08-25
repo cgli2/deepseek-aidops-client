@@ -27,7 +27,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
         )
         .show(ctx, |ui| {
             // 忙碌时仍允许发送：控制器会把输入放入 FIFO 任务队列。
-            let can_send = !state.input.trim().is_empty();
+            // 图片粘贴与文件上传都可作为独立消息发送，无需额外输入文字。
+            let can_send = !state.input.trim().is_empty() || !state.attachments.is_empty();
             // ── 待发送队列：挂在输入框正上方（紧挨输入卡片），有队列时显示 ──
             super::workspace::render_pending_queue(ui, state, pal);
             // ── 输入卡片：圆角 + 细边框 + 阴影浮起，卡片自身提供 chrome ──
@@ -78,36 +79,36 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     ui.add_space(6.0);
                 }
                 // 文本编辑区：去掉自身边框/背景，由卡片提供 chrome。
-                // 限制最大高度：ScrollArea 包裹 TextEdit，内容超长时出现内置滚动条，
-                // 避免卡片无限长高撑到导航头顶部。
-                const COMPOSER_MAX_H: f32 = 150.0;
-                let response = {
-                    let mut resp = None;
-                    egui::ScrollArea::vertical()
-                        .max_height(COMPOSER_MAX_H)
-                        .show(ui, |ui| {
-                            resp = Some(
-                                ui.add_enabled(
-                                    !state.optimizing,
-                                    egui::TextEdit::multiline(&mut state.input)
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(3)
-                                        .font(egui::FontId::proportional(13.5))
-                                        .frame(false)
-                                        .margin(egui::Margin::same(0.0))
-                                        .hint_text(
-                                            egui::RichText::new(if state.optimizing {
-                                                "正在优化输入…（加载中，请稍候）"
-                                            } else {
-                                                "描述任务、粘贴代码或提出问题…"
-                                            })
-                                            .color(pal.dim),
-                                        ),
+                // TextEdit 本身没有最大高度约束，需由 ScrollArea 提供固定上限。
+                // 关闭滚动到光标时的补间动画，防止长文本输入时卡片位置逐帧来回变化。
+                const COMPOSER_MAX_H: f32 = 125.0;
+                let response = egui::ScrollArea::vertical()
+                    .id_salt("composer-input-scroll")
+                    .max_height(COMPOSER_MAX_H)
+                    // 内容超过上限后固定滚动区尺寸，避免滚动条出现/消失或文本换行重算
+                    // 反复改变底部面板高度，导致输入窗口在长文本输入时抖动。
+                    .auto_shrink([false, false])
+                    .animated(false)
+                    .show(ui, |ui| {
+                        ui.add_enabled(
+                            !state.optimizing,
+                            egui::TextEdit::multiline(&mut state.input)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(3)
+                                .font(egui::FontId::proportional(13.5))
+                                .frame(false)
+                                .margin(egui::Margin::same(0.0))
+                                .hint_text(
+                                    egui::RichText::new(if state.optimizing {
+                                        "正在优化输入…（加载中，请稍候）"
+                                    } else {
+                                        "描述任务、粘贴代码或提出问题…"
+                                    })
+                                    .color(pal.dim),
                                 ),
-                            );
-                        });
-                    resp.expect("composer text edit must render")
-                };
+                        )
+                    })
+                    .inner;
                 // Enter 发送 / Shift+Enter 换行：egui 会先插入换行，这里去掉尾随 \n 再提交。
                 let enter = response.has_focus()
                     && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -127,10 +128,20 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         .map(std::path::PathBuf::from)
                         .collect()
                 });
+                // 在原生窗口中 Ctrl+V 常会被 eframe 直接翻译为 Paste 事件，未必仍保留
+                // Key::V 按键事件；图片没有文本载荷时尤其如此。因此两种事件都必须触发
+                // 系统剪贴板读取，才能把截图/复制的图片转换成附件。
+                let clipboard_paste_event = response.has_focus()
+                    && ctx.input(|i| {
+                        i.events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::Paste(_)))
+                    });
                 let command_v = response.has_focus()
                     && ctx.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
+                let should_read_clipboard = command_v || clipboard_paste_event;
                 let mut pasted_paths = pasted_text_paths;
-                if command_v {
+                if should_read_clipboard {
                     pasted_paths.extend(paste_clipboard_files());
                 }
                 pasted_paths.retain(|path| path.is_file());
@@ -143,7 +154,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     }
                 // 图片剪贴板不一定会转换成 Egui 的文本 Paste 事件。仅当剪贴板中
                 // 没有文件时才将图片落为临时附件，避免一次粘贴附上无关内容。
-                } else if command_v {
+                } else if should_read_clipboard {
                     if let Some(path) = paste_clipboard_image() {
                         add_attachment(state, path);
                     }
@@ -802,10 +813,15 @@ fn add_attachment(state: &mut AppState, path: std::path::PathBuf) {
         .to_ascii_lowercase()
         .as_str()
     {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" => "image/*",
-        "txt" | "md" | "csv" | "json" | "toml" | "yaml" | "yml" => "text/plain",
-        "doc" | "docx" => "application/msword",
-        "xls" | "xlsx" => "application/vnd.ms-excel",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" => "image/*",
+        "txt" | "md" | "csv" | "log" => "text/plain",
+        "xml" => "application/xml",
+        "json" => "application/json",
+        "toml" | "yaml" | "yml" => "text/plain",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }

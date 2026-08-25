@@ -155,22 +155,41 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             egui::Id::new(("copy-icon", index)),
                                             egui::Sense::click(),
                                         );
-                                        // 交付完成状态：回合已结束且这是最后一条非空消息时，
-                                        // 明确标注任务已完成，让用户一眼看到最终结果。
+                                        // 交付状态只接受 Runtime 的 Delivery 事件；TurnEnd 或模型
+                                        // 文本出现“完成”都不能推导为成功，避免未验证任务假完成。
                                         let is_final = !state.busy
                                             && msg.kind == "assistant"
                                             && messages
                                                 .iter()
                                                 .skip(index + 1)
                                                 .all(|m| m.text.is_empty());
-                                        if is_final {
+                                        if is_final && state.delivery.is_some() {
                                             ui.add_space(2.0);
-                                            ui.label(
-                                                egui::RichText::new("✓ 已交付 · 任务完成")
-                                                    .size(10.5)
-                                                    .strong()
-                                                    .color(pal.accent),
-                                            );
+                                            let delivery = state.delivery.as_ref().expect("checked above");
+                                            let (text, color) = match delivery.outcome {
+                                                harness_session::DeliveryOutcome::Verified => (
+                                                    format!("✓ 已验证交付 · {} 项验证", delivery.verification_count),
+                                                    pal.accent,
+                                                ),
+                                                harness_session::DeliveryOutcome::Blocked => (
+                                                    format!("! 未完成 · 剩余 {} 项验收", delivery.remaining),
+                                                    pal.warn,
+                                                ),
+                                                harness_session::DeliveryOutcome::Interrupted => (
+                                                    "! 任务中断 · 未验证交付".into(),
+                                                    pal.warn,
+                                                ),
+                                                harness_session::DeliveryOutcome::Cancelled => (
+                                                    "◌ 已取消 · 未验证交付".into(),
+                                                    pal.dim,
+                                                ),
+                                            };
+                                            ui.label(egui::RichText::new(text).size(10.5).strong().color(color));
+                                            if let Some(reason) = &delivery.reason {
+                                                ui.label(
+                                                    egui::RichText::new(reason).size(10.0).color(pal.dim),
+                                                );
+                                            }
                                         }
                                         #[cfg(target_os = "macos")]
                                         ui.add_space(2.0);
@@ -553,7 +572,7 @@ pub(super) fn render_pending_queue(ui: &mut egui::Ui, state: &mut AppState, pal:
     ui.add_space(8.0);
 }
 
-/// 解析计划消息为待办列表：形如 "1. ✓ xxx" / "2. … xxx" / "3. · xxx"。
+/// 解析计划消息为待办列表。`!` 为模型自报完成、`×` 为显式阻塞；二者都不等于验收。
 /// 返回 (标记符号, 待办文本)。
 fn parse_plan_checklist(text: &str) -> Vec<(char, String)> {
     let mut out = Vec::new();
@@ -570,7 +589,7 @@ fn parse_plan_checklist(text: &str) -> Vec<(char, String)> {
         let Some(rest) = rest else { continue };
         let mut cs = rest.chars();
         if let Some(mark) = cs.next() {
-            if matches!(mark, '✓' | '…' | '·' | '-' | 'x' | 'X') {
+            if matches!(mark, '✓' | '!' | '×' | '…' | '·' | '-' | 'x' | 'X') {
                 let item: String = cs.collect::<String>().trim().to_string();
                 if !item.is_empty() {
                     out.push((mark, item));
@@ -629,7 +648,11 @@ fn render_work_batch(
             ui.set_max_width(max_w * 0.96);
             if !plan_items.is_empty() {
                 ui.label(
-                    egui::RichText::new(format!("📋 任务计划 · {plan_done}/{plan_total} 完成"))
+                    // 计划进度来自模型的 PlanUpdate，只能说明“模型声称的执行进度”；
+                    // 真正交付由上方 Delivery 状态在验证后单独标识。
+                    egui::RichText::new(format!(
+                        "📋 执行计划（待验收）· {plan_done}/{plan_total} 自报完成"
+                    ))
                         .size(11.0)
                         .strong()
                         .color(if plan_done == plan_total {
@@ -642,6 +665,8 @@ fn render_work_batch(
                 for (mark, item) in &plan_items {
                     let (sym, color) = match mark {
                         '✓' => ("✓", pal.accent),
+                        '!' => ("!", pal.warn),
+                        '×' | 'x' | 'X' => ("×", pal.err_text),
                         '…' => ("…", pal.warn),
                         _ => ("·", pal.dim),
                     };

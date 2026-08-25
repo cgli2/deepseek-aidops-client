@@ -556,6 +556,44 @@ impl AppState {
         }
     }
 
+    /// 异步优化输入：后台线程调用 LLM 重写用户输入，非阻塞回传结果。
+    pub(super) fn optimize_input(&mut self) {
+        if self.optimizing {
+            return;
+        }
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            self.optimize_msg = "请先输入内容再优化".into();
+            return;
+        }
+        self.optimizing = true;
+        self.optimize_msg.clear();
+        let llm = self.host.llm_control.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
+        self.optimize_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = llm.complete_one_shot(text);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// 非阻塞消费优化结果：成功则替换输入框内容。
+    pub(super) fn poll_optimize(&mut self) {
+        let Some(rx) = self.optimize_rx.as_ref() else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.optimize_rx = None;
+        self.optimizing = false;
+        match result {
+            Ok(optimized) => {
+                self.input = optimized;
+                self.optimize_msg.clear();
+            }
+            Err(error) => {
+                self.optimize_msg = format!("优化失败：{error}");
+            }
+        }
+    }
+
     /// 构建文件树（懒构建 2 层）。
     pub(super) fn build_tree(&mut self) {
         let fs = self.host.fs.clone();

@@ -186,6 +186,14 @@ pub(super) struct AppState {
     pub(super) git_rx: Option<std::sync::mpsc::Receiver<GitRefreshResult>>,
     /// 文件树区域当前视图：true = Git 变更列表，false = 文件树。
     pub(super) tree_show_git: bool,
+    // ── 输入优化（Transformative：将用户原始输入重写为 LLM 友好格式）──
+    /// 正在优化输入（按钮 loading 态）。
+    pub(super) optimizing: bool,
+    /// 优化结果回传通道（非阻塞轮询）。
+    pub(super) optimize_rx:
+        Option<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
+    /// 优化错误/状态提示。
+    pub(super) optimize_msg: String,
 }
 
 pub(super) struct GitRefreshResult {
@@ -379,6 +387,9 @@ impl AppState {
             git_generation: 0,
             git_rx: None,
             tree_show_git: false,
+            optimizing: false,
+            optimize_rx: None,
+            optimize_msg: String::new(),
             // host/log 放最后：上方字段仍需借用 host.settings，提前移入会报 E0505。
             host,
             log,

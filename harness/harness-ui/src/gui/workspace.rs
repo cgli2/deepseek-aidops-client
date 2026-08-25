@@ -114,7 +114,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             .skip(index)
                                             .all(|m| m.text.is_empty());
                                     render_work_batch(ui, &messages[start..index], start, max_w, pal, batch_live);
-                                    ui.add_space(6.0);
+                                    ui.add_space(4.0);
                                     continue;
                                 }
                                 let (fill, text_color): (egui::Color32, egui::Color32) =
@@ -135,63 +135,26 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         })
                                         .stroke(egui::Stroke::new(1.0_f32, pal.border));
                                     bubble.show(ui, |ui| {
-                                        // 最终回答使用接近整行的稳定阅读宽度，避免短行 Markdown
-                                        // 按内容收缩成窄卡片；思考/工具过程由独立工作卡渲染，不受影响。
-                                        let assistant_content_w = (max_w - 40.0).max(280.0);
-                                        if msg.kind == "assistant" {
-                                            ui.set_width(assistant_content_w);
-                                        } else {
-                                            ui.set_max_width(max_w * 0.96);
-                                        }
+                                        // 所有气泡（用户/助手/错误）与工作批次卡统一固定同一宽度，
+                                        // 保证最大化时左右边界完全对齐；宽度不随内容收缩。
+                                        ui.set_width(max_w * 0.96);
                                         // 本轮起点：最近一条用户消息（含）；供一键复制整轮对话。
                                         let turn_start = messages[..index]
                                             .iter()
                                             .rposition(|m| m.kind == "user" && !m.text.is_empty())
                                             .unwrap_or(0);
-                                        // 头部行：右上角角色标签。用负边距把标签行上移贴近气泡
-                                        // 顶边（气泡顶部内边距为 12/10px），
-                                        // 并压缩后续间距，减少头部占用的高度。
-                                        ui.add_space(-9.0);
-                                        ui.horizontal(|ui| {
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    // 复制小图标（矢量双矩形，不依赖字体字形、
-                                                    // 不会变豆腐块）：一键复制本条气泡，
-                                                    // pending_copy 帧末统一写剪贴板。
-                                                    let (copy_rect, copy_resp) = ui
-                                                        .allocate_exact_size(
-                                                            egui::vec2(12.0, 12.0),
-                                                            egui::Sense::click(),
-                                                        );
-                                                    let icon_color = if copy_resp.hovered() {
-                                                        ui.ctx().set_cursor_icon(
-                                                            egui::CursorIcon::PointingHand,
-                                                        );
-                                                        pal.text
-                                                    } else {
-                                                        pal.dim
-                                                    };
-                                                    super::icons::draw_copy_icon(
-                                                        ui.painter(),
-                                                        copy_rect.center(),
-                                                        icon_color,
-                                                        fill,
-                                                    );
-                                                    if copy_resp.clicked() {
-                                                        state.pending_copy =
-                                                            Some(msg.text.clone());
-                                                    }
-                                                    copy_resp.on_hover_text("复制本条内容");
-                                                    ui.label(
-                                                        egui::RichText::new(&msg.label)
-                                                            .size(10.5)
-                                                            .color(pal.dim),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(0.0);
+                                        // 复制小图标绝对定位到气泡右上角：只注册交互区、不推进
+                                        // 布局游标，因此不占正文首行高度（此前头部行 + 负边距仍会
+                                        // 挤出一行）。图标绘制放在正文之后，保证覆盖在最上层。
+                                        let icon_rect = egui::Rect::from_min_size(
+                                            ui.max_rect().right_top() + egui::vec2(-16.0, 3.0),
+                                            egui::vec2(12.0, 12.0),
+                                        );
+                                        let copy_resp = ui.interact(
+                                            icon_rect,
+                                            egui::Id::new(("copy-icon", index)),
+                                            egui::Sense::click(),
+                                        );
                                         // 交付完成状态：回合已结束且这是最后一条非空消息时，
                                         // 明确标注任务已完成，让用户一眼看到最终结果。
                                         let is_final = !state.busy
@@ -279,6 +242,25 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 .selectable(true),
                                             )
                                         };
+                                        // 绘制悬浮在右上角的复制图标（矢量双矩形，不依赖字体字形、
+                                        // 不会变豆腐块），并处理 hover 光标与点击复制；图标绘制
+                                        // 在正文之后，会覆盖在最上层，且不参与正常布局流。
+                                        let icon_color = if copy_resp.hovered() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            pal.text
+                                        } else {
+                                            pal.dim
+                                        };
+                                        super::icons::draw_copy_icon(
+                                            ui.painter(),
+                                            icon_rect.center(),
+                                            icon_color,
+                                            fill,
+                                        );
+                                        if copy_resp.clicked() {
+                                            state.pending_copy = Some(msg.text.clone());
+                                        }
+                                        let _ = copy_resp.on_hover_text("复制本条内容");
                                         // 右键菜单：复制单条内容，或一键复制整轮对话（含多个气泡）。
                                         resp.context_menu(|ui| {
                                             if ui.button("📋 复制本条内容").clicked() {
@@ -293,7 +275,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         });
                                     });
                                 });
-                                ui.add_space(10.0);
+                                ui.add_space(4.0);
                                 index += 1;
                             }
                             // 标准模式只展示常规对话。保留专家团状态供用户切回团队模式
@@ -301,7 +283,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                             if state.multi_agent {
                                 for council in state.councils.values() {
                                     render_council_card(ui, council, max_w, pal);
-                                    ui.add_space(8.0);
+                                    ui.add_space(4.0);
                                 }
                             }
                             // 运行状态不再单独占一条计时气泡：进行中批次的「工作过程」
@@ -642,8 +624,9 @@ fn render_work_batch(
         .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
+            // 思考/工具过程内容很短（单行摘要），用 set_max_width 只限制上限、
+            // 让卡片按内容自然宽度收缩，避免撑满整行留下大片空白。
             ui.set_max_width(max_w * 0.96);
-            // ── 计划待办：重要内容，常显不折叠 ──
             if !plan_items.is_empty() {
                 ui.label(
                     egui::RichText::new(format!("📋 任务计划 · {plan_done}/{plan_total} 完成"))

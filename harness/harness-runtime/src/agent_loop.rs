@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -7,7 +7,7 @@ use harness_capability::assets::{ChatTurn, ConversationMemory, Skill, SkillLibra
 use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
 use harness_core::{error::Result, types::UserInput, AppContext};
-use harness_llm::{Chunk, LlmProvider, Message, Role, ToolCall, ToolResult, Usage};
+use harness_llm::{Chunk, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolResult, Usage};
 use harness_session::{SessionEvent, SessionLog};
 use harness_tool::ToolRegistry;
 use tokio_util::sync::CancellationToken;
@@ -23,33 +23,51 @@ use crate::execution::{
 /// `Turn` = 0..n `Step`；`debt` 计数控制续跑；`agent/turn-stopping` 为唯一串行终止点。
 pub struct AgentLoop;
 
-/// 将循环定义为“相同调用连续产生相同结果”，而非仅仅相同命令。
-/// 结果只保留哈希，避免控制状态复制工具原文。
+/// 相同调用的结果守卫。成功调用在工作区未发生写入前不应原样重试；失败调用
+/// 只允许一次定向重试。结果只保留哈希，避免控制状态复制工具原文。
 #[derive(Default)]
 struct ToolRepeatGuard {
-    previous: Option<(String, u64)>,
-    identical_outcomes: u8,
+    previous: Option<(String, u64, bool)>,
     recovery_attempts: HashMap<String, u8>,
     /// 同一调用（名称+参数）的累计执行次数：即使每次输出略有差异（扫描类命令
     /// 常见），超过阈值也判定为低价值重复。取证：同回合扫描脚本被跑 13 次。
     cumulative: HashMap<String, u8>,
 }
 
-/// 同回合内同一调用（名称+参数完全相同）的最大执行次数。
-const MAX_SAME_CALLS_PER_TURN: u8 = 4;
+/// 同回合内同一失败调用（名称+参数完全相同）最多执行两次（首次 + 一次定向重试）。
+const MAX_SAME_CALLS_PER_TURN: u8 = 2;
+
+/// 单次模型响应内的原子任务门禁。它补足跨步骤状态机的时间差：首个 search 的
+/// 结果尚未写入执行状态时，也不能让模型并行发起更多定位搜索。
+#[derive(Default)]
+struct AtomicStepGate {
+    search_queued: bool,
+}
+
+impl AtomicStepGate {
+    fn allows(&mut self, atomic: bool, signature: &str) -> bool {
+        if !atomic || !signature.starts_with("search:") {
+            return true;
+        }
+        if self.search_queued {
+            return false;
+        }
+        self.search_queued = true;
+        true
+    }
+}
 
 impl ToolRepeatGuard {
     fn should_block(&self, signature: &str) -> bool {
-        let consecutive_identical = self
+        let repeated_success = self
             .previous
             .as_ref()
-            .is_some_and(|(previous, _)| previous == signature)
-            && self.identical_outcomes >= 2;
-        let cumulative_exhausted = self
+            .is_some_and(|(previous, _, ok)| previous == signature && *ok);
+        let failed_retries_exhausted = self
             .cumulative
             .get(signature)
             .is_some_and(|count| *count >= MAX_SAME_CALLS_PER_TURN);
-        consecutive_identical || cumulative_exhausted
+        repeated_success || failed_retries_exhausted
     }
 
     fn record_result(&mut self, signature: &str, result: &ToolResult) {
@@ -57,25 +75,27 @@ impl ToolRepeatGuard {
         result.ok.hash(&mut hasher);
         result.content.hash(&mut hasher);
         let fingerprint = hasher.finish();
+        // 成功写入改变了观察对象：之后允许重新运行同一验证命令，但仍不会允许
+        // 紧随其后的原样重复。其它成功读取/搜索不改变对象，必须换参数或换路径。
+        let changed_workspace = result.ok
+            && (signature.starts_with("edit:")
+                || (signature.starts_with("fs:") && signature.contains("\"op\":\"write\"")));
+        if changed_workspace {
+            self.cumulative.clear();
+            self.recovery_attempts.clear();
+            self.previous = None;
+        }
         let changed_path =
             self.previous
                 .as_ref()
-                .is_none_or(|(previous_signature, previous_fingerprint)| {
+                .is_none_or(|(previous_signature, previous_fingerprint, _)| {
                     previous_signature != signature || *previous_fingerprint != fingerprint
                 });
         if changed_path {
             // 一次真正不同的观察意味着模型已改变调查路径；旧的恢复次数不再相关。
             self.recovery_attempts.clear();
         }
-        self.identical_outcomes = match &self.previous {
-            Some((previous_signature, previous_fingerprint))
-                if previous_signature == signature && *previous_fingerprint == fingerprint =>
-            {
-                self.identical_outcomes.saturating_add(1)
-            }
-            _ => 1,
-        };
-        self.previous = Some((signature.to_string(), fingerprint));
+        self.previous = Some((signature.to_string(), fingerprint, result.ok));
         // 累计计数：与「连续相同结果」互补，拦截输出有微小差异的空转重复。
         *self.cumulative.entry(signature.to_string()).or_default() = self
             .cumulative
@@ -288,7 +308,20 @@ impl AgentLoop {
 
             // 每一步都执行上下文预算，而非仅在回合开始时裁剪；工具循环越长，
             // 节省的重复 prompt token 越明显。
-            let mut s = llm.stream(apply_context_budget(pre_input));
+            // 原子任务以低推理、短输出请求模型：工具门禁只能减少后续回合，只有这里
+            // 能抑制首个 tool call 前的隐藏长思考与 `omitted` token 消耗。非原子任务
+            // 完全保留用户的模型设置和默认输出预算。
+            let request_options = if execution.solve_mode
+                == crate::execution::SolveMode::AtomicDelivery
+            {
+                RequestOptions {
+                    max_output_tokens: Some(1_536),
+                    reasoning_effort: Some("off".into()),
+                }
+            } else {
+                RequestOptions::default()
+            };
+            let mut s = llm.stream_with_options(apply_context_budget(pre_input), request_options);
             let mut assistant_text = String::new();
             let mut assistant_tools = Vec::new();
             let mut step_had_tools = false;
@@ -359,8 +392,15 @@ impl AgentLoop {
                 // 串行执行以保全状态与顺序语义；通过门禁的调用收集后 join 并行分发。
                 // 此前同一步的 N 个工具调用逐个 await，与系统提示词鼓励的并行调用相悖。
                 let mut pending: Vec<(&ToolCall, String, ActionProposal)> = Vec::new();
+                let mut pending_signatures = HashSet::new();
+                // 原子任务的第一阶段只能有一个定位动作。否则模型即使知道“后续要
+                // 缩小范围”，也可能在同一响应里并发发出 N 个不同关键词的泛搜。
+                let mut atomic_step_gate = AtomicStepGate::default();
                 for tc in &chunk.tool_calls {
-                    let sig = format!("{}:{}", tc.name, tc.args);
+                    // 守卫与行动门禁共用归一化签名，避免仅因路径分隔符或 `cd` 前缀
+                    // 不同就绕过重复判定。
+                    let proposal = ActionProposal::from_tool_call(tc, &execution.contract);
+                    let sig = proposal.signature.clone();
                     log.append(SessionEvent::ToolCall {
                         id: log.gen_id(),
                         call: tc.clone(),
@@ -372,7 +412,7 @@ impl AgentLoop {
                             call_id: tc.id.clone(),
                             ok: false,
                             content: format!(
-                                "[tool-loop guard] 工具 {} 相同参数的调用已重复多次（连续相同结果或累计达到 {MAX_SAME_CALLS_PER_TURN} 次上限）；本次未执行。请分析已有结果、换用不同参数/工具或直接基于现有证据收尾，不要原样重试。",
+                                "[tool-loop guard] 工具 {} 的相同参数调用不会带来新信息：成功调用不得原样重试，失败调用最多首次加一次定向重试。本次未执行；请分析已有结果、换用不同参数/工具或直接基于现有证据收尾。",
                                 tc.name
                             ),
                             continuation_debt: 0,
@@ -385,7 +425,7 @@ impl AgentLoop {
                         step_had_tools = true;
                         if recovery <= MAX_LOOP_RECOVERY_PROMPTS {
                             loop_recovery_prompts.push(format!(
-                                "[循环恢复] 工具 {} 的相同调用已连续两次产生相同结果，本次已拦截（恢复提示 {recovery}/{MAX_LOOP_RECOVERY_PROMPTS}）。任务尚未完成：先解释现有结果，再选择不同参数、不同工具或下一项验证；禁止原样重试。",
+                                "[循环恢复] 工具 {} 的相同调用已被拦截（恢复提示 {recovery}/{MAX_LOOP_RECOVERY_PROMPTS}）。任务尚未完成：先解释现有结果，再选择不同参数、不同工具或下一项验证；禁止原样重试。",
                                 tc.name
                             ));
                         } else {
@@ -394,9 +434,49 @@ impl AgentLoop {
                         continue;
                     }
 
+                    if !atomic_step_gate.allows(
+                        execution.solve_mode == crate::execution::SolveMode::AtomicDelivery,
+                        &sig,
+                    ) {
+                            let blocked = ToolResult {
+                                call_id: tc.id.clone(),
+                                ok: false,
+                                content: "[atomic-delivery guard] 单点回归的当前阶段只允许一个定位 search；请先使用该结果缩小到具体文件/行号，再决定下一步。".into(),
+                                continuation_debt: 0,
+                            };
+                            log.append(SessionEvent::ToolResult {
+                                id: log.gen_id(),
+                                result: blocked.clone(),
+                            });
+                            messages.push(Message::tool(tc.id.clone(), blocked.content));
+                            step_had_tools = true;
+                            continue;
+                    }
+
+                    // 同一回复里出现完全相同的并行调用时，执行其中一个不会比执行全部
+                    // 少任何信息，只会放大空跑成本。这里在分发前去重，仍给每个调用补齐
+                    // 协议要求的 tool result。
+                    if !pending_signatures.insert(sig.clone()) {
+                        let blocked = ToolResult {
+                            call_id: tc.id.clone(),
+                            ok: false,
+                            content: format!(
+                                "[tool-loop guard] 工具 {} 与本步骤中已排队调用的参数完全相同，已跳过重复执行；请使用第一个结果继续。",
+                                tc.name
+                            ),
+                            continuation_debt: 0,
+                        };
+                        log.append(SessionEvent::ToolResult {
+                            id: log.gen_id(),
+                            result: blocked.clone(),
+                        });
+                        messages.push(Message::tool(tc.id.clone(), blocked.content));
+                        step_had_tools = true;
+                        continue;
+                    }
+
                     // 通用行动门禁：每个工具动作必须关联验收目标。调用/时间预算是软检查点，
                     // 只触发进展诊断与续期，不会因为任务耗时较长而拒绝必要动作。
-                    let proposal = ActionProposal::from_tool_call(tc, &execution.contract);
                     if let GateDecision::Deny(reason) =
                         ActionGate::authorize(&proposal, &execution, &budget)
                     {
@@ -1004,7 +1084,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 问候、提问、普通对话直接回答，不使用工具。\n\
 \n\
 ## 复杂任务工作流\n\
-- 多步任务先调用 plan 发布结构化计划；在里程碑节点批量更新状态（doing/done），不必每完成一小步就更新一次。\n\
+- 只有多个独立交付物、范围不明确或高风险任务才调用 plan；单点、范围明确的修复直接执行“定位 → 修改 → 验证”，不要为计划本身增加往返。\n\
 - 相互独立的多个操作尽量在同一次回复里作为多个工具调用一起发出，减少往返。\n\
 - 独立且耗时的子任务用 delegate 委托子代理，主线程只整合结果。\n\
 - 回合结束前给出简洁、可读的最终总结。\n\
@@ -1013,7 +1093,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 最小路径优先：先用 search 定位与目标直接相关的最小文件集，再有针对性地读取；禁止全仓库递归扫描、批量试探性搜索与自造临时扫描脚本。\n\
 - 读取大文件用 fs 的 start_line/end_line 按区间读取；严禁编写临时脚本（python/ps1 等）截取或提取文件内容。\n\
 - 纯界面/配置类任务：search 定位到少数目标文件后集中批量编辑，全部改完再做一次构建验证，不要每改一处就编译一次。\n\
-- 已读过的文件不要重复读取；同一命令/同一参数的调用最多重试有限次数，输出无新信息时立即换路或基于现有证据推进。\n\
+- 已读过的文件不要重复读取；成功的同一命令/同一参数不得原样重试，失败调用只允许一次带明确原因的定向重试。search 有命中后，下一次读取必须使用命中的路径和最小行区间；下一次搜索必须缩小目录或验证不同假设。\n\
 - 探索（读取/搜索/列目录）应尽快收敛到写操作与验证；交付目标达成后立即停止，不做重复确认与打磨。\n\
 - 步数预算有限且续期次数封顶：收到检查点/收尾提示时必须服从，基于现有证据交付总结，不要继续扩张探索。\n\
 - shell 命令已在工作区根目录执行：不要重复 cd 到工作区，直接用相对路径。\n\
@@ -1270,40 +1350,53 @@ mod tests {
     }
 
     #[test]
-    fn repeat_guard_blocks_identical_outcomes_and_cumulative_spin() {
+    fn repeat_guard_blocks_success_retries_but_allows_retry_after_a_write() {
         let mut guard = ToolRepeatGuard::default();
         let sig = "shell:{\"cmd\":\"status\"}";
-        let first = ToolResult {
+        let success = ToolResult {
             call_id: "c1".into(),
             ok: true,
             content: "still running".into(),
             continuation_debt: 0,
         };
-        let changed = ToolResult {
-            content: "finished".into(),
-            ..first.clone()
+        // 成功读取后，原样调用不会获得新信息，下一次调用必须被拦截。
+        guard.record_result(sig, &success);
+        assert!(guard.should_block(sig));
+
+        // 成功写入改变观察对象，允许重新运行同一验证命令。
+        let write = ToolResult {
+            call_id: "edit-1".into(),
+            ok: true,
+            content: "updated".into(),
+            continuation_debt: 0,
         };
-        // 第 1 次执行：不拦截。
-        guard.record_result(sig, &first);
+        guard.record_result("edit:{\"path\":\"src/app.rs\"}", &write);
         assert!(!guard.should_block(sig));
-        // 第 2 次执行（输出变化）：连续规则未触发。
-        guard.record_result(sig, &changed);
+
+        // 失败调用允许一次定向重试；第二次失败后不再重试。
+        let failed = ToolResult {
+            call_id: "c2".into(),
+            ok: false,
+            content: "temporary failure".into(),
+            continuation_debt: 0,
+        };
+        guard.record_result(sig, &failed);
         assert!(!guard.should_block(sig));
-        // 第 3 次执行（与上次结果相同）：连续相同结果规则拦截。
-        guard.record_result(sig, &changed);
+        guard.record_result(sig, &failed);
         assert!(guard.should_block(sig));
         assert_eq!(guard.note_recovery(sig), 1);
-        // 第 4 次执行（输出又变了，连续规则重置）：但累计次数达到上限，
-        // 累计规则接管拦截——拦截输出微差的空转重复（取证：扫描脚本跑 13 次）。
-        let new_observation = ToolResult {
-            content: "state changed".into(),
-            ..changed
-        };
-        guard.record_result(sig, &new_observation);
-        assert!(guard.should_block(sig));
-        assert_eq!(guard.note_recovery(sig), 1);
+
         // 不同签名的调用不受影响。
-        guard.record_result("shell:{\"cmd\":\"other\"}", &first);
         assert!(!guard.should_block("shell:{\"cmd\":\"other\"}"));
+    }
+
+    #[test]
+    fn atomic_step_gate_allows_only_one_search_per_model_response() {
+        let mut gate = AtomicStepGate::default();
+        assert!(gate.allows(true, "search:{\"pattern\":\"optimizing\"}"));
+        assert!(!gate.allows(true, "search:{\"pattern\":\"loading\"}"));
+        // 读取和写入不是定位泛扫；它们由跨步骤 ActionGate 判断是否符合阶段。
+        assert!(gate.allows(true, "fs:{\"op\":\"read\"}"));
+        assert!(gate.allows(false, "search:{\"pattern\":\"anything\"}"));
     }
 }

@@ -9,6 +9,7 @@ impl eframe::App for AppState {
         self.poll_git_changes();
         self.poll_mem();
         self.poll_models();
+        self.poll_optimize();
         self.busy = self.host.sink.busy();
 
         let pal = palette(self.dark);

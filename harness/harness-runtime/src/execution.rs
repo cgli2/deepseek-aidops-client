@@ -22,6 +22,9 @@ pub enum StrategyKind {
 /// 防止被通用 Agent 当成开放式研究题而全仓泛搜。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolveMode {
+    /// 单点回归：用户给出了一个具体交互、前后行为和可观察的失败结果。
+    /// 该模式由 Runtime 走受控短路径，不把任务交给开放式 Agent 自行探索。
+    AtomicDelivery,
     FastDiagnosis,
     ScopedDelivery,
     OpenEnded,
@@ -38,6 +41,29 @@ pub struct SolvePlan {
 impl SolvePlan {
     pub fn for_contract(contract: &TaskContract, strategy: StrategyKind) -> Self {
         let text = contract.objective.as_str();
+        let is_atomic_regression = contract.risk != RiskLevel::High
+            && contract.acceptance_criteria.len() == 1
+            && text.chars().count() <= 500
+            && [
+                "之前", "原来", "加了", "之后", "不再", "失效", "不生效", "没有变化", "回归",
+            ]
+            .iter()
+            .any(|word| text.contains(word));
+        if is_atomic_regression
+            && !matches!(
+                strategy,
+                StrategyKind::Investigative | StrategyKind::Comparative | StrategyKind::Monitoring
+            )
+        {
+            return Self {
+                mode: SolveMode::AtomicDelivery,
+                // 这是“单路径回归”的首个状态机窗口，而不是硬性中断线。窗口内若发生
+                // 写入，后续验证仍可正常继续；没有写入的泛搜则不能靠续期维持空转。
+                initial_steps: 6,
+                initial_tool_calls: 8,
+                instructions: "[原子交付模式] 这是一个单点回归，不要创建计划、委派子代理或解释长篇思路。严格按：1) 用一个与用户描述直接对应的高信号符号/路径定位；2) 仅读取命中处及紧邻调用链；3) 做最小修复；4) 运行一次相关验证并交付。首次 search 命中后，不得再做无目录限定的搜索；成功调用不得重试，写入后才可重跑相同验证。每一步只执行当前阶段唯一必要的动作。".into(),
+            };
+        }
         let mentions_surface = ["界面", "面板", "UI", "显示", "结果"]
             .iter()
             .any(|word| text.contains(word));
@@ -58,9 +84,11 @@ impl SolvePlan {
         if matches!(strategy, StrategyKind::Transformative | StrategyKind::Verification) {
             return Self {
                 mode: SolveMode::ScopedDelivery,
-                initial_steps: 16,
-                initial_tool_calls: 20,
-                instructions: "[范围受限交付模式] 先定位与验收条件直接相关的最小文件集；每轮操作都必须推进定位、修改或验证之一。没有新证据时换假设，不做全仓扫描；先完成最小修改，再执行针对性验证。".into(),
+                // 这是首个收敛检查点而非任务硬截止。对一个明确的小改动，10 步/12 次
+                // 工具调用足够完成“定位 → 修改 → 验证”；更复杂的任务仍可凭真实产出续期。
+                initial_steps: 10,
+                initial_tool_calls: 12,
+                instructions: "[范围受限交付模式] 先用一个高信号的代码符号/路径搜索定位与验收条件直接相关的最小文件集；命中后集中读取必要区间、完成最小修改、执行一次针对性验证。不要从 UI 文案或泛化自然语言开始搜索；同一成功调用不得重试，失败调用最多定向重试一次。没有新证据时换假设，不做全仓扫描。".into(),
             };
         }
         Self {
@@ -182,7 +210,7 @@ impl TaskContract {
             self.constraints.join("；")
         };
         format!(
-            "[本回合执行契约]\n目标：{}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期（最多续期 {} 次，用尽后必须基于现有证据收尾）。执行准则：最小路径优先——先直接定位与目标直接相关的最小文件集，禁止全仓库泛扫与重复读取已读文件；探索类调用不超过总调用三成，其余应为直接产出交付的写操作与验证；同一工具调用未带来新信息时立即换路或收尾；交付目标达成即停止，不做重复确认与打磨。",
+            "[本回合执行契约]\n目标：{}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期（最多续期 {} 次，用尽后必须基于现有证据收尾）。执行准则：最小路径优先——先直接定位与目标直接相关的最小文件集，禁止全仓库泛扫与重复读取已读文件；每次探索必须消除具体不确定性或决定下一步，范围明确的小任务在首次定位后转入修改与验证，范围未知或调查型任务可保留必要取证；同一工具调用未带来新信息时立即换路或收尾；交付目标达成即停止，不做重复确认与打磨。",
             self.objective,
             strategy,
             self.acceptance_criteria
@@ -216,6 +244,7 @@ pub struct DecisionRecord {
 pub struct ExecutionState {
     pub contract: TaskContract,
     pub strategy: StrategyKind,
+    pub solve_mode: SolveMode,
     pub started_at: Instant,
     pub steps: usize,
     pub tool_calls: usize,
@@ -236,9 +265,11 @@ pub struct ExecutionState {
 
 impl ExecutionState {
     pub fn new(contract: TaskContract, strategy: StrategyKind) -> Self {
+        let solve_mode = SolvePlan::for_contract(&contract, strategy).mode;
         Self {
             contract,
             strategy,
+            solve_mode,
             started_at: Instant::now(),
             steps: 0,
             tool_calls: 0,
@@ -501,7 +532,15 @@ impl BudgetManager {
         let stagnant = evidence_delta == 0 || success_delta == 0;
         // “进展”不等同于“写了代码”：成功测试、定位到新根因、得到新的只读证据
         // 都能实质推进任务。仅在没有任何可验证进展时才记为停滞。
-        let meaningful_progress = write_delta > 0 || (evidence_delta > 0 && success_delta > 0);
+        // 交付型任务中，“又成功读到一个文件/搜索到一条命中”不是续期理由；否则模型
+        // 只要不断换关键词泛搜，就能把预算无限延长。调查/比较/验证类任务则允许由独立
+        // 证据续期，因为它们的交付物本来就是结论而非写入。
+        let read_only_delivery = matches!(
+            state.strategy,
+            StrategyKind::Investigative | StrategyKind::Comparative | StrategyKind::Verification
+        );
+        let meaningful_progress = write_delta > 0
+            || (read_only_delivery && evidence_delta > 0 && success_delta > 0);
 
         state.checkpoint_steps = state.steps;
         state.checkpoint_tool_calls = state.tool_calls;
@@ -594,11 +633,42 @@ pub struct ActionGate;
 impl ActionGate {
     pub fn authorize(
         proposal: &ActionProposal,
-        _state: &ExecutionState,
+        state: &ExecutionState,
         _budget: &Budget,
     ) -> GateDecision {
         if proposal.supports.is_empty() {
             return GateDecision::Deny("该调用未关联任何验收标准".into());
+        }
+        if state.solve_mode == SolveMode::AtomicDelivery {
+            let sig = proposal.signature.as_str();
+            if sig.starts_with("plan:") || sig.starts_with("delegate:") {
+                return GateDecision::Deny(
+                    "原子交付任务不允许计划或委派；直接执行当前路径的定位、修改或验证".into(),
+                );
+            }
+            if sig.starts_with("fs:") && sig.contains("\"op\":\"list\"") {
+                return GateDecision::Deny(
+                    "原子交付任务禁止列目录泛扫；先使用一个高信号 search 定位".into(),
+                );
+            }
+            if sig.starts_with("search:") {
+                let already_located = state
+                    .evidence
+                    .keys()
+                    .any(|signature| signature.starts_with("search:"));
+                if already_located && !sig.contains("\"dir\":") {
+                    return GateDecision::Deny(
+                        "首次定位已有结果；后续 search 必须限定到命中目录或验证不同的局部假设"
+                            .into(),
+                    );
+                }
+            }
+            if sig.starts_with("shell:") && state.write_operations == 0 {
+                return GateDecision::Deny(
+                    "原子交付任务的 shell 仅用于修改后的针对性验证；先定位并完成最小修改"
+                        .into(),
+                );
+            }
         }
         GateDecision::Allow
     }
@@ -710,6 +780,28 @@ mod tests {
     }
 
     #[test]
+    fn scoped_delivery_has_a_small_initial_convergence_window() {
+        let contract = TaskContract::from_input("调整一个会话气泡的对齐方式");
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
+        assert_eq!(plan.mode, SolveMode::ScopedDelivery);
+        assert!(plan.initial_steps <= 10);
+        assert!(plan.initial_tool_calls <= 12);
+        assert!(plan.instructions.contains("高信号"));
+    }
+
+    #[test]
+    fn atomic_regression_uses_a_short_state_machine_window() {
+        let contract = TaskContract::from_input(
+            "输入优化加了 loading 之后，结果没有变化，修复这个单点回归",
+        );
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
+        assert_eq!(plan.mode, SolveMode::AtomicDelivery);
+        assert_eq!(plan.initial_steps, 6);
+        assert_eq!(plan.initial_tool_calls, 8);
+        assert!(plan.instructions.contains("不要创建计划"));
+    }
+
+    #[test]
     fn turns_numbered_or_bulleted_requests_into_acceptance_items() {
         let contract = TaskContract::from_input("请完成：\n1. 建立契约\n2. 增加预算\n- 补充测试");
         assert_eq!(contract.deliverables.len(), 3);
@@ -805,6 +897,25 @@ mod tests {
     }
 
     #[test]
+    fn delivery_task_does_not_extend_for_read_only_exploration() {
+        let contract = TaskContract::from_input("调整一个会话气泡的对齐方式");
+        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
+        budget.renewals_used = budget.max_renewals;
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let proposal = ActionProposal {
+            signature: "search:{\"pattern\":\"bubble\"}".into(),
+            question: "搜索候选文件".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&proposal, true, "找到若干候选文件");
+        state.steps = 10;
+
+        assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
+        assert_eq!(budget.delivery_extensions, 0);
+    }
+
+    #[test]
     fn budget_scales_with_risk_and_enters_convergence() {
         let low = TaskContract::from_input("解释这段内容");
         let high = TaskContract::from_input("删除生产数据库配置");
@@ -838,6 +949,63 @@ mod tests {
         state.tool_calls = budget.max_tool_calls;
         assert_eq!(
             ActionGate::authorize(&proposal, &state, &budget),
+            GateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn atomic_gate_blocks_broad_second_search_and_pre_change_verification() {
+        let contract = TaskContract::from_input(
+            "输入优化加了 loading 之后，结果没有变化，修复这个单点回归",
+        );
+        let budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        assert_eq!(state.solve_mode, SolveMode::AtomicDelivery);
+        let locate = ActionProposal {
+            signature: "search:{\"pattern\":\"optimizing\"}".into(),
+            question: "定位状态字段".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert_eq!(
+            ActionGate::authorize(&locate, &state, &budget),
+            GateDecision::Allow
+        );
+        state.record_tool_result(&locate, true, "composer.rs:91");
+        assert!(matches!(
+            ActionGate::authorize(&locate, &state, &budget),
+            GateDecision::Deny(_)
+        ));
+        let scoped_search = ActionProposal {
+            signature: "search:{\"dir\":\"harness-ui/src/gui\",\"pattern\":\"poll_optimize\"}"
+                .into(),
+            question: "验证紧邻调用链".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert_eq!(
+            ActionGate::authorize(&scoped_search, &state, &budget),
+            GateDecision::Allow
+        );
+        let verify = ActionProposal {
+            signature: "shell:{\"command\":\"cargo test -p harness-ui\"}".into(),
+            question: "验证修复".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert!(matches!(
+            ActionGate::authorize(&verify, &state, &budget),
+            GateDecision::Deny(_)
+        ));
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"harness-ui/src/gui/composer.rs\"}".into(),
+            question: "修复回填".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&edit, true, "updated");
+        assert_eq!(
+            ActionGate::authorize(&verify, &state, &budget),
             GateDecision::Allow
         );
     }

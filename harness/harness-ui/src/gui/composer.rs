@@ -87,7 +87,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         .max_height(COMPOSER_MAX_H)
                         .show(ui, |ui| {
                             resp = Some(
-                                ui.add(
+                                ui.add_enabled(
+                                    !state.optimizing,
                                     egui::TextEdit::multiline(&mut state.input)
                                         .desired_width(f32::INFINITY)
                                         .desired_rows(3)
@@ -95,9 +96,11 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                         .frame(false)
                                         .margin(egui::Margin::same(0.0))
                                         .hint_text(
-                                            egui::RichText::new(
-                                                "描述任务、粘贴代码或提出问题…",
-                                            )
+                                            egui::RichText::new(if state.optimizing {
+                                                "正在优化输入…（加载中，请稍候）"
+                                            } else {
+                                                "描述任务、粘贴代码或提出问题…"
+                                            })
                                             .color(pal.dim),
                                         ),
                                 ),
@@ -108,9 +111,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 // Enter 发送 / Shift+Enter 换行：egui 会先插入换行，这里去掉尾随 \n 再提交。
                 let enter = response.has_focus()
                     && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                // 从资源管理器复制文件路径后直接粘贴：识别真实文件并按上传处理。
+                // Egui 只会把部分剪贴板内容转换为文本 Paste 事件。这里保留文本路径
+                // 的兼容逻辑，同时在 Windows 上读取资源管理器复制文件使用的 CF_HDROP。
                 // 普通文本粘贴仍保留在编辑器中，不会误变成附件。
-                let pasted_paths: Vec<std::path::PathBuf> = ctx.input(|i| {
+                let pasted_text_paths: Vec<std::path::PathBuf> = ctx.input(|i| {
                     i.events
                         .iter()
                         .filter_map(|event| match event {
@@ -123,20 +127,23 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         .map(std::path::PathBuf::from)
                         .collect()
                 });
+                let command_v = response.has_focus()
+                    && ctx.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
+                let mut pasted_paths = pasted_text_paths;
+                if command_v {
+                    pasted_paths.extend(paste_clipboard_files());
+                }
+                pasted_paths.retain(|path| path.is_file());
+                pasted_paths.sort();
+                pasted_paths.dedup();
                 if !pasted_paths.is_empty() {
+                    clear_input_if_it_only_contains_paths(&mut state.input, &pasted_paths);
                     for path in pasted_paths {
-                        let rendered = path.display().to_string();
-                        if state.input.trim() == rendered {
-                            state.input.clear();
-                        }
                         add_attachment(state, path);
                     }
-                }
-                // 图片剪贴板不一定会转换成 Egui 的文本 Paste 事件。检测 Ctrl+V 后
-                // 直接读取系统图像剪贴板，落为临时 PNG，再与普通上传走同一附件链路。
-                let image_paste = response.has_focus()
-                    && ctx.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
-                if image_paste {
+                // 图片剪贴板不一定会转换成 Egui 的文本 Paste 事件。仅当剪贴板中
+                // 没有文件时才将图片落为临时附件，避免一次粘贴附上无关内容。
+                } else if command_v {
                     if let Some(path) = paste_clipboard_image() {
                         add_attachment(state, path);
                     }
@@ -596,6 +603,47 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         }
                     }
 
+                    // ── 优化按钮：在发送按钮左侧，点击后异步调用 LLM 重写输入 ──
+                    let can_optimize = !state.input.trim().is_empty() && !state.optimizing;
+                    let (orect, oresp) =
+                        ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click());
+                    let ofill = if oresp.hovered() {
+                        pal.hover
+                    } else {
+                        pal.field
+                    };
+                    ui.painter()
+                        .rect_filled(orect, egui::Rounding::same(8.0), ofill);
+                    ui.painter().rect(
+                        orect,
+                        egui::Rounding::same(8.0),
+                        egui::Color32::TRANSPARENT,
+                        egui::Stroke::new(
+                            1.0_f32,
+                            if state.optimizing { pal.accent } else { pal.border },
+                        ),
+                    );
+                    // 魔法棒图标 ✨
+                    let ocolor = if state.optimizing { pal.accent } else { pal.text };
+                    ui.painter().text(
+                        orect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "✨",
+                        egui::FontId::proportional(14.0),
+                        ocolor,
+                    );
+                    if oresp.clicked() && can_optimize {
+                        state.optimize_input();
+                    }
+                    let tip = if state.optimizing {
+                        "正在优化…"
+                    } else if can_optimize {
+                        "优化输入（用 LLM 重写为更友好的提示词）"
+                    } else {
+                        "输入内容后可优化"
+                    };
+                    oresp.on_hover_text(tip);
+
                     // 弹性空间 → 圆形发送/停止按钮
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let btn_size = 34.0;
@@ -671,6 +719,11 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
             // 忙碌时每秒心跳重绘：egui 无输入事件不自动刷新，已用时计数需心跳驱动。
             if state.busy {
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
+            // 优化输入是异步后台线程 + 非阻塞轮询：若无输入事件 egui 不会重绘，
+            // poll_optimize 就永远不会执行，结果无法回填到输入框。因此优化期间也要心跳重绘。
+            if state.optimizing {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
             ui.add_space(4.0);
             // 卡片下方的提示行与状态行（轻量 footer）
@@ -762,6 +815,74 @@ fn add_attachment(state: &mut AppState, path: std::path::PathBuf) {
         .push(harness_core::Attachment { path, mime });
 }
 
+/// 仅当输入框内容完全是本次粘贴的文件路径时清除它，避免污染待发送的消息正文。
+fn clear_input_if_it_only_contains_paths(input: &mut String, paths: &[std::path::PathBuf]) {
+    let pasted = input
+        .lines()
+        .map(|line| line.trim().trim_matches('"'))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if !pasted.is_empty()
+        && pasted.iter().all(|line| {
+            paths
+                .iter()
+                .any(|path| path.as_os_str().to_string_lossy() == *line)
+        })
+    {
+        input.clear();
+    }
+}
+
+/// 资源管理器复制文件时将路径写入 Windows 的 `CF_HDROP`，而非文本剪贴板。
+/// Egui/winit 不会把该格式转为 `Event::Paste`，因此需要在 Ctrl+V 时直接读取。
+#[cfg(windows)]
+fn paste_clipboard_files() -> Vec<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        System::{
+            DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard},
+            Ole::CF_HDROP,
+        },
+        UI::Shell::DragQueryFileW,
+    };
+
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 || OpenClipboard(0) == 0 {
+            return Vec::new();
+        }
+        struct ClipboardGuard;
+        impl Drop for ClipboardGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    CloseClipboard();
+                }
+            }
+        }
+        let _clipboard = ClipboardGuard;
+        let hdrop = GetClipboardData(CF_HDROP as u32);
+        if hdrop == 0 {
+            return Vec::new();
+        }
+        let count = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0);
+        (0..count)
+            .filter_map(|index| {
+                let len = DragQueryFileW(hdrop, index, std::ptr::null_mut(), 0);
+                if len == 0 {
+                    return None;
+                }
+                let mut name = vec![0_u16; len as usize + 1];
+                let copied = DragQueryFileW(hdrop, index, name.as_mut_ptr(), name.len() as u32);
+                (copied > 0).then(|| std::path::PathBuf::from(std::ffi::OsString::from_wide(&name[..copied as usize])))
+            })
+            .collect()
+    }
+}
+
+#[cfg(not(windows))]
+fn paste_clipboard_files() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
 fn paste_clipboard_image() -> Option<std::path::PathBuf> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let image = clipboard.get_image().ok()?;
@@ -813,4 +934,30 @@ fn uuid_like_suffix() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos().to_string())
         .unwrap_or_else(|_| "image".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_input_if_it_only_contains_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn clears_only_a_path_only_paste() {
+        let path = PathBuf::from(r"C:\\work\\report.pdf");
+        let mut input = format!("\"{}\"\n", path.display());
+
+        clear_input_if_it_only_contains_paths(&mut input, std::slice::from_ref(&path));
+
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn retains_message_text_when_it_includes_a_path() {
+        let path = PathBuf::from(r"C:\\work\\report.pdf");
+        let mut input = format!("请分析这个文件：{}", path.display());
+
+        clear_input_if_it_only_contains_paths(&mut input, std::slice::from_ref(&path));
+
+        assert_eq!(input, format!("请分析这个文件：{}", path.display()));
+    }
 }

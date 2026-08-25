@@ -130,4 +130,8 @@ pub trait LlmControl: Any + Send + Sync + 'static {
         let _ = (base_url, api_key);
         Ok(Vec::new())
     }
+
+    fn complete_one_shot(&self, _prompt: String) -> Result<String, String> {
+        Err("one-shot completion not supported by this provider".into())
+    }
 }

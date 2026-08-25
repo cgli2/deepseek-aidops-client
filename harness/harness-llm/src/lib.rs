@@ -181,6 +181,14 @@ pub struct ToolResult {
 /// 流式输出类型（对象安全：返回具体 `Pin<Box<...>>`，非 `impl Trait`）。
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Chunk>> + Send>>;
 
+/// 单次请求的运行时覆盖项。默认不改变用户配置；Runtime 仅在已识别为原子任务时
+/// 收紧输出与思考，避免一个单点回归消耗完整的长推理预算。
+#[derive(Debug, Clone, Default)]
+pub struct RequestOptions {
+    pub max_output_tokens: Option<u64>,
+    pub reasoning_effort: Option<String>,
+}
+
 /// LLM Provider 定义（能力接缝的 Definition）。Provider 可有多个（DeepSeek/OpenAI/.../replay）。
 ///
 /// `: Any` 使 `dyn LlmProvider` 本身满足 `Service`，可作为 `Arc<dyn LlmProvider>` 注册进 `AppContext`。
@@ -189,6 +197,9 @@ pub trait LlmProvider: Any + Send + Sync {
     fn name(&self) -> &'static str;
     fn tools(&self) -> Vec<ToolSchema>;
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream;
+    fn stream_with_options(&self, msgs: Vec<Message>, _options: RequestOptions) -> ChunkStream {
+        self.stream(msgs)
+    }
 }
 
 /// 可热切换的模型 Provider，供 GUI 在运行时配置 DeepSeek 连接。
@@ -221,8 +232,12 @@ impl LlmProvider for ManagedLlm {
     }
 
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream {
+        self.stream_with_options(msgs, RequestOptions::default())
+    }
+
+    fn stream_with_options(&self, msgs: Vec<Message>, options: RequestOptions) -> ChunkStream {
         match self.provider.read() {
-            Ok(provider) => provider.clone().stream(msgs),
+            Ok(provider) => provider.clone().stream_with_options(msgs, options),
             Err(_) => Box::pin(futures::stream::once(async {
                 Err(Error::Llm("model configuration lock poisoned".into()))
             })),
@@ -341,6 +356,45 @@ impl harness_core::LlmControl for ManagedLlm {
         api_key: String,
     ) -> std::result::Result<Vec<String>, String> {
         crate::openai_compat::fetch_models(base_url, api_key)
+    }
+
+
+    fn complete_one_shot(&self, prompt: String) -> std::result::Result<String, String> {
+        use futures::StreamExt;
+        let provider = self
+            .provider
+            .read()
+            .map_err(|_| "model configuration lock poisoned".to_string())?
+            .clone();
+        let msgs = vec![
+            Message::system(
+                "You are a prompt optimization assistant. Rewrite the user's input to be clear, \
+                 well-structured, and friendly for an LLM to process. Output ONLY the optimized \
+                 prompt text, nothing else.",
+            ),
+            Message::user(&prompt),
+        ];
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| format!("failed to create runtime: {e}"))?;
+        rt.block_on(async move {
+            let mut stream = provider.stream(msgs);
+            let mut parts: Vec<String> = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(c) => {
+                        if let Some(t) = c.text {
+                            parts.push(t);
+                        }
+                    }
+                    Err(e) => return Err(format!("stream error: {e}")),
+                }
+            }
+            let result = parts.join("").trim().to_string();
+            if result.is_empty() {
+                return Err("LLM returned empty response".into());
+            }
+            Ok(result)
+        })
     }
 }
 

@@ -83,6 +83,51 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                 .show(ui, |ui| {
                     // ── 版本更新横幅（非 Idle 时显示）──
                     state.draw_update_banner(ui, &pal);
+                    if let Some(projection) = &state.execution_projection {
+                        egui::Frame::default()
+                            .fill(pal.field)
+                            .rounding(egui::Rounding::same(8.0))
+                            .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                            .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("运行时").strong().color(pal.accent),
+                                    );
+                                    ui.label(format!(
+                                        "{} · {}",
+                                        projection.intent, projection.phase
+                                    ));
+                                    ui.label(format!(
+                                        "步骤 {} · 工具 {} · 证据 {}",
+                                        projection.step,
+                                        projection.tool_calls,
+                                        projection.evidence_count
+                                    ));
+                                    ui.label(format!(
+                                        "已验证 {} · 阻塞 {}",
+                                        projection.verified_count, projection.blocked_count
+                                    ));
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "允许：{}",
+                                            if projection.allowed_tools.is_empty() {
+                                                "无（收尾）".into()
+                                            } else {
+                                                projection.allowed_tools.join("、")
+                                            }
+                                        ))
+                                        .color(pal.dim),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(&projection.detail)
+                                        .size(10.5)
+                                        .color(pal.dim),
+                                );
+                            });
+                        ui.add_space(6.0);
+                    }
                     egui::ScrollArea::vertical()
                         .stick_to_bottom(true)
                         .auto_shrink(false)
@@ -102,18 +147,25 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                     let start = index;
                                     index += 1;
                                     while index < messages.len()
-                                        && matches!(messages[index].kind.as_str(), "thinking" | "tool" | "plan")
+                                        && matches!(
+                                            messages[index].kind.as_str(),
+                                            "thinking" | "tool" | "plan"
+                                        )
                                     {
                                         index += 1;
                                     }
                                     // live：agent 正在流式工作且该批之后还没有任何新消息，
                                     // 即当前回合的进行中批次——折叠态也需要呈现动效。
                                     let batch_live = state.busy
-                                        && messages
-                                            .iter()
-                                            .skip(index)
-                                            .all(|m| m.text.is_empty());
-                                    render_work_batch(ui, &messages[start..index], start, max_w, pal, batch_live);
+                                        && messages.iter().skip(index).all(|m| m.text.is_empty());
+                                    render_work_batch(
+                                        ui,
+                                        &messages[start..index],
+                                        start,
+                                        max_w,
+                                        pal,
+                                        batch_live,
+                                    );
                                     ui.add_space(4.0);
                                     continue;
                                 }
@@ -165,29 +217,41 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 .all(|m| m.text.is_empty());
                                         if is_final && state.delivery.is_some() {
                                             ui.add_space(2.0);
-                                            let delivery = state.delivery.as_ref().expect("checked above");
+                                            let delivery =
+                                                state.delivery.as_ref().expect("checked above");
                                             let (text, color) = match delivery.outcome {
                                                 harness_session::DeliveryOutcome::Verified => (
-                                                    format!("✓ 已验证交付 · {} 项验证", delivery.verification_count),
+                                                    format!(
+                                                        "✓ 已验证交付 · {} 项验证",
+                                                        delivery.verification_count
+                                                    ),
                                                     pal.accent,
                                                 ),
                                                 harness_session::DeliveryOutcome::Blocked => (
-                                                    format!("! 未完成 · 剩余 {} 项验收", delivery.remaining),
+                                                    format!(
+                                                        "! 未完成 · 剩余 {} 项验收",
+                                                        delivery.remaining
+                                                    ),
                                                     pal.warn,
                                                 ),
-                                                harness_session::DeliveryOutcome::Interrupted => (
-                                                    "! 任务中断 · 未验证交付".into(),
-                                                    pal.warn,
-                                                ),
-                                                harness_session::DeliveryOutcome::Cancelled => (
-                                                    "◌ 已取消 · 未验证交付".into(),
-                                                    pal.dim,
-                                                ),
+                                                harness_session::DeliveryOutcome::Interrupted => {
+                                                    ("! 任务中断 · 未验证交付".into(), pal.warn)
+                                                }
+                                                harness_session::DeliveryOutcome::Cancelled => {
+                                                    ("◌ 已取消 · 未验证交付".into(), pal.dim)
+                                                }
                                             };
-                                            ui.label(egui::RichText::new(text).size(10.5).strong().color(color));
+                                            ui.label(
+                                                egui::RichText::new(text)
+                                                    .size(10.5)
+                                                    .strong()
+                                                    .color(color),
+                                            );
                                             if let Some(reason) = &delivery.reason {
                                                 ui.label(
-                                                    egui::RichText::new(reason).size(10.0).color(pal.dim),
+                                                    egui::RichText::new(reason)
+                                                        .size(10.0)
+                                                        .color(pal.dim),
                                                 );
                                             }
                                         }
@@ -205,22 +269,23 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 code_text: pal.text,
                                                 code_bg: pal.field,
                                             };
-                                            let job = crate::markdown::to_job(&msg.text, &theme, markdown_w);
+                                            let job = crate::markdown::to_job(
+                                                &msg.text, &theme, markdown_w,
+                                            );
                                             // 正文响应独立持有：右键菜单始终挂在 Markdown 正文上
                                             // （此前挂在最后一个文件路径按钮上，右键正文不弹菜单）。
-                                            let md_resp = ui.add(
-                                                egui::Label::new(job).selectable(true),
-                                            );
+                                            let md_resp =
+                                                ui.add(egui::Label::new(job).selectable(true));
                                             // 文件路径识别：正文用完整 markdown 渲染，
                                             // 识别出的文件路径作为可点击 chip 追加在正文下方，
                                             // 不打断正文排版。
                                             let mut file_paths: Vec<String> = Vec::new();
                                             for b in crate::markdown::parse_blocks(
-                                                &msg.text,
-                                                &theme,
-                                                markdown_w,
+                                                &msg.text, &theme, markdown_w,
                                             ) {
-                                                if let crate::markdown::MarkdownBlock::FilePath(p) = b {
+                                                if let crate::markdown::MarkdownBlock::FilePath(p) =
+                                                    b
+                                                {
                                                     if !file_paths.contains(&p) {
                                                         file_paths.push(p);
                                                     }
@@ -229,7 +294,9 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             if !file_paths.is_empty() {
                                                 ui.add_space(6.0);
                                                 ui.label(
-                                                    egui::RichText::new("文件：").size(10.5).color(pal.dim),
+                                                    egui::RichText::new("文件：")
+                                                        .size(10.5)
+                                                        .color(pal.dim),
                                                 );
                                                 for path in file_paths {
                                                     let label = egui::RichText::new(&path)
@@ -242,7 +309,9 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                         .stroke(egui::Stroke::NONE);
                                                     let rb = ui.add(btn);
                                                     if rb.hovered() {
-                                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::PointingHand,
+                                                        );
                                                     }
                                                     let rb = rb.on_hover_text("点击预览此文件");
                                                     if rb.clicked() {
@@ -265,7 +334,8 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         // 不会变豆腐块），并处理 hover 光标与点击复制；图标绘制
                                         // 在正文之后，会覆盖在最上层，且不参与正常布局流。
                                         let icon_color = if copy_resp.hovered() {
-                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            ui.ctx()
+                                                .set_cursor_icon(egui::CursorIcon::PointingHand);
                                             pal.text
                                         } else {
                                             pal.dim
@@ -286,9 +356,13 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 ui.ctx().copy_text(msg.text.clone());
                                                 ui.close_menu();
                                             }
-                                            if ui.button("📋 复制整轮对话（含过程与回复）").clicked() {
-                                                ui.ctx()
-                                                    .copy_text(format_turn_text(&messages, turn_start));
+                                            if ui
+                                                .button("📋 复制整轮对话（含过程与回复）")
+                                                .clicked()
+                                            {
+                                                ui.ctx().copy_text(format_turn_text(
+                                                    &messages, turn_start,
+                                                ));
                                                 ui.close_menu();
                                             }
                                         });
@@ -621,10 +695,11 @@ fn render_work_batch(
         .filter(|msg| msg.kind == "plan")
         .flat_map(|msg| parse_plan_checklist(&msg.text))
         .collect();
-    let (plan_done, plan_total) = plan_items.iter().fold(
-        (0usize, 0usize),
-        |(d, t), (mark, _)| (d + usize::from(*mark == '✓'), t + 1),
-    );
+    let (plan_done, plan_total) = plan_items
+        .iter()
+        .fold((0usize, 0usize), |(d, t), (mark, _)| {
+            (d + usize::from(*mark == '✓'), t + 1)
+        });
     let mut parts: Vec<String> = Vec::new();
     if thinking_count > 0 {
         parts.push(format!("思考 {thinking_count} 条"));
@@ -653,13 +728,13 @@ fn render_work_batch(
                     egui::RichText::new(format!(
                         "📋 执行计划（待验收）· {plan_done}/{plan_total} 自报完成"
                     ))
-                        .size(11.0)
-                        .strong()
-                        .color(if plan_done == plan_total {
-                            pal.accent
-                        } else {
-                            pal.text
-                        }),
+                    .size(11.0)
+                    .strong()
+                    .color(if plan_done == plan_total {
+                        pal.accent
+                    } else {
+                        pal.text
+                    }),
                 );
                 ui.add_space(3.0);
                 for (mark, item) in &plan_items {
@@ -671,12 +746,7 @@ fn render_work_batch(
                         _ => ("·", pal.dim),
                     };
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(sym)
-                                .size(12.5)
-                                .strong()
-                                .color(color),
-                        );
+                        ui.label(egui::RichText::new(sym).size(12.5).strong().color(color));
                         // egui 0.30 的 strikethrough() 不再接受 bool 参数，改为条件应用。
                         let mut text = egui::RichText::new(item)
                             .size(12.0)
@@ -698,9 +768,10 @@ fn render_work_batch(
                 let glyph = ["◐", "◓", "◑", "◒"][((secs as u64) % 4) as usize];
                 // 按 500ms 推进重绘，驱动旋转帧与流式光标的闪烁。
                 let phase_ms = ((secs * 2.0) % 1.0 * 1000.0) as u64;
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(
-                    500 - phase_ms.min(499),
-                ));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(
+                        500 - phase_ms.min(499),
+                    ));
                 egui::RichText::new(format!("{glyph} 工作过程 · {summary} · 进行中"))
                     .size(11.5)
                     .color(pal.accent)
@@ -710,43 +781,45 @@ fn render_work_batch(
                     .color(pal.dim)
             };
             let collapsing = egui::CollapsingHeader::new(header)
-            .id_salt(("work-batch", start_index))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                for (position, msg) in messages.iter().enumerate() {
-                    if msg.kind == "plan" {
-                        continue; // 计划已在折叠区外常显
+                .id_salt(("work-batch", start_index))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    for (position, msg) in messages.iter().enumerate() {
+                        if msg.kind == "plan" {
+                            continue; // 计划已在折叠区外常显
+                        }
+                        if position > 0 {
+                            ui.separator();
+                        }
+                        let label = match msg.kind.as_str() {
+                            "thinking" => "思考",
+                            "tool" => "工具",
+                            _ => "过程",
+                        };
+                        // 收拢：每条过程只显示一行摘要，避免思考/工具内容占满屏幕。
+                        // 完整内容仍可通过右键「复制全部内容」获取。
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(label).size(10.5).color(pal.dim));
+                            let summary = one_line_summary(
+                                &msg.text,
+                                if msg.kind == "tool" { 90 } else { 60 },
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&summary).monospace().size(11.5).color(
+                                        if msg.kind == "thinking" {
+                                            pal.dim
+                                        } else {
+                                            pal.text
+                                        },
+                                    ),
+                                )
+                                .selectable(true),
+                            );
+                        });
                     }
-                    if position > 0 {
-                        ui.separator();
-                    }
-                    let label = match msg.kind.as_str() {
-                        "thinking" => "思考",
-                        "tool" => "工具",
-                        _ => "过程",
-                    };
-                    // 收拢：每条过程只显示一行摘要，避免思考/工具内容占满屏幕。
-                    // 完整内容仍可通过右键「复制全部内容」获取。
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(label).size(10.5).color(pal.dim));
-                        let summary =
-                            one_line_summary(&msg.text, if msg.kind == "tool" { 90 } else { 60 });
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&summary).monospace().size(11.5).color(
-                                    if msg.kind == "thinking" {
-                                        pal.dim
-                                    } else {
-                                        pal.text
-                                    },
-                                ),
-                            )
-                            .selectable(true),
-                        );
-                    });
-                }
-            });
+                });
             // 折叠头右键：一键复制整个工作过程卡（思考/工具/计划原文）。
             collapsing.header_response.context_menu(|ui| {
                 if ui.button("📋 复制本批过程内容").clicked() {
@@ -778,7 +851,11 @@ fn render_work_batch(
                     .find(|m| m.kind != "plan" && !m.text.is_empty())
                 {
                     let secs = ui.input(|i| i.time);
-                    let cursor = if ((secs * 2.0) as u64) % 2 == 0 { "▌" } else { " " };
+                    let cursor = if ((secs * 2.0) as u64) % 2 == 0 {
+                        "▌"
+                    } else {
+                        " "
+                    };
                     let preview = one_line_summary(&last.text, 80);
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {

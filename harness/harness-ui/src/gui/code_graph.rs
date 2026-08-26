@@ -83,49 +83,51 @@ pub(super) fn render(
         rows += 1;
         let is_open = expanded.contains(file);
         let mut toggle = false;
-        let header = ui
-            .horizontal(|ui| {
-                // 折叠三角（矢量，不依赖字体字形）。
-                let (tri, tri_resp) =
-                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                let c = tri.center();
-                let s = egui::Stroke::new(
-                    1.4_f32,
-                    if tri_resp.hovered() { pal.text } else { pal.dim },
-                );
-                let pts: [egui::Pos2; 3] = if is_open {
-                    [
-                        egui::pos2(c.x - 3.2, c.y - 2.0),
-                        egui::pos2(c.x + 3.2, c.y - 2.0),
-                        egui::pos2(c.x, c.y + 2.6),
-                    ]
-                } else {
-                    [
-                        egui::pos2(c.x - 1.8, c.y - 3.2),
-                        egui::pos2(c.x - 1.8, c.y + 3.2),
-                        egui::pos2(c.x + 2.8, c.y),
-                    ]
-                };
-                ui.painter().add(egui::Shape::closed_line(pts.to_vec(), s));
-                if tri_resp.clicked() {
-                    toggle = true;
-                }
-                ui.label(
-                    egui::RichText::new(file_short_name(file))
-                        .size(12.5)
-                        .strong()
-                        .color(pal.text),
-                );
-                // 文件路径完整显示（dim 小字）。
-                ui.label(egui::RichText::new(file).size(10.5).color(pal.dim));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    count_badge(ui, pal, idxs.len());
-                });
+        let header = ui.horizontal(|ui| {
+            // 折叠三角（矢量，不依赖字体字形）。
+            let (tri, tri_resp) =
+                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            let c = tri.center();
+            let s = egui::Stroke::new(
+                1.4_f32,
                 if tri_resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-            })
-            ;
+                    pal.text
+                } else {
+                    pal.dim
+                },
+            );
+            let pts: [egui::Pos2; 3] = if is_open {
+                [
+                    egui::pos2(c.x - 3.2, c.y - 2.0),
+                    egui::pos2(c.x + 3.2, c.y - 2.0),
+                    egui::pos2(c.x, c.y + 2.6),
+                ]
+            } else {
+                [
+                    egui::pos2(c.x - 1.8, c.y - 3.2),
+                    egui::pos2(c.x - 1.8, c.y + 3.2),
+                    egui::pos2(c.x + 2.8, c.y),
+                ]
+            };
+            ui.painter().add(egui::Shape::closed_line(pts.to_vec(), s));
+            if tri_resp.clicked() {
+                toggle = true;
+            }
+            ui.label(
+                egui::RichText::new(file_short_name(file))
+                    .size(12.5)
+                    .strong()
+                    .color(pal.text),
+            );
+            // 文件路径完整显示（dim 小字）。
+            ui.label(egui::RichText::new(file).size(10.5).color(pal.dim));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                count_badge(ui, pal, idxs.len());
+            });
+            if tri_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        });
         let header_rect = header.response.rect;
         let header_resp = ui.interact(
             header_rect,
@@ -189,7 +191,8 @@ fn render_stats(ui: &mut egui::Ui, pal: &Palette, symbols: &[CodeSymbol]) {
         for (label, n) in stats {
             let w = 92.0;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 46.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, egui::Rounding::same(9.0), pal.field);
+            ui.painter()
+                .rect_filled(rect, egui::Rounding::same(9.0), pal.field);
             ui.painter().rect(
                 rect,
                 egui::Rounding::same(9.0),
@@ -232,7 +235,8 @@ fn count_badge(ui: &mut egui::Ui, pal: &Palette, n: usize) {
     let text = format!("{n}");
     let w = 14.0 + text.chars().count() as f32 * 8.5;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, egui::Rounding::same(9.0), pal.hover);
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(9.0), pal.hover);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -253,10 +257,8 @@ fn symbol_row(
 ) -> bool {
     let (kind_label, kind_color) = kind_style(&sym.kind);
     let is_sel = sel.as_ref().is_some_and(|id| id == &sym.id);
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 34.0),
-        egui::Sense::click(),
-    );
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
     if is_sel || resp.hovered() {
         ui.painter()
             .rect_filled(rect.shrink(1.0), egui::Rounding::same(7.0), pal.hover);
@@ -267,7 +269,8 @@ fn symbol_row(
             egui::pos2(rect.min.x + 2.0, rect.min.y + 6.0),
             egui::vec2(2.5, rect.height() - 12.0),
         );
-        ui.painter().rect_filled(bar, egui::Rounding::same(2.0), pal.accent);
+        ui.painter()
+            .rect_filled(bar, egui::Rounding::same(2.0), pal.accent);
     }
     let mut x = rect.min.x + 12.0;
     // 类型徽标
@@ -300,8 +303,7 @@ fn symbol_row(
     // 签名（dim，截断防溢出）
     if !sym.signature.is_empty() {
         let sig: String = sym.signature.chars().take(46).collect();
-        let w = (sig.chars().count() as f32 * 6.8)
-            .min((ui.available_width() - x - 160.0).max(0.0));
+        let w = (sig.chars().count() as f32 * 6.8).min((ui.available_width() - x - 160.0).max(0.0));
         if w > 20.0 {
             ui.painter().text(
                 egui::pos2(x, rect.center().y),
@@ -391,7 +393,8 @@ fn detail_panel(
                 let badge = kind_badge(pal, &kind_label, kind_color);
                 let (b, _) =
                     ui.allocate_exact_size(egui::vec2(badge.w, 18.0), egui::Sense::hover());
-                ui.painter().rect_filled(b, egui::Rounding::same(4.0), badge.bg);
+                ui.painter()
+                    .rect_filled(b, egui::Rounding::same(4.0), badge.bg);
                 ui.painter().text(
                     b.center(),
                     egui::Align2::CENTER_CENTER,
@@ -399,7 +402,12 @@ fn detail_panel(
                     egui::FontId::proportional(10.0),
                     badge.fg,
                 );
-                ui.label(egui::RichText::new(&sym.name).size(14.0).strong().color(pal.text));
+                ui.label(
+                    egui::RichText::new(&sym.name)
+                        .size(14.0)
+                        .strong()
+                        .color(pal.text),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if close_button(ui, pal) {
                         *sel = None;
@@ -408,7 +416,11 @@ fn detail_panel(
             });
             ui.add_space(4.0);
             if !sym.signature.is_empty() {
-                ui.label(egui::RichText::new(&sym.signature).size(12.0).color(pal.dim));
+                ui.label(
+                    egui::RichText::new(&sym.signature)
+                        .size(12.0)
+                        .color(pal.dim),
+                );
             }
             ui.label(
                 egui::RichText::new(format!("文件: {}", sym.file))
@@ -470,7 +482,11 @@ fn chip_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
     let text_w = label.chars().count() as f32 * 7.2 + 16.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(text_w, 20.0), egui::Sense::click());
     let fill = if resp.hovered() { pal.hover } else { pal.field };
-    let stroke_color = if resp.hovered() { pal.accent } else { pal.border };
+    let stroke_color = if resp.hovered() {
+        pal.accent
+    } else {
+        pal.border
+    };
     ui.painter().rect(
         rect,
         egui::Rounding::same(10.0),
@@ -494,7 +510,8 @@ fn chip_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
 fn chip_text(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     let text_w = label.chars().count() as f32 * 7.2 + 16.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(text_w, 20.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, egui::Rounding::same(10.0), pal.field);
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(10.0), pal.field);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,

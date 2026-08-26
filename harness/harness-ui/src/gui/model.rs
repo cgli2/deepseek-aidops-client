@@ -3,6 +3,8 @@
 #[derive(Clone)]
 pub(super) struct ChatMsg {
     pub(super) kind: String,
+    /// 预留：发送方展示名（当前气泡头部按 kind 渲染，暂未读取）。
+    #[allow(dead_code)]
     pub(super) label: String,
     pub(super) text: String,
     /// Assistant 原文累积，用于跨分片剥离 DSML；其他消息类型保持为空。
@@ -16,6 +18,20 @@ pub(super) struct DeliveryUi {
     pub(super) remaining: usize,
     pub(super) verification_count: usize,
     pub(super) reason: Option<String>,
+}
+
+/// Runtime 遥测的轻量 UI 投影。只消费 SessionEvent，UI 不反向改变执行状态。
+#[derive(Clone)]
+pub(super) struct ExecutionProjectionUi {
+    pub(super) intent: String,
+    pub(super) phase: String,
+    pub(super) allowed_tools: Vec<String>,
+    pub(super) step: usize,
+    pub(super) tool_calls: usize,
+    pub(super) evidence_count: usize,
+    pub(super) verified_count: usize,
+    pub(super) blocked_count: usize,
+    pub(super) detail: String,
 }
 
 #[derive(Clone, Default)]
@@ -87,5 +103,9 @@ pub(super) const BUILTIN_PLUGINS: &[(&str, &str, &str)] = &[
     ("git", "Git", "查看差异、提交历史与分支操作"),
     ("memory", "Memory", "跨会话记忆检索与沉淀"),
     ("hooks", "Hooks", "生命周期钩子：提交前检查等自动化"),
-    ("superpowers", "Superpowers", "系统工作流扩展：提供规划、执行、验证等内置技能"),
+    (
+        "superpowers",
+        "Superpowers",
+        "系统工作流扩展：提供规划、执行、验证等内置技能",
+    ),
 ];

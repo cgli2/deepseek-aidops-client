@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use crate::intent::{IntentKind, IntentProfile};
 use harness_llm::ToolCall;
 use harness_session::{DeliveryCriterion, DeliveryOutcome, DeliveryReport};
 
@@ -31,6 +32,30 @@ pub enum SolveMode {
     OpenEnded,
 }
 
+/// 工具调用的运行时阶段。它是实际执行状态的投影，不接受模型的计划文本推动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPhase {
+    Locate,
+    Inspect,
+    Change,
+    Verify,
+    Conclude,
+    Explore,
+}
+
+impl ToolPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Locate => "locate",
+            Self::Inspect => "inspect",
+            Self::Change => "change",
+            Self::Verify => "verify",
+            Self::Conclude => "conclude",
+            Self::Explore => "explore",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SolvePlan {
     pub mode: SolveMode,
@@ -42,14 +67,11 @@ pub struct SolvePlan {
 impl SolvePlan {
     pub fn for_contract(contract: &TaskContract, strategy: StrategyKind) -> Self {
         let text = contract.objective.as_str();
+        let intent = IntentProfile::compile(text);
         let is_atomic_regression = contract.risk != RiskLevel::High
             && contract.acceptance_criteria.len() == 1
             && text.chars().count() <= 500
-            && [
-                "之前", "原来", "加了", "之后", "不再", "失效", "不生效", "没有变化", "回归",
-            ]
-            .iter()
-            .any(|word| text.contains(word));
+            && intent.kind == IntentKind::AtomicRegression;
         if is_atomic_regression
             && !matches!(
                 strategy,
@@ -82,7 +104,10 @@ impl SolvePlan {
                 instructions: "[快速诊断模式] 这是一个可比较的数据/界面不一致问题。严格按 Observe → Compare → Locate → Fix/Report 执行：先确认两端资源身份（路径、项目、环境、配置），再比较原始数据与 Provider/UI 数据。每次工具调用必须用于区分具体假设；先执行最多 3 个确定性探针，再只读取最短依赖链中的文件。禁止全仓泛搜、重复读取或为了理解而扩展范围；证据足够时立即修复并验证，若无需修改则直接给出根因与证据。".into(),
             };
         }
-        if matches!(strategy, StrategyKind::Transformative | StrategyKind::Verification) {
+        if matches!(
+            strategy,
+            StrategyKind::Transformative | StrategyKind::Verification
+        ) {
             return Self {
                 mode: SolveMode::ScopedDelivery,
                 // 这是首个收敛检查点而非任务硬截止。对一个明确的小改动，10 步/12 次
@@ -330,15 +355,81 @@ impl ExecutionState {
         );
     }
 
+    /// 动态白名单只由已获得的证据/写入/验证状态推进。高精确任务不再把
+    /// plan、delegate 或无关工具 schema 暴露给模型，且 dispatch 前还会二次校验。
+    pub fn tool_phase(&self) -> ToolPhase {
+        if self.can_complete() && !self.satisfied_criteria.is_empty() {
+            return ToolPhase::Conclude;
+        }
+        // 纯核验请求（如“检查目录”）的首个动作本来就是受控 shell/test，
+        // 不能强迫它先做一次无意义搜索再获得验证工具。
+        if self.strategy == StrategyKind::Verification && self.write_operations == 0 {
+            return ToolPhase::Verify;
+        }
+        match self.solve_mode {
+            SolveMode::AtomicDelivery | SolveMode::ScopedDelivery | SolveMode::FastDiagnosis => {
+                if self.write_operations > 0 {
+                    if self.verification_evidence.is_empty() {
+                        ToolPhase::Verify
+                    } else {
+                        ToolPhase::Conclude
+                    }
+                } else if self.evidence.is_empty() {
+                    ToolPhase::Locate
+                } else if self.evidence.keys().any(|key| key.starts_with("fs:")) {
+                    ToolPhase::Change
+                } else if self.evidence.keys().any(|key| key.starts_with("search:")) {
+                    ToolPhase::Inspect
+                } else {
+                    ToolPhase::Change
+                }
+            }
+            SolveMode::OpenEnded => ToolPhase::Explore,
+        }
+    }
+
+    pub fn allowed_tools(&self) -> Vec<String> {
+        let names: &[&str] = match self.tool_phase() {
+            ToolPhase::Locate => &["search"],
+            ToolPhase::Inspect => &["fs", "search"],
+            ToolPhase::Change => &["edit", "fs"],
+            ToolPhase::Verify => &["shell"],
+            ToolPhase::Conclude => &[],
+            ToolPhase::Explore => &["fs", "edit", "shell", "search", "plan", "delegate"],
+        };
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    pub fn allows_tool(&self, tool: &str) -> bool {
+        // 开放探索阶段保留插件/测试注入的自定义工具；精确交付阶段才执行
+        // 闭合白名单，避免把扩展生态误判为未知工具。
+        if self.tool_phase() == ToolPhase::Explore {
+            return true;
+        }
+        self.allowed_tools().iter().any(|allowed| allowed == tool)
+    }
+
     fn is_verification(&self, proposal: &ActionProposal) -> bool {
         if !proposal.signature.starts_with("shell:") {
             return false;
         }
         let signature = proposal.signature.to_ascii_lowercase();
         [
-            "cargo test", "cargo check", "cargo build", "npm test", "npm run test",
-            "npm run build", "pnpm test", "yarn test", "pytest", "python -m pytest",
-            "py_compile", "go test", "mvn test", "gradle test", "tsc ",
+            "cargo test",
+            "cargo check",
+            "cargo build",
+            "npm test",
+            "npm run test",
+            "npm run build",
+            "pnpm test",
+            "yarn test",
+            "pytest",
+            "python -m pytest",
+            "py_compile",
+            "go test",
+            "mvn test",
+            "gradle test",
+            "tsc ",
             "git diff --check",
         ]
         .iter()
@@ -404,7 +495,11 @@ impl ExecutionState {
             .filter(|item| !item.summary.trim().is_empty())
             .take(4)
             .map(|item| {
-                let summary: String = item.summary.split_whitespace().collect::<Vec<_>>().join(" ");
+                let summary: String = item
+                    .summary
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 format!("- {}", summary.chars().take(160).collect::<String>())
             })
             .collect::<Vec<_>>();
@@ -536,6 +631,9 @@ pub struct Budget {
     pub max_steps: usize,
     pub max_tool_calls: usize,
     pub max_duration: Duration,
+    /// 不可续期的总熔断。阶段预算可因真实进展延展，但绝不能越过这两项。
+    pub hard_max_steps: usize,
+    pub hard_max_tool_calls: usize,
     pub convergence_ratio: f32,
     /// 允许的自动续期次数上限：此前无限续期会让单回合步数无上限增长
     /// （实测一个简单任务跑出 1000+ 步）；用尽后必须强制收尾。
@@ -587,6 +685,8 @@ impl BudgetManager {
             max_steps,
             max_tool_calls,
             max_duration,
+            hard_max_steps: max_steps.saturating_mul(3).max(12),
+            hard_max_tool_calls: max_tool_calls.saturating_mul(3).max(16),
             convergence_ratio: 0.75,
             max_renewals: std::env::var("HARNESS_MAX_RENEWALS")
                 .ok()
@@ -614,6 +714,16 @@ impl BudgetManager {
         let calls = calls.max(1);
         budget.max_tool_calls = budget.max_tool_calls.min(calls);
         budget.tool_window = budget.max_tool_calls;
+    }
+
+    /// 原子/高精确任务的总熔断，比阶段检查点更严格；到达后不再许可新探索。
+    pub fn cap_hard_limits(budget: &mut Budget, steps: usize, calls: usize) {
+        budget.hard_max_steps = budget.hard_max_steps.min(steps.max(1));
+        budget.hard_max_tool_calls = budget.hard_max_tool_calls.min(calls.max(1));
+    }
+
+    pub fn hard_exhausted(state: &ExecutionState, budget: &Budget) -> bool {
+        state.steps >= budget.hard_max_steps || state.tool_calls >= budget.hard_max_tool_calls
     }
 
     pub fn phase(state: &ExecutionState, budget: &Budget) -> BudgetPhase {
@@ -660,8 +770,8 @@ impl BudgetManager {
             state.strategy,
             StrategyKind::Investigative | StrategyKind::Comparative | StrategyKind::Verification
         );
-        let meaningful_progress = write_delta > 0
-            || (read_only_delivery && evidence_delta > 0 && success_delta > 0);
+        let meaningful_progress =
+            write_delta > 0 || (read_only_delivery && evidence_delta > 0 && success_delta > 0);
 
         state.checkpoint_steps = state.steps;
         state.checkpoint_tool_calls = state.tool_calls;
@@ -755,10 +865,24 @@ impl ActionGate {
     pub fn authorize(
         proposal: &ActionProposal,
         state: &ExecutionState,
-        _budget: &Budget,
+        budget: &Budget,
     ) -> GateDecision {
+        let tool = proposal.signature.split(':').next().unwrap_or_default();
+        if !state.allows_tool(tool) {
+            return GateDecision::Deny(format!(
+                "当前 {} 阶段的动态工具白名单不包含 {tool}；允许：{}",
+                state.tool_phase().as_str(),
+                state.allowed_tools().join(", ")
+            ));
+        }
         if proposal.supports.is_empty() {
             return GateDecision::Deny("该调用未关联任何验收标准".into());
+        }
+        if state.tool_calls >= budget.hard_max_tool_calls {
+            return GateDecision::Deny(format!(
+                "已达到任务绝对工具调用上限 {}；禁止继续探索，应基于现有证据交付或报告阻塞",
+                budget.hard_max_tool_calls
+            ));
         }
         if state.solve_mode == SolveMode::AtomicDelivery {
             let sig = proposal.signature.as_str();
@@ -786,8 +910,7 @@ impl ActionGate {
             }
             if sig.starts_with("shell:") && state.write_operations == 0 {
                 return GateDecision::Deny(
-                    "原子交付任务的 shell 仅用于修改后的针对性验证；先定位并完成最小修改"
-                        .into(),
+                    "原子交付任务的 shell 仅用于修改后的针对性验证；先定位并完成最小修改".into(),
                 );
             }
         }
@@ -847,7 +970,10 @@ impl DomainPolicy for GeneralDomainPolicy {
             .any(|word| text.contains(word))
         {
             StrategyKind::Comparative
-        } else if ["验证", "确认", "检查", "审查"]
+        // “检查 / 审查 / 确认”常是普通提问或代码探索的对象，不能仅凭一个
+        // 词就收窄成只能运行 shell 的验证阶段。只有明确的验证动作才进入
+        // Verification；其余请求保留完整的探索工具面。
+        } else if ["验证", "测试", "编译", "构建", "lint", "格式检查"]
             .iter()
             .any(|word| text.contains(word))
         {
@@ -915,14 +1041,28 @@ mod tests {
 
     #[test]
     fn atomic_regression_uses_a_short_state_machine_window() {
-        let contract = TaskContract::from_input(
-            "输入优化加了 loading 之后，结果没有变化，修复这个单点回归",
-        );
+        let contract =
+            TaskContract::from_input("输入优化加了 loading 之后，结果没有变化，修复这个单点回归");
         let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
         assert_eq!(plan.mode, SolveMode::AtomicDelivery);
         assert_eq!(plan.initial_steps, 6);
         assert_eq!(plan.initial_tool_calls, 8);
         assert!(plan.instructions.contains("不要创建计划"));
+    }
+
+    #[test]
+    fn stale_state_after_mutation_is_atomic_regression() {
+        let contract = TaskContract::from_input(
+            "系统管理中先删除再添加配置后，对话框仍显示旧状态，需要及时同步刷新",
+        );
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
+        assert_eq!(plan.mode, SolveMode::AtomicDelivery);
+
+        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
+        BudgetManager::cap_hard_limits(&mut budget, 8, 10);
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        state.steps = 8;
+        assert!(BudgetManager::hard_exhausted(&state, &budget));
     }
 
     #[test]
@@ -944,6 +1084,21 @@ mod tests {
                 "插件管理，界面排版重新改造一下，分成两个tab页"
             )),
             StrategyKind::Transformative
+        );
+    }
+
+    #[test]
+    fn review_word_does_not_force_shell_only_verification_mode() {
+        let policy = GeneralDomainPolicy;
+        assert_eq!(
+            policy.select_strategy(&TaskContract::from_input(
+                "审查 composer 中输入为何自动换行"
+            )),
+            StrategyKind::Direct
+        );
+        assert_eq!(
+            policy.select_strategy(&TaskContract::from_input("运行测试验证这次修改")),
+            StrategyKind::Verification
         );
     }
 
@@ -1175,9 +1330,8 @@ mod tests {
 
     #[test]
     fn atomic_gate_blocks_broad_second_search_and_pre_change_verification() {
-        let contract = TaskContract::from_input(
-            "输入优化加了 loading 之后，结果没有变化，修复这个单点回归",
-        );
+        let contract =
+            TaskContract::from_input("输入优化加了 loading 之后，结果没有变化，修复这个单点回归");
         let budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         assert_eq!(state.solve_mode, SolveMode::AtomicDelivery);
@@ -1228,6 +1382,45 @@ mod tests {
             ActionGate::authorize(&verify, &state, &budget),
             GateDecision::Allow
         );
+    }
+
+    #[test]
+    fn dynamic_tool_whitelist_follows_verified_execution_evidence() {
+        let contract =
+            TaskContract::from_input("输入优化加了 loading 之后，结果没有变化，修复这个单点回归");
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        assert_eq!(state.tool_phase(), ToolPhase::Locate);
+        assert_eq!(state.allowed_tools(), vec!["search"]);
+
+        let locate = ActionProposal {
+            signature: "search:{\"pattern\":\"loading\"}".into(),
+            question: "定位".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&locate, true, "composer.rs:91");
+        assert_eq!(state.tool_phase(), ToolPhase::Inspect);
+        assert_eq!(state.allowed_tools(), vec!["fs", "search"]);
+
+        let inspect = ActionProposal {
+            signature: "fs:{\"op\":\"read\",\"path\":\"composer.rs\"}".into(),
+            question: "读取".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&inspect, true, "state update missing");
+        assert_eq!(state.tool_phase(), ToolPhase::Change);
+        assert_eq!(state.allowed_tools(), vec!["edit", "fs"]);
+
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"composer.rs\"}".into(),
+            question: "修复".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&edit, true, "updated");
+        assert_eq!(state.tool_phase(), ToolPhase::Verify);
+        assert_eq!(state.allowed_tools(), vec!["shell"]);
     }
 
     #[test]

@@ -218,9 +218,8 @@ impl AppState {
         let handle = self.host.rt.handle();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<harness_capability::assets::Skill>>();
         std::thread::spawn(move || {
-            let items = handle.block_on(async move {
-                skill.list_skills().await.unwrap_or_default()
-            });
+            let items =
+                handle.block_on(async move { skill.list_skills().await.unwrap_or_default() });
             let _ = tx.send(items);
         });
         if let Ok(items) = rx.recv() {
@@ -235,9 +234,8 @@ impl AppState {
         let handle = self.host.rt.handle();
         let (tx, rx) = std::sync::mpsc::channel::<bool>();
         std::thread::spawn(move || {
-            let ok = handle.block_on(async move {
-                skill.set_skill_enabled(&id, enabled).await.is_ok()
-            });
+            let ok =
+                handle.block_on(async move { skill.set_skill_enabled(&id, enabled).await.is_ok() });
             let _ = tx.send(ok);
         });
         let _ = rx.recv();
@@ -252,9 +250,7 @@ impl AppState {
         let handle = self.host.rt.handle();
         let (tx, rx) = std::sync::mpsc::channel::<bool>();
         std::thread::spawn(move || {
-            let ok = handle.block_on(async move {
-                skill.delete_skill(&id).await.unwrap_or(false)
-            });
+            let ok = handle.block_on(async move { skill.delete_skill(&id).await.unwrap_or(false) });
             let _ = tx.send(ok);
         });
         let _ = rx.recv();
@@ -369,7 +365,10 @@ impl AppState {
             });
             let _ = tx.send(res);
         });
-        rx.recv()
-            .unwrap_or_else(|_| Err(harness_core::error::Error::Runtime("后台任务异常退出".into())))
+        rx.recv().unwrap_or_else(|_| {
+            Err(harness_core::error::Error::Runtime(
+                "后台任务异常退出".into(),
+            ))
+        })
     }
 }

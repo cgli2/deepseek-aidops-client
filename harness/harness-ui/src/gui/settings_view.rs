@@ -1,4 +1,4 @@
-﻿//! Settings modal layout and page routing.
+//! Settings modal layout and page routing.
 
 use super::model::PluginKind;
 use super::*;
@@ -9,7 +9,10 @@ const PROVIDER_PRESETS: &[(&str, &str)] = &[
     ("openai", "https://api.openai.com/v1"),
     ("anthropic", "https://api.anthropic.com"),
     ("openrouter", "https://openrouter.ai/api/v1"),
-    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    (
+        "gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
     ("moonshot", "https://api.moonshot.cn/v1"),
     ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
     ("ollama", "http://localhost:11434/v1"),

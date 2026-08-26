@@ -43,7 +43,7 @@ impl DeepSeek {
             "max_tokens": options
                 .max_output_tokens
                 .unwrap_or_else(crate::max_output_tokens),
-            "tools": openai_compat::tools_json(&openai_compat::coding_tools()),
+            "tools": openai_compat::tools_json(&crate::allowed_coding_tools(options.allowed_tools.as_deref())),
             "tool_choice": "auto",
             "stream_options": { "include_usage": true },
         });
@@ -103,6 +103,7 @@ mod tests {
             &RequestOptions {
                 max_output_tokens: Some(1_536),
                 reasoning_effort: Some("off".into()),
+                ..Default::default()
             },
         );
         assert_eq!(body["max_tokens"], 1_536);

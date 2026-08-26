@@ -9,6 +9,8 @@ pub(super) struct AppState {
     pub(super) messages: Vec<ChatMsg>,
     /// 唯一由 Runtime Delivery 事件更新；不能由模型文本或 TurnEnd 推导成功。
     pub(super) delivery: Option<DeliveryUi>,
+    /// 当前运行时阶段/白名单/证据的只读投影，供主面板在执行中显示。
+    pub(super) execution_projection: Option<ExecutionProjectionUi>,
     /// 专家团结构化投影（由持久化 CouncilEvent 重建）。
     pub(super) councils: std::collections::BTreeMap<String, CouncilUi>,
     pub(super) input: String,
@@ -192,8 +194,7 @@ pub(super) struct AppState {
     /// 正在优化输入（按钮 loading 态）。
     pub(super) optimizing: bool,
     /// 优化结果回传通道（非阻塞轮询）。
-    pub(super) optimize_rx:
-        Option<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
+    pub(super) optimize_rx: Option<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
     /// 优化错误/状态提示。
     pub(super) optimize_msg: String,
 }
@@ -279,6 +280,7 @@ impl AppState {
                 raw: String::new(),
             }],
             delivery: None,
+            execution_projection: None,
             councils: std::collections::BTreeMap::new(),
             input: String::new(),
             busy: false,
@@ -469,6 +471,7 @@ impl AppState {
                     details.push(format!("turn_start「{}」", brief(input, 40)));
                     self.push("user", "你", input);
                     self.delivery = None;
+                    self.execution_projection = None;
                     // 队列中的任务真正开始执行时重新计时，不能沿用前一个任务的耗时。
                     self.turn_started = Some(std::time::Instant::now());
                     self.record_activity("正在准备上下文");
@@ -541,7 +544,11 @@ impl AppState {
                     self.push("plan", "计划", s.trim_end());
                 }
                 SessionEvent::Delivery { report, .. } => {
-                    let remaining = report.criteria.iter().filter(|item| !item.satisfied).count();
+                    let remaining = report
+                        .criteria
+                        .iter()
+                        .filter(|item| !item.satisfied)
+                        .count();
                     details.push(format!(
                         "delivery {:?} remaining={remaining}",
                         report.outcome
@@ -556,6 +563,20 @@ impl AppState {
                 SessionEvent::Usage { usage, .. } => {
                     prompt_tokens += usage.prompt_tokens;
                     completion_tokens += usage.completion_tokens;
+                }
+                SessionEvent::Telemetry { telemetry, .. } => {
+                    details.push(format!("telemetry {}", telemetry.phase));
+                    self.execution_projection = Some(ExecutionProjectionUi {
+                        intent: telemetry.intent.clone(),
+                        phase: telemetry.phase.clone(),
+                        allowed_tools: telemetry.allowed_tools.clone(),
+                        step: telemetry.step,
+                        tool_calls: telemetry.tool_calls,
+                        evidence_count: telemetry.evidence_count,
+                        verified_count: telemetry.verified_count,
+                        blocked_count: telemetry.blocked_count,
+                        detail: telemetry.detail.clone(),
+                    });
                 }
                 SessionEvent::Council { event, .. } => {
                     details.push("council".into());
@@ -581,7 +602,9 @@ impl AppState {
         self.last_event = next;
         let mut line = format!("[log] +{} events", events.len());
         if assistant_chunks > 0 {
-            line.push_str(&format!(" | assistant×{assistant_chunks}({assistant_chars}ch)"));
+            line.push_str(&format!(
+                " | assistant×{assistant_chunks}({assistant_chars}ch)"
+            ));
         }
         if thinking_chars > 0 {
             line.push_str(&format!(" | thinking({thinking_chars}ch)"));
@@ -900,8 +923,8 @@ impl AppState {
             // 文件工具共享同一工作区根；不同项目之间不能在任一后台回合执行时切换，
             // 否则运行中的工具调用可能落到错误项目。同项目内的历史会话不受此限制。
             if self.host.sink.any_busy() {
-                self.note = "当前有后台任务运行：可并行切换同项目会话，跨项目切换请等待任务结束"
-                    .into();
+                self.note =
+                    "当前有后台任务运行：可并行切换同项目会话，跨项目切换请等待任务结束".into();
                 return;
             }
             if let Some(root) = dir.parent().and_then(|p| p.parent()) {

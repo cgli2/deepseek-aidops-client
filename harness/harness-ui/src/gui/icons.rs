@@ -357,7 +357,12 @@ pub(super) fn draw_copy_icon(
     let s = egui::Stroke::new(1.1_f32, color);
     // 后矩形（右上偏移）
     let back = egui::Rect::from_min_size(egui::pos2(c.x - 1.8, c.y - 5.0), egui::vec2(6.6, 7.2));
-    painter.rect(back, egui::Rounding::same(1.5), egui::Color32::TRANSPARENT, s);
+    painter.rect(
+        back,
+        egui::Rounding::same(1.5),
+        egui::Color32::TRANSPARENT,
+        s,
+    );
     // 前矩形（左下偏移，bg 填充遮掉后矩形被盖住的边线）
     let front = egui::Rect::from_min_size(egui::pos2(c.x - 4.8, c.y - 2.2), egui::vec2(6.6, 7.2));
     painter.rect(front, egui::Rounding::same(1.5), bg, s);

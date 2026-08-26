@@ -4,10 +4,10 @@ use std::sync::Arc;
 use async_stream::stream;
 use futures::StreamExt;
 use harness_core::error::Error;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::openai_compat;
-use crate::{Chunk, ChunkStream, LlmProvider, Message, Role, ToolCall, ToolSchema};
+use crate::{Chunk, ChunkStream, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolSchema};
 
 /// Anthropic Provider（原生 Messages API + HTTP/SSE）。
 ///
@@ -59,10 +59,18 @@ impl LlmProvider for Anthropic {
     }
 
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream {
+        self.stream_with_options(msgs, RequestOptions::default())
+    }
+
+    fn stream_with_options(&self, msgs: Vec<Message>, options: RequestOptions) -> ChunkStream {
         let base_url = self.base_url.clone();
         let api_key = self.api_key.clone();
         let model = self.model.clone();
-        let body = request_body(&model, &msgs, self.reasoning_effort.as_deref());
+        let effort = options
+            .reasoning_effort
+            .as_deref()
+            .or(self.reasoning_effort.as_deref());
+        let body = request_body(&model, &msgs, effort, &options);
 
         Box::pin(stream! {
             let client = match crate::openai_compat::shared_client() {
@@ -202,7 +210,12 @@ impl LlmProvider for Anthropic {
 
 /// 内部消息 → Anthropic Messages API 请求体（system 提取为顶层字段，工具结果转
 /// `tool_result` 块，assistant 工具调用转 `tool_use` 块）。
-fn request_body(model: &str, msgs: &[Message], reasoning_effort: Option<&str>) -> Value {
+fn request_body(
+    model: &str,
+    msgs: &[Message],
+    reasoning_effort: Option<&str>,
+    options: &RequestOptions,
+) -> Value {
     let system: Vec<&str> = msgs
         .iter()
         .filter(|m| m.role == Role::System)
@@ -238,7 +251,7 @@ fn request_body(model: &str, msgs: &[Message], reasoning_effort: Option<&str>) -
             _ => messages.push(json!({ "role": role_name(m.role), "content": m.content })),
         }
     }
-    let tools: Vec<Value> = openai_compat::coding_tools()
+    let tools: Vec<Value> = crate::allowed_coding_tools(options.allowed_tools.as_deref())
         .into_iter()
         .map(|t| {
             json!({
@@ -250,7 +263,7 @@ fn request_body(model: &str, msgs: &[Message], reasoning_effort: Option<&str>) -
         .collect();
     let mut body = json!({
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": options.max_output_tokens.unwrap_or(4096),
         "stream": true,
         "system": system.join("\n\n"),
         "messages": messages,
@@ -292,7 +305,7 @@ mod tests {
             ),
             Message::tool("c1", "file content"),
         ];
-        let body = request_body("claude-test", &msgs, None);
+        let body = request_body("claude-test", &msgs, None, &RequestOptions::default());
         assert_eq!(body["system"], "be helpful");
         assert_eq!(body["stream"], true);
         let messages = body["messages"].as_array().unwrap();

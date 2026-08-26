@@ -187,6 +187,22 @@ pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Chunk>> + Send>>;
 pub struct RequestOptions {
     pub max_output_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
+    /// Runtime 在每个执行阶段只把当前允许的工具 schema 发给模型。`None`
+    /// 保持 Provider 的完整工具集，空列表则明确禁用工具调用。
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+/// 按运行时白名单裁剪编码工具。这里而不是 Provider 内部实现，确保所有上游
+/// Provider 收到完全一致的工具面。
+pub fn allowed_coding_tools(allowed: Option<&[String]>) -> Vec<ToolSchema> {
+    let all = openai_compat::coding_tools();
+    match allowed {
+        None => all,
+        Some(names) => all
+            .into_iter()
+            .filter(|tool| names.iter().any(|name| name == &tool.name))
+            .collect(),
+    }
 }
 
 /// LLM Provider 定义（能力接缝的 Definition）。Provider 可有多个（DeepSeek/OpenAI/.../replay）。
@@ -359,7 +375,6 @@ impl harness_core::LlmControl for ManagedLlm {
         crate::openai_compat::fetch_models(base_url, api_key)
     }
 
-
     fn complete_one_shot(&self, prompt: String) -> std::result::Result<String, String> {
         use futures::StreamExt;
         let provider = self
@@ -375,8 +390,8 @@ impl harness_core::LlmControl for ManagedLlm {
             ),
             Message::user(&prompt),
         ];
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("failed to create runtime: {e}"))?;
+        let rt =
+            tokio::runtime::Runtime::new().map_err(|e| format!("failed to create runtime: {e}"))?;
         rt.block_on(async move {
             let mut stream = provider.stream(msgs);
             let mut parts: Vec<String> = Vec::new();
@@ -405,33 +420,38 @@ mod managed_tests {
     use harness_core::LlmControl;
 
     #[test]
+    fn filters_tool_schemas_to_runtime_whitelist() {
+        let allowed = vec!["search".to_string(), "fs".to_string()];
+        let names = allowed_coding_tools(Some(&allowed))
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["fs", "search"]);
+        assert!(allowed_coding_tools(Some(&[])).is_empty());
+    }
+
+    #[test]
     fn runtime_configuration_validates_and_switches_provider() {
         let managed = ManagedLlm::new(ReplayLlm::new(vec![]), "演示模式");
-        assert!(
-            managed
-                .configure_deepseek("bad".into(), "deepseek-chat".into(), "key".into(), None)
-                .is_err()
-        );
-        assert!(
-            managed
-                .configure_deepseek(
-                    "https://api.deepseek.com".into(),
-                    "".into(),
-                    "key".into(),
-                    None
-                )
-                .is_err()
-        );
-        assert!(
-            managed
-                .configure_deepseek(
-                    "https://api.deepseek.com".into(),
-                    "deepseek-chat".into(),
-                    "".into(),
-                    None
-                )
-                .is_err()
-        );
+        assert!(managed
+            .configure_deepseek("bad".into(), "deepseek-chat".into(), "key".into(), None)
+            .is_err());
+        assert!(managed
+            .configure_deepseek(
+                "https://api.deepseek.com".into(),
+                "".into(),
+                "key".into(),
+                None
+            )
+            .is_err());
+        assert!(managed
+            .configure_deepseek(
+                "https://api.deepseek.com".into(),
+                "deepseek-chat".into(),
+                "".into(),
+                None
+            )
+            .is_err());
         managed
             .configure_deepseek(
                 "https://api.deepseek.com/".into(),
@@ -450,17 +470,15 @@ mod managed_tests {
         let managed = ManagedLlm::new(ReplayLlm::new(vec![]), "演示模式");
 
         // 非法地址：拒绝
-        assert!(
-            managed
-                .configure_provider(
-                    "openai".into(),
-                    "bad".into(),
-                    "deepseek-v4".into(),
-                    "k".into(),
-                    None
-                )
-                .is_err()
-        );
+        assert!(managed
+            .configure_provider(
+                "openai".into(),
+                "bad".into(),
+                "deepseek-v4".into(),
+                "k".into(),
+                None
+            )
+            .is_err());
 
         // 合法 openai 厂商：成功并替换 provider
         managed

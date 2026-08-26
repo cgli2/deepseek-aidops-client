@@ -71,6 +71,12 @@ pub enum SessionEvent {
         id: EventId,
         usage: Usage,
     },
+    /// Runtime 的执行遥测和 UI 投影来源。它不进入模型上下文；重放时可恢复
+    /// 当前阶段、动态工具白名单与交付证据，而不是从模型自述推断状态。
+    Telemetry {
+        id: EventId,
+        telemetry: ExecutionTelemetry,
+    },
     /// 专家团编排事件。所有任务状态、证据与门禁结果均落盘，可恢复和审计。
     Council {
         id: EventId,
@@ -191,6 +197,19 @@ pub struct DeliveryReport {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutionTelemetry {
+    pub intent: String,
+    pub phase: String,
+    pub allowed_tools: Vec<String>,
+    pub step: usize,
+    pub tool_calls: usize,
+    pub evidence_count: usize,
+    pub verified_count: usize,
+    pub blocked_count: usize,
+    pub detail: String,
+}
+
 /// 会话历史列表条目（侧栏「历史记录」面板展示用）。
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -223,6 +242,7 @@ fn event_id(ev: &SessionEvent) -> EventId {
         | SessionEvent::TurnStopping { id, .. }
         | SessionEvent::TurnEnd { id }
         | SessionEvent::Usage { id, .. }
+        | SessionEvent::Telemetry { id, .. }
         | SessionEvent::Council { id, .. } => *id,
     }
 }
@@ -368,9 +388,7 @@ impl SessionLog {
                     outcome: DeliveryOutcome::Interrupted,
                     criteria: Vec::new(),
                     verification: Vec::new(),
-                    reason: Some(
-                        "程序退出或意外中断；本回合没有生成完整的验收报告".into(),
-                    ),
+                    reason: Some("程序退出或意外中断；本回合没有生成完整的验收报告".into()),
                 },
             });
         }
@@ -858,6 +876,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn telemetry_event_survives_json_round_trip() {
+        let event = SessionEvent::Telemetry {
+            id: 7,
+            telemetry: ExecutionTelemetry {
+                phase: "verify".into(),
+                allowed_tools: vec!["shell".into()],
+                verified_count: 1,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, SessionEvent::Telemetry { telemetry, .. }
+            if telemetry.phase == "verify" && telemetry.allowed_tools == ["shell"]));
+    }
+
+    #[test]
     fn summarize_title_extracts_clean_titles() {
         // 短标题原样保留。
         assert_eq!(summarize_title("第一个问题"), "第一个问题");
@@ -1067,7 +1102,10 @@ mod tests {
         });
         let file_a = log
             .path()
-            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
             .unwrap();
         let running = log.pin();
 

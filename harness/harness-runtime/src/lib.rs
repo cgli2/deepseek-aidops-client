@@ -6,13 +6,16 @@ pub mod council;
 pub mod events;
 pub mod execution;
 pub mod facts;
+pub mod intent;
 pub mod scheduler;
 pub mod subagent;
 pub mod task;
+pub mod task_ledger;
 
 pub use agent_loop::{AgentLoop, DeterministicCompaction};
 pub use controller::SessionController;
 pub use events::{PreStep, TurnStopping};
+pub use intent::{IntentKind, IntentProfile};
 pub use execution::{
     ActionGate, ActionProposal, Budget, BudgetManager, Completion, CompletionJudge, DomainPolicy,
     ExecutionState, GeneralDomainPolicy, SolveMode, SolvePlan, StrategyKind, TaskContract,
@@ -20,3 +23,4 @@ pub use execution::{
 pub use scheduler::Scheduler;
 pub use subagent::InProcessSubagent;
 pub use task::{SessionId, Task};
+pub use task_ledger::{LedgerStatus, TaskLedger};

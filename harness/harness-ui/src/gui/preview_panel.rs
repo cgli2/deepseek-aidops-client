@@ -247,11 +247,7 @@ impl AppState {
                     } else {
                         name_trunc
                     };
-                    ui.label(
-                        egui::RichText::new(&name_disp)
-                            .size(12.5)
-                            .color(pal.text),
-                    );
+                    ui.label(egui::RichText::new(&name_disp).size(12.5).color(pal.text));
                     let is_markdown = self
                         .preview_path
                         .as_deref()
@@ -300,7 +296,9 @@ impl AppState {
                 });
             });
         // 头部下方分隔线
-        let sep = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover()).0;
+        let sep = ui
+            .allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover())
+            .0;
         ui.painter().rect_filled(sep, 0.0, pal.border);
 
         // 内容区（滚动区填满面板可用高）
@@ -310,161 +308,161 @@ impl AppState {
             .auto_shrink(false)
             .max_height(avail_h)
             .show(ui, |ui| {
-            if self.preview_content.is_none()
-                && self.preview_error.is_none()
-                && self.preview_rx.is_some()
-            {
-                ui.add_space(20.0);
-                ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
-                // 不在此逐帧 request_repaint：app.rs 已按 80ms 周期重绘并轮询 poll_preview，
-                // 内容就绪后自然更新，避免点击后 CPU 满载空转。
-                return;
-            }
-            if let Some(err) = &self.preview_error {
-                ui.add_space(20.0);
-                ui.label(
-                    egui::RichText::new(format!("! {err}"))
-                        .size(12.0)
-                        .color(pal.err_text),
-                );
-                return;
-            }
-            match self.preview_mode {
-                crate::preview::PreviewMode::Markdown => {
-                    if let Some(content) = &self.preview_content {
-                        if self.preview_truncated {
-                            ui.label(
-                                egui::RichText::new("文件过大，仅显示前 512KB")
-                                    .size(10.5)
-                                    .color(pal.warn),
-                            );
-                            ui.add_space(4.0);
-                        }
-                        let width = (ui.available_width() - 24.0).max(80.0);
-                        let job = crate::markdown::to_job(
-                            content,
-                            &crate::markdown::MdTheme {
-                                text: pal.text,
-                                dim: pal.dim,
-                                accent: pal.accent,
-                                code_text: pal.text,
-                                code_bg: pal.field,
-                            },
-                            width,
-                        );
-                        egui::Frame::default()
-                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                            .show(ui, |ui| {
-                                ui.add(egui::Label::new(job).selectable(true));
-                            });
-                    }
+                if self.preview_content.is_none()
+                    && self.preview_error.is_none()
+                    && self.preview_rx.is_some()
+                {
+                    ui.add_space(20.0);
+                    ui.label(egui::RichText::new("加载中...").size(12.0).color(pal.dim));
+                    // 不在此逐帧 request_repaint：app.rs 已按 80ms 周期重绘并轮询 poll_preview，
+                    // 内容就绪后自然更新，避免点击后 CPU 满载空转。
+                    return;
                 }
-                crate::preview::PreviewMode::Source => {
-                    if self.preview_content.is_some() {
-                        if self.preview_truncated {
-                            ui.label(
-                                egui::RichText::new("文件过大，仅显示前 512KB")
-                                    .size(10.5)
-                                    .color(pal.warn),
-                            );
-                            ui.add_space(4.0);
-                        }
-                        // 语法高亮渲染：行号 + 高亮 token 统一在 LayoutJob 里，
-                        // egui 按文本哈希缓存 galley，tokenize 只做一次。
-                        // 水平滚动：无限宽度 + 横向滚动区，长行不换行，按中键拖动查看。
-                        let job = self
-                            .preview_highlight
-                            .clone()
-                            .unwrap_or_else(|| egui::text::LayoutJob::default());
-                        let resp = ui.add(egui::Label::new(job).selectable(true));
-                        let _ = resp;
-                    }
+                if let Some(err) = &self.preview_error {
+                    ui.add_space(20.0);
+                    ui.label(
+                        egui::RichText::new(format!("! {err}"))
+                            .size(12.0)
+                            .color(pal.err_text),
+                    );
+                    return;
                 }
-                crate::preview::PreviewMode::Diff => {
-                    // 加载中（点击瞬间 diff 尚未异步返回）：显示加载提示，不误导为"无修改"。
-                    if self.preview_rx.is_some() && self.preview_diff.is_none() {
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Diff 加载中...")
-                                .size(12.0)
-                                .color(pal.dim),
-                        );
-                    } else if let Some(diff) = &self.preview_diff {
-                        let diff_lines = crate::preview::parse_diff(diff);
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        // 全宽色块渲染：每行 allocate 整行宽，painter 画背景 + 符号 + 文本。
-                        // 行高 20px，行号 + 符号列固定宽，背景色铺满整行（不随文本截断）。
-                        let row_h = 20.0;
-                        let mut line_no = 0usize;
-                        for dl in &diff_lines {
-                            let (bg, fg, sign, sign_color) = match dl.kind {
-                                crate::preview::DiffLineKind::Add => {
-                                    (pal.diff_add_bg, pal.text, "+", pal.diff_sign_add)
-                                }
-                                crate::preview::DiffLineKind::Del => {
-                                    (pal.diff_del_bg, pal.text, "-", pal.diff_sign_del)
-                                }
-                                crate::preview::DiffLineKind::Hunk => {
-                                    (pal.diff_hunk_bg, pal.accent, "@", pal.accent)
-                                }
-                                crate::preview::DiffLineKind::Meta => {
-                                    (egui::Color32::TRANSPARENT, pal.dim, "", pal.dim)
-                                }
-                                crate::preview::DiffLineKind::Context => {
-                                    (egui::Color32::TRANSPARENT, pal.dim, " ", pal.dim)
-                                }
-                            };
-                            let (row_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            // 整行背景色块
-                            if bg != egui::Color32::TRANSPARENT {
-                                ui.painter().rect_filled(row_rect, 0.0, bg);
-                            }
-                            let cy = row_rect.center().y;
-                            // 符号列（+ / - / @）
-                            if !sign.is_empty() {
-                                ui.painter().text(
-                                    egui::pos2(row_rect.min.x + 8.0, cy),
-                                    egui::Align2::LEFT_CENTER,
-                                    sign,
-                                    egui::FontId::monospace(11.5),
-                                    sign_color,
+                match self.preview_mode {
+                    crate::preview::PreviewMode::Markdown => {
+                        if let Some(content) = &self.preview_content {
+                            if self.preview_truncated {
+                                ui.label(
+                                    egui::RichText::new("文件过大，仅显示前 512KB")
+                                        .size(10.5)
+                                        .color(pal.warn),
                                 );
+                                ui.add_space(4.0);
                             }
-                            // 内容文本（去掉行首 + - @ 符号，避免重复）
-                            let text_content =
-                                dl.text.trim_start_matches(['+', '-', '@']).trim_start();
-                            ui.painter().text(
-                                egui::pos2(row_rect.min.x + 22.0, cy),
-                                egui::Align2::LEFT_CENTER,
-                                text_content,
-                                egui::FontId::monospace(11.5),
-                                fg,
+                            let width = (ui.available_width() - 24.0).max(80.0);
+                            let job = crate::markdown::to_job(
+                                content,
+                                &crate::markdown::MdTheme {
+                                    text: pal.text,
+                                    dim: pal.dim,
+                                    accent: pal.accent,
+                                    code_text: pal.text,
+                                    code_bg: pal.field,
+                                },
+                                width,
                             );
-                            // Meta / Hunk 行也推进行号计数
-                            if matches!(
-                                dl.kind,
-                                crate::preview::DiffLineKind::Add
-                                    | crate::preview::DiffLineKind::Del
-                                    | crate::preview::DiffLineKind::Context
-                            ) {
-                                line_no += 1;
-                            }
-                            let _ = line_no;
+                            egui::Frame::default()
+                                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(job).selectable(true));
+                                });
                         }
-                    } else {
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("该文件无未提交修改（已跟踪且干净）")
-                                .size(12.0)
-                                .color(pal.dim),
-                        );
+                    }
+                    crate::preview::PreviewMode::Source => {
+                        if self.preview_content.is_some() {
+                            if self.preview_truncated {
+                                ui.label(
+                                    egui::RichText::new("文件过大，仅显示前 512KB")
+                                        .size(10.5)
+                                        .color(pal.warn),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            // 语法高亮渲染：行号 + 高亮 token 统一在 LayoutJob 里，
+                            // egui 按文本哈希缓存 galley，tokenize 只做一次。
+                            // 水平滚动：无限宽度 + 横向滚动区，长行不换行，按中键拖动查看。
+                            let job = self
+                                .preview_highlight
+                                .clone()
+                                .unwrap_or_else(|| egui::text::LayoutJob::default());
+                            let resp = ui.add(egui::Label::new(job).selectable(true));
+                            let _ = resp;
+                        }
+                    }
+                    crate::preview::PreviewMode::Diff => {
+                        // 加载中（点击瞬间 diff 尚未异步返回）：显示加载提示，不误导为"无修改"。
+                        if self.preview_rx.is_some() && self.preview_diff.is_none() {
+                            ui.add_space(20.0);
+                            ui.label(
+                                egui::RichText::new("Diff 加载中...")
+                                    .size(12.0)
+                                    .color(pal.dim),
+                            );
+                        } else if let Some(diff) = &self.preview_diff {
+                            let diff_lines = crate::preview::parse_diff(diff);
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            // 全宽色块渲染：每行 allocate 整行宽，painter 画背景 + 符号 + 文本。
+                            // 行高 20px，行号 + 符号列固定宽，背景色铺满整行（不随文本截断）。
+                            let row_h = 20.0;
+                            let mut line_no = 0usize;
+                            for dl in &diff_lines {
+                                let (bg, fg, sign, sign_color) = match dl.kind {
+                                    crate::preview::DiffLineKind::Add => {
+                                        (pal.diff_add_bg, pal.text, "+", pal.diff_sign_add)
+                                    }
+                                    crate::preview::DiffLineKind::Del => {
+                                        (pal.diff_del_bg, pal.text, "-", pal.diff_sign_del)
+                                    }
+                                    crate::preview::DiffLineKind::Hunk => {
+                                        (pal.diff_hunk_bg, pal.accent, "@", pal.accent)
+                                    }
+                                    crate::preview::DiffLineKind::Meta => {
+                                        (egui::Color32::TRANSPARENT, pal.dim, "", pal.dim)
+                                    }
+                                    crate::preview::DiffLineKind::Context => {
+                                        (egui::Color32::TRANSPARENT, pal.dim, " ", pal.dim)
+                                    }
+                                };
+                                let (row_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), row_h),
+                                    egui::Sense::hover(),
+                                );
+                                // 整行背景色块
+                                if bg != egui::Color32::TRANSPARENT {
+                                    ui.painter().rect_filled(row_rect, 0.0, bg);
+                                }
+                                let cy = row_rect.center().y;
+                                // 符号列（+ / - / @）
+                                if !sign.is_empty() {
+                                    ui.painter().text(
+                                        egui::pos2(row_rect.min.x + 8.0, cy),
+                                        egui::Align2::LEFT_CENTER,
+                                        sign,
+                                        egui::FontId::monospace(11.5),
+                                        sign_color,
+                                    );
+                                }
+                                // 内容文本（去掉行首 + - @ 符号，避免重复）
+                                let text_content =
+                                    dl.text.trim_start_matches(['+', '-', '@']).trim_start();
+                                ui.painter().text(
+                                    egui::pos2(row_rect.min.x + 22.0, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    text_content,
+                                    egui::FontId::monospace(11.5),
+                                    fg,
+                                );
+                                // Meta / Hunk 行也推进行号计数
+                                if matches!(
+                                    dl.kind,
+                                    crate::preview::DiffLineKind::Add
+                                        | crate::preview::DiffLineKind::Del
+                                        | crate::preview::DiffLineKind::Context
+                                ) {
+                                    line_no += 1;
+                                }
+                                let _ = line_no;
+                            }
+                        } else {
+                            ui.add_space(20.0);
+                            ui.label(
+                                egui::RichText::new("该文件无未提交修改（已跟踪且干净）")
+                                    .size(12.0)
+                                    .color(pal.dim),
+                            );
+                        }
                     }
                 }
-            }
-        });
+            });
     }
 
     // ── 文件树 ──────────────────────────────────────────────────
@@ -528,7 +526,9 @@ impl AppState {
     /// GUI 帧中非阻塞消费 Git 查询结果。回包必须同时匹配刷新代次和当前工作区，
     /// 否则是切项目前的旧结果，直接丢弃。
     pub(super) fn poll_git_changes(&mut self) {
-        let Some(rx) = self.git_rx.as_ref() else { return };
+        let Some(rx) = self.git_rx.as_ref() else {
+            return;
+        };
         let Ok(update) = rx.try_recv() else { return };
         self.git_rx = None;
         let current_workspace = self
@@ -579,7 +579,9 @@ impl AppState {
 
     /// 非阻塞消费优化结果：成功则替换输入框内容。
     pub(super) fn poll_optimize(&mut self) {
-        let Some(rx) = self.optimize_rx.as_ref() else { return };
+        let Some(rx) = self.optimize_rx.as_ref() else {
+            return;
+        };
         let Ok(result) = rx.try_recv() else { return };
         self.optimize_rx = None;
         self.optimizing = false;
@@ -784,8 +786,8 @@ impl AppState {
                     "✨ 工作区干净，无未提交变更 · {}",
                     self.git_workspace
                 ))
-                    .size(12.0)
-                    .color(pal.accent),
+                .size(12.0)
+                .color(pal.accent),
             );
             return;
         }

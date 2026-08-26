@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::openai_compat;
-use crate::{ChunkStream, LlmProvider, Message, ToolSchema};
+use crate::{ChunkStream, LlmProvider, Message, RequestOptions, ToolSchema};
 
 /// 本地 LLM Provider（llama.cpp HTTP server，OpenAI 兼容协议）。feature `local` 启用。
 ///
@@ -31,11 +31,17 @@ impl LlmProvider for LocalLlm {
     }
 
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream {
+        self.stream_with_options(msgs, RequestOptions::default())
+    }
+
+    fn stream_with_options(&self, msgs: Vec<Message>, options: RequestOptions) -> ChunkStream {
         let body = json!({
             "model": "local",
             "messages": openai_compat::messages_json(&msgs),
             "stream": true,
             "stream_options": { "include_usage": true },
+            "tools": openai_compat::tools_json(&crate::allowed_coding_tools(options.allowed_tools.as_deref())),
+            "tool_choice": "auto",
         });
         openai_compat::stream_chat("Local", self.base_url.clone(), String::new(), body)
     }

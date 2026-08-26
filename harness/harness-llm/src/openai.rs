@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::openai_compat;
-use crate::{ChunkStream, LlmProvider, Message, ToolSchema};
+use crate::{ChunkStream, LlmProvider, Message, RequestOptions, ToolSchema};
 
 /// OpenAI Provider（HTTP+SSE，OpenAI 兼容 `/chat/completions`）。
 ///
@@ -48,12 +48,16 @@ impl LlmProvider for OpenAI {
     }
 
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream {
+        self.stream_with_options(msgs, RequestOptions::default())
+    }
+
+    fn stream_with_options(&self, msgs: Vec<Message>, options: RequestOptions) -> ChunkStream {
         let body = json!({
             "model": self.model,
             "messages": openai_compat::messages_json(&msgs),
             "stream": true,
-            "max_tokens": crate::max_output_tokens(),
-            "tools": openai_compat::tools_json(&openai_compat::coding_tools()),
+            "max_tokens": options.max_output_tokens.unwrap_or_else(crate::max_output_tokens),
+            "tools": openai_compat::tools_json(&crate::allowed_coding_tools(options.allowed_tools.as_deref())),
             "tool_choice": "auto",
             "stream_options": { "include_usage": true },
         });

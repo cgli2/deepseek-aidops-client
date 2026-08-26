@@ -297,9 +297,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
 
                     // 模型下拉菜单预估尺寸（列表 + 管理入口）：向上展开定位与外部点击判定。
                     let menu_w = chip_w.max(210.0).min(260.0);
-                    let model_item_rows =
-                        state.profiles.len() + state.f_models.len() + 3;
-                    let model_menu_h = (model_item_rows as f32 * 26.0 + 30.0).min(340.0);
+                    let model_item_rows = state.profiles.len() + state.f_models.len() + 3;
+                    let model_menu_h = (model_item_rows as f32 * 26.0 + 30.0).min(380.0);
 
                     // ── 权限 chip（自定义 28px，与左侧模型 chip 同高/同 chrome；默认 ComboBox 不可控高度） ──
                     let label_max_w: f32 = ["只读", "工作区写入", "完全访问"]
@@ -374,7 +373,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                 let menu_rect = egui::Rect::from_min_max(
                                     egui::pos2(prect.left(), prect.top() - 96.0),
                                     egui::pos2(prect.left() + perm_w, prect.top()),
-                                );                                if !prect.contains(pos) && !menu_rect.contains(pos) {
+                                );
+                                if !prect.contains(pos) && !menu_rect.contains(pos) {
                                     state.perm_menu_open = false;
                                 }
                             }
@@ -489,6 +489,13 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                     .show(ui, |ui| {
                                         ui.set_min_width(menu_w);
                                         ui.spacing_mut().item_spacing.y = 2.0;
+                                        // 列表区限高 300px + 内部滚动：条目较多时弹层会向上扩张，
+                                        // 若无上限会超出外部点击判定区域（甚至推出屏幕顶部），
+                                        // 导致顶部条目点不中（"新配置的模型选择不到"）。
+                                        egui::ScrollArea::vertical()
+                                            .max_height(300.0)
+                                            .auto_shrink([true; 2])
+                                            .show(ui, |ui| {
                                         // 保存的配置分组：直接复用整套连接信息并立即生效。
                                         // 仅列出已启用的条目（停用配置在「系统管理 · 模型配置」中管理）。
                                         let profiles: Vec<_> = state
@@ -556,16 +563,17 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                                         }
                                                         None => {
                                                             state.f_model = model.clone();
-                                                            let _ = state.host.settings.set(
-                                                                "llm.model",
-                                                                &state.f_model,
-                                                            );
+                                                            let _ = state
+                                                                .host
+                                                                .settings
+                                                                .set("llm.model", &state.f_model);
                                                         }
                                                     }
                                                     state.model_menu_open = false;
                                                 }
                                             }
                                         }
+                                        }); // ── ScrollArea 列表区结束 ──
                                         ui.add_space(2.0);
                                         ui.separator();
                                         let manage = ui.selectable_label(
@@ -631,11 +639,19 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         egui::Color32::TRANSPARENT,
                         egui::Stroke::new(
                             1.0_f32,
-                            if state.optimizing { pal.accent } else { pal.border },
+                            if state.optimizing {
+                                pal.accent
+                            } else {
+                                pal.border
+                            },
                         ),
                     );
                     // 魔法棒图标 ✨
-                    let ocolor = if state.optimizing { pal.accent } else { pal.text };
+                    let ocolor = if state.optimizing {
+                        pal.accent
+                    } else {
+                        pal.text
+                    };
                     ui.painter().text(
                         orect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -856,7 +872,9 @@ fn paste_clipboard_files() -> Vec<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::{
         System::{
-            DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard},
+            DataExchange::{
+                CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+            },
             Ole::CF_HDROP,
         },
         UI::Shell::DragQueryFileW,
@@ -888,7 +906,11 @@ fn paste_clipboard_files() -> Vec<std::path::PathBuf> {
                 }
                 let mut name = vec![0_u16; len as usize + 1];
                 let copied = DragQueryFileW(hdrop, index, name.as_mut_ptr(), name.len() as u32);
-                (copied > 0).then(|| std::path::PathBuf::from(std::ffi::OsString::from_wide(&name[..copied as usize])))
+                (copied > 0).then(|| {
+                    std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                        &name[..copied as usize],
+                    ))
+                })
             })
             .collect()
     }

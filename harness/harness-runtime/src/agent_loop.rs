@@ -3,12 +3,14 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use harness_capability::assets::{ChatTurn, ConversationMemory, Skill, SkillLibrary};
+use harness_capability::assets::{
+    ChatTurn, ConversationMemory, FactKind, LifecycleLayer, MemoryFact, Skill, SkillLibrary,
+};
 use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
 use harness_core::{error::Result, types::UserInput, AppContext};
 use harness_llm::{Chunk, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolResult, Usage};
-use harness_session::{SessionEvent, SessionLog};
+use harness_session::{ExecutionTelemetry, SessionEvent, SessionLog};
 use harness_tool::ToolRegistry;
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +19,7 @@ use crate::execution::{
     ActionGate, ActionProposal, BudgetManager, Completion, CompletionJudge, DomainPolicy,
     ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
+use crate::TaskLedger;
 
 /// Agent 循环 / Turn-Step 生命周期（原 §5.6）。
 ///
@@ -169,7 +172,13 @@ impl AgentLoop {
         let solve_plan = SolvePlan::for_contract(&contract, strategy);
         BudgetManager::cap_initial_step_window(&mut budget, solve_plan.initial_steps);
         BudgetManager::cap_initial_tool_window(&mut budget, solve_plan.initial_tool_calls);
+        if solve_plan.mode == crate::execution::SolveMode::AtomicDelivery {
+            // 原子回归允许一次定位、局部读取、修改和验证；阶段续期不能把它扩张为
+            // 数十轮泛搜。超限后仍会输出可恢复的 Blocked，而非宣称完成。
+            BudgetManager::cap_hard_limits(&mut budget, 8, 10);
+        }
         let mut execution = ExecutionState::new(contract, strategy);
+        let mut ledger = TaskLedger::from_contract(&execution.contract);
 
         // 从追加日志重建多轮上下文；不能每个 turn 都只发送当前一句，否则 GUI 看似能聊天，
         // 实际模型完全不记得上一轮以及之前的工具结果。
@@ -191,7 +200,11 @@ impl AgentLoop {
         // 第一次 llm.stream() 之前，每一项都直接叠加进首 token 延迟。
         let compaction = ctx.try_get::<dyn Compaction>();
         let skill_library = ctx.try_get::<dyn SkillLibrary>();
-        let (compacted, matched_skills) = tokio::join!(
+        let conversation_memory = ctx.try_get::<dyn ConversationMemory>();
+        let experience_workspace = ctx
+            .try_get::<harness_core::Workspace>()
+            .map(|ws| ws.root().display().to_string());
+        let (compacted, matched_skills, recalled_experience) = tokio::join!(
             async {
                 match compaction {
                     Some(compaction) => compaction.compact(history.clone()).await.ok(),
@@ -201,6 +214,28 @@ impl AgentLoop {
             async {
                 match skill_library {
                     Some(skills) => skills.match_skills(&input_text).await.ok(),
+                    None => None,
+                }
+            },
+            async {
+                match conversation_memory {
+                    Some(memory) => memory
+                        .recall(&input_text, LifecycleLayer::L2)
+                        .await
+                        .ok()
+                        .map(|facts| {
+                            facts
+                                .into_iter()
+                                .filter(|fact| {
+                                    experience_workspace.as_ref().is_none_or(|workspace| {
+                                        !fact.source.contains("workspace=")
+                                            || fact
+                                                .source
+                                                .contains(&format!("workspace={workspace}"))
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        }),
                     None => None,
                 }
             }
@@ -218,6 +253,7 @@ impl AgentLoop {
             id: log.gen_id(),
             text: "正在理解你的问题…".into(),
         });
+        append_telemetry(&log, &execution, &ledger, "任务已编译，等待首次定位");
 
         let mut debt: usize = 1;
         // 跨步累积本轮助手最终文本，供回合结束时沉淀为 L0 记忆。
@@ -242,6 +278,11 @@ impl AgentLoop {
         if let Some(matched) = &matched_skills {
             if let Some(instructions) = render_skill_instructions(matched) {
                 messages.insert(1, Message::system(&instructions));
+            }
+        }
+        if let Some(facts) = recalled_experience.as_deref() {
+            if let Some(instructions) = render_experience(facts) {
+                messages.insert(1, Message::system(instructions));
             }
         }
         // 项目事实注入：manifest 位置/工具链/打包入口等稳定环境信息一次告知，
@@ -269,6 +310,7 @@ impl AgentLoop {
         let mut cancelled = false;
         let mut delivery_verified = false;
         let mut budget_exhausted = false;
+        let mut absolute_budget_hit = false;
         let mut convergence_notified = false;
         // 预算续期耗尽后只给一次最终收尾窗口（2 步）；窗口也用尽则强制停止。
         let mut final_window_armed = false;
@@ -280,14 +322,31 @@ impl AgentLoop {
         /// 未达上限一律自动续期换路继续，不让用户手动发“继续”。
         const MAX_STAGNANT_WINDOWS: u32 = 3;
         let mut empty_response_retries = 0usize;
+        let mut length_recovery_pending = false;
         while debt > 0 {
             steps += 1;
             execution.steps = steps;
             debt -= 1;
+            if BudgetManager::hard_exhausted(&execution, &budget) {
+                absolute_budget_hit = true;
+                hard_stop = true;
+                log.append(SessionEvent::Assistant {
+                    id: log.gen_id(),
+                    chunk: Chunk {
+                        text: Some(format!(
+                            "[blocked] 已达到本任务的绝对熔断（{} 步 / {} 次工具调用）；停止新的探索以避免空转。当前证据会被保留，可在补充范围或约束后继续。",
+                            budget.hard_max_steps, budget.hard_max_tool_calls
+                        )),
+                        ..Default::default()
+                    },
+                });
+                break;
+            }
             log.append(SessionEvent::StepStart {
                 id: log.gen_id(),
                 step: steps,
             });
+            append_telemetry(&log, &execution, &ledger, "请求模型执行当前阶段");
 
             // 瀑布前处理：可重写/拒绝消息；空链返回输入本身（终态恒等）。
             // 链从事件总线注册表收集：插件可经 `on_waterfall::<PreStep>` 注入
@@ -316,13 +375,22 @@ impl AgentLoop {
             // 完全保留用户的模型设置和默认输出预算。
             let request_options = if execution.solve_mode
                 == crate::execution::SolveMode::AtomicDelivery
+                || length_recovery_pending
             {
                 RequestOptions {
-                    max_output_tokens: Some(1_536),
+                    max_output_tokens: Some(if length_recovery_pending {
+                        1_024
+                    } else {
+                        1_536
+                    }),
                     reasoning_effort: Some("off".into()),
+                    allowed_tools: Some(execution.allowed_tools()),
                 }
             } else {
-                RequestOptions::default()
+                RequestOptions {
+                    allowed_tools: Some(execution.allowed_tools()),
+                    ..Default::default()
+                }
             };
             let mut s = llm.stream_with_options(apply_context_budget(pre_input), request_options);
             let mut assistant_text = String::new();
@@ -442,19 +510,19 @@ impl AgentLoop {
                         execution.solve_mode == crate::execution::SolveMode::AtomicDelivery,
                         &sig,
                     ) {
-                            let blocked = ToolResult {
+                        let blocked = ToolResult {
                                 call_id: tc.id.clone(),
                                 ok: false,
                                 content: "[atomic-delivery guard] 单点回归的当前阶段只允许一个定位 search；请先使用该结果缩小到具体文件/行号，再决定下一步。".into(),
                                 continuation_debt: 0,
                             };
-                            log.append(SessionEvent::ToolResult {
-                                id: log.gen_id(),
-                                result: blocked.clone(),
-                            });
-                            messages.push(Message::tool(tc.id.clone(), blocked.content));
-                            step_had_tools = true;
-                            continue;
+                        log.append(SessionEvent::ToolResult {
+                            id: log.gen_id(),
+                            result: blocked.clone(),
+                        });
+                        messages.push(Message::tool(tc.id.clone(), blocked.content));
+                        step_had_tools = true;
+                        continue;
                     }
 
                     // 同一回复里出现完全相同的并行调用时，执行其中一个不会比执行全部
@@ -601,6 +669,26 @@ impl AgentLoop {
                                 });
                                 repeat_guard.record_result(sig, &res);
                                 execution.record_tool_result(proposal, res.ok, &res.content);
+                                for criterion in &proposal.supports {
+                                    ledger.activate(criterion);
+                                    if res.ok && execution.satisfied_criteria.contains(criterion) {
+                                        ledger.add_evidence(
+                                            criterion,
+                                            res.content.chars().take(480).collect(),
+                                        );
+                                        ledger.verify(criterion);
+                                    }
+                                }
+                                append_telemetry(
+                                    &log,
+                                    &execution,
+                                    &ledger,
+                                    if res.ok {
+                                        "已记录工具结果"
+                                    } else {
+                                        "工具结果失败，等待调整"
+                                    },
+                                );
                                 messages.push(Message::tool(tc.id.clone(), res.content.clone()));
                             }
                             step_had_tools = true;
@@ -638,6 +726,7 @@ impl AgentLoop {
                 });
             }
             if !should_recover_empty {
+                length_recovery_pending = false;
                 messages.insert(
                     messages.len().saturating_sub(assistant_tools.len()),
                     Message::assistant_with_tools(assistant_text, assistant_tools),
@@ -654,14 +743,24 @@ impl AgentLoop {
                 let reason = empty_response_reason.as_deref().unwrap_or("unknown");
                 // `length` 不是普通空响应：完整历史重试只会进一步扩大请求。改为
                 // 紧凑检查点 + 一次短恢复，让模型直接收敛到下一步或最终结论。
-                let retry_limit = if reason == "length" { 1 } else { MAX_EMPTY_RESPONSE_RETRIES };
+                let retry_limit = if reason == "length" {
+                    1
+                } else {
+                    MAX_EMPTY_RESPONSE_RETRIES
+                };
                 if empty_response_retries < retry_limit {
                     empty_response_retries += 1;
                     debt += 1;
                     if reason == "length" {
-                        messages.retain(|message| message.role == Role::System);
-                        messages.push(Message::system(execution.compact_checkpoint()));
+                        // 原实现保留所有系统消息再追加 checkpoint；技能、事实和契约叠加后
+                        // 仍可能超上下文。恢复请求只保留可执行的当前任务快照。
+                        messages.clear();
+                        messages.push(Message::system(format!(
+                            "[长度恢复·最小快照]\n{}\n只允许：输出一个下一步工具调用，或给出含阻塞原因的最终结论；禁止重新规划、泛搜和复述历史。",
+                            execution.compact_checkpoint()
+                        )));
                         messages.push(Message::user(&input_text));
+                        length_recovery_pending = true;
                     }
                     messages.push(Message::user(format!(
                         "[恢复请求] 上一次模型响应为空（finish_reason={reason}），没有生成正文或工具调用；这不代表任务完成。请基于现有上下文继续：若需要信息或执行操作，调用恰当工具；否则给出可验证的完整答复。不要只输出思考过程。自动重试第 {empty_response_retries}/{retry_limit} 次。"
@@ -672,7 +771,7 @@ impl AgentLoop {
                         chunk: Chunk {
                             text: Some(format!(
                                 "[error] 模型连续 {} 次返回空响应（最后 finish_reason={reason}）。请求未被视为完成；请检查模型/网关日志、输出 token 限制或切换模型后重试。",
-                                MAX_EMPTY_RESPONSE_RETRIES + 1
+                                retry_limit + 1
                             )),
                             ..Default::default()
                         },
@@ -746,6 +845,12 @@ impl AgentLoop {
                     Completion::Converge(reason) if !convergence_notified => {
                         convergence_notified = true;
                         messages.push(Message::user(&format!("[系统提示] {reason}")));
+                        // 收敛提示必须伴随一次新的模型请求；此前无工具调用时 debt
+                        // 已归零，提示虽写入上下文却没有机会被模型执行，回合直接以
+                        // Blocked 结束。只补一次，后续仍由预算/重复守卫负责收尾。
+                        if !hard_stop {
+                            debt += 1;
+                        }
                     }
                     Completion::Complete => {
                         delivery_verified = true;
@@ -782,6 +887,11 @@ impl AgentLoop {
 
         let (outcome, reason) = if delivery_verified {
             (harness_session::DeliveryOutcome::Verified, None)
+        } else if absolute_budget_hit {
+            (
+                harness_session::DeliveryOutcome::Blocked,
+                Some("已达到绝对探索预算；为避免空跑而停止，尚缺完整验收证据".into()),
+            )
         } else if cancelled {
             (
                 harness_session::DeliveryOutcome::Cancelled,
@@ -805,11 +915,102 @@ impl AgentLoop {
         };
         log.append(SessionEvent::Delivery {
             id: log.gen_id(),
-            report: execution.delivery_report(outcome, reason),
+            report: execution.delivery_report(outcome.clone(), reason),
         });
+        // 只在 Runtime 验证通过后沉淀经验卡；模型文本或 TurnEnd 绝不触发写入，
+        // 这样下一次检索到的是可复核的解决路径而不是自报完成。
+        if outcome == harness_session::DeliveryOutcome::Verified {
+            if let Some(conv) = ctx.try_get::<dyn ConversationMemory>() {
+                let workspace = ctx
+                    .try_get::<harness_core::Workspace>()
+                    .map(|ws| ws.root().display().to_string())
+                    .unwrap_or_else(|| "unknown-workspace".into());
+                let evidence = execution
+                    .verification_evidence
+                    .values()
+                    .flatten()
+                    .take(3)
+                    .map(|item| item.chars().take(220).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let fingerprint = stable_fingerprint(&execution.contract.objective);
+                let card =
+                    MemoryFact {
+                        id: format!("solve-card:{fingerprint}"),
+                        kind: FactKind::Decision,
+                        content: format!(
+                        "[SolveCard]\\n问题：{}\\n工作区：{}\\n有效验证：{}\\n结果：已验证交付。",
+                        execution.contract.objective.chars().take(600).collect::<String>(),
+                        workspace,
+                        evidence,
+                    ),
+                        layer: LifecycleLayer::L2,
+                        confidence: 0.9,
+                        source: format!(
+                            "solve-card;workspace={workspace};fingerprint={fingerprint}"
+                        ),
+                    };
+                let _ = conv.remember(card).await;
+            }
+        }
+        append_telemetry(&log, &execution, &ledger, "回合结束，交付状态已落盘");
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });
         Ok(())
     }
+}
+
+fn append_telemetry(
+    log: &SessionLog,
+    execution: &ExecutionState,
+    ledger: &TaskLedger,
+    detail: &str,
+) {
+    let current = ledger
+        .current_item()
+        .map(|item| format!("{}：{}", item.id, item.description))
+        .unwrap_or_else(|| "全部验收项已处理".into());
+    log.append(SessionEvent::Telemetry {
+        id: log.gen_id(),
+        telemetry: ExecutionTelemetry {
+            intent: format!(
+                "{:?}",
+                crate::IntentProfile::compile(&execution.contract.objective).kind
+            ),
+            phase: execution.tool_phase().as_str().into(),
+            allowed_tools: execution.allowed_tools(),
+            step: execution.steps,
+            tool_calls: execution.tool_calls,
+            evidence_count: execution.evidence.len(),
+            verified_count: ledger.verified_count(),
+            blocked_count: ledger.blocked_count(),
+            detail: format!("{detail}；当前验收：{current}"),
+        },
+    });
+}
+
+fn render_experience(facts: &[MemoryFact]) -> Option<String> {
+    let cards = facts
+        .iter()
+        .filter(|fact| fact.content.starts_with("[SolveCard]"))
+        .take(3)
+        .map(|fact| fact.content.chars().take(700).collect::<String>())
+        .collect::<Vec<_>>();
+    (!cards.is_empty()).then(|| {
+        format!(
+            "[已验证历史经验]\\n以下是检索出的经验卡，只能作为候选线索；先用当前工作区证据验证，不能把它当作当前事实：\\n{}",
+            cards.join("\\n---\\n")
+        )
+    })
+}
+
+fn stable_fingerprint(text: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// 生成紧凑的技能系统指令，避免用户导入的长技能文档无限放大上下文。
@@ -1178,6 +1379,32 @@ mod tests {
         assert!(rendered.contains("inspect diff；run tests"));
         assert!(rendered.contains("findings recorded"));
         assert!(render_skill_instructions(&[]).is_none());
+    }
+
+    #[test]
+    fn retrieval_only_injects_verified_solve_cards_as_untrusted_hints() {
+        let cards = vec![
+            MemoryFact {
+                id: "solve-card:abc".into(),
+                kind: FactKind::Decision,
+                content: "[SolveCard]\n问题：刷新失败\n结果：已验证交付。".into(),
+                layer: LifecycleLayer::L2,
+                confidence: 0.9,
+                source: "solve-card".into(),
+            },
+            MemoryFact {
+                id: "ordinary-fact".into(),
+                kind: FactKind::Fact,
+                content: "这不是可执行经验".into(),
+                layer: LifecycleLayer::L2,
+                confidence: 0.8,
+                source: "test".into(),
+            },
+        ];
+        let rendered = render_experience(&cards).expect("solve card should be injected");
+        assert!(rendered.contains("刷新失败"));
+        assert!(rendered.contains("候选线索"));
+        assert!(!rendered.contains("这不是可执行经验"));
     }
 
     /// 全链路 Demo 回归（约定目录 + 自动加载）：外部技能包落盘进约定目录 →

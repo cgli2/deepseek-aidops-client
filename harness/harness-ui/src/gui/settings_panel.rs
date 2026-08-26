@@ -257,7 +257,11 @@ impl AppState {
         }
         // Trellis 插件：启停与文件路径在勾选/编辑时已热生效（共享控制句柄），
         // 这里无损写回 .harness.toml（未知字段保留 + 原子写），保证重启后保持。
-        if let Some(t) = self.plugin_rows.iter().find(|r| r.kind == PluginKind::Trellis) {
+        if let Some(t) = self
+            .plugin_rows
+            .iter()
+            .find(|r| r.kind == PluginKind::Trellis)
+        {
             if let Ok((mut cfg, raw, Some(path))) = harness_core::Config::load_with_raw() {
                 cfg.trellis.enabled = t.enabled;
                 cfg.trellis.spec_file = t.spec_file.clone();

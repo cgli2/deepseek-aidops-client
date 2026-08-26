@@ -115,8 +115,9 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 // Egui 只会把部分剪贴板内容转换为文本 Paste 事件。这里保留文本路径
                 // 的兼容逻辑，同时在 Windows 上读取资源管理器复制文件使用的 CF_HDROP。
                 // 普通文本粘贴仍保留在编辑器中，不会误变成附件。
-                let pasted_text_paths: Vec<std::path::PathBuf> = ctx.input(|i| {
-                    i.events
+                let (pasted_text_paths, clipboard_paste_event, command_v) = ctx.input(|i| {
+                    let pasted_text_paths = i
+                        .events
                         .iter()
                         .filter_map(|event| match event {
                             egui::Event::Paste(text) => Some(text),
@@ -126,21 +127,29 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         .map(|text| text.trim().trim_matches('"'))
                         .filter(|text| std::path::Path::new(text).is_file())
                         .map(std::path::PathBuf::from)
-                        .collect()
+                        .collect();
+                    let clipboard_paste_event = i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Paste(_)));
+                    // 不能使用 InputState::modifiers：它是这一帧结束时的状态。若 Ctrl 与 V
+                    // 在同一批原生事件中都已释放，该状态会是 false，导致截图/CF_HDROP 粘贴
+                    // 被漏掉。Key 事件自带按下那一刻的修饰键状态，才是可靠的判断依据。
+                    let command_v = i.events.iter().any(is_paste_shortcut);
+                    (pasted_text_paths, clipboard_paste_event, command_v)
                 });
                 // 在原生窗口中 Ctrl+V 常会被 eframe 直接翻译为 Paste 事件，未必仍保留
                 // Key::V 按键事件；图片没有文本载荷时尤其如此。因此两种事件都必须触发
                 // 系统剪贴板读取，才能把截图/复制的图片转换成附件。
-                let clipboard_paste_event = response.has_focus()
-                    && ctx.input(|i| {
-                        i.events
-                            .iter()
-                            .any(|event| matches!(event, egui::Event::Paste(_)))
-                    });
-                let command_v = response.has_focus()
-                    && ctx.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
-                let should_read_clipboard = command_v || clipboard_paste_event;
-                let mut pasted_paths = pasted_text_paths;
+                let should_read_clipboard =
+                    response.has_focus() && (command_v || clipboard_paste_event);
+                // 粘贴事件是全局输入；仅当编辑器拥有焦点时才把路径变成附件，避免用户在
+                // 设置表单等其他输入控件粘贴路径时误把文件加入当前消息。
+                let mut pasted_paths = if response.has_focus() {
+                    pasted_text_paths
+                } else {
+                    Vec::new()
+                };
                 if should_read_clipboard {
                     pasted_paths.extend(paste_clipboard_files());
                 }
@@ -814,6 +823,22 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
     send_now
 }
 
+/// 判断原生按键事件是否代表系统粘贴快捷键。
+///
+/// 必须使用事件携带的 modifiers，而不能读取 `InputState::modifiers`；后者可能已经被
+/// 同一帧稍后的 Ctrl/V 释放事件更新，从而漏掉截图和资源管理器文件的粘贴。
+fn is_paste_shortcut(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::V,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command || modifiers.ctrl
+    )
+}
+
 fn add_attachment(state: &mut AppState, path: std::path::PathBuf) {
     if state
         .attachments
@@ -976,7 +1001,7 @@ fn uuid_like_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clear_input_if_it_only_contains_paths;
+    use super::{clear_input_if_it_only_contains_paths, is_paste_shortcut};
     use std::path::PathBuf;
 
     #[test]
@@ -997,5 +1022,21 @@ mod tests {
         clear_input_if_it_only_contains_paths(&mut input, std::slice::from_ref(&path));
 
         assert_eq!(input, format!("请分析这个文件：{}", path.display()));
+    }
+
+    #[test]
+    fn detects_paste_from_the_key_event_modifiers() {
+        let event = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+
+        assert!(is_paste_shortcut(&event));
     }
 }

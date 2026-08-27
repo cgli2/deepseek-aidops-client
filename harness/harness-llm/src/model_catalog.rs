@@ -27,7 +27,8 @@ impl ThinkingLevel {
     /// 转成发送给上游 `reasoning_effort` 的字符串；`Auto` 返回 `None`（即不发送该字段）。
     pub fn as_upstream(self) -> Option<&'static str> {
         match self {
-            ThinkingLevel::Off => Some("off"),
+            // DeepSeek/OpenAI 兼容端的枚举值是 `none`；`Off` 只是本地 UI 语义。
+            ThinkingLevel::Off => Some("none"),
             ThinkingLevel::Minimal => Some("minimal"),
             ThinkingLevel::Low => Some("low"),
             ThinkingLevel::Medium => Some("medium"),
@@ -173,6 +174,7 @@ mod tests {
     #[test]
     fn thinking_level_auto_maps_to_none() {
         assert_eq!(ThinkingLevel::Auto.as_upstream(), None);
+        assert_eq!(ThinkingLevel::Off.as_upstream(), Some("none"));
         assert_eq!(ThinkingLevel::High.as_upstream(), Some("high"));
     }
 }

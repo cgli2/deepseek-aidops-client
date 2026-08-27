@@ -37,6 +37,7 @@ impl LlmProvider for TwoStepLlm {
         let chunk = if call == 0 {
             Chunk {
                 text: None,
+                reasoning: Some("先调用 echo 工具取得结果。".into()),
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "echo".into(),
@@ -170,6 +171,10 @@ async fn tool_result_is_sent_back_and_turn_finishes() {
     assert!(requests[1]
         .iter()
         .any(|m| m.tool_call_id.as_deref() == Some("call-1") && m.content.trim() == "hello"));
+    assert!(requests[1].iter().any(|m| {
+        m.tool_calls.iter().any(|call| call.id == "call-1")
+            && m.reasoning_content.as_deref() == Some("先调用 echo 工具取得结果。")
+    }));
     assert!(log.replay().iter().any(|e| matches!(e, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("工具执行完成"))));
     assert!(matches!(
         log.replay().last(),

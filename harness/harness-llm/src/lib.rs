@@ -61,6 +61,11 @@ pub struct Message {
     pub role: Role,
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// DeepSeek thinking mode requires the assistant's upstream reasoning trace to
+    /// accompany its tool calls on every subsequent request.  This is deliberately
+    /// kept separate from visible `content`: it is protocol state, not user text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
@@ -71,6 +76,7 @@ impl Message {
             role: Role::System,
             content: text.into(),
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: None,
         }
     }
@@ -79,6 +85,7 @@ impl Message {
             role: Role::User,
             content: text.into(),
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: None,
         }
     }
@@ -87,6 +94,7 @@ impl Message {
             role: Role::Assistant,
             content: text.into(),
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: None,
         }
     }
@@ -96,6 +104,21 @@ impl Message {
             role: Role::Assistant,
             content: text.into(),
             tool_calls,
+            reasoning_content: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_with_tools_and_reasoning(
+        text: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        reasoning_content: Option<String>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: text.into(),
+            tool_calls,
+            reasoning_content: reasoning_content.filter(|content| !content.is_empty()),
             tool_call_id: None,
         }
     }
@@ -105,6 +128,7 @@ impl Message {
             role: Role::Tool,
             content: text.into(),
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: Some(call_id.into()),
         }
     }
@@ -113,7 +137,8 @@ impl Message {
 /// 流式分片（SSE 的一帧）。
 ///
 /// `reasoning` 承载模型思考链增量（DeepSeek v4 `reasoning_content`）：
-/// 仅用于 UI「思考中」反馈与会话日志展示，不进入模型上下文。
+/// 用于 UI「思考中」反馈与会话日志展示；当该助手回复包含工具调用时，
+/// Runtime 必须原样送回 DeepSeek 的后续请求，否则 thinking mode 会拒绝请求。
 /// `usage` 承载一次请求的最终 token 用量（由 `stream_options.include_usage` 触发，
 /// 在流末尾单独成帧），用于 AIOps 用量/成本计量，不进入模型上下文。
 /// `empty_response` 表示上游正常结束却既没有正文也没有工具调用；它不是给用户展示的

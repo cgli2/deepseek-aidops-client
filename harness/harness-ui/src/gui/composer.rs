@@ -141,8 +141,14 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 // 在原生窗口中 Ctrl+V 常会被 eframe 直接翻译为 Paste 事件，未必仍保留
                 // Key::V 按键事件；图片没有文本载荷时尤其如此。因此两种事件都必须触发
                 // 系统剪贴板读取，才能把截图/复制的图片转换成附件。
+                // 在 Windows 原生后端中，eframe 在识别 Ctrl+V 后会先尝试读取“文本”
+                // 剪贴板；资源管理器复制的文件没有文本格式时，它既不生成 Paste 事件、也不
+                // 把 V 键事件交给 egui。因此只看 egui events 永远不会进入 CF_HDROP 分支。
+                // 使用 GetAsyncKeyState 作为 Windows 上的兜底，直接在按键仍处于按下状态的
+                // 这一帧读取文件剪贴板；普通文本仍由 TextEdit 的默认粘贴路径处理。
+                let native_paste = response.has_focus() && native_paste_shortcut_pressed();
                 let should_read_clipboard =
-                    response.has_focus() && (command_v || clipboard_paste_event);
+                    response.has_focus() && (command_v || clipboard_paste_event || native_paste);
                 // 粘贴事件是全局输入；仅当编辑器拥有焦点时才把路径变成附件，避免用户在
                 // 设置表单等其他输入控件粘贴路径时误把文件加入当前消息。
                 let mut pasted_paths = if response.has_focus() {
@@ -302,12 +308,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         state.perm_menu_open = false;
                         state.model_menu_open = !state.model_menu_open;
                     }
-                    mresp.on_hover_text("切换模型（下拉直接选择）");
+                    mresp.clone().on_hover_text("切换模型（下拉直接选择）");
 
-                    // 模型下拉菜单预估尺寸（列表 + 管理入口）：向上展开定位与外部点击判定。
+                    // 下拉菜单宽度固定，避免模型名/滚动条让弹层横向反复调整。
                     let menu_w = chip_w.max(210.0).min(260.0);
-                    let model_item_rows = state.profiles.len() + state.f_models.len() + 3;
-                    let model_menu_h = (model_item_rows as f32 * 26.0 + 30.0).min(380.0);
 
                     // ── 权限 chip（自定义 28px，与左侧模型 chip 同高/同 chrome；默认 ComboBox 不可控高度） ──
                     let label_max_w: f32 = ["只读", "工作区写入", "完全访问"]
@@ -448,37 +452,17 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     // 模型下拉弹层：向上展开（与权限菜单同 chrome），
                     // 列出「保存的配置」+「上游模型」+「管理配置」入口，点击直接切换。
                     if state.model_menu_open {
-                        // 外部点击关闭（在渲染 Area 之前判定，避免一帧闪烁）
-                        let pressed = ctx.input(|i| i.pointer.any_pressed());
-                        let press_origin = ctx.input(|i| i.pointer.press_origin());
-                        if pressed {
-                            if let Some(pos) = press_origin {
-                                let menu_rect = egui::Rect::from_min_max(
-                                    egui::pos2(mrect.left(), mrect.top() - model_menu_h),
-                                    egui::pos2(mrect.right(), mrect.top()),
-                                );
-                                if !mrect.contains(pos) && !menu_rect.contains(pos) {
-                                    state.model_menu_open = false;
-                                }
-                            }
-                        }
-                    }
-                    if state.model_menu_open {
-                        // 直接锚定在下拉触点（chip）的左下角：菜单底边紧贴 chip 顶边、
-                        // 左对齐 chip 左缘，向上展开。不再依赖预估高度，彻底消除
-                        // 「弹层离触点太远」的缝隙（此前用固定预估高度定位导致大段留白）。
-                        let screen = ctx.screen_rect();
-                        egui::Area::new(egui::Id::new("model_menu_area"))
-                            .anchor(
-                                egui::Align2::LEFT_BOTTOM,
-                                egui::vec2(
-                                    mrect.left() - screen.left(),
-                                    mrect.top() - screen.bottom(),
-                                ),
-                            )
+                        // `Area::anchor` 会先使用上一帧的尺寸定位、再按本帧的滚动区尺寸重算；
+                        // 菜单在高度阈值附近时两套尺寸会互相来回纠正。固定菜单底边到 chip 顶边，
+                        // 并关闭 Area/ScrollArea 动画，使内容高度变化也不会带动输入区抖动。
+                        let menu_response = egui::Area::new(egui::Id::new("model_menu_area"))
+                            .fixed_pos(mrect.left_top())
+                            .pivot(egui::Align2::LEFT_BOTTOM)
+                            .default_width(menu_w)
                             .movable(false)
                             .interactable(true)
                             .order(egui::Order::Foreground)
+                            .fade_in(false)
                             .show(ctx, |ui| {
                                 egui::Frame::none()
                                     .fill(pal.panel)
@@ -502,8 +486,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                         // 若无上限会超出外部点击判定区域（甚至推出屏幕顶部），
                                         // 导致顶部条目点不中（"新配置的模型选择不到"）。
                                         egui::ScrollArea::vertical()
+                                            .id_salt("model-menu-list")
                                             .max_height(300.0)
-                                            .auto_shrink([true; 2])
+                                            .auto_shrink([false, true])
+                                            .animated(false)
                                             .show(ui, |ui| {
                                         // 保存的配置分组：直接复用整套连接信息并立即生效。
                                         // 仅列出已启用的条目（停用配置在「系统管理 · 模型配置」中管理）。
@@ -597,7 +583,17 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                             state.model_menu_open = false;
                                         }
                                     });
-                            });
+                            })
+                            .response;
+
+                        // 使用 Area 的真实响应判定外部点击；不再依赖会与实际滚动高度不一致的
+                        // 预估矩形，点击菜单右侧滚动条或底部入口也不会错误关闭菜单。
+                        let clicked_outside =
+                            mresp.clicked_elsewhere() && menu_response.clicked_elsewhere();
+                        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                        if clicked_outside || escape {
+                            state.model_menu_open = false;
+                        }
                     }
 
                     // ── 附件按钮：与左侧权限 chip 同高(28)/同 chrome，图标更醒目 ──
@@ -837,6 +833,27 @@ fn is_paste_shortcut(event: &egui::Event) -> bool {
             ..
         } if modifiers.command || modifiers.ctrl
     )
+}
+
+/// Windows 的 eframe 后端会在 Ctrl+V 时吞掉没有文本载荷的按键事件。
+///
+/// 文件从资源管理器复制后只提供 `CF_HDROP`，所以通过当前按键状态补回这个丢失的触发
+/// 信号。其它平台仍沿用 egui 的原生 Paste/Key 事件。
+#[cfg(windows)]
+fn native_paste_shortcut_pressed() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    const VK_CONTROL: i32 = 0x11;
+    const VK_V: i32 = 0x56;
+    unsafe {
+        let key_is_down = |key| (GetAsyncKeyState(key) as u16 & 0x8000) != 0;
+        key_is_down(VK_CONTROL) && key_is_down(VK_V)
+    }
+}
+
+#[cfg(not(windows))]
+fn native_paste_shortcut_pressed() -> bool {
+    false
 }
 
 fn add_attachment(state: &mut AppState, path: std::path::PathBuf) {

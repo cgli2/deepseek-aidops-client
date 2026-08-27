@@ -7,6 +7,7 @@ use std::time::Duration;
 use harness_capability::hook::{Hook, HookDecision, HookPayload};
 use harness_core::AppContext;
 use harness_core::error::Result;
+use harness_core::Attachment;
 use harness_core::ui_input::UiInputSink;
 use harness_llm::{Chunk, LlmProvider, ReplayLlm};
 use harness_runtime::SessionController;
@@ -46,6 +47,13 @@ async fn submit_writes_turn_events() {
     let ctrl = SessionController::new(ctx.clone(), tokio::runtime::Handle::current());
     ctrl.submit("hello".into());
     ctrl.submit("queued follow-up".into());
+    ctrl.submit_with_attachments(
+        String::new(),
+        vec![Attachment {
+            path: "clipboard-image.png".into(),
+            mime: "image/png".into(),
+        }],
+    );
     assert!(ctrl.busy());
 
     // 轮询等待 turn 结束（最多 2s）。
@@ -56,7 +64,7 @@ async fn submit_writes_turn_events() {
             .iter()
             .filter(|e| matches!(e, SessionEvent::TurnEnd { .. }))
             .count()
-            == 2
+            == 3
         {
             break;
         }
@@ -86,5 +94,5 @@ async fn submit_writes_turn_events() {
             _ => None,
         })
         .collect();
-    assert_eq!(inputs, vec!["hello", "queued follow-up"]);
+    assert_eq!(inputs, vec!["hello", "queued follow-up", ""]);
 }

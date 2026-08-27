@@ -94,7 +94,9 @@ impl UiInputSink for SessionController {
     }
 
     fn submit_with_attachments(&self, text: String, attachments: Vec<harness_core::Attachment>) {
-        if text.trim().is_empty() {
+        // 附件本身就是有效输入：输入框允许只粘贴文件/截图后直接发送，不能因没有
+        // 额外文字而在控制器入口被静默丢弃。
+        if text.trim().is_empty() && attachments.is_empty() {
             return;
         }
         let (id, session_ctx) = self.current_session_context();

@@ -327,6 +327,18 @@ fn complete_response_chunks(response: &Value) -> std::result::Result<Vec<Chunk>,
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let mut chunks = Vec::new();
+    // A few compatible gateways return a full JSON response even when stream was
+    // requested. Preserve DeepSeek's protocol state on this fallback path too.
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        chunks.push(Chunk {
+            reasoning: Some(reasoning.to_string()),
+            ..Default::default()
+        });
+    }
     if let Some(content) = message.get("content").and_then(Value::as_str) {
         if !content.is_empty() {
             chunks.push(Chunk {
@@ -406,6 +418,18 @@ pub fn messages_json(msgs: &[Message]) -> Vec<Value> {
                 Role::Tool => "tool",
             };
             let mut value = json!({ "role": role, "content": m.content });
+            // DeepSeek thinking mode treats reasoning_content as part of the
+            // assistant tool-call transcript.  It must be preserved verbatim on
+            // the next request, but must never be fabricated for other roles.
+            if m.role == Role::Assistant {
+                if let Some(reasoning) = m
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|reasoning| !reasoning.is_empty())
+                {
+                    value["reasoning_content"] = json!(reasoning);
+                }
+            }
             if !m.tool_calls.is_empty() {
                 value["tool_calls"] = json!(m
                     .tool_calls
@@ -572,23 +596,27 @@ mod tests {
 
     #[test]
     fn messages_json_maps_roles_and_tool_fields() {
+        let mut assistant = Message::assistant_with_tools(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "fs".into(),
+                args: json!({"op":"read"}),
+            }],
+        );
+        assistant.reasoning_content = Some("先检查文件，再调用工具。".into());
         let msgs = vec![
             Message::system("sys"),
             Message::user("hi"),
-            Message::assistant_with_tools(
-                "",
-                vec![ToolCall {
-                    id: "c1".into(),
-                    name: "fs".into(),
-                    args: json!({"op":"read"}),
-                }],
-            ),
+            assistant,
             Message::tool("c1", "file content"),
         ];
         let v = messages_json(&msgs);
         assert_eq!(v[0]["role"], "system");
         assert_eq!(v[1]["role"], "user");
         assert_eq!(v[2]["tool_calls"][0]["function"]["name"], "fs");
+        assert_eq!(v[2]["reasoning_content"], "先检查文件，再调用工具。");
+        assert!(v[1].get("reasoning_content").is_none());
         assert_eq!(v[3]["role"], "tool");
         assert_eq!(v[3]["tool_call_id"], "c1");
     }
@@ -636,6 +664,7 @@ mod tests {
             "choices": [{
                 "finish_reason": "tool_calls",
                 "message": {
+                    "reasoning_content": "need to inspect first",
                     "content": "我先检查。",
                     "tool_calls": [{
                         "id": "call-1",
@@ -646,9 +675,10 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14 }
         });
         let chunks = complete_response_chunks(&response).unwrap();
-        assert_eq!(chunks[0].text.as_deref(), Some("我先检查。"));
-        assert_eq!(chunks[1].tool_calls[0].name, "fs");
-        assert_eq!(chunks[2].usage.unwrap().total_tokens, 14);
+        assert_eq!(chunks[0].reasoning.as_deref(), Some("need to inspect first"));
+        assert_eq!(chunks[1].text.as_deref(), Some("我先检查。"));
+        assert_eq!(chunks[2].tool_calls[0].name, "fs");
+        assert_eq!(chunks[3].usage.unwrap().total_tokens, 14);
 
         let empty = complete_response_chunks(&json!({
             "choices": [{ "finish_reason": "length", "message": { "content": null } }]

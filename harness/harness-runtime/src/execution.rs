@@ -355,6 +355,25 @@ impl ExecutionState {
         );
     }
 
+    /// 续跑时只继承上一回合已经由 Runtime 验证过的验收项；搜索、计划文本和
+    /// 模型自述都不能让新回合跳过验证。预算本身重新开启一个有界窗口，避免
+    /// 因历史累计值在首步立即再次触发硬熔断。
+    pub fn restore_verified_criteria(&mut self, report: &DeliveryReport) {
+        for criterion in &report.criteria {
+            if !criterion.satisfied {
+                continue;
+            }
+            let evidence = if criterion.evidence.is_empty() {
+                vec!["上一回合已通过运行时验证".into()]
+            } else {
+                criterion.evidence.clone()
+            };
+            self.verification_evidence
+                .insert(criterion.id.clone(), evidence);
+            self.satisfied_criteria.insert(criterion.id.clone());
+        }
+    }
+
     /// 动态白名单只由已获得的证据/写入/验证状态推进。高精确任务不再把
     /// plan、delegate 或无关工具 schema 暴露给模型，且 dispatch 前还会二次校验。
     pub fn tool_phase(&self) -> ToolPhase {
@@ -724,6 +743,18 @@ impl BudgetManager {
 
     pub fn hard_exhausted(state: &ExecutionState, budget: &Budget) -> bool {
         state.steps >= budget.hard_max_steps || state.tool_calls >= budget.hard_max_tool_calls
+    }
+
+    /// 非原子任务首次命中总熔断时，运行时可在已有有效结果的前提下自动给出一个
+    /// 同量级、但次数受调用方限制的续跑窗口。它不是无限续期：无进展、原子任务
+    /// 或第二次熔断仍会由调用方转为 Blocked。
+    pub fn extend_hard_window(budget: &mut Budget) {
+        budget.hard_max_steps = budget
+            .hard_max_steps
+            .saturating_add(budget.step_window.saturating_mul(3));
+        budget.hard_max_tool_calls = budget
+            .hard_max_tool_calls
+            .saturating_add(budget.tool_window.saturating_mul(3));
     }
 
     pub fn phase(state: &ExecutionState, budget: &Budget) -> BudgetPhase {
@@ -1464,6 +1495,21 @@ mod tests {
         // 最终收尾窗口给足 6 步完成汇总交付，不再扩张。
         BudgetManager::arm_final_window(&state, &mut budget);
         assert_eq!(budget.max_steps, state.steps + 6);
+    }
+
+    #[test]
+    fn hard_budget_extension_opens_one_more_bounded_window() {
+        let contract = TaskContract::from_input("完成一项多步骤任务");
+        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Direct);
+        BudgetManager::cap_initial_step_window(&mut budget, 10);
+        BudgetManager::cap_initial_tool_window(&mut budget, 12);
+        let old_steps = budget.hard_max_steps;
+        let old_calls = budget.hard_max_tool_calls;
+
+        BudgetManager::extend_hard_window(&mut budget);
+
+        assert_eq!(budget.hard_max_steps, old_steps + 30);
+        assert_eq!(budget.hard_max_tool_calls, old_calls + 36);
     }
 
     /// 签名归一化：cd 全路径前缀与路径分隔符差异不应绕过重复守卫

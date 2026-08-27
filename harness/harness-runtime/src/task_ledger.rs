@@ -2,6 +2,7 @@
 use std::collections::BTreeMap;
 
 use crate::execution::TaskContract;
+use harness_session::DeliveryReport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerStatus {
@@ -46,6 +47,22 @@ impl TaskLedger {
                 })
                 .collect(),
         }
+    }
+
+    /// 从上一回合的运行时交付报告恢复已验证项。模型的 PlanUpdate 不能恢复
+    /// Ledger：它只是自报进度；只有 DeliveryReport 中的验证证据可跨回合继承。
+    pub fn from_delivery(contract: &TaskContract, report: &DeliveryReport) -> Self {
+        let mut ledger = Self::from_contract(contract);
+        for criterion in &report.criteria {
+            if !criterion.satisfied {
+                continue;
+            }
+            if let Some(item) = ledger.items.get_mut(&criterion.id) {
+                item.status = LedgerStatus::Verified;
+                item.evidence = criterion.evidence.clone();
+            }
+        }
+        ledger
     }
     pub fn activate(&mut self, id: &str) -> bool {
         self.items

@@ -10,7 +10,9 @@ use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
 use harness_core::{error::Result, types::UserInput, AppContext};
 use harness_llm::{Chunk, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolResult, Usage};
-use harness_session::{ExecutionTelemetry, SessionEvent, SessionLog};
+use harness_session::{
+    DeliveryOutcome, DeliveryReport, ExecutionTelemetry, SessionEvent, SessionLog,
+};
 use harness_tool::ToolRegistry;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +41,88 @@ struct ToolRepeatGuard {
 
 /// 同回合内同一失败调用（名称+参数完全相同）最多执行两次（首次 + 一次定向重试）。
 const MAX_SAME_CALLS_PER_TURN: u8 = 2;
+
+/// 用户的“继续”不是一个新的、只有一句话的 Direct 任务。它必须接回最近一个
+/// 未验证结束的根任务，否则复杂迁移会被重新分类为 Direct，并误用 36/48 这类
+/// 小任务硬预算。
+#[derive(Clone)]
+struct ResumeState {
+    objective: String,
+    report: DeliveryReport,
+}
+
+fn is_continuation_request(text: &str) -> bool {
+    let trimmed = text.trim().to_lowercase();
+    ["继续", "接着", "续跑", "恢复", "continue", "resume"]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// 从追加日志逆向找到最近的未完成根任务。若最近一回合本身也是“继续”，继续
+/// 向前穿透，直到命中真实目标；这使连续多次续跑始终继承同一契约与策略。
+fn latest_resumable_task(events: &[SessionEvent]) -> Option<ResumeState> {
+    let mut end = events.len();
+    // 目标文本要穿透“继续”找到根任务，但验收状态必须采用最近一次 Delivery；
+    // 新版续跑回合的 TurnStart 仍记录用户原话，而其 Delivery 已是根任务的报告。
+    let mut latest_report: Option<DeliveryReport> = None;
+    loop {
+        let delivery_index = (0..end).rev().find(|&index| {
+            matches!(
+                events[index],
+                SessionEvent::Delivery {
+                    report: DeliveryReport {
+                        outcome: DeliveryOutcome::Blocked | DeliveryOutcome::Interrupted,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })?;
+        let report = match &events[delivery_index] {
+            SessionEvent::Delivery { report, .. } => report.clone(),
+            _ => unreachable!("delivery index was matched above"),
+        };
+        let turn_index = (0..delivery_index)
+            .rev()
+            .find(|&index| matches!(events[index], SessionEvent::TurnStart { .. }))?;
+        let objective = match &events[turn_index] {
+            SessionEvent::TurnStart { input, .. } => input.clone(),
+            _ => unreachable!("turn index was matched above"),
+        };
+        if !is_continuation_request(&objective) {
+            return Some(ResumeState {
+                objective,
+                report: latest_report.unwrap_or(report),
+            });
+        }
+        latest_report.get_or_insert(report);
+        end = turn_index;
+    }
+}
+
+fn resume_instruction(resume: &ResumeState) -> String {
+    let completed = resume
+        .report
+        .criteria
+        .iter()
+        .filter(|criterion| criterion.satisfied)
+        .map(|criterion| criterion.id.as_str())
+        .collect::<Vec<_>>();
+    let remaining = resume
+        .report
+        .criteria
+        .iter()
+        .filter(|criterion| !criterion.satisfied)
+        .map(|criterion| format!("{}={}", criterion.id, criterion.description))
+        .collect::<Vec<_>>();
+    format!(
+        "[续跑任务]\n这是同一任务的后续执行，不要重新创建计划或按本句重新分类。\n原始目标：{}\n已验证：{}\n未完成：{}\n上次停止原因：{}\n从第一个未完成验收项继续；保留已验证项，不重复已完成的定位、修改或验证。",
+        resume.objective,
+        if completed.is_empty() { "无".into() } else { completed.join("、") },
+        if remaining.is_empty() { "无".into() } else { remaining.join("；") },
+        resume.report.reason.as_deref().unwrap_or("未提供")
+    )
+}
 
 /// 单次模型响应内的原子任务门禁。它补足跨步骤状态机的时间差：首个 search 的
 /// 结果尚未写入执行状态时，也不能让模型并行发起更多定位搜索。
@@ -154,10 +238,20 @@ impl AgentLoop {
         let bus = ctx.events();
 
         let input_text = input.text.clone();
+        // 会话正文可以重放，但任务的策略/验收状态不能从一句“继续”重新推断。
+        // 只在明确续跑表达式下恢复，普通新请求仍完全按其自身目标执行。
+        let history = log.replay();
+        let resume = is_continuation_request(&input_text)
+            .then(|| latest_resumable_task(&history))
+            .flatten();
+        let task_text = resume
+            .as_ref()
+            .map(|state| state.objective.clone())
+            .unwrap_or_else(|| input_text.clone());
 
         // 先把自然语言请求编译成通用执行契约，再由可替换的领域策略选择执行方式。
         // 没有注册领域策略时使用通用分类器，不把代码修复等场景写死在 Agent Loop。
-        let contract = TaskContract::from_input(&input_text);
+        let contract = TaskContract::from_input(&task_text);
         let default_policy = GeneralDomainPolicy;
         let strategy = ctx
             .try_get::<dyn DomainPolicy>()
@@ -178,11 +272,16 @@ impl AgentLoop {
             BudgetManager::cap_hard_limits(&mut budget, 8, 10);
         }
         let mut execution = ExecutionState::new(contract, strategy);
-        let mut ledger = TaskLedger::from_contract(&execution.contract);
+        if let Some(state) = &resume {
+            execution.restore_verified_criteria(&state.report);
+        }
+        let mut ledger = resume
+            .as_ref()
+            .map(|state| TaskLedger::from_delivery(&execution.contract, &state.report))
+            .unwrap_or_else(|| TaskLedger::from_contract(&execution.contract));
 
         // 从追加日志重建多轮上下文；不能每个 turn 都只发送当前一句，否则 GUI 看似能聊天，
         // 实际模型完全不记得上一轮以及之前的工具结果。
-        let history = log.replay();
         // 记忆自动沉淀（L0 工作记忆）：每个用户回合写入对话记忆（无后端则落本地文件）。
         // 失败容忍——记忆写入不影响对话流程；放后台任务，不阻塞首帧。
         if let Some(conv) = ctx.try_get::<dyn ConversationMemory>() {
@@ -272,6 +371,9 @@ impl AgentLoop {
             ),
         );
         messages.insert(1, Message::system(solve_plan.instructions.clone()));
+        if let Some(state) = &resume {
+            messages.insert(1, Message::system(resume_instruction(state)));
+        }
         // 技能注入点：只匹配启用的 SKILL.md 资产，并在本回合的系统上下文中
         // 提供可执行步骤与验收条件。禁用或删除后，SkillLibrary 不会返回它们，
         // 因而从下一回合起立即不再影响模型行为。匹配已在预处理阶段与压缩并行完成。
@@ -311,6 +413,10 @@ impl AgentLoop {
         let mut delivery_verified = false;
         let mut budget_exhausted = false;
         let mut absolute_budget_hit = false;
+        // 对确有有效结果的较大任务，首次总熔断自动开一次有界续跑窗口；避免用户
+        // 被迫反复发送“继续”，同时仍保留第二次熔断作为死循环保险。
+        const MAX_HARD_BUDGET_EXTENSIONS: u8 = 1;
+        let mut hard_budget_extensions = 0u8;
         let mut convergence_notified = false;
         // 预算续期耗尽后只给一次最终收尾窗口（2 步）；窗口也用尽则强制停止。
         let mut final_window_armed = false;
@@ -328,6 +434,28 @@ impl AgentLoop {
             execution.steps = steps;
             debt -= 1;
             if BudgetManager::hard_exhausted(&execution, &budget) {
+                let can_auto_resume = hard_budget_extensions < MAX_HARD_BUDGET_EXTENSIONS
+                    && execution.solve_mode != crate::execution::SolveMode::AtomicDelivery
+                    && execution.successful_tool_results > 0;
+                if can_auto_resume {
+                    hard_budget_extensions += 1;
+                    BudgetManager::extend_hard_window(&mut budget);
+                    // 软窗口也要前移，否则下一步会立即落回预算诊断分支，尚未给模型
+                    // 执行“换路/写入/验证”的机会。
+                    BudgetManager::extend_window(&mut budget);
+                    messages.push(Message::user(format!(
+                        "[自动续跑·{hard_budget_extensions}/{MAX_HARD_BUDGET_EXTENSIONS}] 已达到本阶段总预算，但已有 {} 次成功工具结果。无需等待用户输入：保留当前证据，停止重复探索，直接围绕未满足验收项完成写入或验证。再次达到总预算时必须基于证据收尾或报告明确阻塞。",
+                        execution.successful_tool_results
+                    )));
+                    append_telemetry(
+                        &log,
+                        &execution,
+                        &ledger,
+                        "总预算已自动延展，继续当前未满足验收项",
+                    );
+                    debt = 1;
+                    continue;
+                }
                 absolute_budget_hit = true;
                 hard_stop = true;
                 log.append(SessionEvent::Assistant {
@@ -383,7 +511,9 @@ impl AgentLoop {
                     } else {
                         1_536
                     }),
-                    reasoning_effort: Some("off".into()),
+                    // DeepSeek/OpenAI 兼容端使用 `none` 表示关闭；`off` 是旧目录
+                    // 的内部别名，直接透传会被网关以 HTTP 400 拒绝并中断整个回合。
+                    reasoning_effort: Some("none".into()),
                     allowed_tools: Some(execution.allowed_tools()),
                 }
             } else {
@@ -395,6 +525,7 @@ impl AgentLoop {
             let mut s = llm.stream_with_options(apply_context_budget(pre_input), request_options);
             let mut assistant_text = String::new();
             let mut assistant_tools = Vec::new();
+            let mut assistant_reasoning = String::new();
             let mut step_had_tools = false;
             let mut loop_recovery_prompts = Vec::new();
             let mut loop_recovery_exhausted = false;
@@ -432,8 +563,8 @@ impl AgentLoop {
                         break;
                     }
                 };
-                // 思考链增量只写 Thinking 事件（UI「思考中」反馈），不进回复文本/模型上下文；
-                // 仅当有文本或工具调用时写 Assistant 事件，避免空消息噪声。
+                // 思考链同时写 UI Thinking 事件和 Assistant 流事件。后者在模型产生
+                // tool_call 时是 DeepSeek 的协议上下文，不能只留在 UI 日志里。
                 if let Some(r) = &chunk.reasoning {
                     log.append(SessionEvent::Thinking {
                         id: log.gen_id(),
@@ -450,7 +581,7 @@ impl AgentLoop {
                         .or_else(|| Some("unknown".into()));
                     continue;
                 }
-                if chunk.text.is_some() || !chunk.tool_calls.is_empty() {
+                if chunk.text.is_some() || !chunk.tool_calls.is_empty() || chunk.reasoning.is_some() {
                     log.append(SessionEvent::Assistant {
                         id: log.gen_id(),
                         chunk: chunk.clone(),
@@ -458,6 +589,9 @@ impl AgentLoop {
                 }
                 if let Some(text) = &chunk.text {
                     assistant_text.push_str(text);
+                }
+                if let Some(reasoning) = &chunk.reasoning {
+                    assistant_reasoning.push_str(reasoning);
                 }
                 assistant_tools.extend(chunk.tool_calls.clone());
                 // 工具调用并行化：门禁（循环守卫/行动门禁/访问策略/PreToolUse 钩子）
@@ -729,7 +863,11 @@ impl AgentLoop {
                 length_recovery_pending = false;
                 messages.insert(
                     messages.len().saturating_sub(assistant_tools.len()),
-                    Message::assistant_with_tools(assistant_text, assistant_tools),
+                    Message::assistant_with_tools_and_reasoning(
+                        assistant_text,
+                        assistant_tools,
+                        (!assistant_reasoning.is_empty()).then_some(assistant_reasoning),
+                    ),
                 );
             }
             for prompt in loop_recovery_prompts {
@@ -1052,32 +1190,67 @@ fn render_skill_instructions(skills: &[Skill]) -> Option<String> {
 
 fn messages_from_events(events: &[SessionEvent]) -> Vec<Message> {
     let mut messages = vec![Message::system(SYSTEM_PROMPT)];
+    // DeepSeek can stream reasoning_content in frames before the frame containing
+    // its tool call. Older logs stored those frames only as Thinking events, while
+    // newer logs additionally store them in the Assistant chunk. Keep fragments
+    // until the visible assistant frame is available in either representation.
+    let mut pending_reasoning = String::new();
     for event in events {
         match event {
-            SessionEvent::TurnStart { input, .. } => messages.push(Message::user(input)),
+            SessionEvent::TurnStart { input, .. } => {
+                // A reasoning-only response without text or a tool call is not a
+                // valid reusable assistant turn. Do not attach it to a later user
+                // turn (and never invent reasoning content).
+                pending_reasoning.clear();
+                messages.push(Message::user(input));
+            }
             SessionEvent::Assistant { chunk, .. } => {
                 // SSE 流式下每个文本增量都是一条 Assistant 事件；重建上下文时必须把相邻的
                 // 纯文本 assistant 分片合并为一条消息，否则会向模型发送大量连续 assistant
                 // 消息（OpenAI 兼容协议不接受，多轮对话直接报错）。
                 let text = chunk.text.clone().unwrap_or_default();
+                if let Some(reasoning) = &chunk.reasoning {
+                    // 新日志顺序为 Thinking → Assistant(reasoning)，避免将同一 SSE
+                    // 分片记录两次；旧日志只有 Thinking，仍可在此后工具帧完成恢复。
+                    if !pending_reasoning.ends_with(reasoning) {
+                        pending_reasoning.push_str(reasoning);
+                    }
+                }
+                if text.is_empty() && chunk.tool_calls.is_empty() {
+                    continue;
+                }
+                let reasoning_content = (!pending_reasoning.is_empty())
+                    .then(|| std::mem::take(&mut pending_reasoning));
                 if chunk.tool_calls.is_empty() {
                     if let Some(last) = messages.last_mut() {
                         if last.role == Role::Assistant && last.tool_calls.is_empty() {
                             last.content.push_str(&text);
+                            if let Some(reasoning) = reasoning_content {
+                                last.reasoning_content
+                                    .get_or_insert_with(String::new)
+                                    .push_str(&reasoning);
+                            }
                             continue;
                         }
                     }
                 }
-                messages.push(Message::assistant_with_tools(
+                messages.push(Message::assistant_with_tools_and_reasoning(
                     text,
                     chunk.tool_calls.clone(),
+                    reasoning_content,
                 ));
             }
-            SessionEvent::ToolResult { result, .. } => messages.push(Message::tool(
-                &result.call_id,
-                &compress_tool_context(&result.content),
-            )),
-            // Thinking / Step* / PlanUpdate 仅 UI 展示，不进入模型上下文。
+            SessionEvent::ToolResult { result, .. } => {
+                pending_reasoning.clear();
+                messages.push(Message::tool(
+                    &result.call_id,
+                    &compress_tool_context(&result.content),
+                ));
+            }
+            // 旧版日志的 Thinking 事件是恢复 DeepSeek tool-call 协议的唯一来源。
+            // 新版同时有 Assistant(reasoning) 会在上方去重。
+            SessionEvent::Thinking { text, .. } => pending_reasoning.push_str(text),
+            // Step* / PlanUpdate 仅 UI 展示，不进入模型上下文。
             _ => {}
         }
     }
@@ -1511,8 +1684,22 @@ mod tests {
                 id: 1,
                 input: "第一问".into(),
             },
-            SessionEvent::Assistant {
+            // 旧版只写 Thinking，因此也必须能恢复。
+            SessionEvent::Thinking {
                 id: 2,
+                text: "先读取文件。".into(),
+            },
+            // DeepSeek may send reasoning_content in its own SSE frame before
+            // the tool-call frame; 新版会再保存在 Assistant chunk，不能重复。
+            SessionEvent::Assistant {
+                id: 3,
+                chunk: Chunk {
+                    reasoning: Some("先读取文件。".into()),
+                    ..Default::default()
+                },
+            },
+            SessionEvent::Assistant {
+                id: 4,
                 chunk: Chunk {
                     text: Some("处理中".into()),
                     tool_calls: vec![ToolCall {
@@ -1524,7 +1711,7 @@ mod tests {
                 },
             },
             SessionEvent::ToolResult {
-                id: 3,
+                id: 5,
                 result: ToolResult {
                     call_id: "c1".into(),
                     ok: true,
@@ -1532,12 +1719,13 @@ mod tests {
                     continuation_debt: 0,
                 },
             },
-            SessionEvent::TurnEnd { id: 4 },
+            SessionEvent::TurnEnd { id: 6 },
         ];
         let messages = messages_from_events(&events);
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, Role::User);
         assert_eq!(messages[2].tool_calls[0].id, "c1");
+        assert_eq!(messages[2].reasoning_content.as_deref(), Some("先读取文件。"));
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("c1"));
     }
 
@@ -1661,5 +1849,61 @@ mod tests {
         // 读取和写入不是定位泛扫；它们由跨步骤 ActionGate 判断是否符合阶段。
         assert!(gate.allows(true, "fs:{\"op\":\"read\"}"));
         assert!(gate.allows(false, "search:{\"pattern\":\"anything\"}"));
+    }
+
+    #[test]
+    fn continuation_recovers_the_root_task_instead_of_reclassifying_the_short_command() {
+        let root_report = DeliveryReport {
+            outcome: DeliveryOutcome::Blocked,
+            criteria: vec![harness_session::DeliveryCriterion {
+                id: "item-1".into(),
+                description: "迁移旧配置".into(),
+                satisfied: true,
+                evidence: vec!["migration test passed".into()],
+            }],
+            verification: vec!["migration test passed".into()],
+            reason: Some("预算窗口结束".into()),
+        };
+        // 新版续跑回合虽然记录了用户的短句，但 DeliveryReport 仍对应根任务的
+        // 验收项；下一次续跑必须继承这个最新报告，而不是退回首轮报告。
+        let generic_resume_report = DeliveryReport {
+            outcome: DeliveryOutcome::Blocked,
+            criteria: vec![harness_session::DeliveryCriterion {
+                id: "item-1".into(),
+                description: "迁移旧配置".into(),
+                satisfied: true,
+                evidence: vec!["migration test passed again".into()],
+            }],
+            verification: vec!["migration test passed again".into()],
+            reason: Some("下一阶段预算窗口结束".into()),
+        };
+        let events = vec![
+            SessionEvent::TurnStart {
+                id: 1,
+                input: "迁移配置中心\n- 迁移旧配置\n- 验证 CLI".into(),
+            },
+            SessionEvent::Delivery {
+                id: 2,
+                report: root_report,
+            },
+            SessionEvent::TurnEnd { id: 3 },
+            SessionEvent::TurnStart {
+                id: 4,
+                input: "继续把第一阶段做完".into(),
+            },
+            SessionEvent::Delivery {
+                id: 5,
+                report: generic_resume_report,
+            },
+        ];
+
+        let resumed = latest_resumable_task(&events).expect("should find root task");
+        assert!(resumed.objective.starts_with("迁移配置中心"));
+        assert_eq!(resumed.report.criteria[0].id, "item-1");
+        assert_eq!(
+            resumed.report.criteria[0].evidence,
+            ["migration test passed again"]
+        );
+        assert!(resume_instruction(&resumed).contains("不要重新创建计划"));
     }
 }

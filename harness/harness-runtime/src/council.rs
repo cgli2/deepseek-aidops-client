@@ -1,6 +1,7 @@
 //! 可恢复的专家团 DAG 编排器：确定性依赖调度、并行执行、重试与质量门禁。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -72,7 +73,9 @@ impl CouncilOrchestrator {
         let log = ctx.get::<SessionLog>();
         let subagent = ctx.get::<dyn Subagent>();
         let council_id = Uuid::new_v4().to_string();
-        let specs = dynamic_plan(&goal);
+        let task_class = classify_task(&goal);
+        let fast_track = task_class == TaskClass::SmallChange;
+        let specs = dynamic_plan_for_class(&goal, task_class);
         let evidence = collect_shared_evidence(ctx);
         validate_dag(&specs)?;
 
@@ -98,9 +101,14 @@ impl CouncilOrchestrator {
         append_answer(
             &log,
             format!(
-                "专家团已启动：已创建 {} 个 DAG 节点，最多并行 {} 位专家。首批专家正在分析，我会持续更新下方任务卡。\n\n",
+                "专家团已启动：已创建 {} 个 DAG 节点，最多并行 {} 位专家。{}\n\n",
                 specs.len(),
-                self.max_parallel
+                self.max_parallel,
+                if fast_track {
+                    "已启用快速交付：一个开发专家直接完成修改，随后执行本地校验并生成交付。若 35 秒无结果会立即取消并精简重试，不会长期占用队列。"
+                } else {
+                    "首批专家正在分析，我会持续更新下方任务卡。"
+                }
             ),
         );
 
@@ -257,21 +265,20 @@ impl CouncilOrchestrator {
                         // （cargo check 最长 120s），期间其它就绪节点无法启动。
                         let ctx = ctx.clone();
                         let task_id = id.clone();
+                        let fast_validation = fast_track;
                         running_ids.insert(id);
                         running_started.insert(task_id.clone(), Instant::now());
                         running.push(Box::pin(async move {
                             let started = Instant::now();
-                            let result = match run_local_validation(&ctx).await {
+                            let result = match run_local_validation(&ctx, fast_validation).await {
                                 Some(Ok(summary)) => Ok(format!(
                                     "GATE: PASS\n{summary}\n[本地校验用时 {}ms]",
                                     started.elapsed().as_millis()
                                 )),
-                                Some(Err(detail)) => Err(Error::Subagent(format!(
-                                    "本地校验未通过：{detail}"
-                                ))),
-                                None => Err(Error::Subagent(
-                                    "未发现可用本地校验能力".into(),
-                                )),
+                                Some(Err(detail)) => {
+                                    Err(Error::Subagent(format!("本地校验未通过：{detail}")))
+                                }
+                                None => Err(Error::Subagent("未发现可用本地校验能力".into())),
                             };
                             (task_id, "本地确定性校验", result)
                         }));
@@ -294,12 +301,16 @@ impl CouncilOrchestrator {
                 let task = tasks.get_mut(&id).unwrap();
                 task.state = CouncilTaskState::Running;
                 task.attempt += 1;
-                let task_timeout_secs = council_task_timeout_secs(&task.spec.id, task.attempt);
+                let task_timeout_secs =
+                    council_task_timeout_secs(&task.spec.id, task.attempt, fast_track);
+                let active_timeout_secs = council_active_task_timeout_secs(fast_track);
                 task_event(
                     &log,
                     &council_id,
                     task,
-                    &format!("专家已分配，开始执行 · 最长等待 {task_timeout_secs} 秒"),
+                    &format!(
+                        "专家已分配：{task_timeout_secs} 秒内必须产生文本或工具动作；持续有实际动作时最长执行 {active_timeout_secs} 秒"
+                    ),
                 );
                 let prompt = task_prompt(&goal, &task.spec, &upstream, &evidence, task.attempt);
                 let task_id = id.clone();
@@ -308,13 +319,35 @@ impl CouncilOrchestrator {
                     "analysis" | "requirements" | "risk" | "design" | "delivery"
                 );
                 let sub = subagent.clone();
+                let progress_log = log.clone();
+                let progress_council_id = council_id.clone();
+                let progress_task_id = id.clone();
+                let progress_attempt = task.attempt;
+                let reporter = Arc::new(move |detail: String| {
+                    emit(
+                        &progress_log,
+                        CouncilEvent::TaskStateChanged {
+                            council_id: progress_council_id.clone(),
+                            task_id: progress_task_id.clone(),
+                            state: CouncilTaskState::Running,
+                            attempt: progress_attempt,
+                            detail,
+                        },
+                    );
+                });
                 running_ids.insert(id);
                 running_started.insert(task_id.clone(), Instant::now());
                 running.push(Box::pin(async move {
                     let (channel, result) =
-                        match tokio::time::timeout(Duration::from_secs(task_timeout_secs), async {
+                        match tokio::time::timeout(Duration::from_secs(active_timeout_secs), async {
                             if brief {
-                                match sub.spawn_brief(&prompt).await {
+                                match sub
+                                    .spawn_brief_with_timeout(
+                                        &prompt,
+                                        Duration::from_secs(task_timeout_secs),
+                                    )
+                                    .await
+                                {
                                     // 部分兼容模型可能只回 reasoning/空分片。不能把这种
                                     // 协议差异当作专家失败，立刻升级到能完成 AgentLoop 的通道。
                                     Err(error)
@@ -324,22 +357,35 @@ impl CouncilOrchestrator {
                                     {
                                         (
                                             "完整 Agent（轻量通道空响应后升级）",
-                                            sub.spawn(&prompt).await,
+                                            sub.spawn_with_timeout(
+                                                &prompt,
+                                                Duration::from_secs(task_timeout_secs),
+                                            )
+                                            .await,
                                         )
                                     }
                                     result => ("轻量 LLM", result),
                                 }
                             } else {
-                                ("完整 Agent", sub.spawn(&prompt).await)
+                                (
+                                    "完整 Agent（过程可见）",
+                                    sub.spawn_observed(
+                                        &prompt,
+                                        Duration::from_secs(task_timeout_secs),
+                                        Duration::from_secs(task_timeout_secs),
+                                        reporter,
+                                    )
+                                    .await,
+                                )
                             }
                         })
                         .await
                         {
                             Ok(result) => result,
                             Err(_) => (
-                                if brief { "轻量 LLM" } else { "完整 Agent" },
+                                if brief { "轻量 LLM" } else { "完整 Agent（过程可见）" },
                                 Err(Error::Subagent(format!(
-                                    "child timed out after {task_timeout_secs} seconds"
+                                    "child exceeded the active execution limit of {active_timeout_secs} seconds"
                                 ))),
                             ),
                         };
@@ -449,7 +495,7 @@ impl CouncilOrchestrator {
                                     "执行失败，将自动重试"
                                 };
                                 task_event(&log, &council_id, task, &format!("{route}：{detail}"));
-                            } else if !task.resume_attempted {
+                            } else if !fast_track && !task.resume_attempted {
                                 // 仅重新打开当前失败节点；依赖均已 Done，因此调度器会复用
                                 // 已验收的设计/实现/测试证据，不会从头重复执行。
                                 task.resume_attempted = true;
@@ -523,11 +569,7 @@ impl CouncilOrchestrator {
             );
             log.append(SessionEvent::Delivery {
                 id: log.gen_id(),
-                report: council_delivery_report(
-                    &tasks,
-                    DeliveryOutcome::Blocked,
-                    Some(failed),
-                ),
+                report: council_delivery_report(&tasks, DeliveryOutcome::Blocked, Some(failed)),
             });
         }
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });
@@ -597,8 +639,27 @@ fn classify_task(goal: &str) -> TaskClass {
     }
     if goal.chars().count() <= 160
         && contains_any(&[
-            "按钮", "宽度", "高度", "颜色", "字体", "间距", "文案", "样式", "布局", "ui", "css",
-            "label", "button",
+            "按钮",
+            "宽度",
+            "高度",
+            "颜色",
+            "字体",
+            "间距",
+            "文案",
+            "样式",
+            "布局",
+            "ui",
+            "css",
+            "label",
+            "button",
+            "下拉",
+            "下拉框",
+            "菜单",
+            "选项",
+            "模式",
+            "paper",
+            "live",
+            "sim",
         ])
     {
         return TaskClass::SmallChange;
@@ -606,7 +667,12 @@ fn classify_task(goal: &str) -> TaskClass {
     TaskClass::StandardChange
 }
 
+#[cfg(test)]
 fn dynamic_plan(goal: &str) -> Vec<CouncilTaskSpec> {
+    dynamic_plan_for_class(goal, classify_task(goal))
+}
+
+fn dynamic_plan_for_class(goal: &str, task_class: TaskClass) -> Vec<CouncilTaskSpec> {
     let task =
         |id: &str, title: &str, role: &str, deps: &[&str], scopes: &[&str], criteria: &[&str]| {
             CouncilTaskSpec {
@@ -619,7 +685,7 @@ fn dynamic_plan(goal: &str) -> Vec<CouncilTaskSpec> {
                 acceptance_criteria: criteria.iter().map(|v| (*v).into()).collect(),
             }
         };
-    match classify_task(goal) {
+    match task_class {
         TaskClass::Analysis => vec![
             task(
                 "analysis",
@@ -641,19 +707,19 @@ fn dynamic_plan(goal: &str) -> Vec<CouncilTaskSpec> {
         TaskClass::SmallChange => vec![
             task(
                 "implementation",
-                "实现与局部验证",
-                "开发专家",
+                "快速实现",
+                "快速交付开发专家",
                 &[],
                 &["workspace"],
-                &["完成必要修改", "报告变更与验证"],
+                &["只定位必要文件", "完成必要修改", "执行局部验证并报告变更"],
             ),
             task(
                 "testing",
-                "快速构建验证",
-                "测试专家",
+                "快速本地校验",
+                "确定性校验器",
                 &["implementation"],
                 &[],
-                &["执行相关检查", "给出明确门禁结论"],
+                &["执行 git 差异校验", "给出明确门禁结论"],
             ),
             task(
                 "delivery",
@@ -813,9 +879,7 @@ fn evaluate_gates(tasks: &HashMap<String, TaskRuntime>) -> Vec<CouncilGateResult
             && !has_blocker(&t.summary)
     });
     let evidence = tasks.values().all(|t| {
-        !t.summary.trim().is_empty()
-            && !t.spec.acceptance_criteria.is_empty()
-            && task_has_passed(t)
+        !t.summary.trim().is_empty() && !t.spec.acceptance_criteria.is_empty() && task_has_passed(t)
     });
     vec![
         CouncilGateResult {
@@ -870,7 +934,10 @@ fn evaluate_gates(tasks: &HashMap<String, TaskRuntime>) -> Vec<CouncilGateResult
 /// `Done` 仅代表调度器停止该节点，不能等价于验收通过。所有完成门禁和最终
 /// Delivery 都共用此规则，避免超时降级、空摘要或带阻断项的节点混入成功交付。
 fn task_has_passed(task: &TaskRuntime) -> bool {
-    if task.state != CouncilTaskState::Done || task.summary.trim().is_empty() || has_blocker(&task.summary) {
+    if task.state != CouncilTaskState::Done
+        || task.summary.trim().is_empty()
+        || has_blocker(&task.summary)
+    {
         return false;
     }
     if matches!(task.spec.id.as_str(), "testing" | "review") {
@@ -923,13 +990,18 @@ fn task_prompt(
     evidence: &CouncilEvidence,
     attempt: u32,
 ) -> String {
+    let fast_instruction = if task.role == "快速交付开发专家" {
+        "\n这是 60 秒级的低风险局部修改：不要规划、不要委派、不要扫描整个仓库。先用一次精确搜索或读取定位目标，直接修改，然后仅做与改动相关的快速验证并交付。"
+    } else {
+        ""
+    };
     let gate_instruction = if matches!(task.id.as_str(), "testing" | "review") {
         "\n这是质量门禁任务。结论必须单独包含严格标记 `GATE: PASS` 或 `GATE: FAIL - 具体阻断原因`；存在任何未解决的失败时严禁输出 PASS。"
     } else {
         ""
     };
     format!(
-        "你是专家团中的{}。\n总目标：{}\n当前任务：{}\n任务说明：{}\n验收标准：{}\n允许写入范围：{}\n共享事实快照（已缓存，请勿重复扫描同类信息）：\n工作区：{}\nGit：{}\n已验收上游摘要：\n{}\n{}\n请实际完成任务并验证。最终严格使用以下短格式，字段缺失写“无”：\nSTATUS: PASS 或 FAIL\nSUMMARY: 一两句结论\nFILES: 改动路径\nCHECKS: 已执行命令/证据\nRISKS: 风险、限制或阻断\n{}",
+        "你是专家团中的{}。\n总目标：{}\n当前任务：{}\n任务说明：{}\n验收标准：{}\n允许写入范围：{}\n共享事实快照（已缓存，请勿重复扫描同类信息）：\n工作区：{}\nGit：{}\n已验收上游摘要：\n{}\n{}\n{}\n请实际完成任务并验证。最终严格使用以下短格式，字段缺失写“无”：\nSTATUS: PASS 或 FAIL\nSUMMARY: 一两句结论\nFILES: 改动路径\nCHECKS: 已执行命令/证据\nRISKS: 风险、限制或阻断\n{}",
         task.role,
         goal,
         task.title,
@@ -952,6 +1024,7 @@ fn task_prompt(
         } else {
             ""
         },
+        fast_instruction,
         gate_instruction
     )
 }
@@ -1015,10 +1088,31 @@ fn structured_summary(answer: &str) -> String {
 }
 
 fn local_delivery_summary(tasks: &HashMap<String, TaskRuntime>) -> String {
-    let implementation = tasks
-        .get("implementation")
-        .map(|task| compact(&task.summary, 700))
-        .unwrap_or_else(|| "无实现节点".into());
+    // 交付摘要必须覆盖全部上游节点：分析类小图（analysis -> delivery）没有
+    // implementation/testing 节点，硬编码 ID 会把分析专家的真实结论整段丢弃，
+    // 产出"无实现节点"的空壳 PASS。按节点 ID 排序保证输出稳定。
+    let mut upstream_ids: Vec<&String> = tasks
+        .keys()
+        .filter(|id| id.as_str() != "delivery")
+        .collect();
+    upstream_ids.sort();
+    let evidence = if upstream_ids.is_empty() {
+        "无上游节点证据".to_string()
+    } else {
+        upstream_ids
+            .iter()
+            .map(|id| {
+                let task = &tasks[*id];
+                format!(
+                    "## {}（{}）\n{}",
+                    task.spec.title,
+                    id,
+                    compact(&task.summary, 700)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
     let testing = tasks
         .get("testing")
         .map(|task| compact(&task.summary, 400))
@@ -1029,7 +1123,7 @@ fn local_delivery_summary(tasks: &HashMap<String, TaskRuntime>) -> String {
         .all(|(_, task)| task_has_passed(task));
     if upstream_passed {
         format!(
-            "STATUS: PASS\nSUMMARY: 已基于开发节点和质量门禁生成交付。\nFILES: 见实现证据。\nCHECKS: {testing}\nRISKS: 无新增阻断。\n\n实现证据：\n{implementation}"
+            "STATUS: PASS\nSUMMARY: 已基于上游节点证据和质量门禁生成交付。\nFILES: 见上游证据。\nCHECKS: {testing}\nRISKS: 无新增阻断。\n\n上游证据：\n{evidence}"
         )
     } else {
         "STATUS: FAIL\nSUMMARY: 上游节点尚未提交可验收的 PASS 证据，不能生成成功交付。\nFILES: 无\nCHECKS: 无\nRISKS: 请修复或重新验证失败/降级的上游节点。".into()
@@ -1097,10 +1191,17 @@ fn diff_requires_expert_review(files: &[GitChange], diff: &str) -> bool {
 }
 
 /// 返回 None 表示当前上下文没有本地执行能力，调用方应透明升级测试专家。
-async fn run_local_validation(ctx: &AppContext) -> Option<std::result::Result<String, String>> {
+async fn run_local_validation(
+    ctx: &AppContext,
+    fast_validation: bool,
+) -> Option<std::result::Result<String, String>> {
     let shell = ctx.try_get::<dyn Shell>()?;
     let root = ctx.try_get::<Workspace>()?.root();
-    let (cwd, command) = if root.join("Cargo.toml").is_file() {
+    let (cwd, command) = if fast_validation {
+        // 快速路径不再为一处样式/文案改动启动整个工作区构建。语法、类型和完整
+        // 回归仍属于普通/高风险路径；这里先用确定性差异检查在几秒内放行交付。
+        (root.clone(), "git diff --check".to_string())
+    } else if root.join("Cargo.toml").is_file() {
         (root, "cargo check --workspace".to_string())
     } else if root.join("harness").join("Cargo.toml").is_file() {
         (root.join("harness"), "cargo check --workspace".to_string())
@@ -1138,7 +1239,20 @@ async fn run_local_validation(ctx: &AppContext) -> Option<std::result::Result<St
         )))
     }
 }
-fn council_task_timeout_secs(task_id: &str, attempt: u32) -> u64 {
+fn council_task_timeout_secs(task_id: &str, attempt: u32, fast_track: bool) -> u64 {
+    if fast_track {
+        let configured = std::env::var("HARNESS_COUNCIL_FAST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(35)
+            .clamp(15, 90);
+        // 小任务只允许一次短重试；失败需要尽快释放专家槽，而非静默堆积数分钟。
+        return if attempt > 1 {
+            (configured / 2).max(15)
+        } else {
+            configured
+        };
+    }
     let (key, fallback) = match task_id {
         "requirements" | "risk" => ("HARNESS_COUNCIL_ANALYSIS_TIMEOUT_SECS", 35),
         "design" | "delivery" => ("HARNESS_COUNCIL_DESIGN_TIMEOUT_SECS", 60),
@@ -1156,6 +1270,16 @@ fn council_task_timeout_secs(task_id: &str, attempt: u32) -> u64 {
     } else {
         configured
     }
+}
+
+/// 首个动作之后的硬上限。此前把这个上限同时当作“首个响应期限”，导致工具已经
+/// 在执行的正常任务也会被误杀；现在只有没有新动作才会由子代理的 idle 计时取消。
+fn council_active_task_timeout_secs(fast_track: bool) -> u64 {
+    std::env::var("HARNESS_COUNCIL_ACTIVE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(if fast_track { 120 } else { 600 })
+        .clamp(60, 1_800)
 }
 fn has_blocker(text: &str) -> bool {
     ["阻断：", "测试失败", "未通过", "critical", "blocker"]
@@ -1281,6 +1405,13 @@ mod tests {
     fn task_router_builds_minimal_graphs() {
         assert_eq!(classify_task("解释这段设计的优缺点"), TaskClass::Analysis);
         assert_eq!(dynamic_plan("把按钮宽度改小").len(), 3);
+        let dropdown = dynamic_plan("右上角模式下拉框去掉 sim，只保留 paper 和 live，代码逻辑不变");
+        assert_eq!(
+            classify_task("右上角模式下拉框去掉 sim，只保留 paper 和 live，代码逻辑不变"),
+            TaskClass::SmallChange
+        );
+        assert_eq!(dropdown[0].role, "快速交付开发专家");
+        assert_eq!(dropdown[1].role, "确定性校验器");
         assert_eq!(dynamic_plan("修复消息处理错误并增加测试").len(), 3);
         assert!(
             dynamic_plan("修复消息处理错误并增加测试")
@@ -1315,6 +1446,38 @@ mod tests {
         let summary = local_delivery_summary(&tasks);
         assert!(summary.contains("STATUS: PASS"));
         assert!(summary.contains("CHECKS:"));
+    }
+
+    #[test]
+    fn local_delivery_includes_analysis_evidence() {
+        // 分析类小图（analysis -> delivery）没有 implementation/testing 节点，
+        // 交付摘要必须携带分析专家的真实结论，不能退化为"无实现节点"的空壳 PASS。
+        let mut tasks = HashMap::new();
+        for spec in dynamic_plan("解释这段设计的优缺点") {
+            let id = spec.id.clone();
+            let summary = if id == "analysis" {
+                "STATUS: PASS\nSUMMARY: 专家团运行正常：DAG 调度、本地质量门禁与重试链路均已验证。\nRISKS: 无"
+                    .into()
+            } else {
+                String::new()
+            };
+            tasks.insert(
+                id,
+                TaskRuntime {
+                    spec,
+                    state: CouncilTaskState::Done,
+                    attempt: 1,
+                    summary,
+                    local_checked: false,
+                    resume_attempted: false,
+                },
+            );
+        }
+        assert_eq!(tasks.len(), 2);
+        let summary = local_delivery_summary(&tasks);
+        assert!(summary.contains("STATUS: PASS"));
+        assert!(summary.contains("专家团运行正常"));
+        assert!(!summary.contains("无实现节点"));
     }
 
     #[test]

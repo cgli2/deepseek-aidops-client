@@ -94,5 +94,13 @@ async fn submit_writes_turn_events() {
             _ => None,
         })
         .collect();
-    assert_eq!(inputs, vec!["hello", "queued follow-up", ""]);
+    // 附件-only 输入会被规范化为显式分析请求（见 agent_loop 的
+    // attachment_only_input_becomes_an_explicit_analysis_request），不再是空串。
+    assert_eq!(inputs.len(), 3);
+    assert_eq!(&inputs[..2], &["hello", "queued follow-up"]);
+    assert!(
+        !inputs[2].is_empty(),
+        "attachment-only input should be turned into an explicit analysis request, got: {:?}",
+        inputs[2]
+    );
 }

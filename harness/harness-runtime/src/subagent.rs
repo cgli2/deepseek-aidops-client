@@ -4,6 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use harness_capability::subagent::Subagent;
+use harness_capability::subagent::SubagentProgressReporter;
 use harness_core::AppContext;
 use harness_core::error::{Error, Result};
 use harness_core::types::UserInput;
@@ -30,11 +31,19 @@ impl InProcessSubagent {
             timeout,
         })
     }
-}
 
-#[async_trait]
-impl Subagent for InProcessSubagent {
-    async fn spawn(&self, task: &str) -> Result<String> {
+    async fn run_agent(&self, task: &str, timeout: Duration) -> Result<String> {
+        self.run_agent_observed(task, timeout, timeout, Arc::new(|_| {}))
+            .await
+    }
+
+    async fn run_agent_observed(
+        &self,
+        task: &str,
+        first_output_timeout: Duration,
+        idle_timeout: Duration,
+        reporter: SubagentProgressReporter,
+    ) -> Result<String> {
         let _permit = self
             .slots
             .acquire()
@@ -54,27 +63,80 @@ impl Subagent for InProcessSubagent {
             text: task.to_string(),
             attachments: vec![],
         };
-        // 超时结构化取消：仅 drop future 不足以终止子回合已派生的工作；
-        // 走可取消入口，到期后通知取消并给短宽限等待其刷日志/释放资源，
-        // 避免僵尸任务继续占用 LLM 连接与槽位。
+        // 子代理日志是过程真相源。将其投影给编排器，既能让用户看到真实执行，
+        // 也让“首个可交付动作”和“活动中空转”采用不同的超时策略。
         let cancel = CancellationToken::new();
         let agent = AgentLoop::new();
         let run = agent.run_turn_cancellable(&child, input, cancel.clone());
         tokio::pin!(run);
-        let outcome = tokio::select! {
-            r = &mut run => Some(r),
-            _ = tokio::time::sleep(self.timeout) => None,
+        let started = std::time::Instant::now();
+        let mut last_action = started;
+        let mut saw_action = false;
+        let mut cursor = 0;
+        let outcome = loop {
+            tokio::select! {
+                r = &mut run => break Some(r),
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    let (next, events) = log.replay_from(cursor);
+                    cursor = next;
+                    let mut latest = None;
+                    let mut action_seen = false;
+                    for event in events {
+                        match event {
+                            SessionEvent::StepStart { .. } => {
+                                latest = Some("专家正在请求模型下一步".to_string());
+                            }
+                            SessionEvent::Thinking { .. } => {
+                                latest = Some("模型正在分析；尚未产生文本或工具动作".to_string());
+                            }
+                            SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref().is_some_and(|text| !text.trim().is_empty()) => {
+                                action_seen = true;
+                                latest = Some("专家已产生文本结果，正在继续收敛交付".to_string());
+                            }
+                            SessionEvent::ToolCall { call, .. } => {
+                                action_seen = true;
+                                latest = Some(format!("专家正在调用工具：{}", call.name));
+                            }
+                            SessionEvent::ToolResult { result, .. } => {
+                                action_seen = true;
+                                latest = Some(if result.ok {
+                                    "专家已收到工具结果，正在执行下一步".to_string()
+                                } else {
+                                    "专家收到失败的工具结果，正在调整执行方案".to_string()
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    if action_seen {
+                        saw_action = true;
+                        last_action = std::time::Instant::now();
+                    }
+                    if let Some(detail) = latest {
+                        reporter(detail);
+                    }
+                    let elapsed = started.elapsed();
+                    let inactive = if saw_action {
+                        last_action.elapsed() >= idle_timeout
+                    } else {
+                        elapsed >= first_output_timeout
+                    };
+                    if inactive {
+                        cancel.cancel();
+                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut run).await;
+                        let reason = if saw_action {
+                            format!("child made no new delivery activity for {} seconds", idle_timeout.as_secs())
+                        } else {
+                            format!("child produced no text or tool action after {} seconds", first_output_timeout.as_secs())
+                        };
+                        break Some(Err(Error::Subagent(reason)));
+                    }
+                }
+            }
         };
         match outcome {
             Some(result) => result?,
-            None => {
-                cancel.cancel();
-                let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
-                return Err(Error::Subagent(format!(
-                    "child timed out after {} seconds",
-                    self.timeout.as_secs()
-                )));
-            }
+            None => unreachable!("the observed subagent loop always returns an outcome"),
         }
         let answer = log
             .replay()
@@ -91,7 +153,7 @@ impl Subagent for InProcessSubagent {
         }
     }
 
-    async fn spawn_brief(&self, task: &str) -> Result<String> {
+    async fn run_brief(&self, task: &str, timeout: Duration) -> Result<String> {
         let _permit = self
             .slots
             .acquire()
@@ -119,14 +181,47 @@ impl Subagent for InProcessSubagent {
                 Ok(answer)
             }
         };
-        tokio::time::timeout(self.timeout, collect)
-            .await
-            .map_err(|_| {
-                Error::Subagent(format!(
-                    "brief child timed out after {} seconds",
-                    self.timeout.as_secs()
-                ))
-            })?
+        tokio::time::timeout(timeout, collect).await.map_err(|_| {
+            Error::Subagent(format!(
+                "brief child timed out after {} seconds",
+                timeout.as_secs()
+            ))
+        })?
+    }
+}
+
+#[async_trait]
+impl Subagent for InProcessSubagent {
+    async fn spawn(&self, task: &str) -> Result<String> {
+        self.run_agent(task, self.timeout).await
+    }
+
+    async fn spawn_with_timeout(&self, task: &str, timeout: Duration) -> Result<String> {
+        self.run_agent(task, timeout.min(self.timeout)).await
+    }
+
+    async fn spawn_observed(
+        &self,
+        task: &str,
+        first_output_timeout: Duration,
+        idle_timeout: Duration,
+        reporter: SubagentProgressReporter,
+    ) -> Result<String> {
+        self.run_agent_observed(
+            task,
+            first_output_timeout.min(self.timeout),
+            idle_timeout.min(self.timeout),
+            reporter,
+        )
+        .await
+    }
+
+    async fn spawn_brief(&self, task: &str) -> Result<String> {
+        self.run_brief(task, self.timeout).await
+    }
+
+    async fn spawn_brief_with_timeout(&self, task: &str, timeout: Duration) -> Result<String> {
+        self.run_brief(task, timeout.min(self.timeout)).await
     }
 }
 

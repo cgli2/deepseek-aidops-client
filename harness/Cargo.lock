@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "harness-acp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "harness-core",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "harness-bin"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "embed-resource",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "harness-capability"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "harness-core",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "harness-llm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-aidops"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "harness-capability",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-git"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "harness-capability",
  "harness-core",
@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-hook"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "harness-capability",
  "harness-core",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-local"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "encoding_rs",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-memory"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "harness-capability",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-sandbox"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "harness-core",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-trellis"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "harness-core",
  "harness-llm",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-wasm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "harness-capability",
  "harness-core",
@@ -1889,7 +1889,7 @@ dependencies = [
 
 [[package]]
 name = "harness-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "harness-sdk"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "harness-core",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "harness-session"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "harness-core",
  "harness-llm",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "harness-capability",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "harness-ui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "arboard",

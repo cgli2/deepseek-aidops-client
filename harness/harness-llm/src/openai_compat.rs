@@ -417,7 +417,17 @@ pub fn messages_json(msgs: &[Message]) -> Vec<Value> {
                 Role::Assistant => "assistant",
                 Role::Tool => "tool",
             };
-            let mut value = json!({ "role": role, "content": m.content });
+            let content = if m.role == Role::User && !m.image_data_urls.is_empty() {
+                let mut parts = Vec::with_capacity(m.image_data_urls.len() + 1);
+                parts.push(json!({ "type": "text", "text": m.content }));
+                parts.extend(m.image_data_urls.iter().map(|url| {
+                    json!({ "type": "image_url", "image_url": { "url": url } })
+                }));
+                Value::Array(parts)
+            } else {
+                Value::String(m.content.clone())
+            };
+            let mut value = json!({ "role": role, "content": content });
             // DeepSeek thinking mode treats reasoning_content as part of the
             // assistant tool-call transcript.  It must be preserved verbatim on
             // the next request, but must never be fabricated for other roles.
@@ -619,6 +629,22 @@ mod tests {
         assert!(v[1].get("reasoning_content").is_none());
         assert_eq!(v[3]["role"], "tool");
         assert_eq!(v[3]["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn messages_json_encodes_user_images_as_openai_content_parts() {
+        let message = Message::user_with_images(
+            "请识别图片",
+            vec!["data:image/png;base64,aGVsbG8=".into()],
+        );
+        let value = messages_json(&[message]);
+        assert_eq!(value[0]["content"][0]["type"], "text");
+        assert_eq!(value[0]["content"][0]["text"], "请识别图片");
+        assert_eq!(value[0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            value[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
     }
 
     #[test]

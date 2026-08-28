@@ -60,6 +60,10 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// 当前用户消息随附的图片 data URL。仅在本轮请求中保留；Provider 根据自身协议
+    /// 转成图像内容块，避免把本地文件路径误当成模型已经看过的图片。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_data_urls: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
     /// DeepSeek thinking mode requires the assistant's upstream reasoning trace to
     /// accompany its tool calls on every subsequent request.  This is deliberately
@@ -75,6 +79,7 @@ impl Message {
         Self {
             role: Role::System,
             content: text.into(),
+            image_data_urls: vec![],
             tool_calls: vec![],
             reasoning_content: None,
             tool_call_id: None,
@@ -84,6 +89,20 @@ impl Message {
         Self {
             role: Role::User,
             content: text.into(),
+            image_data_urls: vec![],
+            tool_calls: vec![],
+            reasoning_content: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// 构造带内联图片的用户消息。图片使用 data URL，调用方应只传入已验证大小及
+    /// MIME 类型的本地附件；各 Provider 决定是否以及如何上传给视觉模型。
+    pub fn user_with_images(text: impl Into<String>, image_data_urls: Vec<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: text.into(),
+            image_data_urls,
             tool_calls: vec![],
             reasoning_content: None,
             tool_call_id: None,
@@ -93,6 +112,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: text.into(),
+            image_data_urls: vec![],
             tool_calls: vec![],
             reasoning_content: None,
             tool_call_id: None,
@@ -103,6 +123,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: text.into(),
+            image_data_urls: vec![],
             tool_calls,
             reasoning_content: None,
             tool_call_id: None,
@@ -117,6 +138,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: text.into(),
+            image_data_urls: vec![],
             tool_calls,
             reasoning_content: reasoning_content.filter(|content| !content.is_empty()),
             tool_call_id: None,
@@ -127,6 +149,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: text.into(),
+            image_data_urls: vec![],
             tool_calls: vec![],
             reasoning_content: None,
             tool_call_id: Some(call_id.into()),
@@ -237,6 +260,10 @@ pub fn allowed_coding_tools(allowed: Option<&[String]>) -> Vec<ToolSchema> {
 pub trait LlmProvider: Any + Send + Sync {
     fn name(&self) -> &'static str;
     fn tools(&self) -> Vec<ToolSchema>;
+    /// 是否可接收用户图片。默认关闭，防止文本模型收到不兼容的多模态请求。
+    fn supports_vision(&self) -> bool {
+        false
+    }
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream;
     fn stream_with_options(&self, msgs: Vec<Message>, _options: RequestOptions) -> ChunkStream {
         self.stream(msgs)

@@ -968,44 +968,31 @@ fn paste_clipboard_image() -> Option<std::path::PathBuf> {
     let image = clipboard.get_image().ok()?;
     let dir = std::env::temp_dir().join("deepseek-aidops-attachments");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("clipboard-{}.bmp", uuid_like_suffix()));
-    save_rgba_as_bmp(&path, image.width as u32, image.height as u32, &image.bytes).ok()?;
+    // 视觉 API 普遍支持 PNG/JPEG/WebP，但不保证接受 BMP。将系统剪贴板的 RGBA
+    // 统一编码为 PNG，确保粘贴截图可直接进入多模态请求。
+    let path = dir.join(format!("clipboard-{}.png", uuid_like_suffix()));
+    save_rgba_as_png(&path, image.width as u32, image.height as u32, &image.bytes).ok()?;
     Some(path)
 }
 
-/// 无额外图像依赖地写出 32-bit BGRA BMP；用于把系统剪贴板图片转成普通附件文件。
-fn save_rgba_as_bmp(
+fn save_rgba_as_png(
     path: &std::path::Path,
     width: u32,
     height: u32,
     rgba: &[u8],
 ) -> std::io::Result<()> {
-    let pixels = width as usize * height as usize;
-    if width == 0 || height == 0 || rgba.len() < pixels * 4 {
+    if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid clipboard image",
         ));
     }
-    let image_bytes = pixels * 4;
-    let file_size = 54 + image_bytes;
-    let mut out = Vec::with_capacity(file_size);
-    out.extend_from_slice(b"BM");
-    out.extend_from_slice(&(file_size as u32).to_le_bytes());
-    out.extend_from_slice(&[0; 4]);
-    out.extend_from_slice(&(54u32).to_le_bytes());
-    out.extend_from_slice(&(40u32).to_le_bytes());
-    out.extend_from_slice(&(width as i32).to_le_bytes());
-    out.extend_from_slice(&(-(height as i32)).to_le_bytes()); // top-down
-    out.extend_from_slice(&(1u16).to_le_bytes());
-    out.extend_from_slice(&(32u16).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&(image_bytes as u32).to_le_bytes());
-    out.extend_from_slice(&[0; 16]);
-    for pixel in rgba.chunks_exact(4).take(pixels) {
-        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-    }
-    std::fs::write(path, out)
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
+    writer.write_image_data(rgba).map_err(std::io::Error::other)
 }
 
 fn uuid_like_suffix() -> String {
@@ -1018,7 +1005,9 @@ fn uuid_like_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_input_if_it_only_contains_paths, is_paste_shortcut};
+    use super::{
+        clear_input_if_it_only_contains_paths, is_paste_shortcut, save_rgba_as_png,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -1055,5 +1044,20 @@ mod tests {
         };
 
         assert!(is_paste_shortcut(&event));
+    }
+
+    #[test]
+    fn clipboard_rgba_is_encoded_as_png() {
+        let path = std::env::temp_dir().join(format!(
+            "harness-clipboard-image-{}.png",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        save_rgba_as_png(&path, 1, 1, &[0x11, 0x22, 0x33, 0xff]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -1892,6 +1892,7 @@ name = "harness-runtime"
 version = "0.2.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "harness-capability",
  "harness-core",
@@ -1958,6 +1959,7 @@ dependencies = [
  "harness-provider-trellis",
  "harness-provider-wasm",
  "harness-session",
+ "png",
  "pulldown-cmark",
  "rand 0.8.7",
  "ratatui",

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use futures::StreamExt;
 use harness_capability::assets::{
     ChatTurn, ConversationMemory, FactKind, LifecycleLayer, MemoryFact, Skill, SkillLibrary,
@@ -237,7 +238,9 @@ impl AgentLoop {
         let hook = ctx.get::<dyn Hook>();
         let bus = ctx.events();
 
-        let input_text = input.text.clone();
+        // 仅附文件/图片也必须形成完整任务，不能把空 user message 交给上游模型；
+        // 后者常被网关当作无效输入或返回空输出，表现为会话窗口毫无响应。
+        let input_text = attachment_prompt(&input);
         // 会话正文可以重放，但任务的策略/验收状态不能从一句“继续”重新推断。
         // 只在明确续跑表达式下恢复，普通新请求仍完全按其自身目标执行。
         let history = log.replay();
@@ -357,8 +360,10 @@ impl AgentLoop {
         let mut debt: usize = 1;
         // 跨步累积本轮助手最终文本，供回合结束时沉淀为 L0 记忆。
         let mut last_assistant = String::new();
-        let attachment_context = render_attachment_context(&input.attachments);
-        messages.push(Message::user(&input_text));
+        let (image_data_urls, image_notes) =
+            inline_image_data_urls(&input.attachments, llm.supports_vision());
+        let attachment_context = render_attachment_context(&input.attachments, &image_notes);
+        messages.push(Message::user_with_images(&input_text, image_data_urls));
         if !attachment_context.is_empty() {
             messages.insert(1, Message::system(&attachment_context));
         }
@@ -1320,7 +1325,7 @@ fn compress_stale_tool_results(mut messages: Vec<Message>) -> Vec<Message> {
 /// 近期对话。短内容不变，长内容保留开头、错误附近和结尾。
 /// 显式上传的附件是本回合输入条件。文本附件直接提供受限摘录；二进制附件保留
 /// 文件名、MIME 与路径，要求 Agent 在用户授权范围内按需调用合适工具处理。
-fn render_attachment_context(attachments: &[harness_core::Attachment]) -> String {
+fn render_attachment_context(attachments: &[harness_core::Attachment], image_notes: &[String]) -> String {
     if attachments.is_empty() {
         return String::new();
     }
@@ -1358,7 +1363,90 @@ fn render_attachment_context(attachments: &[harness_core::Attachment]) -> String
         }
         out.push('\n');
     }
+    if !image_notes.is_empty() {
+        out.push_str("[图片处理状态]\n");
+        for note in image_notes {
+            out.push_str("- ");
+            out.push_str(note);
+            out.push('\n');
+        }
+    }
     out
+}
+
+/// 单张图片上限，防止一次粘贴把原图 base64 膨胀后挤爆模型上下文或请求体。
+const MAX_INLINE_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+fn attachment_prompt(input: &UserInput) -> String {
+    if input.text.trim().is_empty() && !input.attachments.is_empty() {
+        "请分析并说明我附上的附件内容；如包含图片，请识别其中可见的信息。若当前模型或文件类型不支持直接识别，请明确说明原因及下一步可行操作。".to_string()
+    } else {
+        input.text.clone()
+    }
+}
+
+/// 把可识别的本地图片转换为 Provider 可发送的 data URL。
+///
+/// 视觉能力明确关闭时绝不上传原图，避免把图片传给文本模型并得到难以理解的 400；
+/// 同时返回可见状态说明，保证用户不会误以为图片已经被识别。
+fn inline_image_data_urls(
+    attachments: &[harness_core::Attachment],
+    vision_enabled: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut urls = Vec::new();
+    let mut notes = Vec::new();
+    for attachment in attachments {
+        let Some(mime) = vision_image_mime(attachment) else {
+            continue;
+        };
+        let name = attachment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("未命名图片");
+        if !vision_enabled {
+            notes.push(format!("{name}：当前所选模型不支持图片识别，未发送原图。"));
+            continue;
+        }
+        let bytes = match std::fs::read(&attachment.path) {
+            Ok(bytes) if bytes.len() as u64 <= MAX_INLINE_IMAGE_BYTES => bytes,
+            Ok(bytes) => {
+                notes.push(format!(
+                    "{name}：图片大小 {} MiB，超过 {} MiB 上限，未发送原图。",
+                    bytes.len() / 1024 / 1024,
+                    MAX_INLINE_IMAGE_BYTES / 1024 / 1024
+                ));
+                continue;
+            }
+            Err(error) => {
+                notes.push(format!("{name}：无法读取图片（{error}），未发送原图。"));
+                continue;
+            }
+        };
+        urls.push(format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ));
+        notes.push(format!("{name}：已作为图片内容发送给视觉模型。"));
+    }
+    (urls, notes)
+}
+
+fn vision_image_mime(attachment: &harness_core::Attachment) -> Option<&'static str> {
+    match attachment
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 fn compress_tool_context(content: &str) -> String {
@@ -1675,6 +1763,47 @@ mod tests {
         assert!(compacted.chars().count() <= 16_000);
         assert!(compacted.contains("error: expected failure"));
         assert!(compacted.contains("工具输出已压缩"));
+    }
+
+    #[test]
+    fn attachment_only_input_becomes_an_explicit_analysis_request() {
+        let prompt = attachment_prompt(&UserInput {
+            text: String::new(),
+            attachments: vec![harness_core::Attachment {
+                path: "screenshot.png".into(),
+                mime: "image/png".into(),
+            }],
+        });
+        assert!(prompt.contains("分析"));
+        assert!(prompt.contains("图片"));
+    }
+
+    #[test]
+    fn inline_image_data_urls_only_include_supported_images() {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-attachment-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("image.png");
+        std::fs::write(&image, [1_u8, 2, 3]).unwrap();
+        let attachments = vec![harness_core::Attachment {
+            path: image,
+            mime: "image/png".into(),
+        }];
+
+        let (urls, notes) = inline_image_data_urls(&attachments, true);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].starts_with("data:image/png;base64,"));
+        assert!(notes[0].contains("已作为图片内容发送"));
+
+        let (urls, notes) = inline_image_data_urls(&attachments, false);
+        assert!(urls.is_empty());
+        assert!(notes[0].contains("不支持图片识别"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

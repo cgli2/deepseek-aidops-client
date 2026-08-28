@@ -58,6 +58,10 @@ impl LlmProvider for Anthropic {
         openai_compat::coding_tools()
     }
 
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream {
         self.stream_with_options(msgs, RequestOptions::default())
     }
@@ -248,6 +252,15 @@ fn request_body(
                 }
                 messages.push(json!({ "role": "assistant", "content": content }));
             }
+            Role::User if !m.image_data_urls.is_empty() => {
+                let mut content = vec![json!({ "type": "text", "text": m.content })];
+                content.extend(
+                    m.image_data_urls
+                        .iter()
+                        .filter_map(|url| image_content_block(url)),
+                );
+                messages.push(json!({ "role": "user", "content": content }));
+            }
             _ => messages.push(json!({ "role": role_name(m.role), "content": m.content })),
         }
     }
@@ -286,6 +299,20 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
+/// 将 `data:<mime>;base64,<payload>` 转为 Anthropic 的 image source block。
+/// Runtime 只会构造经大小/MIME 校验的 data URL，这里仍做格式校验以保护请求边界。
+fn image_content_block(data_url: &str) -> Option<Value> {
+    let (header, data) = data_url.split_once(',')?;
+    let media_type = header.strip_prefix("data:")?.strip_suffix(";base64")?;
+    matches!(media_type, "image/jpeg" | "image/png" | "image/gif" | "image/webp")
+        .then(|| {
+            json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media_type, "data": data },
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +341,24 @@ mod tests {
         assert_eq!(messages[1]["content"][1]["type"], "tool_use");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "c1");
+    }
+
+    #[test]
+    fn request_body_maps_user_image_data_url() {
+        let body = request_body(
+            "claude-test",
+            &[Message::user_with_images(
+                "描述图片",
+                vec!["data:image/png;base64,aGVsbG8=".into()],
+            )],
+            None,
+            &RequestOptions::default(),
+        );
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(
+            body["messages"][0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
     }
 }

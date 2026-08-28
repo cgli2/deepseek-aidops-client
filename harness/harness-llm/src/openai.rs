@@ -47,6 +47,10 @@ impl LlmProvider for OpenAI {
         openai_compat::coding_tools()
     }
 
+    fn supports_vision(&self) -> bool {
+        supports_vision_model(&self.model)
+    }
+
     fn stream(&self, msgs: Vec<Message>) -> ChunkStream {
         self.stream_with_options(msgs, RequestOptions::default())
     }
@@ -62,5 +66,29 @@ impl LlmProvider for OpenAI {
             "stream_options": { "include_usage": true },
         });
         openai_compat::stream_chat("OpenAI", self.base_url.clone(), self.api_key.clone(), body)
+    }
+}
+
+/// OpenAI 兼容端点没有统一的 capabilities 接口；只对常见视觉模型启用图片内容块，
+/// 避免将图片意外发给纯文本模型。其它模型仍能收到附件文字摘录。
+fn supports_vision_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    [
+        "gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "vision", "qwen-vl", "qwen2-vl",
+        "qwen2.5-vl", "qvq", "llava", "minicpm-v", "gemma-3",
+    ]
+    .iter()
+    .any(|name| model.contains(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_vision_model;
+
+    #[test]
+    fn recognizes_common_vision_model_names() {
+        assert!(supports_vision_model("gpt-4o"));
+        assert!(supports_vision_model("Qwen2.5-VL-72B-Instruct"));
+        assert!(!supports_vision_model("deepseek-chat"));
     }
 }

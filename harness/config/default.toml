@@ -1,0 +1,15 @@
+# DeepSeek AIOps 默认配置。敏感信息不得写入本文件。
+sandbox_mode = "WorkspaceWrite"
+approval_policy = "Ask"
+permission_preset = "balanced"
+
+[llm]
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+# API Key 请在桌面端“模型设置”中配置；程序使用 AES-256-GCM 加密后保存到 SQLite（跨操作系统通用）。
+api_key = ""
+
+[ui]
+profile = "gui"

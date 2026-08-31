@@ -1,0 +1,21 @@
+[package]
+name = "harness-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+# 版本管理 / 自动升级：阻塞式拉取发布清单与下载新 exe（后台线程，不阻塞 egui 主循环）。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# 下载后完整性校验（清单提供 sha256 时）。
+sha2 = "0.10"

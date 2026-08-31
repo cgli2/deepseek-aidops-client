@@ -1,0 +1,36 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check all features
+        run: cargo check --workspace --all-features
+      - name: Run tests
+        run: cargo test --workspace
+      - name: Package app and DMG
+        run: ./scripts/build.sh package
+      - name: Verify bundle
+        run: |
+          test "$(defaults read "$PWD/dist/AIOPS Desktop.app/Contents/Info" CFBundleIdentifier)" = "com.clotee.aidops"
+          codesign --verify --deep --strict "$PWD/dist/AIOPS Desktop.app"
+          hdiutil verify "$PWD"/dist/AIOPS-Desktop-*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aidops-desktop-macos
+          path: harness/dist/*.dmg
+          if-no-files-found: error

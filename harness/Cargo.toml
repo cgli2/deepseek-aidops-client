@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+  "harness-core",
+  "harness-runtime",
+  "harness-capability",
+  "harness-provider-local",
+  "harness-provider-sandbox",
+  "harness-provider-wasm",
+  "harness-provider-memory",
+  "harness-provider-aidops",
+  "harness-provider-hook",
+"harness-provider-trellis",
+  "harness-provider-git",
+  "harness-llm",
+  "harness-tool",
+  "harness-session",
+  "harness-ui",
+  "harness-acp",
+  "harness-sdk",
+  "bin",
+]
+
+[workspace.package]
+version = "0.2.2"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/cgli2/deepseek-aidops-client"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+toml = "0.8"
+
+# 二进制体积 / 速度（原 §14 性能预算）
+# 注：fat LTO + codegen-units=1 的链接内存峰值在受限沙箱里会被杀，
+# 改用 thin LTO + 多 codegen-units 以显著降低链接期内存占用。
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = true
+opt-level = 3

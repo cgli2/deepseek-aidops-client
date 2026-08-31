@@ -1,0 +1,47 @@
+[package]
+name = "harness-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aidops-desktop"
+path = "src/main.rs"
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-runtime = { path = "../harness-runtime" }
+harness-llm = { path = "../harness-llm" }
+harness-tool = { path = "../harness-tool" }
+harness-session = { path = "../harness-session" }
+harness-capability = { path = "../harness-capability" }
+harness-provider-local = { path = "../harness-provider-local" }
+harness-provider-sandbox = { path = "../harness-provider-sandbox" }
+harness-provider-wasm = { path = "../harness-provider-wasm" }
+harness-provider-memory = { path = "../harness-provider-memory" }
+harness-provider-aidops = { path = "../harness-provider-aidops", optional = true }
+harness-provider-hook = { path = "../harness-provider-hook" }
+harness-provider-trellis = { path = "../harness-provider-trellis" }
+harness-provider-git = { path = "../harness-provider-git" }
+harness-ui = { path = "../harness-ui" }
+harness-acp = { path = "../harness-acp", optional = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+[features]
+default = ["deepseek", "gui", "wasm-tools"]
+tui = ["harness-ui/tui"]
+gui = ["harness-ui/gui"]
+acp = ["harness-acp"]
+aidops = ["harness-provider-aidops"]
+wasm-tools = ["harness-provider-wasm/wasm-tools"]
+local-llm = ["harness-llm/local"]
+deepseek = ["harness-llm/deepseek"]
+
+# 仅 Windows 构建时把 icon 资源编译进 exe（embed-resource 自动定位 rc.exe / windres）。
+[build-dependencies]
+embed-resource = "2"
+
+# 仅 Windows 下用于 GUI 二进制释放附带的控制台窗口（FreeConsole / ShowWindow）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }

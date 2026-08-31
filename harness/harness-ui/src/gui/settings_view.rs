@@ -1,0 +1,1357 @@
+//! Settings modal layout and page routing.
+
+use super::model::PluginKind;
+use super::*;
+
+/// 厂商预置选项（名称 → 默认 API 地址）：下拉直选，也允许自定义输入其他厂商。
+const PROVIDER_PRESETS: &[(&str, &str)] = &[
+    ("deepseek", "https://api.deepseek.com/v1"),
+    ("openai", "https://api.openai.com/v1"),
+    ("anthropic", "https://api.anthropic.com"),
+    ("openrouter", "https://openrouter.ai/api/v1"),
+    (
+        "gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
+    ("moonshot", "https://api.moonshot.cn/v1"),
+    ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
+    ("ollama", "http://localhost:11434/v1"),
+];
+
+pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
+    // ── 设置弹层 ─────────────────────────────────────────────
+    // ── 设置模态：全屏半透明遮罩 + 居中圆角面板（替代默认 Window 标题栏样式）──
+    if state.settings_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.settings_open = false;
+    }
+    if !state.settings_open {
+        // 关闭后清空面板矩形，避免残留矩形影响后续遮罩误触防护。
+        state.modal_panel_rect = None;
+    }
+    if state.settings_open {
+        let page = state.settings_page.clone();
+        let system_page = matches!(
+            page.as_str(),
+            "模型配置"
+                | "模型设置"
+                | "技能管理"
+                | "记忆系统"
+                | "记忆"
+                | "参数配置"
+                | "系统配置"
+                | "系统更新"
+                | "更新"
+        );
+        let display_title = if system_page {
+            "系统管理"
+        } else {
+            page.as_str()
+        };
+        let screen = ctx.screen_rect();
+        // 系统管理采用紧凑、稳定的双栏尺寸；内容多少不再改变弹窗大小。
+        let panel_w = if system_page {
+            (screen.width() - 180.0).clamp(700.0, 860.0)
+        } else {
+            (screen.width() - 320.0).clamp(520.0, 660.0)
+        };
+        let panel_h = if system_page {
+            (screen.height() - 100.0).clamp(520.0, 680.0)
+        } else {
+            (screen.height() - 56.0).clamp(534.0, 914.0)
+        };
+        let scroll_h = panel_h - 94.0;
+        // 内容变化（插件行、提示文字、滚动条）不能影响面板位置；否则居中锚点会
+        // 和自动尺寸互相反馈，在 Windows 上表现为持续抖动。
+        let panel_pos = egui::pos2(
+            screen.left() + (screen.width() - panel_w) * 0.5,
+            screen.top() + ((screen.height() - panel_h) * 0.5).max(20.0),
+        );
+
+        // 蒙层：纯装饰压暗（直接画到 Background 层，不注册任何交互控件）。
+        // ⚠️ 不能用带 Sense 的 Area 做蒙层：egui 0.30 会给 interactable Area 自动注册
+        // 覆盖整个区域的“置顶点击”控件（area.rs move_response），抢占面板交互并自动
+        // 把蒙层提到 Foreground 最前，表现为弹窗被蒙层挡住/点不动。
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("modal_dim"),
+        ))
+        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(130));
+
+        // 点面板外关闭：原始输入判定（本帧不注册任何全屏交互控件，不与面板抢事件）。
+        // modal_open_last_frame 守卫：打开当帧的 press 是侧栏触发点击，不得误关。
+        if state.modal_open_last_frame {
+            let pressed = ctx.input(|i| i.pointer.any_pressed());
+            let origin = ctx.input(|i| i.pointer.press_origin());
+            if pressed {
+                if let Some(pos) = origin {
+                    let on_panel = state.modal_panel_rect.is_some_and(|r| r.contains(pos));
+                    if !on_panel {
+                        state.settings_open = false;
+                    }
+                }
+            }
+        }
+
+        // 面板层：Foreground 层。蒙层已无交互控件，本层是前景唯一可交互层，
+        // 不会被抬到更前；层内 ComboBox 下拉注册更晚 → 盖住面板。
+        // 切勿用 Tooltip：下拉菜单开在 Foreground 层，面板若更高会把菜单整个盖住。
+        egui::Area::new("settings_panel".into())
+                .order(egui::Order::Foreground)
+                .fixed_pos(panel_pos)
+                .show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(pal.panel)
+                        .rounding(egui::Rounding::same(14.0))
+                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                        .shadow(egui::epaint::Shadow {
+                            offset: egui::vec2(0.0, 10.0),
+                            blur: 28.0,
+                            spread: 0.0,
+                            color: egui::Color32::from_black_alpha(120),
+                        })
+                        .inner_margin(egui::Margin::symmetric(20.0, 16.0))
+                        .show(ui, |ui| {
+                            ui.set_width(panel_w);
+                            ui.set_height(panel_h);
+                            // 头部：标题 + 关闭按钮
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(display_title)
+                                        .size(16.0)
+                                        .strong()
+                                        .color(pal.text),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if close_button(ui, &pal) {
+                                        state.settings_open = false;
+                                    }
+                                });
+                            });
+                            let sep = ui
+                                .allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 1.0),
+                                    egui::Sense::hover(),
+                                )
+                                .0;
+                            ui.painter().rect_filled(sep, 0.0, pal.border);
+                            ui.add_space(10.0);
+                            // 固定反馈区高度，保存提示出现/消失时弹窗与内容区均不跳动。
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 24.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    if !state.note.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&state.note)
+                                                .size(12.0)
+                                                .color(pal.accent),
+                                        );
+                                    }
+                                },
+                            );
+                            ui.horizontal(|ui| {
+                                if system_page {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(156.0);
+                                        ui.add_space(2.0);
+                                        for (target, label) in [
+                                            ("模型配置", "模型配置"),
+                                            ("技能管理", "技能管理"),
+                                            ("记忆系统", "记忆系统"),
+                                            ("参数配置", "参数配置"),
+                                            ("系统更新", "系统更新"),
+                                        ] {
+                                            let selected = match target {
+                                                "模型配置" => matches!(page.as_str(), "模型配置" | "模型设置"),
+                                                "记忆系统" => matches!(page.as_str(), "记忆系统" | "记忆"),
+                                                "参数配置" => matches!(page.as_str(), "参数配置" | "系统配置"),
+                                                "系统更新" => matches!(page.as_str(), "系统更新" | "更新"),
+                                                _ => page == target,
+                                            };
+                                            if ui
+                                                .add_sized(
+                                                    [148.0, 36.0],
+                                                    egui::SelectableLabel::new(selected, label),
+                                                )
+                                                .clicked()
+                                            {
+                                                state.settings_page = target.into();
+                                                state.note.clear();
+                                            }
+                                            ui.add_space(4.0);
+                                        }
+                                    });
+                                    ui.separator();
+                                    ui.add_space(10.0);
+                                }
+                                egui::ScrollArea::vertical()
+                                .min_scrolled_height(scroll_h)
+                                .max_height(scroll_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // 外层是系统管理的左右分栏；右侧内容必须重新建立纵向布局，
+                                    // 否则会继承 horizontal，把所有表单项排成一整行并撑宽弹窗。
+                                    ui.vertical(|ui| match page.as_str() {
+                                    "模型配置" | "模型设置" => {
+                                        ui.set_min_width(if system_page { panel_w - 220.0 } else { panel_w - 12.0 });
+                                        // 表单输入框统一几何：宽度以「模型名称」列为基准（预留右侧按钮位）；
+                                        // 高度 34px 与按钮等高，用对称上下边距撑高（而非 min_size）——
+                                        // egui 文本锚定在内框左上角，只有边距对称才能保证垂直居中。
+                                        let field_w = (ui.available_width() - 150.0).max(260.0);
+                                        let body_row_h = ui.fonts(|f| {
+                                            f.row_height(&egui::TextStyle::Body.resolve(ui.style()))
+                                        });
+                                        let field_pad_y = ((34.0 - body_row_h) / 2.0).max(2.0);
+                                        let field_margin = egui::Margin::symmetric(4.0, field_pad_y);
+                                        // desired_width 是内框宽：扣除左右边距后外宽恰好 = field_w，
+                                        // 否则「模型名称」行总宽溢出，右侧按钮会被压进输入框。
+                                        let field_inner_w = field_w - field_margin.sum().x;
+                                        // ── 模型列表管理区：启用 / 停用 · 编辑 · 删除 ──
+                                        field_label(ui, &pal, "已添加的模型");
+                                        let active_model = state
+                                            .host
+                                            .settings
+                                            .get("llm.model")
+                                            .unwrap_or_default();
+                                        if state.profiles.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("尚未添加模型配置，请在下方表单新增。")
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                            );
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("profile_list_scroll")
+                                                .max_height(190.0)
+                                                .show(ui, |ui| {
+                                                    for profile in state.profiles.clone() {
+                                                        let is_editing = state
+                                                            .editing_profile
+                                                            .as_deref()
+                                                            == Some(profile.name.as_str());
+                                                        ui.group(|ui| {
+                                                            ui.horizontal(|ui| {
+                                                                let mut enabled = profile.enabled;
+                                                                if ui
+                                                                    .checkbox(&mut enabled, "")
+                                                                    .on_hover_text(if profile.enabled {
+                                                                        "停用该模型（保留配置，不再参与快捷切换）"
+                                                                    } else {
+                                                                        "启用该模型"
+                                                                    })
+                                                                    .changed()
+                                                                {
+                                                                    let _ = state
+                                                                        .host
+                                                                        .settings
+                                                                        .set_model_profile_enabled(&profile.name, enabled);
+                                                                    state.refresh_profiles();
+                                                                    state.note = format!(
+                                                                        "模型「{}」已{}",
+                                                                        profile.name,
+                                                                        if enabled { "启用" } else { "停用" }
+                                                                    );
+                                                                }
+                                                                ui.vertical(|ui| {
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.label(
+                                                                            egui::RichText::new(&profile.name)
+                                                                                .size(13.0)
+                                                                                .strong()
+                                                                                .color(if profile.enabled { pal.text } else { pal.dim }),
+                                                                        );
+                                                                        if profile.enabled && profile.model == active_model {
+                                                                            ui.label(
+                                                                                egui::RichText::new("当前")
+                                                                                    .size(10.5)
+                                                                                    .color(pal.accent),
+                                                                            );
+                                                                        }
+                                                                        if is_editing {
+                                                                            ui.label(
+                                                                                egui::RichText::new("编辑中")
+                                                                                    .size(10.5)
+                                                                                    .color(pal.warn),
+                                                                            );
+                                                                        }
+                                                                    });
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!(
+                                                                            "{} · {}",
+                                                                            profile.provider, profile.base_url
+                                                                        ))
+                                                                        .size(11.0)
+                                                                        .color(pal.dim),
+                                                                    );
+                                                                });
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        if ghost_button(ui, &pal, "删除") {
+                                                                            let _ = state
+                                                                                .host
+                                                                                .settings
+                                                                                .delete_model_profile(&profile.name);
+                                                                            if is_editing {
+                                                                                state.editing_profile = None;
+                                                                            }
+                                                                            state.refresh_profiles();
+                                                                            state.note =
+                                                                                format!("已删除模型配置「{}」", profile.name);
+                                                                        }
+                                                                        if ghost_button(ui, &pal, "编辑") {
+                                                                            state.f_provider = profile.provider.clone();
+                                                                            state.f_base = profile.base_url.clone();
+                                                                            state.f_model = profile.model.clone();
+                                                                            state.f_key.clear();
+                                                                            state.editing_profile = Some(profile.name.clone());
+                                                                            state.note = format!(
+                                                                                "正在编辑「{}」，保存后覆写该条目（API Key 留空则沿用原 Key）",
+                                                                                profile.name
+                                                                            );
+                                                                        }
+                                                                    },
+                                                                );
+                                                            });
+                                                        });
+                                                        ui.add_space(4.0);
+                                                    }
+                                                });
+                                        }
+                                        // ── 表单：新增 / 编辑模型 ──
+                                        let form_title = match &state.editing_profile {
+                                            Some(n) => format!("编辑模型：{n}"),
+                                            None => "新增模型".to_string(),
+                                        };
+                                        field_label(ui, &pal, &form_title);
+                                        field_label(ui, &pal, "模型厂商（下拉选择预置厂商，也可自定义输入）");
+                                        egui::ComboBox::from_id_salt("provider_preset")
+                                            .width(220.0)
+                                            .selected_text(if state.f_provider.trim().is_empty() {
+                                                "选择厂商…"
+                                            } else {
+                                                state.f_provider.as_str()
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                for (name, base) in PROVIDER_PRESETS {
+                                                    let resp = ui.selectable_label(
+                                                        state.f_provider == *name,
+                                                        egui::RichText::new(*name).size(12.0),
+                                                    );
+                                                    if resp.clicked() {
+                                                        state.f_provider = (*name).to_string();
+                                                        // 预置 API 地址自动回填：仅在当前为空或仍为某预置默认值时覆盖，
+                                                        // 不覆盖用户手填的自定义地址。
+                                                        let replaceable = state.f_base.trim().is_empty()
+                                                            || PROVIDER_PRESETS
+                                                                .iter()
+                                                                .any(|(_, b)| *b == state.f_base.trim());
+                                                        if replaceable {
+                                                            state.f_base = (*base).to_string();
+                                                        }
+                                                    }
+                                                }
+                                                ui.separator();
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("自定义")
+                                                            .size(11.5)
+                                                            .color(pal.dim),
+                                                    );
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut state.f_provider)
+                                                            .desired_width(140.0)
+                                                            .hint_text("输入其他厂商"),
+                                                    );
+                                                });
+                                            });
+                                        field_label(ui, &pal, "API 地址");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_base)
+                                                .desired_width(field_inner_w)
+                                                .margin(field_margin),
+                                        );
+                                        field_label(ui, &pal, "模型名称（可自由填写；留空则保存时取上游列表第一个）");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_model)
+                                                    .desired_width(field_inner_w)
+                                                    .margin(field_margin),
+                                            );
+                                            // 按钮用 right_to_left 子布局锚定在行右缘：
+                                            // 子布局宽度自动取剩余空间，不参与左→右流的宽度计算，
+                                            // 滚动条显隐引起的可用宽微小变化不会导致按钮位移 / 重叠。
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if state.models_loading {
+                                                        ui.spinner();
+                                                        ui.label(
+                                                            egui::RichText::new("获取中…")
+                                                                .size(11.0)
+                                                                .color(pal.dim),
+                                                        );
+                                                    } else if ghost_button(ui, &pal, "获取上游模型列表")
+                                                    {
+                                                        state.fetch_models_from_upstream();
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        if !state.models_msg.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&state.models_msg)
+                                                    .size(11.0)
+                                                    .color(if state.f_models.is_empty() { pal.err_text } else { pal.accent }),
+                                            );
+                                        }
+                                        if !state.f_models.is_empty() {
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "勾选要启用的模型（共 {} 个）：",
+                                                    state.f_models.len()
+                                                ))
+                                                .size(11.5)
+                                                .color(pal.dim),
+                                            );
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("model_list_scroll")
+                                                .max_height(120.0)
+                                                .show(ui, |ui| {
+                                                    for m in state.f_models.clone() {
+                                                        let mut checked = state.f_selected_models.contains(&m);
+                                                        if ui.checkbox(&mut checked, &m).changed() {
+                                                            if checked {
+                                                                state.f_selected_models.insert(m.clone());
+                                                            } else {
+                                                                state.f_selected_models.remove(&m);
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            ui.add_space(4.0);
+                                            let n = state.f_selected_models.len();
+                                            if n > 0 {
+                                                ui.label(
+                                                    egui::RichText::new(format!("已选 {n} 个 · 保存后以第一个为当前模型，其余作为可用模型"))
+                                                        .size(11.0)
+                                                        .color(pal.accent),
+                                                );
+                                            }
+                                        }
+                                        field_label(ui, &pal, "API Key（AES-256-GCM 加密后保存至 SQLite，跨操作系统通用）");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_key)
+                                                .password(true)
+                                                .desired_width(field_inner_w)
+                                                .margin(field_margin),
+                                        );
+                                        field_label(ui, &pal, "思考档位 reasoning_effort（可选：off/low/medium/high/xhigh/max/auto，留空=默认）");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_effort)
+                                                .desired_width(field_inner_w)
+                                                .margin(field_margin),
+                                        );
+                                        ui.add_space(14.0);
+                                        ui.horizontal(|ui| {
+                                            let save_label = if state.editing_profile.is_some() {
+                                                "保存修改并应用"
+                                            } else {
+                                                "添加并应用"
+                                            };
+                                            if accent_button(ui, &pal, save_label) {
+                                                state.apply_model();
+                                            }
+                                            if state.editing_profile.is_some()
+                                                && ghost_button(ui, &pal, "取消编辑")
+                                            {
+                                                state.editing_profile = None;
+                                                state.note = "已取消编辑，可继续新增模型".into();
+                                            }
+                                        });
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "支持采用 OpenAI Chat Completions 协议的服务；保存时以“厂商 · 模型名”建立或更新配置。停用的模型保留在列表中，不参与快捷切换。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                    }
+                                    "新建项目" => {
+                                        ui.label(
+                                            egui::RichText::new("选择项目目录后立即切换到该项目，并保存到侧栏项目列表。")
+                                                .size(12.5)
+                                                .color(pal.text),
+                                        );
+                                        ui.add_space(12.0);
+                                        if accent_button(ui, &pal, "选择项目目录") {
+                                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                let s = path.display().to_string();
+                                                let _ = state.host.settings.add_project(&path);
+                                                state.switch_project(&s);
+                                            }
+                                        }
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(format!("当前项目: {}", state.active_project))
+                                                .size(12.0)
+                                                .color(pal.dim),
+                                        );
+                                    }
+                                    "插件管理" => {
+                                        // 插件管理页：系统插件（随应用发布）/ 自定义插件（可导入、删除、启用、禁用）两个 tab。
+                                        ui.horizontal(|ui| {
+                                            if ui.selectable_label(state.plugin_tab == "sys", "系统插件").clicked() {
+                                                state.plugin_tab = "sys".into();
+                                            }
+                                            if ui.selectable_label(state.plugin_tab == "custom", "自定义插件").clicked() {
+                                                state.plugin_tab = "custom".into();
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.separator();
+                                        ui.add_space(4.0);
+                                        if state.plugin_tab == "sys" {
+                                            // ── 系统插件：随应用发布的 Core（保留现状功能）──
+                                            field_label(ui, &pal, "系统插件（随应用发布，默认启用且不可移除）");
+                                            for i in 0..state.plugin_rows.len() {
+                                                if state.plugin_rows[i].kind == PluginKind::Core {
+                                                    let _ = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
+                                                }
+                                            }
+                                            ui.add_space(8.0);
+                                            ui.horizontal(|ui| {
+                                                if accent_button(ui, &pal, "保存插件设置") {
+                                                    state.save_preferences();
+                                                }
+                                            });
+                                        } else {
+                                            // ── 自定义插件：Trellis（spec 驱动开发）＋ WASM 沙箱插件，可导入 / 删除 / 启用 / 禁用 ──
+                                            field_label(ui, &pal, "Trellis（spec 驱动开发 · 进程内 PreStep 注入，可启用 / 停用 / 配置）");
+                                            for i in 0..state.plugin_rows.len() {
+                                                if state.plugin_rows[i].kind != PluginKind::Trellis {
+                                                    continue;
+                                                }
+                                                let (_, changed) = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
+                                                if changed {
+                                                    let enabled = state.plugin_rows[i].enabled;
+                                                    state.host.trellis.set_enabled(enabled);
+                                                    state.plugin_rows[i].active = enabled;
+                                                    state.note = format!(
+                                                        "Trellis 插件已{}",
+                                                        if enabled { "启用（每步 LLM 前注入规格与任务文件）" } else { "停用" }
+                                                    );
+                                                }
+                                            }
+                                            if let Some(row) = state.plugin_rows.iter_mut().find(|r| r.kind == PluginKind::Trellis) {
+                                                ui.add_space(4.0);
+                                                // 约定路径提示：基于工作区根目录自动推导
+                                                let ws = &state.host.workspace_root;
+                                                let default_spec = std::path::Path::new(ws).join(".harness").join("spec.md");
+                                                let default_tasks = std::path::Path::new(ws).join(".harness").join("tasks.json");
+                                                // 实时解析实际生效路径（空 = 约定默认路径），并探测文件是否存在：
+                                                // 启用但两项文件都不存在时，插件实际零效果，需在面板上明确反馈。
+                                                let spec_path = if row.spec_file.trim().is_empty() {
+                                                    default_spec.display().to_string()
+                                                } else {
+                                                    row.spec_file.clone()
+                                                };
+                                                let tasks_path = if row.tasks_file.trim().is_empty() {
+                                                    default_tasks.display().to_string()
+                                                } else {
+                                                    row.tasks_file.clone()
+                                                };
+                                                let spec_exists = std::path::Path::new(&spec_path).exists();
+                                                let tasks_exists = std::path::Path::new(&tasks_path).exists();
+                                                ui.horizontal(|ui| {
+                                                    field_label(ui, &pal, "规格文件");
+                                                    let mut spec = row.spec_file.clone();
+                                                    let te = egui::TextEdit::singleline(&mut spec)
+                                                        .desired_width(320.0)
+                                                        .hint_text(format!("留空则自动使用 {}", default_spec.display()));
+                                                    if ui.add(te).changed() {
+                                                        row.spec_file = spec.clone();
+                                                        state.host.trellis.set_spec_file(spec);
+                                                    }
+                                                });
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "{} {}",
+                                                            if spec_exists { "✓ 规格已加载" } else { "⚠ 未配置规格文件" },
+                                                            if spec_exists {
+                                                                format!("（{}）", spec_path)
+                                                            } else {
+                                                                "（启用后无效果，可点下方生成示例）".into()
+                                                            }
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(if spec_exists { pal.accent } else { pal.warn }),
+                                                    );
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    field_label(ui, &pal, "任务文件");
+                                                    let mut tasks = row.tasks_file.clone();
+                                                    let te = egui::TextEdit::singleline(&mut tasks)
+                                                        .desired_width(320.0)
+                                                        .hint_text(format!("留空则自动使用 {}", default_tasks.display()));
+                                                    if ui.add(te).changed() {
+                                                        row.tasks_file = tasks.clone();
+                                                        state.host.trellis.set_tasks_file(tasks);
+                                                    }
+                                                });
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "{} {}",
+                                                            if tasks_exists { "✓ 任务文件已加载" } else { "⚠ 未配置任务文件" },
+                                                            if tasks_exists {
+                                                                format!("（{}）", tasks_path)
+                                                            } else {
+                                                                "（启用后无效果，可点下方生成示例）".into()
+                                                            }
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(if tasks_exists { pal.accent } else { pal.warn }),
+                                                    );
+                                                });
+                                                // 一键生成示例：让启用后的 Trellis 立即产生可观察效果（否则仅勾选开关看不出变化）。
+                                                ui.horizontal(|ui| {
+                                                    if accent_button(ui, &pal, "生成示例规格") {
+                                                        let p = std::path::Path::new(&spec_path);
+                                                        if let Some(parent) = p.parent() {
+                                                            let _ = std::fs::create_dir_all(parent);
+                                                        }
+                                                        let sample = "# 项目规格（Trellis 示例）\n\n## 目标\n- 描述本项目要达成的核心目标。\n\n## 约束\n- 技术栈与不可违反的约定。\n\n## 当前阶段\n- 规划 / 开发 / 验证。\n";
+                                                        if std::fs::write(p, sample).is_ok() {
+                                                            state.note = format!("已生成示例规格：{}", spec_path);
+                                                        } else {
+                                                            state.note = "生成示例规格失败（检查路径权限）".into();
+                                                        }
+                                                    }
+                                                    if accent_button(ui, &pal, "生成示例任务文件") {
+                                                        let p = std::path::Path::new(&tasks_path);
+                                                        if let Some(parent) = p.parent() {
+                                                            let _ = std::fs::create_dir_all(parent);
+                                                        }
+                                                        if std::fs::write(p, "[]").is_ok() {
+                                                            state.note = format!("已生成示例任务文件：{}", tasks_path);
+                                                        } else {
+                                                            state.note = "生成示例任务文件失败（检查路径权限）".into();
+                                                        }
+                                                    }
+                                                });
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "启用后：① 每步 LLM 前把项目规格注入系统消息；② 根据用户消息维护任务状态机（完成 X / 任务: ...）。\n\
+                                                         若两项文件均未配置，仅勾选开关不会产生任何可观察效果——请生成示例或填入已有文件后再启用。",
+                                                    )
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                                );
+                                            }
+                                            ui.add_space(10.0);
+                                            ui.separator();
+                                            ui.add_space(6.0);
+                                            field_label(ui, &pal, "WASM 沙箱插件（可导入 / 删除 / 启用 / 禁用）");
+                                            let active_plugins = state.host.wasm_plugins.active_ids();
+                                            ui.label(
+                                                egui::RichText::new(if active_plugins.is_empty() {
+                                                    "运行时：当前没有已加载的 WASM 插件".to_string()
+                                                } else {
+                                                    format!("运行时：已加载 {}", active_plugins.join("、"))
+                                                })
+                                                .size(11.0)
+                                                .color(pal.dim),
+                                            );
+                                            ui.add_space(4.0);
+                                            let mut remove_ids: Vec<String> = Vec::new();
+                                            let mut wasm_count = 0;
+                                            for i in 0..state.plugin_rows.len() {
+                                                if state.plugin_rows[i].kind != PluginKind::Wasm {
+                                                    continue;
+                                                }
+                                                wasm_count += 1;
+                                                let (remove, changed) = plugin_row_ui(ui, &pal, &mut state.plugin_rows[i]);
+                                                if changed {
+                                                    let row = &mut state.plugin_rows[i];
+                                                    let result = if row.enabled {
+                                                        state.host.wasm_plugins.activate(&row.id, std::path::Path::new(&row.desc))
+                                                    } else {
+                                                        state.host.wasm_plugins.deactivate(&row.id)
+                                                    };
+                                                    match result {
+                                                        Ok(()) => {
+                                                            row.active = row.enabled;
+                                                            let _ = state.host.settings.set_plugin_enabled(&row.id, &row.name, row.enabled);
+                                                            state.note = format!("插件「{}」{}", row.name, if row.enabled { "已启用并开始运行" } else { "已禁用并卸载" });
+                                                        }
+                                                        Err(error) => {
+                                                            row.enabled = !row.enabled;
+                                                            state.note = format!("插件状态未变更: {error}");
+                                                        }
+                                                    }
+                                                }
+                                                if remove {
+                                                    remove_ids.push(state.plugin_rows[i].id.clone());
+                                                }
+                                            }
+                                            if wasm_count == 0 {
+                                                ui.label(
+                                                    egui::RichText::new("尚未导入 WASM 插件，点下方「＋ 添加新插件」导入 .wasm / .wat 产物。")
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                                );
+                                                ui.add_space(6.0);
+                                            }
+                                            if !remove_ids.is_empty() {
+                                                for id in &remove_ids {
+                                                    let _ = state.host.wasm_plugins.deactivate(id);
+                                                    let _ = state.host.settings.remove_plugin(id);
+                                                }
+                                                state.plugin_rows.retain(|r| !remove_ids.contains(&r.id));
+                                                state.note = format!("已移除 {} 个插件", remove_ids.len());
+                                            }
+                                            ui.add_space(12.0);
+                                            ui.horizontal(|ui| {
+                                                if accent_button(ui, &pal, "保存插件设置") {
+                                                    state.save_preferences();
+                                                }
+                                                if ghost_button(ui, &pal, "＋ 添加新插件") {
+                                                    state.import_wasm_plugin();
+                                                }
+                                            });
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "自定义插件可导入 .wasm/.wat；勾选即立即加载并执行可选 on_load，取消勾选即卸载。插件仅获得 host_log，默认没有 Shell、文件或网络权限；「移除」只删除登记，不删除你的原始文件。"
+                                                )
+                                                .size(11.0)
+                                                .color(pal.dim),
+                                            );
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                    "技能管理" => {
+                                        if state.skill_items.is_empty() {
+                                            state.refresh_skill_items();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "技能以「技能包」子目录存放于约定目录，Agent 启动时自动扫描注册。新注册的技能包默认未启用，须勾选启用后才参与匹配并注入模型上下文；禁用或删除后下一回合立即停止注入。",
+                                            )
+                                            .size(12.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(4.0);
+                                        // 存储位置可视化：导入的技能落盘于此，提供一键打开目录。
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("存储位置").size(11.5).color(pal.dim));
+                                            ui.label(
+                                                egui::RichText::new(state.skills_storage_dir().display().to_string())
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(pal.text),
+                                            )
+                                            .on_hover_text("技能包子目录（含 SKILL.md）与 JSON 注册记录同目录存放；放入子目录即可在下次启动时自动加载");
+                                        });
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            if accent_button(ui, &pal, "导入技能包（文件夹）") {
+                                                state.import_skill_folder();
+                                            }
+                                            if ghost_button(ui, &pal, "导入 SKILL.md") {
+                                                state.import_skill_file();
+                                            }
+                                            if ghost_button(ui, &pal, "刷新") {
+                                                state.refresh_skill_items();
+                                            }
+                                            if ghost_button(ui, &pal, "打开技能目录") {
+                                                state.open_skills_dir();
+                                            }
+                                        });
+                                        ui.add_space(8.0);
+                                        egui::ScrollArea::vertical().show(ui, |ui| {
+                                            if state.skill_items.is_empty() {
+                                                ui.label(egui::RichText::new("暂无自定义技能。选择一个含 SKILL.md 的文件夹批量导入，或直接在技能目录中放置技能包子目录（重启后自动加载）。").size(12.0).color(pal.dim));
+                                            }
+                                            for sk in state.skill_items.clone() {
+                                                let system_skill = sk.id.starts_with("sp-");
+                                                ui.group(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        let mut enabled = sk.enabled;
+                                                        ui.add_enabled(
+                                                            !system_skill,
+                                                            egui::Checkbox::new(&mut enabled, ""),
+                                                        )
+                                                        .on_hover_text(if system_skill { "由 Superpowers 系统插件管理" } else { "启用 / 禁用此技能" });
+                                                        if !system_skill && enabled != sk.enabled {
+                                                            state.toggle_skill(&sk.id, enabled);
+                                                        }
+                                                        ui.label(egui::RichText::new(&sk.name).size(13.0).strong().color(pal.text));
+                                                        ui.label(egui::RichText::new(format!("v{}", sk.version)).size(10.5).color(pal.dim));
+                                                        if !sk.resource_files.is_empty() {
+                                                            ui.label(egui::RichText::new(format!("· {} 个资源文件", sk.resource_files.len())).size(10.5).color(pal.dim));
+                                                        }
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            if system_skill {
+                                                                ui.label(egui::RichText::new("系统插件提供").size(10.5).color(pal.accent));
+                                                            } else if ghost_button(ui, &pal, "删除") {
+                                                                state.delete_skill_ui(&sk.id);
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.label(egui::RichText::new(&sk.trigger_boundary).size(11.5).color(pal.dim));
+                                                    if !sk.steps.is_empty() {
+                                                        ui.label(egui::RichText::new(format!("步骤: {}", sk.steps.join(" → "))).size(11.0).color(pal.dim));
+                                                    }
+                                                    if !sk.source_path.is_empty() {
+                                                        // 约定包的来源存的是相对技能库根的路径，展示时解析为完整路径；
+                                                        // 旧式绝对路径记录原样展示。
+                                                        let src_path = std::path::Path::new(&sk.source_path);
+                                                        let shown = if src_path.is_absolute() {
+                                                            sk.source_path.clone()
+                                                        } else {
+                                                            state.skills_storage_dir().join(src_path).display().to_string()
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(format!("来源: {shown}"))
+                                                                .size(10.5)
+                                                                .color(pal.dim),
+                                                        )
+                                                        .on_hover_text("约定包以相对技能库根的路径登记，重复导入会更新此技能而非创建副本");
+                                                    }
+                                                });
+                                                ui.add_space(6.0);
+                                            }
+                                        });
+                                    }
+                                    "记忆系统" | "记忆" => {
+                                        // 标签切换：对话记忆 / 技能 / 知识库 / 代码图谱
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (t, label) in [
+                                                ("chat", "对话记忆"),
+                                                ("skill", "技能"),
+                                                ("wiki", "知识库"),
+                                                ("code", "代码图谱"),
+                                            ] {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut state.mem_tab,
+                                                        t.to_string(),
+                                                        label,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    state.mem_loaded = false;
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("搜索").size(12.0).color(pal.dim),
+                                            );
+                                            if ui
+                                                .text_edit_singleline(&mut state.mem_query)
+                                                .changed()
+                                            {
+                                                state.mem_loaded = false;
+                                            }
+                                        });
+                                        ui.add_space(6.0);
+                                        if state.mem_tab.is_empty() {
+                                            state.mem_tab = "chat".into();
+                                        }
+                                        if !state.mem_loaded {
+                                            // 首次打开：自动对当前工作区做一次资产索引
+                                            //（扫描 SKILL.md / *.md / 源码 → Skill/Wiki/CodeGraph），
+                                            // 之后记忆面板才有真实内容可见。
+                                            if !state.mem_bootstrapped {
+                                                state.bootstrap_mem();
+                                            }
+                                            state.refresh_mem();
+                                            state.refresh_skill_items();
+                                            state.mem_loaded = true;
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if ghost_button(ui, &pal, "重新索引资产") {
+                                                state.bootstrap_mem();
+                                            }
+                                            if !state.mem_index_msg.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(&state.mem_index_msg)
+                                                        .size(11.0)
+                                                        .color(pal.dim),
+                                                );
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                        // 代码图谱用结构化视图，展示符号数；其余 tab 展示条目数。
+                                        let mem_count = if state.mem_tab == "code" {
+                                            state.mem_code_symbols.len()
+                                        } else {
+                                            state.mem_items.len()
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "共 {mem_count} 条 · 本地原生记忆（若已连接 aidops 后端，以远端为准）"
+                                            ))
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(6.0);
+if state.mem_tab == "code" {
+                                            // 代码图谱：结构化视图（统计卡 + 按文件分组折叠 + 调用关系导航）。
+                                            super::code_graph::render(
+                                                ui,
+                                                &pal,
+                                                &state.mem_code_symbols,
+                                                &mut state.mem_code_expanded,
+                                                &mut state.mem_code_sel,
+                                                &mut state.mem_code_scroll,
+                                            );
+                                        } else if state.mem_tab == "skill" {
+                                            // 兼容旧“记忆 → 技能”入口；完整管理入口在侧栏“技能管理”。
+                                            ui.horizontal(|ui| {
+                                                if ghost_button(ui, &pal, "导入 SKILL.md") {
+                                                    state.import_skill_file();
+                                                }
+                                            });
+                                            ui.add_space(4.0);
+                                            if state.skill_items.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "暂无技能。点击「导入 SKILL.md」导入自定义技能，或「重新索引资产」扫描工作区中的 SKILL.md。",
+                                                    )
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                                );
+                                            } else {
+                                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                                    for sk in state.skill_items.clone() {
+                                                        ui.group(|ui| {
+                                                            ui.horizontal(|ui| {
+                                                                let mut enabled = sk.enabled;
+                                                                if ui
+                                                                    .checkbox(&mut enabled, "")
+                                                                    .on_hover_text("启用 / 禁用此技能")
+                                                                    .changed()
+                                                                {
+                                                                    state.toggle_skill(&sk.id, enabled);
+                                                                }
+                                                                ui.label(
+                                                                    egui::RichText::new(&sk.name)
+                                                                        .size(13.0)
+                                                                        .color(pal.text)
+                                                                        .strong(),
+                                                                );
+                                                                ui.label(
+                                                                    egui::RichText::new(format!("v{}", sk.version))
+                                                                        .size(10.5)
+                                                                        .color(pal.dim),
+                                                                );
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        if ghost_button(ui, &pal, "删除") {
+                                                                            state.delete_skill_ui(&sk.id);
+                                                                        }
+                                                                    },
+                                                                );
+                                                            });
+                                                            ui.label(
+                                                                egui::RichText::new(&sk.trigger_boundary)
+                                                                    .size(11.5)
+                                                                    .color(if sk.enabled { pal.dim } else { pal.err_text }),
+                                                            );
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "步骤: {}",
+                                                                    sk.steps.join(" → ")
+                                                                ))
+                                                                .size(11.0)
+                                                                .color(pal.dim),
+                                                            );
+                                                        });
+                                                        ui.add_space(6.0);
+                                                    }
+                                                });
+                                            }
+                                        } else {
+                                                                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                            if state.mem_items.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "暂无记忆。点击「重新索引资产」扫描工作区的 SKILL.md / 文档 / 源码，自动沉淀技能、知识库与代码图谱；对话中也会逐步沉淀对话记忆（L0~L3）。",
+                                                    )
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                                );
+                                            }
+                                            for it in &state.mem_items {
+                                                ui.group(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&it.title)
+                                                            .size(13.0)
+                                                            .color(pal.text)
+                                                            .strong(),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(&it.meta)
+                                                            .size(10.5)
+                                                            .color(pal.dim),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(&it.body)
+                                                            .size(12.0)
+                                                            .color(pal.text),
+                                                    );
+                                                });
+                                                ui.add_space(6.0);
+                                            }
+                                        });
+                                    }
+                                    }
+
+                                    "系统更新" | "更新" => {
+                                        state.draw_update_settings(ui, &pal);
+                                    }
+                                    "Git 变更" => {
+                                        // 分支 + 统计 + 刷新
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "分支：{}",
+                                                    if state.git_branch.is_empty() {
+                                                        "未知"
+                                                    } else {
+                                                        &state.git_branch
+                                                    }
+                                                ))
+                                                .size(13.0)
+                                                .strong()
+                                                .color(pal.text),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ghost_button(ui, &pal, "刷新") {
+                                                        state.refresh_git_changes();
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        let n = state.git_changes.len();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "共 {} 个文件有未提交变更",
+                                                n
+                                            ))
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(8.0);
+                                        if n == 0 && state.git_loaded {
+                                            ui.label(
+                                                egui::RichText::new("✨ 工作区干净，无未提交变更")
+                                                    .size(12.0)
+                                                    .color(pal.accent),
+                                            );
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .max_height(scroll_h - 120.0)
+                                                .auto_shrink(false)
+                                                .show(ui, |ui| {
+                                                    let mut open_now: Option<String> = None;
+                                                    for ch in state.git_changes.clone() {
+                                                        // 状态色块
+                                                        let (mark, mcolor) = match ch.marker() {
+                                                            "M" => ("M", pal.warn),
+                                                            "A" => ("A", pal.accent),
+                                                            "D" => ("D", pal.err_text),
+                                                            "R" => ("R", pal.accent),
+                                                            "U" | "??" => ("?", pal.dim),
+                                                            _ => ("*", pal.dim),
+                                                        };
+                                                        let row_h = 30.0;
+                                                        let (rect, resp) = ui.allocate_at_least(
+                                                            egui::vec2(ui.available_width(), row_h),
+                                                            egui::Sense::click(),
+                                                        );
+                                                        if resp.hovered() {
+                                                            ui.painter().rect_filled(
+                                                                rect.shrink(1.0),
+                                                                egui::Rounding::same(6.0),
+                                                                pal.hover,
+                                                            );
+                                                        }
+                                                        // 状态标记小方块
+                                                        let badge = egui::Rect::from_center_size(
+                                                            egui::pos2(rect.min.x + 14.0, rect.center().y),
+                                                            egui::vec2(22.0, 18.0),
+                                                        );
+                                                        ui.painter().rect_filled(
+                                                            badge,
+                                                            egui::Rounding::same(4.0),
+                                                            mcolor.gamma_multiply(0.22),
+                                                        );
+                                                        ui.painter().text(
+                                                            badge.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            mark,
+                                                            egui::FontId::monospace(11.0),
+                                                            mcolor,
+                                                        );
+                                                        // 路径
+                                                        ui.painter().text(
+                                                            egui::pos2(rect.min.x + 44.0, rect.center().y),
+                                                            egui::Align2::LEFT_CENTER,
+                                                            &ch.path,
+                                                            egui::FontId::monospace(11.5),
+                                                            pal.text,
+                                                        );
+                                                        if resp.clicked() {
+                                                            open_now = Some(ch.path.clone());
+                                                        }
+                                                        ui.add_space(2.0);
+                                                    }
+                                                    if let Some(path) = open_now {
+                                                        // 关闭弹层，打开该文件的 Diff 预览
+                                                        state.settings_open = false;
+                                                        state.open_preview(path);
+                                                        state.preview_mode =
+                                                            crate::preview::PreviewMode::Diff;
+                                                    }
+                                                });
+                                        }
+                                    }
+                                    _ => {
+                                        field_label(ui, &pal, "默认访问权限");
+                                        egui::ComboBox::from_id_salt("sys-perm")
+                                            .width(260.0)
+                                            .selected_text(&state.permission)
+                                            .show_ui(ui, |ui| {
+                                                for mode in ["只读", "工作区写入", "完全访问"] {
+                                                    ui.selectable_value(&mut state.permission, mode.to_string(), mode);
+                                                }
+                                            });
+                                        ui.add_space(14.0);
+                                        field_label(ui, &pal, "上下文预算（字符）");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_context_budget)
+                                                    .desired_width(140.0)
+                                                    .hint_text("48000"),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("默认 48000 · 12000–240000")
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "超过预算时，较早对话被压缩为摘要（保留系统提示与最新回合），控制上下文长度、节省 token。留空 = 默认。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(10.0);
+                                        field_label(ui, &pal, "进展检查间隔");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_max_steps)
+                                                    .desired_width(140.0)
+                                                    .hint_text("128"),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("默认 128 · ≥1")
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "每执行这些步骤就评估一次新增证据、失败和重复调用；任务未完成时会诊断原因并自动续期，不会强制收尾。留空 = 默认。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(10.0);
+                                        field_label(ui, &pal, "最大输出 tokens");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_max_tokens)
+                                                    .desired_width(140.0)
+                                                    .hint_text("4096"),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("默认 4096 · 256–32768")
+                                                    .size(11.0)
+                                                    .color(pal.dim),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "单次模型回复的最大输出长度；调小可节省 completion token。留空 = 默认。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(14.0);
+                                        field_label(ui, &pal, "窗口外观");
+                                        let stored_titlebar = state
+                                            .host
+                                            .settings
+                                            .get("ui.integrated_titlebar");
+                                        let mut integrated_titlebar =
+                                            crate::window_chrome::integrated_titlebar_enabled(
+                                                stored_titlebar.as_deref(),
+                                            );
+                                        if ui
+                                            .checkbox(
+                                                &mut integrated_titlebar,
+                                                "融合工作台与系统标题栏",
+                                            )
+                                            .changed()
+                                        {
+                                            let _ = state.host.settings.set(
+                                                "ui.integrated_titlebar",
+                                                if integrated_titlebar { "true" } else { "false" },
+                                            );
+                                            state.note = "窗口外观已保存，重启应用后生效".into();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "macOS 保留原生交通灯；Windows 使用应用窗口控制按钮。异常时关闭可恢复系统标题栏。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(14.0);
+                                        if accent_button(ui, &pal, "保存参数配置") {
+                                            state.save_preferences();
+                                        }
+                                        ui.add_space(10.0);
+                                        field_label(ui, &pal, "aidops 后端连接（可选）");
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "配置后 dsh 把四类记忆资产同步到智程平台；留空则仅用本地文件记忆，桌面可独立工作。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        egui::Frame::default()
+                                            .fill(pal.bg)
+                                            .rounding(egui::Rounding::same(10.0))
+                                            .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                                            .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.add_sized([110.0, 22.0], egui::Label::new(
+                                                egui::RichText::new("后端地址").size(12.0).color(pal.text),
+                                            ));
+                                            ui.add_space(8.0);
+
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_aidops_base)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("后端地址，如 http://localhost:8000"),
+                                        );
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.add_sized([110.0, 22.0], egui::Label::new(
+                                                egui::RichText::new("API Key").size(12.0).color(pal.text),
+                                            ));
+                                            ui.add_space(8.0);
+
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_aidops_key)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("API Key（可选；亦可用环境变量 AIDOPS_API_KEY）")
+                                                .password(true),
+                                        );
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.add_sized([110.0, 22.0], egui::Label::new(
+                                                egui::RichText::new("项目 ID").size(12.0).color(pal.text),
+                                            ));
+                                            ui.add_space(8.0);
+
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.f_aidops_project)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("项目 ID（可选，整数）"),
+                                        );
+                                        });
+                                            });
+                                        ui.add_space(10.0);
+                                        field_label(ui, &pal, "配置文件 .harness.toml");
+                                        ui.horizontal(|ui| {
+                                            if ghost_button(ui, &pal, "重新加载") {
+                                                match Config::load() {
+                                                    Ok(cfg) => {
+                                                        let _ = state.host.llm_control.reload_config(&cfg);
+                                                        state.f_aidops_base = cfg.aidops.base_url;
+                                                        state.f_aidops_key =
+                                                            cfg.aidops.api_key.unwrap_or_default();
+                                                        state.f_aidops_project = cfg
+                                                            .aidops
+                                                            .project_id
+                                                            .map(|v| v.to_string())
+                                                            .unwrap_or_default();
+                                                        state.note = "已从 .harness.toml 重新加载并应用配置".into();
+                                                    }
+                                                    Err(e) => state.note = format!("加载失败: {e}"),
+                                                }
+                                            }
+                                            if ghost_button(ui, &pal, "原子写入") {
+                                                let mut cfg = Config::default();
+                                                cfg.llm.provider = state.f_provider.clone();
+                                                cfg.llm.base_url = state.f_base.clone();
+                                                cfg.llm.model = state.f_model.clone();
+                                                // 不写入 api_key：密钥经 AES-256-GCM 加密存储，明文落盘会泄露；
+                                                // 热重载（reload_config）会回退到运行时缓存的 key。
+                                                cfg.llm.reasoning_effort = state.effort();
+                                                // aidops 后端连接（可选插件入口）：留空 base_url 即不启用。
+                                                cfg.aidops.base_url = state.f_aidops_base.trim().to_string();
+                                                cfg.aidops.api_key = if state.f_aidops_key.trim().is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(state.f_aidops_key.trim().to_string())
+                                                };
+                                                cfg.aidops.project_id =
+                                                    state.f_aidops_project.trim().parse::<i64>().ok();
+                                                match cfg.save_atomic(".harness.toml") {
+                                                    Ok(()) => {
+                                                        state.note = "配置已原子写入 .harness.toml（含 [aidops]，临时文件 + rename）".into()
+                                                    }
+                                                    Err(e) => state.note = format!("写入失败: {e}"),
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "「原子写入」先写临时文件再 rename，崩溃不会损坏原配置；「重新加载」把文件 [llm] 段热重载进运行时，无需重启。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                    }
+                                    });
+                                });
+                            });
+                            // 记录面板矩形：供下一帧“点外部关闭”守卫判定。
+                            state.modal_panel_rect = Some(ui.min_rect());
+                        });
+                });
+        state.modal_open_last_frame = true;
+    } else {
+        state.modal_open_last_frame = false;
+    }
+}

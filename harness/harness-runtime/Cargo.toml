@@ -1,0 +1,26 @@
+[package]
+name = "harness-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-llm = { path = "../harness-llm" }
+harness-tool = { path = "../harness-tool" }
+harness-session = { path = "../harness-session" }
+harness-capability = { path = "../harness-capability" }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+base64 = "0.22"
+# 工具调用签名归一化（execution.rs）需要操作 JSON 参数。
+serde_json = { workspace = true }
+
+[dev-dependencies]
+harness-provider-hook = { path = "../harness-provider-hook" }
+# 技能全链路 e2e：文件夹导入 → 原生技能库 → match_skills → 注入模型上下文。
+harness-provider-memory = { path = "../harness-provider-memory" }

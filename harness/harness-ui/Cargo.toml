@@ -1,0 +1,68 @@
+[package]
+name = "harness-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-session = { path = "../harness-session" }
+harness-llm = { path = "../harness-llm" }
+# GUI 插件管理导入 WASM 插件时，用 wasmtime 沙箱加载器做导入前校验。
+harness-provider-wasm = { path = "../harness-provider-wasm", optional = true, features = ["wasm-tools"] }
+harness-provider-trellis = { path = "../harness-provider-trellis", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rfd = "0.15"
+# 密钥加密：OS 无关的 AES-256-GCM（取代 Windows DPAPI，Linux/macOS 同样加密落盘）。
+aes-gcm = "0.10"
+rand = "0.8"
+# 记忆面板：反序列化本地原生记忆资产（facts/skills/wiki/codegraph）。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 记忆面板接后端实时查询：持有资产 Definition 服务 + 独立 tokio runtime 驱动异步查询。
+harness-capability = { path = "../harness-capability" }
+# 技能管理：导入内置 superpowers 技能集（幂等注册进技能库）。
+harness-provider-memory = { path = "../harness-provider-memory" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+arboard = "3.6"
+png = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_DataExchange", "Win32_System_Ole", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+
+[dependencies.ratatui]
+version = "0.29"
+optional = true
+
+[dependencies.crossterm]
+version = "0.28"
+optional = true
+
+# GUI 采用 egui/eframe（glow 后端）：立即模式无绑定环路、样式自由、
+# 窗口控制交给 OS 标准标题栏（最大化/最小化/自适应由系统保证）。
+[dependencies.egui]
+version = "0.30"
+optional = true
+
+[dependencies.eframe]
+version = "0.30"
+optional = true
+default-features = false
+features = ["glow", "default_fonts"]
+
+# 助手气泡富文本：pulldown-cmark 解析 Markdown，egui LayoutJob 自绘渲染。
+[dependencies.pulldown-cmark]
+version = "0.10"
+optional = true
+
+# 代码预览语法高亮：syntect（纯 Rust，内置语法集与主题，无 C 依赖）。
+[dependencies.syntect]
+version = "5"
+optional = true
+default-features = false
+features = ["default-fancy"]
+
+[features]
+# 默认仅 Ui trait + NullUi（headless）。TUI 是产品默认形态（完成文档 §1），GUI 为可替换实现。
+tui = ["dep:ratatui", "dep:crossterm"]
+gui = ["dep:egui", "dep:eframe", "dep:pulldown-cmark", "dep:syntect", "dep:harness-provider-wasm", "dep:harness-provider-trellis"]

@@ -1,0 +1,15 @@
+[package]
+name = "harness-provider-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-capability = { path = "../harness-capability" }
+harness-provider-sandbox = { path = "../harness-provider-sandbox" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+# 中文 Windows 控制台输出为 GBK 码页，需回退解码避免乱码。
+encoding_rs = "0.8"

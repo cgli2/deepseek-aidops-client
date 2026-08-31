@@ -1,0 +1,17 @@
+[package]
+name = "harness-capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-session = { path = "../harness-session" }
+harness-llm = { path = "../harness-llm" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# 技能批量导入等异步接口的单元测试。
+tokio = { workspace = true }

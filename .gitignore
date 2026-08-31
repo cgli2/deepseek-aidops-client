@@ -1,0 +1,61 @@
+# Rust build output
+target/
+**/target/
+
+# Packaged binaries and generated distribution files
+dist/
+**/dist/
+
+# Build and runtime logs
+*.log
+*.trace
+harness_gui_trace.log
+
+# Harness runtime state
+.harness/
+**/.harness/
+.harness-memory/
+**/.harness-memory/
+
+# Local databases and SQLite sidecar files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+*.local.toml
+
+# Rust and native debug artifacts
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.dSYM/
+
+# Editor and IDE state
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Windows and macOS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+.workbuddy
+.qoder
+.verifytemp
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.ps1
+*.txt

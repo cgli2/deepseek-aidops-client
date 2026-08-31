@@ -1,0 +1,14 @@
+[package]
+name = "harness-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-runtime = { path = "../harness-runtime" }
+harness-session = { path = "../harness-session" }
+tokio = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+async-trait = { workspace = true }

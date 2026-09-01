@@ -2,6 +2,7 @@
 
 pub mod agent_loop;
 pub mod builtin_profile;
+pub mod case_file;
 pub mod controller;
 pub mod council;
 pub mod events;
@@ -20,6 +21,7 @@ pub mod workspace_grounder;
 pub mod workspace_index;
 
 pub use agent_loop::{AgentLoop, DeterministicCompaction};
+pub use case_file::{extract_anchors, normalize_question, CaseFile, TriedEntry};
 pub use controller::SessionController;
 pub use events::{PreStep, TurnStopping};
 pub use goal_execution::{

@@ -757,7 +757,7 @@ impl ActionProposal {
 /// - shell：剥离开头的 `cd [/d] <路径> &&` 前缀（取证：94% 命令携带全路径 cd，
 ///   导致每条命令签名字面唯一、守卫完全失效）；
 /// - fs/edit：路径分隔符统一为正斜杠，绝对/相对写法的同一文件归为同一签名。
-fn normalized_signature(call: &ToolCall) -> String {
+pub(crate) fn normalized_signature(call: &ToolCall) -> String {
     let mut args = call.args.clone();
     if call.name == "shell" {
         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {

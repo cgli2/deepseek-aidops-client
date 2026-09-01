@@ -1461,55 +1461,6 @@ impl GoalExecution {
             .all(|item| item.state == WorkItemState::Verified)
     }
 
-    /// 连续无信息增益的容忍上限。达到后假设空间基本耗尽，继续让模型换关键词
-    /// 只是在烧剩余预算——这正是"蛮力搜索 N 次后熔断"的成因。
-    const MAX_NO_INFORMATION: usize = 4;
-
-    /// 是否陷入无信息增益的空转。已产生写入或验证的工作项说明有实质进展，
-    /// 此时不因后续动作的空转而中断。
-    pub fn is_stalled(&self) -> bool {
-        self.no_information_count >= Self::MAX_NO_INFORMATION
-            && !self.items.values().any(|item| {
-                matches!(
-                    item.state,
-                    WorkItemState::Changed | WorkItemState::Verified
-                )
-            })
-    }
-
-    /// 空转终止报告。把试过的假设讲清楚，让用户能精准补充信息，
-    /// 而不是笼统地说一句"执行失败"。
-    pub fn stall_report(&self) -> String {
-        let mut parts = Vec::new();
-        for item in self.items.values() {
-            let tried: Vec<String> = item
-                .hypotheses
-                .iter()
-                .filter(|hypothesis| hypothesis.attempts > 0)
-                .map(|hypothesis| match hypothesis.state {
-                    HypothesisState::Rejected => format!("{}（已排除）", hypothesis.description),
-                    HypothesisState::Confirmed => format!("{}（已确认）", hypothesis.description),
-                    HypothesisState::Active => format!("{}（仍在进行）", hypothesis.description),
-                })
-                .collect();
-            if !tried.is_empty() {
-                parts.push(format!("[{}] {}", item.id, tried.join("；")));
-            }
-        }
-        let tried = if parts.is_empty() {
-            format!(
-                "已执行 {} 次定位动作，均未产出新的候选文件或证据",
-                self.no_information_count
-            )
-        } else {
-            parts.join("\n")
-        };
-        format!(
-            "连续 {} 次动作没有产生新的定位证据，继续搜索不会再产生新信息。\n已尝试的假设：\n{}\n请补充具体的文件路径、目录或关键符号。",
-            self.no_information_count, tried
-        )
-    }
-
     /// 受控任务的唯一完成判定。旧 ExecutionState 只保留统计与 legacy 路径，
     /// 不再与 SolveGraph 竞争控制阶段或终态。
     pub fn evaluate_completion(&self, step_had_tools: bool) -> GoalCompletion {
@@ -1522,11 +1473,8 @@ impl GoalExecution {
                 return GoalCompletion::Terminal(reason);
             }
         }
-        // 空转熔断必须在"继续"之前判定。旧实现只累加 no_information_count 却
-        // 从不据此停止，于是模型能一路换关键词烧到硬熔断为止。
-        if self.is_stalled() {
-            return GoalCompletion::Terminal(self.stall_report());
-        }
+        // 步骤⑤退位：空转不再作为独立终止来源（no_information_count 降为遥测信号）；
+        // 回合终止唯一收归控制器（栈底 ExhaustedWithArtifact / R3 顶）。
         if self.can_conclude() {
             return if step_had_tools {
                 GoalCompletion::Continue
@@ -2138,46 +2086,6 @@ fn path_is_within(path: &str, anchor: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repeated_no_information_terminates_with_the_tried_hypotheses() {
-        let mut plan =
-            GoalExecution::from_contract(&TaskContract::from_input("点击登录按钮无反应"));
-        plan.no_information_count = GoalExecution::MAX_NO_INFORMATION;
-        match plan.evaluate_completion(false) {
-            GoalCompletion::Terminal(reason) => {
-                assert!(reason.contains("没有产生新的定位证据"), "{reason}");
-                assert!(reason.contains("已尝试的假设"), "{reason}");
-            }
-            other => panic!("连续无信息增益应触发终止，实际得到 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn stall_breaker_stays_dormant_before_the_threshold() {
-        let mut plan =
-            GoalExecution::from_contract(&TaskContract::from_input("点击登录按钮无反应"));
-        plan.no_information_count = GoalExecution::MAX_NO_INFORMATION - 1;
-        assert!(!plan.is_stalled());
-        assert!(!matches!(
-            plan.evaluate_completion(false),
-            GoalCompletion::Terminal(_)
-        ));
-    }
-
-    #[test]
-    fn real_progress_disarms_the_stall_breaker() {
-        let mut plan =
-            GoalExecution::from_contract(&TaskContract::from_input("点击登录按钮无反应"));
-        plan.no_information_count = GoalExecution::MAX_NO_INFORMATION;
-        if let Some(item) = plan.items.values_mut().next() {
-            item.state = WorkItemState::Changed;
-        }
-        assert!(
-            !plan.is_stalled(),
-            "已产生写入说明有实质进展，不应因后续空转而中断"
-        );
-    }
 
     #[test]
     fn locatable_signal_covers_entities_navigation_and_literals() {

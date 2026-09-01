@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use harness_llm::{Chunk, ToolResult};
+use harness_llm::{Chunk, ToolResult, Usage};
 use harness_session::SessionEvent;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
@@ -18,6 +18,7 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
 struct ReplayedTurn {
     input: String,
     responses: Vec<Chunk>,
+    usages: Vec<Usage>,
     tool_results: HashMap<String, ToolResult>,
     tool_names: Vec<String>,
 }
@@ -35,6 +36,7 @@ fn load_fixture(name: &str) -> Vec<ReplayedTurn> {
             SessionEvent::TurnStart { input, .. } => turns.push(ReplayedTurn {
                 input,
                 responses: vec![],
+                usages: vec![],
                 tool_results: HashMap::new(),
                 tool_names: vec![],
             }),
@@ -56,6 +58,13 @@ fn load_fixture(name: &str) -> Vec<ReplayedTurn> {
             SessionEvent::ToolResult { result, .. } => {
                 if let Some(t) = turns.last_mut() {
                     t.tool_results.insert(result.call_id.clone(), result);
+                }
+            }
+            // 真实 token 成本只记录在独立 Usage 事件（Assistant chunk 不带 usage）；
+            // 采集进回合队列，重放时按请求序重新注入，R3 与判顶才有可测对象。
+            SessionEvent::Usage { usage, .. } => {
+                if let Some(t) = turns.last_mut() {
+                    t.usages.push(usage);
                 }
             }
             _ => {}
@@ -101,8 +110,11 @@ impl Hook for AllowHook {
 
 /// 按日志顺序逐条吐出录制的模型响应；脚本耗尽时返回收敛文本，
 /// 使发散中的旧守卫循环能以某个 Delivery 收尾而不是挂死。
+/// `usages` 按请求序附加录制成本到 chunk（原始 Assistant chunk 不带 usage），
+/// 使 agent_loop 写出 Usage 事件、重放 token 成本与原始会话对齐（R3 可测）。
 struct ReplayLlm {
     queue: Mutex<VecDeque<Chunk>>,
+    usages: Mutex<VecDeque<Usage>>,
 }
 
 #[async_trait]
@@ -114,10 +126,13 @@ impl LlmProvider for ReplayLlm {
         vec![]
     }
     fn stream(&self, _msgs: Vec<Message>) -> ChunkStream {
-        let chunk = self.queue.lock().unwrap().pop_front().unwrap_or_else(|| Chunk {
+        let mut chunk = self.queue.lock().unwrap().pop_front().unwrap_or_else(|| Chunk {
             text: Some("[回放脚本已耗尽] 基于现有证据直接给出结论。".into()),
             ..Default::default()
         });
+        if chunk.usage.is_none() {
+            chunk.usage = self.usages.lock().unwrap().pop_front();
+        }
         Box::pin(futures::stream::iter(vec![Ok(chunk)]))
     }
 }
@@ -182,6 +197,7 @@ async fn replay_session_with(fixture: &str, mode: GovernorMode) -> Arc<SessionLo
         let ctx = AppContext::new();
         let llm: Arc<dyn LlmProvider> = Arc::new(ReplayLlm {
             queue: Mutex::new(turn.responses.into()),
+            usages: Mutex::new(turn.usages.into()),
         });
         let tools = ToolRegistry::new();
         for name in KNOWN_TOOLS {
@@ -486,5 +502,30 @@ async fn governor_mode_terminates_clarification_loop_without_asking() {
         !turns.iter().any(|t| t.assistant_text.contains("[需要澄清]")),
         "控制器模式下门禁复读文案不得出现：{:?}",
         turns.iter().map(|t| &t.assistant_text).collect::<Vec<_>>()
+    );
+}
+
+/// R3：控制器模式下会话 prompt tokens 必须被前置拦在硬顶之下。
+/// 自证式对照：同一 fixture 的 Legacy 重放必须 > 顶（否则说明 replay 根本没
+/// 复现真实成本，本红线在回放中不可验——此时应改测实机，而非给假绿放行）。
+#[tokio::test]
+async fn governor_mode_caps_session_prompt_tokens() {
+    let baseline = replay_session_with(
+        "7ba3370f_t03_14_symptom.jsonl",
+        GovernorMode::Legacy,
+    )
+    .await;
+    let ceiling_free = r3_prompt_total(&summarize(&baseline));
+    assert!(
+        ceiling_free > harness_runtime::PROMPT_CAP,
+        "对照失效：Legacy 重放成本 {} 未超顶，replay 没复现真实 token 成本",
+        ceiling_free
+    );
+    let log = replay_session_with("7ba3370f_t03_14_symptom.jsonl", GovernorMode::On).await;
+    let total = r3_prompt_total(&summarize(&log));
+    assert!(
+        total <= harness_runtime::PROMPT_CAP,
+        "R3 违例：控制器重放累计 prompt={total} > 顶 {}",
+        harness_runtime::PROMPT_CAP
     );
 }

@@ -25,7 +25,7 @@ use crate::execution::{
 };
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
 use crate::case_file::CaseFile;
-use crate::governor::{is_continuation_request, TurnGovernor};
+use crate::governor::{is_continuation_request, Decision, TurnGovernor};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
 /// 治理路径选择（spec §5 步骤④：新控制器接管决策走 A/B）。
@@ -521,7 +521,7 @@ impl AgentLoop {
         let case_file = CaseFile::from_replay(&history);
         let read_only = matches!(intent.kind, crate::IntentKind::Investigation);
         let grounded = workspace_index.is_some() && goal_execution.goal.has_locatable_signal();
-        let governor =
+        let mut governor =
             (self.governor == GovernorMode::On).then(|| TurnGovernor::new(&case_file, grounded, read_only));
 
         if let Some(clar) = crate::IntentProfile::requires_clarification(
@@ -812,6 +812,23 @@ impl AgentLoop {
             .unwrap_or(300)
             .clamp(5, 3_600);
         let mut steps = 0usize;
+        // 控制器模式专属状态。Legacy 下 governor 为 None，这些变量恒为初值且不被读。
+        // session_prompt_tokens / last_prompt_tokens：会话累计 prompt 与上一轮实际 prompt
+        // （R3 增量下界）。必须在每步 Usage 落盘处即时累加——session_case 只在回合末观测
+        // 点 absorb，用它判顶会让「一步超顶」和「多步超顶」都不触发。
+        let mut session_prompt_tokens = case_file.prompt_tokens;
+        // 首请求增量的下界取「历史最后一次请求的实际 prompt」：上下文跨回合单调不减，
+        // 用它而非 0，否则每回合第一个请求会无条件发出并可能一步跨顶。
+        let mut last_prompt_tokens = history
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                SessionEvent::Usage { usage, .. } => Some(usage.prompt_tokens),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let mut session_case = case_file.clone();
+        let mut case_cursor = history.len();
         // 只有“同一调用连续得到相同结果”才被视为停滞；先要求模型换路，不立即终止。
         const MAX_LOOP_RECOVERY_PROMPTS: u8 = 2;
         let mut repeat_guard = ToolRepeatGuard::default();
@@ -840,6 +857,25 @@ impl AgentLoop {
         let mut empty_response_retries = 0usize;
         let mut length_recovery_pending = false;
         while debt > 0 {
+            // R3 前置：到顶就绝不向模型发请求——超顶后唯一去路是收尾交付。
+            // 放在 steps 自增与 StepStart 之前，避免留下"开了步却没请求"的空步骤。
+            if let Some(gov) = governor.as_ref() {
+                if gov.should_stop_before_request(session_prompt_tokens, last_prompt_tokens) {
+                    log.append(SessionEvent::Assistant {
+                        id: log.gen_id(),
+                        chunk: Chunk {
+                            text: Some(format!(
+                                "【成本顶】会话 prompt tokens {} + 预计增量 {} ≥ 硬顶 {}，停止探索并进入收尾交付。",
+                                session_prompt_tokens,
+                                last_prompt_tokens,
+                                crate::governor::PROMPT_CAP
+                            )),
+                            ..Default::default()
+                        },
+                    });
+                    break;
+                }
+            }
             steps += 1;
             execution.steps = steps;
             debt -= 1;
@@ -1501,6 +1537,10 @@ impl AgentLoop {
             // 本步用量落盘：Usage 事件不进模型上下文、不影响多轮重建，
             // 仅用于会话级成本计量（usage_total）。
             if step_usage.total_tokens > 0 {
+                // 判顶前置需要「上一轮实际发了多少 prompt」与「会话累计 prompt」，
+                // 二者都必须在 step_usage 被 move 进事件之前取。
+                last_prompt_tokens = step_usage.prompt_tokens;
+                session_prompt_tokens += step_usage.prompt_tokens;
                 log.append(SessionEvent::Usage {
                     id: log.gen_id(),
                     usage: step_usage,
@@ -1682,6 +1722,26 @@ impl AgentLoop {
                 }
             }
 
+            // 控制器观测点：把本步新事件折叠进投影，由 TurnGovernor 给出唯一决策。
+            // 换路/降级只注入提示（旧守卫并行存续，其退位属步骤⑤）；
+            // Terminate 是全系统唯一的回合终止来源（spec §4.1 G1）。
+            if let Some(gov) = governor.as_mut() {
+                let (next_cursor, fresh) = log.replay_from(case_cursor);
+                case_cursor = next_cursor;
+                session_case.absorb(&fresh);
+                match gov.observe(&session_case, steps, execution.write_operations) {
+                    Decision::SwitchStrategy => messages.push(Message::user(format!(
+                        "[换路] 本窗口零增益，策略已切换至 {}。禁止重复 case file 中已尝试过的 {} 次调用。",
+                        gov.strategy_hint(),
+                        session_case.tried.len()
+                    ))),
+                    Decision::Degrade => messages.push(Message::user(
+                        "[降至栈底] 请交付可验证的子目标：停止扩大探索，把已确认的部分整理为结构化交付（已完成、证据锚点、未完成原因、下一步）。",
+                    )),
+                    Decision::Terminate(_) => break,
+                    Decision::Continue => {}
+                }
+            }
             // 唯一终止检查点（serial，无 next()）。
             let stop = bus
                 .serial(TurnStopping {

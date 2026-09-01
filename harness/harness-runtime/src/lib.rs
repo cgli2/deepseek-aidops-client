@@ -10,6 +10,7 @@ pub mod execution;
 pub mod facts;
 pub mod concept_registry;
 pub mod goal_execution;
+pub mod governor;
 pub mod solve_sketch;
 pub mod intent;
 pub mod scheduler;
@@ -29,6 +30,7 @@ pub use goal_execution::{
     Hypothesis, HypothesisState, PhaseAttempts, PhaseBudget, SolveGraph, SolvePhase, WorkItem,
     WorkItemState,
 };
+pub use governor::strategy::{Strategy, StrategyStack, WINDOW_STEPS};
 pub use intent::{
     Clarification, ClarificationKind, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior,
     inspect_diff,

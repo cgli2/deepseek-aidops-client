@@ -421,12 +421,32 @@ fn a1_guard_trips(turns: &[TurnSummary]) -> usize {
     breaker + gate_msgs
 }
 
-/// A2（辅助）：同一工具签名跨回合重复的最大回合数。
+/// A2 意图分类（spec §3，2026-09-01 实机判读）：回读/编译验证类重复是健康的交付
+/// 自查，不计跨轮重复；search 与其余 shell 属探索，保留计入。
+fn is_exploratory(sig: &str) -> bool {
+    if sig.starts_with("search:") || sig.starts_with("delegate:") {
+        return true;
+    }
+    if sig.starts_with("fs:") {
+        return sig.contains("\"op\":\"edit\"") || sig.contains("\"op\":\"write\"");
+    }
+    if sig.starts_with("shell:") {
+        return !["check", "build", "compile", "test", "py_compile"]
+            .iter()
+            .any(|k| sig.contains(k));
+    }
+    if sig.starts_with("plan:") || sig.starts_with("memory:") {
+        return false;
+    }
+    true // 未分类按探索计，宁严勿漏
+}
+
+/// A2（辅助）：同一探索型工具签名跨回合重复的最大回合数（回读/验证类豁免）。
 fn a2_max_cross_turn_repeat(turns: &[TurnSummary]) -> usize {
     let mut by_sig: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, t) in turns.iter().enumerate() {
         let mut in_turn: std::collections::HashSet<&String> = std::collections::HashSet::new();
-        for sig in &t.signatures {
+        for sig in t.signatures.iter().filter(|s| is_exploratory(s.as_str())) {
             if in_turn.insert(sig) {
                 by_sig.entry(sig.clone()).or_default().push(i);
             }
@@ -513,6 +533,34 @@ async fn red_lines_gitfix() {
     assert!(r4.is_empty(), "R4 违例: {r4:?}");
     let missing = missing_artifact_violations(&turns);
     assert!(missing.is_empty(), "R4 资产缺失: {missing:?}");
+}
+
+/// A2 意图细化回归（阶段 3 T3）：回读/编译验证豁免，探索重复保留。
+#[test]
+fn a2_exempts_readback_and_verify_repeats() {
+    let mk = |sigs: &[&str]| TurnSummary {
+        signatures: sigs.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    let verify = vec![
+        mk(&[
+            "fs:{\"op\":\"read\",\"path\":\"a.py\"}",
+            "shell:{\"command\":\"python -m py_compile a.py\"}",
+        ]),
+        mk(&["fs:{\"op\":\"read\",\"path\":\"a.py\"}"]),
+        mk(&["fs:{\"op\":\"read\",\"path\":\"a.py\"}"]),
+    ];
+    assert_eq!(
+        a2_max_cross_turn_repeat(&verify),
+        0,
+        "纯读取/编译验证重复不计 A2"
+    );
+    let loops = vec![
+        mk(&["shell:{\"command\":\"dir /s\"}"]),
+        mk(&["shell:{\"command\":\"dir /s\"}"]),
+        mk(&["shell:{\"command\":\"dir /s\"}"]),
+    ];
+    assert_eq!(a2_max_cross_turn_repeat(&loops), 3, "探索型 shell 重复仍须计入");
 }
 
 /// 成功会话回归：重放不得把健康会话跑坏（至少保留一个 Verified 交付）。

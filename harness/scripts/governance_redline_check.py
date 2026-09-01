@@ -70,6 +70,20 @@ def has_path_anchor(text: str) -> bool:
     )
 
 
+def is_exploratory(sig: str) -> bool:
+    """A2 意图分类（与 session_replay.rs 同源，2026-09-01 实机判读）：
+    回读/编译验证类重复是健康的交付自查不计；search 与其余 shell 属探索保留计入。"""
+    if sig.startswith("search:") or sig.startswith("delegate:"):
+        return True
+    if sig.startswith("fs:"):
+        return '"op":"edit"' in sig or '"op":"write"' in sig
+    if sig.startswith("shell:"):
+        return not any(k in sig for k in ("check", "build", "compile", "test", "py_compile"))
+    if sig.startswith("plan:") or sig.startswith("memory:"):
+        return False
+    return True  # 未分类按探索计，宁严勿漏
+
+
 def meters(turns):
     v = {}
     full = ["".join(t["texts"]) for t in turns]
@@ -103,7 +117,8 @@ def meters(turns):
     by_sig = {}
     for i, t in enumerate(turns):
         for sig in set(t["sigs"]):
-            by_sig.setdefault(sig, set()).add(i)
+            if is_exploratory(sig):
+                by_sig.setdefault(sig, set()).add(i)
     a2 = max((len(s) for s in by_sig.values()), default=0)
     v["A2"] = [] if a2 <= A2_CAP else [f"同一工具签名跨 {a2} 个回合重复 > {A2_CAP}"]
     return v, a1, a2

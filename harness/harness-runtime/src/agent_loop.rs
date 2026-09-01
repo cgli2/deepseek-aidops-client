@@ -1835,8 +1835,7 @@ impl AgentLoop {
                 raw_outcome,
                 DeliveryOutcome::Verified | DeliveryOutcome::Cancelled
             ) {
-            let (next_cursor, fresh) = log.replay_from(case_cursor);
-            case_cursor = next_cursor;
+            let (_, fresh) = log.replay_from(case_cursor);
             session_case.absorb(&fresh);
             let mut final_case = session_case.clone();
             if let Some(gov) = governor.as_ref() {

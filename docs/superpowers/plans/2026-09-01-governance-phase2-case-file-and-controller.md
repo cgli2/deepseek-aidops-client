@@ -2117,3 +2117,31 @@ git commit -m "docs(governance): 归档阶段 2 实施记录与红线全绿证�
 3. Case File 对真实会话日志的保真对拍 6 项全绿（步骤②验收）。
 4. 每条红线为何变绿都有可解释的机制（出口收口 / 成本顶前置 / asked 去重），且新增的 `missing_artifact_violations` 锁排除了"检查变宽导致的假绿"。
 5. spec 状态行与实施记录已更新，实机清单已移交步骤⑤。
+
+---
+
+## 阶段 2 实施记录（2026-09-01，inline 执行）
+
+子代理在本平台不可用，改用 executing-plans 逐 Task TDD 内联执行；每个 Task 先红后绿、独立提交。
+
+- 红线门禁：`cargo test -p harness-runtime --test session_replay -- --test-threads=1` → **8 passed / 0 failed / 0 ignored**（三红线已解 `#[ignore]` 切 On 模式）。
+- 跑绿证据（实测）：症状段 On 累计 prompt = **294,928**（判顶生效，卡在顶下），Legacy = **1,561,542**（远超顶，自证 replay 复现了真实成本）；A1 = 1（≤ 12）；A2 On = 2 = Legacy = 2（不退化）；R1/R2/R4 违例集均空；`missing_artifact_violations` 三 fixture 均空（非 Verified 回合 100% 带四要素资产）。
+- 保真对拍：`case_file_fidelity` 6 项全绿；full fixture 读出真实 prompt tokens > 300k，关闭阶段 1 的 R3 敏感性疑虑。
+- 全库：`cargo test --workspace` 42 结果行全 ok、0 失败；`cargo clippy -p harness-runtime --all-targets` 0 error。
+- 提交序列：T1 125087d / T2 08b95f8 / T3 74a3f10 / T4 55e1199 / T5 b12e286 / T6 4dac4af / T7 e0accb7 / T8 9a33924 / T9 b6629c6 / T10（本次）。
+
+### 执行中偏离计划之处（均已回归测试兜底）
+1. **T1 设计缺陷修正**：`asked` 的回合助手文本改用投影内 `turn_text` 缓冲结算，而非对事件切片反向找 `TurnStart`——全量单次 fold 的切片含后续回合时回溯法会把澄清文本挂错回合（T1 单元测试跑红暴露）。
+2. **T2 构造方向修正**：`FULL` 常量原按 spec 文字顺序把栈顶帧写在 vector 头部，与 `current()/pop()` 取尾部相反，测试跑红暴露；改为「栈底在头、栈顶在尾」，`for_task(false)` 取 `FULL[..5]`。
+3. **T4 测试断言修正**：计划版 `positive_gain` 用例把「基线重置」误预期为给当前策略续命，与零增益即换路的控制器语义矛盾；改为验证「旧锚点被基线吸收后不重复计增益」。
+4. **T5/T7 GoalContract 无 Default**：测试改用既有 `compile()` 构造后显式设字段（计划已预见）。
+5. **T7 冒烟断言边界收缩**：计划把「出口无 SystemFailure」放在 T7，但 outcome 收口是 T9 职责——四回合以 SystemFailure 收尾正是待收口的旧终态；T7 冒烟收缩为其真正该验的（不挂死 + 无门禁复读文案）。
+6. **T8 重大保真缺口修正（阶段 1 遗留）**：真实 token 成本只记录在独立 `Usage` 事件（Assistant chunk 不带 usage），阶段 1 驱动器完全丢弃 → 重放 token 恒为 0、R3 与判顶逻辑无从验证、R3 测试假绿。现按请求序把录制的 `Usage` 注入 `ReplayLlm` 响应；判顶增量下界 `last_prompt` 回合起点取历史末条 `Usage.prompt`（上下文单调）非 0，否则每回合首请求无条件发出会一步跨顶（实测修正前 339,934 > 顶）。R3 测试改为自证式 A/B。
+7. **T10 断言合并**：T8/T9 的独立 `governor_mode_caps` / `every_non_verified` 测试断言已折进解除封存的 `red_lines_*`（症状段复用同一次 Legacy 基线同时证 R3 超顶与 A2 不退化），删除重复测试避免对 1.4MB/4.7MB fixture 的多次昂贵重放。
+
+### 遗留与实机清单（转交步骤⑤ / 阶段 3）
+1. 实机双跑对照（spec §5 步骤④硬性验收，六项指标）：本机无打包实机环境，**未执行**，标 SKIPPED；步骤④完成宣告以「回放四红线全绿」为据，实机对照待补。
+2. gate 触发的 ask_user（On 模式满足三重前置时）仍走 NeedsUserInput 早返回，不带四要素资产——其 reason 带 `CLARIFICATION_REASON_PREFIX`，R4 度量器会要求锚点。当前四 fixture 均不触发该路径（续跑/开放模板被拒）；实机若出现需补「gate 问题也带候选锚点」。
+3. 策略切换提示 `[换路]/[降至栈底]` 与旧 `[自动接续]/[强制收敛]` 提示在 On 模式共存（旧守卫未退位），步数成本略升——退位删除属步骤⑤。
+4. 绝对 A2 ≤ 2 门禁转实机三场景复核。
+5. `stack_pos` 未进 CaseFile 投影（回合级状态，SessionLog 无源派），需写回 spec §4.3。

@@ -360,9 +360,8 @@ fn r2_violations(turns: &[TurnSummary]) -> Vec<String> {
     dups
 }
 
-/// R3：会话 prompt tokens 硬顶。
-const PROMPT_CAP: u64 = 300_000;
-
+/// R3：会话 prompt tokens 累计。硬顶单点取自 `harness_runtime::PROMPT_CAP`
+/// （控制器侧判顶与本度量器必须同一常量，禁止两处各自写死）。
 fn r3_prompt_total(turns: &[TurnSummary]) -> u64 {
     turns.iter().map(|t| t.prompt_tokens).sum()
 }
@@ -449,45 +448,71 @@ fn missing_artifact_violations(turns: &[TurnSummary]) -> Vec<String> {
         .collect()
 }
 
-/// 澄清死循环段（turn 15–18）：R1（"继续"不得 NeedsUserInput）+ R2（文案不复读）+ R4（留资产）。
+/// 澄清死循环段（turn 15–18）：R1 + R2 + R4 + 资产锁。控制器模式正式门禁（步骤④已接管）。
 #[tokio::test]
-#[ignore = "红线门禁：旧守卫代码上预期失败（跑红证明）；新控制器接管（步骤④）后移除"]
 async fn red_lines_clarification_loop() {
-    let log = replay_session("7ba3370f_t15_18_clarification.jsonl").await;
+    let log = replay_session_with(
+        "7ba3370f_t15_18_clarification.jsonl",
+        GovernorMode::On,
+    )
+    .await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 4);
     let (r1, r2, r4) = (r1_violations(&turns), r2_violations(&turns), r4_violations(&turns));
     assert!(r1.is_empty(), "R1 违例: {r1:?}");
     assert!(r2.is_empty(), "R2 违例: {r2:?}");
     assert!(r4.is_empty(), "R4 违例: {r4:?}");
+    let missing = missing_artifact_violations(&turns);
+    assert!(missing.is_empty(), "R4 资产缺失: {missing:?}");
 }
 
-/// 症状任务段（turn 3–14）：R1 + R3（300k token 顶）+ R4 + A1/A2 辅助。
+/// 症状任务段（turn 3–14）：R1 + R3 + R4 + A1 + 资产锁 + A2 的 A/B 对照。
 #[tokio::test]
-#[ignore = "红线门禁：旧守卫代码上预期失败（跑红证明）；新控制器接管（步骤④）后移除"]
 async fn red_lines_symptom_task() {
-    let log = replay_session("7ba3370f_t03_14_symptom.jsonl").await;
+    let log = replay_session_with("7ba3370f_t03_14_symptom.jsonl", GovernorMode::On).await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 12);
     let (r1, r4) = (r1_violations(&turns), r4_violations(&turns));
     let tokens = r3_prompt_total(&turns);
-    let (a1, a2) = (a1_guard_trips(&turns), a2_max_cross_turn_repeat(&turns));
+    let a1 = a1_guard_trips(&turns);
+    let a2_on = a2_max_cross_turn_repeat(&turns);
     assert!(r1.is_empty(), "R1 违例: {r1:?}");
-    assert!(tokens <= PROMPT_CAP, "R3 违例: prompt={tokens} > {PROMPT_CAP}");
+    assert!(
+        tokens <= harness_runtime::PROMPT_CAP,
+        "R3 违例: prompt={tokens} > 顶 {}",
+        harness_runtime::PROMPT_CAP
+    );
     assert!(r4.is_empty(), "R4 违例: {r4:?}");
     assert!(a1 <= 12, "A1 违例: 守卫/熔断触发 {a1} > 12");
-    assert!(a2 <= 2, "A2 违例: 跨轮重复 {a2} > 2");
+    let missing = missing_artifact_violations(&turns);
+    assert!(missing.is_empty(), "R4 资产缺失: {missing:?}");
+
+    // 同一次 Legacy 基线重放同时承担两项对照（避免第三次昂贵 replay）：
+    //   ① R3 自证：Legacy 成本必须 > 顶，否则 replay 没复现真实 token 成本；
+    //   ② A2 不退化：控制器模式跨轮重复不得高于旧守卫（绝对 A2 ≤ 2 属实机验收，
+    //      回放里的模型是录制脚本，其跨轮重复是既成事实，控制器无法改变）。
+    let legacy_log =
+        replay_session_with("7ba3370f_t03_14_symptom.jsonl", GovernorMode::Legacy).await;
+    let legacy = summarize(&legacy_log);
+    let legacy_tokens = r3_prompt_total(&legacy);
+    assert!(
+        legacy_tokens > harness_runtime::PROMPT_CAP,
+        "R3 对照失效：Legacy 重放成本 {legacy_tokens} 未超顶，replay 没复现真实成本"
+    );
+    let a2_legacy = a2_max_cross_turn_repeat(&legacy);
+    assert!(a2_on <= a2_legacy, "A2 退化：控制器 {a2_on} > 旧守卫 {a2_legacy}");
 }
 
-/// git 修复段（turn 19–22）：R4（edit matched-0 / length 截断回合也要留资产）。
+/// git 修复段（turn 19–22）：R4 + 资产锁（edit matched-0 / length 截断回合也要留资产）。
 #[tokio::test]
-#[ignore = "红线门禁：旧守卫代码上预期失败（跑红证明）；新控制器接管（步骤④）后移除"]
 async fn red_lines_gitfix() {
-    let log = replay_session("7ba3370f_t19_22_gitfix.jsonl").await;
+    let log = replay_session_with("7ba3370f_t19_22_gitfix.jsonl", GovernorMode::On).await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 4);
     let r4 = r4_violations(&turns);
     assert!(r4.is_empty(), "R4 违例: {r4:?}");
+    let missing = missing_artifact_violations(&turns);
+    assert!(missing.is_empty(), "R4 资产缺失: {missing:?}");
 }
 
 /// 成功会话回归：重放不得把健康会话跑坏（至少保留一个 Verified 交付）。
@@ -504,9 +529,7 @@ async fn success_session_replay_keeps_verified() {
 }
 
 /// A/B 冒烟：控制器模式下澄清死循环段被门禁拒绝后仍能每回合收尾（不挂死），
-/// 且不出现门禁复读文案（R1/R2 前提）。
-/// 断言边界：旧 outcome 链的 SystemFailure/Interrupted 收敛为 ExhaustedWithArtifact
-/// 由 T9 的 `governor_mode_*` 测试负责，此处不预先要求。
+/// 且不出现门禁复读文案（R1/R2 前提）。outcome 收口与资产由 red_lines_* 断言。
 #[tokio::test]
 async fn governor_mode_terminates_clarification_loop_without_asking() {
     let log =
@@ -522,42 +545,20 @@ async fn governor_mode_terminates_clarification_loop_without_asking() {
     );
 }
 
-/// R3：控制器模式下会话 prompt tokens 必须被前置拦在硬顶之下。
-/// 自证式对照：同一 fixture 的 Legacy 重放必须 > 顶（否则说明 replay 根本没
-/// 复现真实成本，本红线在回放中不可验——此时应改测实机，而非给假绿放行）。
+/// A/B 对照：控制器接管不得把健康会话跑坏。
 #[tokio::test]
-async fn governor_mode_caps_session_prompt_tokens() {
-    let baseline = replay_session_with(
-        "7ba3370f_t03_14_symptom.jsonl",
-        GovernorMode::Legacy,
-    )
-    .await;
-    let ceiling_free = r3_prompt_total(&summarize(&baseline));
+async fn governor_mode_success_session_still_verifies() {
+    let log = replay_session_with("success_677bd6e0.jsonl", GovernorMode::On).await;
+    let turns = summarize(&log);
     assert!(
-        ceiling_free > harness_runtime::PROMPT_CAP,
-        "对照失效：Legacy 重放成本 {} 未超顶，replay 没复现真实 token 成本",
-        ceiling_free
+        turns
+            .iter()
+            .any(|t| t.outcome == Some(DeliveryOutcome::Verified)),
+        "成功会话在控制器模式下应仍有 Verified 交付: {turns:?}"
     );
-    let log = replay_session_with("7ba3370f_t03_14_symptom.jsonl", GovernorMode::On).await;
-    let total = r3_prompt_total(&summarize(&log));
     assert!(
-        total <= harness_runtime::PROMPT_CAP,
-        "R3 违例：控制器重放累计 prompt={total} > 顶 {}",
-        harness_runtime::PROMPT_CAP
+        r3_prompt_total(&turns) <= harness_runtime::PROMPT_CAP,
+        "健康会话也不应突破成本顶: {}",
+        r3_prompt_total(&turns)
     );
-}
-
-/// R4（加强）：控制器模式下每个非 Verified 回合都要带结构化资产。
-#[tokio::test]
-async fn governor_mode_every_non_verified_turn_carries_artifact() {
-    for fixture in [
-        "7ba3370f_t03_14_symptom.jsonl",
-        "7ba3370f_t15_18_clarification.jsonl",
-        "7ba3370f_t19_22_gitfix.jsonl",
-    ] {
-        let log = replay_session_with(fixture, GovernorMode::On).await;
-        let turns = summarize(&log);
-        let missing = missing_artifact_violations(&turns);
-        assert!(missing.is_empty(), "{fixture} 缺资产：{missing:?}");
-    }
 }

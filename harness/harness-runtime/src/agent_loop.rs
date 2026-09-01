@@ -24,6 +24,7 @@ use crate::execution::{
     ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
+use crate::governor::is_continuation_request;
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
 /// Agent 循环 / Turn-Step 生命周期（原 §5.6）。
@@ -96,13 +97,6 @@ fn is_search_like(name: &str) -> bool {
 /// 搜索缓存键：工具名 + 归一化参数（Debug 表示即可，足以区分不同查询）。
 fn search_cache_key(name: &str, args: &impl std::fmt::Debug) -> String {
     format!("{}::{:?}", name, args)
-}
-
-fn is_continuation_request(text: &str) -> bool {
-    let trimmed = text.trim().to_lowercase();
-    ["继续", "接着", "续跑", "恢复", "continue", "resume"]
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
 }
 
 /// 从追加日志逆向找到最近的未完成根任务。若最近一回合本身也是“继续”，继续

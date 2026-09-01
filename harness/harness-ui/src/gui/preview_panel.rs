@@ -768,11 +768,19 @@ impl AppState {
         if self.git_changes.is_empty() {
             if let Some(error) = &self.git_error {
                 ui.add_space(16.0);
-                ui.label(
-                    egui::RichText::new(format!("无法读取 Git 状态：{error}"))
-                        .size(12.0)
-                        .color(pal.err_text),
-                );
+                if error.contains("not a git repository") {
+                    ui.label(
+                        egui::RichText::new("当前目录不是 Git 仓库或未初始化")
+                            .size(12.0)
+                            .color(pal.dim),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("无法读取 Git 状态：{error}"))
+                            .size(12.0)
+                            .color(pal.err_text),
+                    );
+                }
                 ui.label(
                     egui::RichText::new(format!("查询工作区：{}", self.git_workspace))
                         .size(10.5)

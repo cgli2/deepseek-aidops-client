@@ -30,6 +30,7 @@ pub use goal_execution::{
     Hypothesis, HypothesisState, PhaseAttempts, PhaseBudget, SolveGraph, SolvePhase, WorkItem,
     WorkItemState,
 };
+pub use governor::sensors::{artifact_text, delta_between, WindowDelta};
 pub use governor::strategy::{Strategy, StrategyStack, WINDOW_STEPS};
 pub use intent::{
     Clarification, ClarificationKind, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior,

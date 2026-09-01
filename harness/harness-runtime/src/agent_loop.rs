@@ -28,20 +28,21 @@ use crate::case_file::CaseFile;
 use crate::governor::{artifact_text, is_continuation_request, Decision, TurnGovernor};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
-/// 治理路径选择（spec §5 步骤④：新控制器接管决策走 A/B）。
+/// 治理路径选择（spec §5 步骤④：控制器接管后 A/B 默认 On）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GovernorMode {
-    /// 旧守卫网络拥有终止权（默认，保证实机可回滚）。
+    /// 旧守卫网络拥有终止权（仅逃生门，步骤⑤删除）。
     Legacy,
-    /// 终止权收归 TurnGovernor；旧守卫并行运行但只产信号。
+    /// 终止权收归 TurnGovernor；旧守卫并行运行但只产信号（默认）。
     On,
 }
 
-/// 解析 `HARNESS_GOVERNOR`：只有显式 on/1/true 才启用，其余一律 Legacy。
+/// 解析 `HARNESS_GOVERNOR`：默认控制器接管（On）；仅显式 legacy/off/0 回退旧路径
+/// （步骤⑤删除 Legacy 前保留一个阶段的逃生门）。
 pub fn parse_governor_mode(value: Option<&str>) -> GovernorMode {
     match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("on" | "1" | "true") => GovernorMode::On,
-        _ => GovernorMode::Legacy,
+        Some("legacy" | "off" | "0") => GovernorMode::Legacy,
+        _ => GovernorMode::On,
     }
 }
 
@@ -2944,20 +2945,22 @@ mod tests {
     }
 
     #[test]
-    fn governor_mode_is_explicit_and_defaults_to_legacy() {
-        // 默认必须走旧路径：绞杀者要求新控制器显式 opt-in，实机随时可回滚。
-        assert_eq!(AgentLoop::new().governor_mode(), GovernorMode::Legacy);
+    fn governor_mode_defaults_to_on_with_legacy_escape_hatch() {
+        // 步骤④接管后默认控制器；HARNESS_GOVERNOR=legacy/off/0 是步骤⑤删除前的逃生门。
+        assert_eq!(AgentLoop::new().governor_mode(), GovernorMode::On);
         assert_eq!(
-            AgentLoop::new().with_governor(GovernorMode::On).governor_mode(),
-            GovernorMode::On
+            AgentLoop::new().with_governor(GovernorMode::Legacy).governor_mode(),
+            GovernorMode::Legacy
         );
         // 解析函数独立可测，不依赖真实进程环境（edition 2024 下 env 写入是 unsafe）。
-        assert_eq!(parse_governor_mode(None), GovernorMode::Legacy);
+        assert_eq!(parse_governor_mode(None), GovernorMode::On);
+        assert_eq!(parse_governor_mode(Some("")), GovernorMode::On);
+        assert_eq!(parse_governor_mode(Some("legacy")), GovernorMode::Legacy);
+        assert_eq!(parse_governor_mode(Some(" OFF ")), GovernorMode::Legacy);
+        assert_eq!(parse_governor_mode(Some("0")), GovernorMode::Legacy);
         assert_eq!(parse_governor_mode(Some("on")), GovernorMode::On);
         assert_eq!(parse_governor_mode(Some(" 1 ")), GovernorMode::On);
         assert_eq!(parse_governor_mode(Some("TRUE")), GovernorMode::On);
-        assert_eq!(parse_governor_mode(Some("legacy")), GovernorMode::Legacy);
-        assert_eq!(parse_governor_mode(Some("")), GovernorMode::Legacy);
     }
 
     #[test]

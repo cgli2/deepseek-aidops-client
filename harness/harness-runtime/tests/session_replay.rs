@@ -230,12 +230,16 @@ async fn replay_session_with(fixture: &str, mode: GovernorMode) -> Arc<SessionLo
 }
 
 async fn replay_session(fixture: &str) -> Arc<SessionLog> {
-    replay_session_with(fixture, GovernorMode::Legacy).await
+    replay_session_with(fixture, GovernorMode::On).await
 }
 
 #[tokio::test]
 async fn clarification_loop_replay_emits_delivery_per_turn() {
-    let log = replay_session("7ba3370f_t15_18_clarification.jsonl").await;
+    let log = replay_session_with(
+        "7ba3370f_t15_18_clarification.jsonl",
+        GovernorMode::Legacy,
+    )
+    .await;
     let events = log.replay();
     let turn_starts = events
         .iter()
@@ -451,11 +455,7 @@ fn missing_artifact_violations(turns: &[TurnSummary]) -> Vec<String> {
 /// 澄清死循环段（turn 15–18）：R1 + R2 + R4 + 资产锁。控制器模式正式门禁（步骤④已接管）。
 #[tokio::test]
 async fn red_lines_clarification_loop() {
-    let log = replay_session_with(
-        "7ba3370f_t15_18_clarification.jsonl",
-        GovernorMode::On,
-    )
-    .await;
+    let log = replay_session("7ba3370f_t15_18_clarification.jsonl").await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 4);
     let (r1, r2, r4) = (r1_violations(&turns), r2_violations(&turns), r4_violations(&turns));
@@ -469,7 +469,7 @@ async fn red_lines_clarification_loop() {
 /// 症状任务段（turn 3–14）：R1 + R3 + R4 + A1 + 资产锁 + A2 的 A/B 对照。
 #[tokio::test]
 async fn red_lines_symptom_task() {
-    let log = replay_session_with("7ba3370f_t03_14_symptom.jsonl", GovernorMode::On).await;
+    let log = replay_session("7ba3370f_t03_14_symptom.jsonl").await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 12);
     let (r1, r4) = (r1_violations(&turns), r4_violations(&turns));
@@ -506,7 +506,7 @@ async fn red_lines_symptom_task() {
 /// git 修复段（turn 19–22）：R4 + 资产锁（edit matched-0 / length 截断回合也要留资产）。
 #[tokio::test]
 async fn red_lines_gitfix() {
-    let log = replay_session_with("7ba3370f_t19_22_gitfix.jsonl", GovernorMode::On).await;
+    let log = replay_session("7ba3370f_t19_22_gitfix.jsonl").await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 4);
     let r4 = r4_violations(&turns);
@@ -518,7 +518,7 @@ async fn red_lines_gitfix() {
 /// 成功会话回归：重放不得把健康会话跑坏（至少保留一个 Verified 交付）。
 #[tokio::test]
 async fn success_session_replay_keeps_verified() {
-    let log = replay_session("success_677bd6e0.jsonl").await;
+    let log = replay_session_with("success_677bd6e0.jsonl", GovernorMode::Legacy).await;
     let turns = summarize(&log);
     assert!(
         turns

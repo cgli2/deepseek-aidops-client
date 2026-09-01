@@ -421,7 +421,10 @@ async fn ambiguous_delivery_is_clarified_before_model_or_tool_calls() {
     let _c = ctx.provide(ToolRegistry::new());
     let _d = ctx.provide(hook);
 
+    // 旧门禁语义（澄清前置于模型调用）属 Legacy 逃生门路径；控制器接管后
+    // ask_user 受栈深前置约束，首回合先给予接地/定位机会而非直接反问（e0accb7 收敛）。
     AgentLoop::new()
+        .with_governor(harness_runtime::GovernorMode::Legacy)
         .run_turn(
             &ctx,
             UserInput {

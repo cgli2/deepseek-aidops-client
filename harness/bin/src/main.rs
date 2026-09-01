@@ -120,6 +120,16 @@ async fn main() -> harness_core::error::Result<()> {
     let log: Arc<SessionLog> = ctx.get::<SessionLog>();
     let ui: Arc<dyn Ui> = ctx.get::<dyn Ui>();
 
+    // ACP 形态：stdio 行分隔 JSON-RPC 外驱（编辑器客户端 / 实机对照编排器）。
+    // session/prompt 每回合阻塞至完成并返回该回合事件；不进 UI 事件循环，stdin 断开即退出。
+    #[cfg(feature = "acp")]
+    if matches!(profile, Profile::Acp) {
+        return harness_acp::AcpServer::new()
+            .run(ctx, log)
+            .await
+            .map_err(harness_core::error::Error::Io);
+    }
+
     // UI 事件循环。GUI（egui/winit）要求事件循环必须在主线程创建，因此 GUI 直接在主线程
     // 阻塞运行（后台回合由多线程 tokio runtime 的工作线程执行，不会饿死）；
     // TUI 保持旧路径 spawn_blocking，避免占用主线程。

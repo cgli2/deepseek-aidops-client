@@ -1,7 +1,7 @@
 # Agent 治理层彻底重设计：闭环控制器 + Case File
 
 - 日期：2026-08-31
-- 状态：设计已获批；步骤①（回放套件）、②（case file 投影 + 真实日志保真对拍）、③（工具层契约）、④（新闭环控制器接管终止权与澄清门禁，A/B 默认 Legacy）已实施，四条红线门禁已解除 `#[ignore]` 并在控制器模式下全绿（A/B 默认仍走旧路径）；待实机三场景对照与步骤⑤（旧计数器退位删除）
+- 状态：设计已获批；步骤①（回放套件）、②（case file 投影 + 真实日志保真对拍）、③（工具层契约）、④（新闭环控制器接管终止权与澄清门禁，A/B 默认 Legacy）已实施，四条红线门禁已解除 `#[ignore]` 并在控制器模式下全绿（A/B 默认仍走旧路径）；实机三场景对照已通过红线级验收（2026-09-01，`governance_ab_run.py --acp` 自动跑，见 `2026-09-01-governance-phase2-onsite-ab-checklist.md` 判读，A2 辅助度量误报待阶段 3 细化）；待步骤⑤（旧计数器退位删除）
 - 范围：harness-runtime 治理层 + 工具层契约；SessionEvent schema、LLM provider 接口、harness-ui 均不动
 - 证据来源：`.harness/sessions/7ba3370f-fcbe-4993-b50a-f89f750ba929.jsonl`（22 轮、3.14M prompt tokens）、`harness/dist/harness_gui_trace.log` 时间戳交叉验证
 

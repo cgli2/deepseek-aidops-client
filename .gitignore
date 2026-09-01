@@ -17,6 +17,10 @@ harness_gui_trace.log
 .harness-memory/
 **/.harness-memory/
 
+# 实机 A/B 对照运行产物（可重跑，持久记录在对照清单文档）
+harness/ab-runs/
+__pycache__/
+
 # Local databases and SQLite sidecar files
 *.db
 *.db-shm

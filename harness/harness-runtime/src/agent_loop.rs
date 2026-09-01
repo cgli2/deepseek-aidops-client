@@ -27,10 +27,35 @@ use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
 use crate::governor::is_continuation_request;
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
+/// 治理路径选择（spec §5 步骤④：新控制器接管决策走 A/B）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernorMode {
+    /// 旧守卫网络拥有终止权（默认，保证实机可回滚）。
+    Legacy,
+    /// 终止权收归 TurnGovernor；旧守卫并行运行但只产信号。
+    On,
+}
+
+/// 解析 `HARNESS_GOVERNOR`：只有显式 on/1/true 才启用，其余一律 Legacy。
+pub fn parse_governor_mode(value: Option<&str>) -> GovernorMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("on" | "1" | "true") => GovernorMode::On,
+        _ => GovernorMode::Legacy,
+    }
+}
+
 /// Agent 循环 / Turn-Step 生命周期（原 §5.6）。
 ///
 /// `Turn` = 0..n `Step`；`debt` 计数控制续跑；`agent/turn-stopping` 为唯一串行终止点。
-pub struct AgentLoop;
+pub struct AgentLoop {
+    governor: GovernorMode,
+}
+
+impl Default for AgentLoop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn goal_executor_enabled() -> bool {
     parse_goal_executor_mode(std::env::var("HARNESS_GOAL_EXECUTOR").ok().as_deref())
@@ -307,7 +332,19 @@ impl Compaction for DeterministicCompaction {
 
 impl AgentLoop {
     pub fn new() -> Self {
-        Self
+        Self {
+            governor: parse_governor_mode(std::env::var("HARNESS_GOVERNOR").ok().as_deref()),
+        }
+    }
+
+    /// 显式指定治理路径：回放套件与实机 A/B 对照用它绕开进程环境变量。
+    pub fn with_governor(mut self, mode: GovernorMode) -> Self {
+        self.governor = mode;
+        self
+    }
+
+    pub fn governor_mode(&self) -> GovernorMode {
+        self.governor
     }
 
     /// 跑一个 turn，直到唯一终止检查点返回 `will_stop`。
@@ -2741,5 +2778,22 @@ mod tests {
             latest_resumable_task(&events).unwrap().objective,
             "这个有问题，帮我修一下"
         );
+    }
+
+    #[test]
+    fn governor_mode_is_explicit_and_defaults_to_legacy() {
+        // 默认必须走旧路径：绞杀者要求新控制器显式 opt-in，实机随时可回滚。
+        assert_eq!(AgentLoop::new().governor_mode(), GovernorMode::Legacy);
+        assert_eq!(
+            AgentLoop::new().with_governor(GovernorMode::On).governor_mode(),
+            GovernorMode::On
+        );
+        // 解析函数独立可测，不依赖真实进程环境（edition 2024 下 env 写入是 unsafe）。
+        assert_eq!(parse_governor_mode(None), GovernorMode::Legacy);
+        assert_eq!(parse_governor_mode(Some("on")), GovernorMode::On);
+        assert_eq!(parse_governor_mode(Some(" 1 ")), GovernorMode::On);
+        assert_eq!(parse_governor_mode(Some("TRUE")), GovernorMode::On);
+        assert_eq!(parse_governor_mode(Some("legacy")), GovernorMode::Legacy);
+        assert_eq!(parse_governor_mode(Some("")), GovernorMode::Legacy);
     }
 }

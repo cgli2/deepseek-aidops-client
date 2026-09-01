@@ -21,7 +21,7 @@ pub mod task_ledger;
 pub mod workspace_grounder;
 pub mod workspace_index;
 
-pub use agent_loop::{AgentLoop, DeterministicCompaction};
+pub use agent_loop::{parse_governor_mode, AgentLoop, DeterministicCompaction, GovernorMode};
 pub use case_file::{extract_anchors, normalize_question, CaseFile, TriedEntry};
 pub use controller::SessionController;
 pub use events::{PreStep, TurnStopping};

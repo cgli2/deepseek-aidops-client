@@ -38,7 +38,7 @@
 
 分段依据（来自 7ba3370f 复盘）：turn 3–14 = 症状任务守卫连环熔断（R1/R3/A2 证据）；turn 15–18 = 澄清模板四次复读（R2 证据，零工具调用、回放最快）；turn 19–22 = git 报错修复 + edit matched-0 + length 截断（R4 证据）。成功会话 = `677bd6e0`（5 回合、131k prompt、含 Verified 交付）。
 
-- [ ] **Step 1: 写抽取脚本**
+- [x] **Step 1: 写抽取脚本**
 
 在工作区根写 `_fixture_extract.py`：
 
@@ -70,12 +70,12 @@ shutil.copy(ROOT / ".harness/sessions/677bd6e0-bcd6-4b7f-bc6f-40fe3834fe54.jsonl
             OUT / "success_677bd6e0.jsonl")
 ```
 
-- [ ] **Step 2: 运行脚本**
+- [x] **Step 2: 运行脚本**
 
 Run: `python -X utf8 _fixture_extract.py`（工作区根目录）
 Expected: `total turns: 22`，5 个文件生成；`..._t15_18_clarification.jsonl` 为四段中最小（应 < 100KB）。
 
-- [ ] **Step 3: 校验 fixture 可解析且回合数正确**
+- [x] **Step 3: 校验 fixture 可解析且回合数正确**
 
 Run:
 ```bash
@@ -83,7 +83,7 @@ python -X utf8 -c "import json,pathlib; [print(f.name, sum(1 for l in f.read_tex
 ```
 Expected: symptom=12，clarification=4，gitfix=4，full=22，success=5。
 
-- [ ] **Step 4: 删除临时脚本，做 Checkpoint**
+- [x] **Step 4: 删除临时脚本，做 Checkpoint**
 
 Run: `rm _fixture_extract.py`
 Checkpoint: 5 个 fixture 文件存在于 `harness/harness-runtime/tests/fixtures/`。
@@ -95,7 +95,7 @@ Checkpoint: 5 个 fixture 文件存在于 `harness/harness-runtime/tests/fixture
 **Files:**
 - Create: `harness/harness-runtime/tests/session_replay.rs`
 
-- [ ] **Step 1: 写解析器与失败测试**
+- [x] **Step 1: 写解析器与失败测试**
 
 创建 `harness/harness-runtime/tests/session_replay.rs`：
 
@@ -181,12 +181,12 @@ fn fixtures_parse_with_expected_turn_counts() {
 }
 ```
 
-- [ ] **Step 2: 运行，确认编译通过且测试绿**
+- [x] **Step 2: 运行，确认编译通过且测试绿**
 
 Run: `cargo test -p harness-runtime --test session_replay`
 Expected: PASS（1 test）。若报缺 `serde_json`：它已是 `harness-runtime` 常规依赖（见其 Cargo.toml `[dependencies]`），不需要新增。
 
-- [ ] **Step 3: Checkpoint**
+- [x] **Step 3: Checkpoint**
 
 Checkpoint: `cargo test -p harness-runtime --test session_replay` 全绿。
 
@@ -197,7 +197,7 @@ Checkpoint: `cargo test -p harness-runtime --test session_replay` 全绿。
 **Files:**
 - Modify: `harness/harness-runtime/tests/session_replay.rs`
 
-- [ ] **Step 1: 追加重放执行器与冒烟测试**
+- [x] **Step 1: 追加重放执行器与冒烟测试**
 
 在 `session_replay.rs` 追加：
 
@@ -347,19 +347,19 @@ async fn clarification_loop_replay_emits_delivery_per_turn() {
 }
 ```
 
-- [ ] **Step 2: 运行，确认编译通过**
+- [x] **Step 2: 运行，确认编译通过**
 
 Run: `cargo test -p harness-runtime --test session_replay`
 Expected: 2 tests PASS。
 
-- [ ] **Step 3: 校准（若冒烟测试失败）**
+- [x] **Step 3: 校准（若冒烟测试失败）**
 
 若 `deliveries != 4`：在测试里临时打印 `log.replay()` 的事件类型序列，对照 `agent_loop.rs` 的终止路径（门禁澄清出口 :489/:538/:583、主出口 :1691）定位缺 Delivery 的回合。常见原因：
 - 缺服务 panic（如 WorkspaceIndex 构建）→ 在 `replay_session` 中补注册最小 stub；
 - 某回合以 `Err` 返回 → 把 `let _ =` 改为 `.expect("…")` 暂时暴露错误，修好后还原。
 校准后本步必须回到全绿。
 
-- [ ] **Step 4: Checkpoint**
+- [x] **Step 4: Checkpoint**
 
 Checkpoint: `cargo test -p harness-runtime --test session_replay` 全绿（2 tests）。
 
@@ -370,7 +370,7 @@ Checkpoint: `cargo test -p harness-runtime --test session_replay` 全绿（2 tes
 **Files:**
 - Modify: `harness/harness-runtime/tests/session_replay.rs`
 
-- [ ] **Step 1: 追加回合摘要与红线度量器**
+- [x] **Step 1: 追加回合摘要与红线度量器**
 
 ```rust
 use harness_session::DeliveryOutcome;
@@ -534,7 +534,7 @@ fn a2_max_cross_turn_repeat(turns: &[TurnSummary]) -> usize {
 }
 ```
 
-- [ ] **Step 2: 追加红线门禁测试（#[ignore] 封存）**
+- [x] **Step 2: 追加红线门禁测试（#[ignore] 封存）**
 
 ```rust
 /// 澄清死循环段（turn 15–18）：R1（"继续"不得 NeedsUserInput）+ R2（文案不复读）+ R4（留资产）。
@@ -592,17 +592,17 @@ async fn success_session_replay_keeps_verified() {
 }
 ```
 
-- [ ] **Step 3: 跑红证明——红线测试必须在旧代码上失败**
+- [x] **Step 3: 跑红证明——红线测试必须在旧代码上失败**
 
 Run: `cargo test -p harness-runtime --test session_replay -- --ignored --test-threads=1`
 Expected: 3 个红线测试 **全部失败**（典型失败：`red_lines_clarification_loop` 报 R2「澄清文案完全相同」；`red_lines_symptom_task` 报 R3 token 超顶）。把失败输出粘贴进实施记录——这是断言有效性的证据（spec §5 步骤①）。若有红线测试意外通过：说明该度量器对旧失败模式不敏感，**先修度量器**（对照 `_analysis_out.txt` 式的逐回合分析找到未捕获的违例形态），再重跑直到跑红。
 
-- [ ] **Step 4: 默认套件保持全绿**
+- [x] **Step 4: 默认套件保持全绿**
 
 Run: `cargo test -p harness-runtime --test session_replay`
 Expected: 3 tests PASS（`--ignored` 的 3 个被跳过）。
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Checkpoint: 默认全绿 + `-- --ignored` 三个红线测试跑红，两者证据都留存。
 
@@ -615,7 +615,7 @@ Checkpoint: 默认全绿 + `-- --ignored` 三个红线测试跑红，两者证�
 
 证据：7ba3370f turn 19 连续 3 次 `old_text must match exactly once (matched 0)` 后守卫中断。契约（spec §4.6）：失配时工具自读磁盘，把候选区域的**磁盘原文 + 行号**回给模型，禁止凭记忆重构。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `editor.rs` 底部 `mod tests` 内追加：
 
@@ -691,12 +691,12 @@ Checkpoint: 默认全绿 + `-- --ignored` 三个红线测试跑红，两者证�
     }
 ```
 
-- [ ] **Step 2: 运行，确认失败**
+- [x] **Step 2: 运行，确认失败**
 
 Run: `cargo test -p harness-provider-local editor`
 Expected: 3 个新测试 FAIL（现有错误消息不含区域报告），旧测试 `edit_replaces_exactly_once_and_rejects_ambiguous_matches` 仍 PASS。
 
-- [ ] **Step 3: 实现失配报告**
+- [x] **Step 3: 实现失配报告**
 
 `editor.rs`：在 `impl Editor for LocalEditor` 外新增函数，并替换 `apply` 中 `count != 1` 分支。
 
@@ -761,12 +761,12 @@ fn mismatch_report(content: &str, old: &str, count: usize) -> String {
         }
 ```
 
-- [ ] **Step 4: 运行，确认全绿**
+- [x] **Step 4: 运行，确认全绿**
 
 Run: `cargo test -p harness-provider-local`
 Expected: 全部 PASS（3 新 + 1 旧）。
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Checkpoint: `cargo test -p harness-provider-local` 全绿。
 
@@ -779,7 +779,7 @@ Checkpoint: `cargo test -p harness-provider-local` 全绿。
 
 证据：7ba3370f turn 5/8/11 模型在 `dir=harness/harness-capability/src` 空手而回后被门禁掐断，而不是自动扩大范围。契约（spec §4.6）：升级在工具内部完成，空结果附「已试范围列表」。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `search.rs` 底部新增：
 
@@ -908,12 +908,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行，确认失败**
+- [x] **Step 2: 运行，确认失败**
 
 Run: `cargo test -p harness-tool`
 Expected: 新测试编译失败或断言失败。已核实的依赖事实：`Search` trait 只有一个方法 `async fn grep(&self, req: SearchRequest) -> Result<Vec<SearchHit>>`（`harness-capability/src/search.rs:31-33`）；`SearchHit { path: PathBuf, line: u32, text: String }`（:19-22）；`harness-tool` 的 dev-dependencies 已含 tokio。
 
-- [ ] **Step 3: 实现作用域阶梯**
+- [x] **Step 3: 实现作用域阶梯**
 
 `search.rs`：在 `impl SearchTool` 后新增阶梯函数，并重写 `call` 的搜索主体。
 
@@ -992,12 +992,12 @@ fn scope_label(scope: &Option<std::path::PathBuf>) -> String {
 
 （保留原文件后续既有的命中行拼接与截断逻辑不变。）
 
-- [ ] **Step 4: 运行，确认全绿**
+- [x] **Step 4: 运行，确认全绿**
 
 Run: `cargo test -p harness-tool`
 Expected: 全部 PASS。
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Checkpoint: `cargo test -p harness-tool` 全绿，且 `cargo test -p harness-runtime --test agent_tool_loop` 不回归。
 
@@ -1010,7 +1010,7 @@ Checkpoint: `cargo test -p harness-tool` 全绿，且 `cargo test -p harness-run
 
 证据：7ba3370f turn 3–14「黑框闪烁」体验根因——`GitCli::run`（:47）与 `changed_files`（:109）裸调 `std::process::Command`，Windows GUI 进程下每个 git 子进程弹一帧控制台。`harness-provider-local/src/bash.rs:48` 已有正确做法可参照。
 
-- [ ] **Step 1: 实现统一的子进程构造器**
+- [x] **Step 1: 实现统一的子进程构造器**
 
 `harness-provider-git/src/lib.rs`：在 `parse_ahead_behind` 前新增：
 
@@ -1029,7 +1029,7 @@ fn git_command(repo: &Path, args: &[&str]) -> Command {
 }
 ```
 
-- [ ] **Step 2: 替换三处 Command 构造**
+- [x] **Step 2: 替换三处 Command 构造**
 
 `run`（`harness-provider-git/src/lib.rs:46-61`）改为：
 
@@ -1063,12 +1063,12 @@ fn git_command(repo: &Path, args: &[&str]) -> Command {
         let output = cmd.output().unwrap();
 ```
 
-- [ ] **Step 3: 运行，确认不回归**
+- [x] **Step 3: 运行，确认不回归**
 
 Run: `cargo test -p harness-provider-git`
 Expected: 2 tests PASS（`workspace_backed_git_follows_project_switches`、`non_repository_is_an_error_not_an_empty_change_list`）。
 
-- [ ] **Step 4: Checkpoint**
+- [x] **Step 4: Checkpoint**
 
 Checkpoint: `cargo test -p harness-provider-git` 全绿。平台行为（无黑框）留待实机验证，记入后续计划的实机清单。
 
@@ -1079,22 +1079,22 @@ Checkpoint: `cargo test -p harness-provider-git` 全绿。平台行为（无黑�
 **Files:**
 - 无新增修改
 
-- [ ] **Step 1: 受影响 crate 全量测试**
+- [x] **Step 1: 受影响 crate 全量测试**
 
 Run: `cargo test -p harness-runtime -p harness-tool -p harness-provider-local -p harness-provider-git`
 Expected: 全绿（红线门禁测试因 `#[ignore]` 被跳过）。
 
-- [ ] **Step 2: 工作区整体编译**
+- [x] **Step 2: 工作区整体编译**
 
 Run: `cargo build --workspace`
 Expected: 成功，无新增错误（警告若为既有则不处理）。
 
-- [ ] **Step 3: 复跑跑红证据**
+- [x] **Step 3: 复跑跑红证据**
 
 Run: `cargo test -p harness-runtime --test session_replay -- --ignored --test-threads=1`
 Expected: 三个红线测试仍失败（与 Task 4 Step 3 一致）。把两次输出归档到实施记录。
 
-- [ ] **Step 4: 更新 spec 状态**
+- [x] **Step 4: 更新 spec 状态**
 
 修改 `docs/superpowers/specs/2026-08-31-agent-governance-redesign-design.md` 第 4 行状态行为：
 
@@ -1102,7 +1102,7 @@ Expected: 三个红线测试仍失败（与 Task 4 Step 3 一致）。把两次�
 - 状态：设计已获批；步骤①（回放套件，红线已跑红）与步骤③（工具层契约）已实施，待步骤②④⑤
 ```
 
-- [ ] **Step 5: Checkpoint（本计划 Done）**
+- [x] **Step 5: Checkpoint（本计划 Done）**
 
 Checkpoint 判据（全部满足才算完成）：
 1. `harness/harness-runtime/tests/fixtures/` 有 5 个 fixture，解析测试绿。

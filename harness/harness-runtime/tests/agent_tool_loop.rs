@@ -672,3 +672,71 @@ async fn v4_already_satisfied_replay_verifies_without_editing() {
             if telemetry.detail.contains("AlreadySatisfied")
     )));
 }
+
+/// 流内直接吐 Err 的 Provider：复现「4xx 报错被当成最终回答」的假绿场景。
+struct ErrorLlm;
+#[async_trait]
+impl LlmProvider for ErrorLlm {
+    fn name(&self) -> &'static str {
+        "error-test"
+    }
+    fn tools(&self) -> Vec<harness_llm::ToolSchema> {
+        vec![]
+    }
+    fn stream(&self, _m: Vec<Message>) -> ChunkStream {
+        Box::pin(futures::stream::iter(vec![Err(
+            harness_core::error::Error::Llm("http 403 AccountOverdueError".into()),
+        )]))
+    }
+}
+
+#[tokio::test]
+async fn provider_error_never_delivers_verified() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let tools = ToolRegistry::new();
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let mut registrations = vec![];
+    registrations.push(ctx.provide(log.clone()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(ErrorLlm);
+    registrations.push(ctx.provide(provider));
+    registrations.push(ctx.provide(tools));
+    registrations.push(ctx.provide(hook));
+
+    let _ = AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "hi".into(),
+                attachments: vec![],
+            },
+        )
+        .await; // 错误已内化为收口，不再上抛；两可（Ok/Err）都不许 Verified
+
+    let outcomes: Vec<_> = log
+        .replay()
+        .into_iter()
+        .filter_map(|e| match e {
+            SessionEvent::Delivery { report, .. } => Some(report.outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 1, "回合必须且只交付一次");
+    assert!(
+        !matches!(outcomes[0], harness_session::DeliveryOutcome::Verified),
+        "provider 错误不得交付 Verified，实际 {:?}",
+        outcomes[0]
+    );
+    let texts: Vec<String> = log
+        .replay()
+        .into_iter()
+        .filter_map(|e| match e {
+            SessionEvent::Assistant { chunk, .. } => chunk.text,
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("[error]")),
+        "错误须对用户可见: {texts:?}"
+    );
+}

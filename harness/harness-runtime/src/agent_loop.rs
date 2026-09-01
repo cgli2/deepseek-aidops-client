@@ -835,6 +835,10 @@ impl AgentLoop {
         // 硬终止标记（取消/流错误/反复无视循环恢复）：阻止步末的 debt 记账复活回合，
         // 否则带着「已宣告未执行」的 tool_call 续跑会直接 400。
         let mut hard_stop = false;
+        // provider 流错误文本不是模型回答：回合收口必须按系统失败处理，
+        // 否则错误串会被当成最终交付（2026-09-01 实机冒烟抓出的假绿 Verified）。
+        let mut provider_error_seen = false;
+        let mut provider_error_summary = String::new();
         let mut cancelled = false;
         let mut delivery_verified = false;
         let mut budget_exhausted = false;
@@ -1051,6 +1055,8 @@ impl AgentLoop {
                 let chunk = match item {
                     Ok(c) => c,
                     Err(e) => {
+                        provider_error_seen = true;
+                        provider_error_summary = e.to_string();
                         log.append(SessionEvent::Assistant {
                             id: log.gen_id(),
                             chunk: Chunk {
@@ -1768,7 +1774,16 @@ impl AgentLoop {
         }
 
         let terminal_reason = goal_execution.actionable_terminal_reason();
-        let (raw_outcome, raw_reason) = if delivery_verified {
+        let (raw_outcome, raw_reason) = if provider_error_seen {
+            // provider 流错误优先级最高：错误文本非模型回答，绝不可 Verified；
+            // On 模式下游出口收口会把 SystemFailure 再包成 PartialDelivery + 四要素资产。
+            (
+                harness_session::DeliveryOutcome::SystemFailure,
+                Some(format!(
+                    "llm provider error（流读取已终止，未获有效模型回答）: {provider_error_summary}"
+                )),
+            )
+        } else if delivery_verified {
             (harness_session::DeliveryOutcome::Verified, None)
         } else if terminal_reason
             .as_deref()

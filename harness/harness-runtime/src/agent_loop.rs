@@ -814,20 +814,12 @@ impl AgentLoop {
             .clamp(5, 3_600);
         let mut steps = 0usize;
         // 控制器模式专属状态。Legacy 下 governor 为 None，这些变量恒为初值且不被读。
-        // session_prompt_tokens / last_prompt_tokens：会话累计 prompt 与上一轮实际 prompt
-        // （R3 增量下界）。必须在每步 Usage 落盘处即时累加——session_case 只在回合末观测
-        // 点 absorb，用它判顶会让「一步超顶」和「多步超顶」都不触发。
-        let mut session_prompt_tokens = case_file.prompt_tokens;
-        // 首请求增量的下界取「历史最后一次请求的实际 prompt」：上下文跨回合单调不减，
-        // 用它而非 0，否则每回合第一个请求会无条件发出并可能一步跨顶。
-        let mut last_prompt_tokens = history
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                SessionEvent::Usage { usage, .. } => Some(usage.prompt_tokens),
-                _ => None,
-            })
-            .unwrap_or(0);
+        // R3 是单次执行回合的安全边界，不是会话的永久熔断器。历史 Usage 仍完整保留在
+        // CaseFile 用于成本审计，但新用户回合（尤其明确的“继续”）必须获得新的执行预算；
+        // 否则会话首次触顶后，后续每个回合都会在发出首个请求前重复触顶，永远无法恢复。
+        // 首请求尚无本回合实际用量可作下界，发出后再以真实 Usage 驱动后续前置判顶。
+        let mut turn_prompt_tokens = 0u64;
+        let mut last_prompt_tokens = 0u64;
         let mut session_case = case_file.clone();
         let mut case_cursor = history.len();
         // 只有“同一调用连续得到相同结果”才被视为停滞；先要求模型换路，不立即终止。
@@ -859,16 +851,18 @@ impl AgentLoop {
         let mut empty_response_retries = 0usize;
         let mut length_recovery_pending = false;
         while debt > 0 {
-            // R3 前置：到顶就绝不向模型发请求——超顶后唯一去路是收尾交付。
+            // R3 前置：本执行回合到顶后暂停，不再向模型发请求。下一条用户消息会新建
+            // 回合预算，并通过 resume 断点继续；历史成本只做审计，不会把会话永久锁死。
             // 放在 steps 自增与 StepStart 之前，避免留下"开了步却没请求"的空步骤。
             if let Some(gov) = governor.as_ref() {
-                if gov.should_stop_before_request(session_prompt_tokens, last_prompt_tokens) {
+                if gov.should_stop_before_request(turn_prompt_tokens, last_prompt_tokens) {
+                    budget_exhausted = true;
                     log.append(SessionEvent::Assistant {
                         id: log.gen_id(),
                         chunk: Chunk {
                             text: Some(format!(
-                                "【成本顶】会话 prompt tokens {} + 预计增量 {} ≥ 硬顶 {}，停止探索并进入收尾交付。",
-                                session_prompt_tokens,
+                                "【执行预算暂停】本回合 prompt tokens {} + 预计增量 {} ≥ 安全边界 {}。任务尚未标记完成；下一条“继续”会从当前断点恢复，并获得新的回合预算。",
+                                turn_prompt_tokens,
                                 last_prompt_tokens,
                                 crate::governor::PROMPT_CAP
                             )),
@@ -1028,7 +1022,6 @@ impl AgentLoop {
             let mut last_leak_reminder = String::new();
             let mut step_had_tools = false;
             let mut loop_recovery_prompts = Vec::new();
-            let mut loop_recovery_exhausted = false;
             let mut empty_response_reason: Option<String> = None;
             // 本步（单次请求）的 token 用量累计（AIOps 成本计量）。
             let mut step_usage = Usage::default();
@@ -1165,8 +1158,6 @@ impl AgentLoop {
                                 "[循环恢复] 工具 {} 的相同调用已被拦截（恢复提示 {recovery}/{MAX_LOOP_RECOVERY_PROMPTS}）。任务尚未完成：先解释现有结果，再选择不同参数、不同工具或下一项验证；禁止原样重试。",
                                 tc.name
                             ));
-                        } else {
-                            loop_recovery_exhausted = true;
                         }
                         continue;
                     }
@@ -1541,10 +1532,10 @@ impl AgentLoop {
             // 本步用量落盘：Usage 事件不进模型上下文、不影响多轮重建，
             // 仅用于会话级成本计量（usage_total）。
             if step_usage.total_tokens > 0 {
-                // 判顶前置需要「上一轮实际发了多少 prompt」与「会话累计 prompt」，
+                // 判顶前置需要「上一轮实际发了多少 prompt」与「本回合累计 prompt」，
                 // 二者都必须在 step_usage 被 move 进事件之前取。
                 last_prompt_tokens = step_usage.prompt_tokens;
-                session_prompt_tokens += step_usage.prompt_tokens;
+                turn_prompt_tokens += step_usage.prompt_tokens;
                 log.append(SessionEvent::Usage {
                     id: log.gen_id(),
                     usage: step_usage,
@@ -1608,18 +1599,6 @@ impl AgentLoop {
                     debt = 0;
                     hard_stop = true;
                 }
-            } else if loop_recovery_exhausted {
-                log.append(SessionEvent::Assistant {
-                    id: log.gen_id(),
-                    chunk: Chunk {
-                        text: Some(
-                            "[error] 模型在收到两次循环恢复提示后仍重复同一工具调用；任务未完成，但继续执行不会产生新信息。请检查该工具结果、补充任务约束或切换模型后继续。".into(),
-                        ),
-                        ..Default::default()
-                    },
-                });
-                debt = 0;
-                hard_stop = true;
             } else if step_had_tools && !hard_stop {
                 debt += 1;
             }
@@ -1841,9 +1820,12 @@ impl AgentLoop {
                     .eliminated
                     .extend(gov.eliminated().iter().cloned());
             }
-            let candidate = raw_reason
-                .as_deref()
-                .map(|r| format!("是否按以下理解继续：{r}"));
+            // 只有真正缺少用户信息时才形成问项。预算暂停、系统错误和普通未完成状态
+            // 都已有确定的恢复路径；把原因改写成“是否继续”会在用户已明确说“继续”后
+            // 原样复读，形成无法退出的伪澄清循环。
+            let candidate = (raw_outcome == DeliveryOutcome::NeedsUserInput)
+                .then(|| raw_reason.as_deref().map(|r| format!("请确认：{r}")))
+                .flatten();
             let artifact = artifact_text(
                 &final_case,
                 raw_reason.as_deref().unwrap_or(""),

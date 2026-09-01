@@ -14,7 +14,10 @@ use std::collections::BTreeSet;
 
 use crate::case_file::{normalize_question, CaseFile};
 
-/// 会话 prompt tokens 硬顶（spec §3 R3）。回放套件引用同一常量，禁止两处各自写死。
+/// 单次执行回合 prompt tokens 安全边界（spec §3 R3）。
+///
+/// SessionLog 仍累计完整 Usage 供审计；边界在每个新用户回合重置，避免一次触顶后
+/// 整个会话永久无法响应“继续”。回放套件引用同一常量，禁止两处各自写死。
 pub const PROMPT_CAP: u64 = 300_000;
 
 /// 候选列表标记：ask_user 的问题必须带工作区派生的候选（R2「禁开放模板」）。
@@ -106,9 +109,9 @@ impl TurnGovernor {
             .unwrap_or_else(|| Strategy::PartialDeliver.to_string())
     }
 
-    /// R3 前置判顶：`prompt_so_far` 为会话累计 prompt tokens，`last_prompt_tokens`
-    /// 为上一轮请求的实际 prompt。上下文单调不减，故后者是下一轮增量的下界，
-    /// 据此拦停可保证累计值不越过硬顶（spec §3「超顶只允许 partial_deliver」）。
+    /// R3 前置判顶：`prompt_so_far` 为本执行回合累计 prompt tokens，
+    /// `last_prompt_tokens` 为本回合上一请求的实际 prompt。后者作为下一请求增量下界，
+    /// 据此在回合安全边界暂停；新用户回合使用新预算并可从断点恢复。
     pub fn should_stop_before_request(&self, prompt_so_far: u64, last_prompt_tokens: u64) -> bool {
         prompt_so_far.saturating_add(last_prompt_tokens) >= PROMPT_CAP
     }

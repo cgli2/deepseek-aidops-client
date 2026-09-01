@@ -6,7 +6,9 @@ use harness_capability::hook::{Hook, HookDecision, HookPayload};
 use harness_core::error::Result;
 use harness_core::types::UserInput;
 use harness_core::AppContext;
-use harness_llm::{Chunk, ChunkStream, LlmProvider, Message, RequestOptions, ToolCall, ToolResult};
+use harness_llm::{
+    Chunk, ChunkStream, LlmProvider, Message, RequestOptions, ToolCall, ToolResult, Usage,
+};
 use harness_runtime::AgentLoop;
 use harness_session::{SessionEvent, SessionLog};
 use harness_tool::{DynTool, ToolRegistry};
@@ -202,6 +204,46 @@ struct TextThenTextLlm {
     requests: Mutex<Vec<Vec<Message>>>,
 }
 
+/// 首回合用一次真实 Usage 把执行预算推到边界；后续响应不再计费，专门验证新回合
+/// 不会继承历史熔断状态。对应实机日志中的 259607 + 57196 永久复读故障。
+struct CapThenResumeLlm {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl LlmProvider for CapThenResumeLlm {
+    fn name(&self) -> &'static str {
+        "cap-then-resume-test"
+    }
+
+    fn tools(&self) -> Vec<harness_llm::ToolSchema> {
+        vec![]
+    }
+
+    fn stream(&self, messages: Vec<Message>) -> ChunkStream {
+        self.requests.lock().unwrap().push(messages);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunk = if call == 0 {
+            Chunk {
+                text: Some("已定位，仍需继续执行".into()),
+                usage: Some(Usage {
+                    prompt_tokens: harness_runtime::PROMPT_CAP,
+                    completion_tokens: 1,
+                    total_tokens: harness_runtime::PROMPT_CAP + 1,
+                }),
+                ..Default::default()
+            }
+        } else {
+            Chunk {
+                text: Some("已从断点恢复执行".into()),
+                ..Default::default()
+            }
+        };
+        Box::pin(futures::stream::iter(vec![Ok(chunk)]))
+    }
+}
+
 #[async_trait]
 impl LlmProvider for TextThenTextLlm {
     fn name(&self) -> &'static str {
@@ -335,6 +377,65 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
     let events = log.replay();
     assert!(events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("恢复后的完整答复"))));
     assert!(!events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref().is_some_and(|text| text.contains("返回了空内容")))));
+}
+
+#[tokio::test]
+async fn continuation_gets_a_fresh_prompt_budget_after_previous_turn_hit_cap() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(CapThenResumeLlm {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(vec![]),
+    });
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(ToolRegistry::new());
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "修复 src/input.rs 的自动换行问题并验证".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1, "首回合应在边界暂停");
+    let first_turn = log.replay();
+    assert!(first_turn.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("【执行预算暂停】"))
+    )));
+    assert!(!first_turn.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("是否按以下理解继续"))
+    )));
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "继续".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        llm.calls.load(Ordering::SeqCst) >= 2,
+        "历史累计已触顶时，明确续跑仍必须真正请求模型"
+    );
+    assert!(llm.requests.lock().unwrap().iter().skip(1).any(|request| {
+        request
+            .iter()
+            .any(|message| message.content.contains("[续跑任务]"))
+    }));
 }
 
 #[tokio::test]

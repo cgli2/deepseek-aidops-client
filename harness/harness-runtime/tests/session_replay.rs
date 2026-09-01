@@ -364,10 +364,27 @@ fn r2_violations(turns: &[TurnSummary]) -> Vec<String> {
     dups
 }
 
-/// R3：会话 prompt tokens 累计。硬顶单点取自 `harness_runtime::PROMPT_CAP`
-/// （控制器侧判顶与本度量器必须同一常量，禁止两处各自写死）。
-fn r3_prompt_total(turns: &[TurnSummary]) -> u64 {
+/// R3：单次执行回合 prompt tokens 峰值。硬顶单点取自
+/// `harness_runtime::PROMPT_CAP`（控制器侧判顶与度量器必须同一常量）。
+fn r3_prompt_peak(turns: &[TurnSummary]) -> u64 {
+    turns.iter().map(|t| t.prompt_tokens).max().unwrap_or(0)
+}
+
+fn prompt_total(turns: &[TurnSummary]) -> u64 {
     turns.iter().map(|t| t.prompt_tokens).sum()
+}
+
+/// 一旦历史累计超过单回合边界，后续回合仍须能请求模型；否则“继续”会被历史
+/// Usage 永久拦在首请求之前。这里不依赖用户文案，只验证跨回合预算确实重置。
+fn requested_after_historical_total_crossed_cap(turns: &[TurnSummary]) -> bool {
+    let mut historical = 0u64;
+    for turn in turns {
+        if historical >= harness_runtime::PROMPT_CAP && turn.prompt_tokens > 0 {
+            return true;
+        }
+        historical = historical.saturating_add(turn.prompt_tokens);
+    }
+    false
 }
 
 /// R4 资产锚点：助手文本中出现「含路径分隔符且带源码扩展名」的 token 即视为
@@ -493,14 +510,18 @@ async fn red_lines_symptom_task() {
     let turns = summarize(&log);
     assert_eq!(turns.len(), 12);
     let (r1, r4) = (r1_violations(&turns), r4_violations(&turns));
-    let tokens = r3_prompt_total(&turns);
+    let tokens = r3_prompt_peak(&turns);
     let a1 = a1_guard_trips(&turns);
     let a2_on = a2_max_cross_turn_repeat(&turns);
     assert!(r1.is_empty(), "R1 违例: {r1:?}");
     assert!(
         tokens <= harness_runtime::PROMPT_CAP,
-        "R3 违例: prompt={tokens} > 顶 {}",
+        "R3 违例: 单回合 prompt 峰值={tokens} > 顶 {}",
         harness_runtime::PROMPT_CAP
+    );
+    assert!(
+        requested_after_historical_total_crossed_cap(&turns),
+        "历史累计触顶后，后续回合必须仍可请求模型（明确续跑不能被永久锁死）"
     );
     assert!(r4.is_empty(), "R4 违例: {r4:?}");
     assert!(a1 <= 12, "A1 违例: 守卫/熔断触发 {a1} > 12");
@@ -514,10 +535,10 @@ async fn red_lines_symptom_task() {
     let legacy_log =
         replay_session_with("7ba3370f_t03_14_symptom.jsonl", GovernorMode::Legacy).await;
     let legacy = summarize(&legacy_log);
-    let legacy_tokens = r3_prompt_total(&legacy);
+    let legacy_tokens = r3_prompt_peak(&legacy);
     assert!(
         legacy_tokens > harness_runtime::PROMPT_CAP,
-        "R3 对照失效：Legacy 重放成本 {legacy_tokens} 未超顶，replay 没复现真实成本"
+        "R3 对照失效：Legacy 单回合成本 {legacy_tokens} 未超顶，replay 没复现真实成本"
     );
     let a2_legacy = a2_max_cross_turn_repeat(&legacy);
     assert!(a2_on <= a2_legacy, "A2 退化：控制器 {a2_on} > 旧守卫 {a2_legacy}");
@@ -605,8 +626,9 @@ async fn governor_mode_success_session_still_verifies() {
         "成功会话在控制器模式下应仍有 Verified 交付: {turns:?}"
     );
     assert!(
-        r3_prompt_total(&turns) <= harness_runtime::PROMPT_CAP,
-        "健康会话也不应突破成本顶: {}",
-        r3_prompt_total(&turns)
+        r3_prompt_peak(&turns) <= harness_runtime::PROMPT_CAP,
+        "健康回合也不应突破成本顶: {}",
+        r3_prompt_peak(&turns)
     );
+    assert!(prompt_total(&turns) > 0, "健康会话必须实际产生 Usage");
 }

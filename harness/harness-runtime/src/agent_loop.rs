@@ -25,7 +25,7 @@ use crate::execution::{
 };
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
 use crate::case_file::CaseFile;
-use crate::governor::{is_continuation_request, Decision, TurnGovernor};
+use crate::governor::{artifact_text, is_continuation_request, Decision, TurnGovernor};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
 /// 治理路径选择（spec §5 步骤④：新控制器接管决策走 A/B）。
@@ -1768,7 +1768,7 @@ impl AgentLoop {
         }
 
         let terminal_reason = goal_execution.actionable_terminal_reason();
-        let (outcome, reason) = if delivery_verified {
+        let (raw_outcome, raw_reason) = if delivery_verified {
             (harness_session::DeliveryOutcome::Verified, None)
         } else if terminal_reason
             .as_deref()
@@ -1825,6 +1825,48 @@ impl AgentLoop {
                 harness_session::DeliveryOutcome::SystemFailure,
                 terminal_reason.or_else(|| Some("回合异常结束，未形成完整验收证据".into())),
             )
+        };
+        // 出口收口（spec §4.2）：控制器模式下只剩两个出口。Verified 即 Delivered；
+        // 用户取消保持 Cancelled（强行改判会剥夺取消语义，且它不是治理失败）；
+        // 其余一律收敛为 PartialDelivery + R4 四要素资产，且资产以 Assistant 事件
+        // 对用户可见——「失败也留资产」若不落到会话流就等于没留。
+        let (outcome, reason) = if self.governor == GovernorMode::On
+            && !matches!(
+                raw_outcome,
+                DeliveryOutcome::Verified | DeliveryOutcome::Cancelled
+            ) {
+            let (next_cursor, fresh) = log.replay_from(case_cursor);
+            case_cursor = next_cursor;
+            session_case.absorb(&fresh);
+            let mut final_case = session_case.clone();
+            if let Some(gov) = governor.as_ref() {
+                final_case
+                    .eliminated
+                    .extend(gov.eliminated().iter().cloned());
+            }
+            let candidate = raw_reason
+                .as_deref()
+                .map(|r| format!("是否按以下理解继续：{r}"));
+            let artifact = artifact_text(
+                &final_case,
+                raw_reason.as_deref().unwrap_or(""),
+                &goal_execution.next_action_hint(),
+                candidate.as_deref(),
+            );
+            log.append(SessionEvent::Assistant {
+                id: log.gen_id(),
+                chunk: Chunk {
+                    text: Some(artifact.clone()),
+                    ..Default::default()
+                },
+            });
+            let original = raw_reason.unwrap_or_else(|| format!("{raw_outcome:?}"));
+            (
+                DeliveryOutcome::PartialDelivery,
+                Some(format!("{artifact}\n原始结论：{original}")),
+            )
+        } else {
+            (raw_outcome, raw_reason)
         };
         log.append(SessionEvent::Delivery {
             id: log.gen_id(),

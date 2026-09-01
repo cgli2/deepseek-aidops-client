@@ -432,6 +432,23 @@ fn a2_max_cross_turn_repeat(turns: &[TurnSummary]) -> usize {
     by_sig.values().map(|v| v.len()).max().unwrap_or(0)
 }
 
+/// R4 加强判据：非 Verified 回合的助手文本必须含 `artifact_text` 的四要素标记。
+/// 这是「红线跑绿不是因为检查变宽」的反作弊锁（spec §7 失败回合 100% 带 artifact）。
+fn missing_artifact_violations(turns: &[TurnSummary]) -> Vec<String> {
+    turns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.outcome != Some(DeliveryOutcome::Verified))
+        .filter(|(_, t)| {
+            !(t.assistant_text.contains("锚点：")
+                && t.assistant_text.contains("假设：")
+                && t.assistant_text.contains("补丁建议：")
+                && t.assistant_text.contains("问项："))
+        })
+        .map(|(i, t)| format!("turn {} outcome={:?} 缺四要素资产", i + 1, t.outcome))
+        .collect()
+}
+
 /// 澄清死循环段（turn 15–18）：R1（"继续"不得 NeedsUserInput）+ R2（文案不复读）+ R4（留资产）。
 #[tokio::test]
 #[ignore = "红线门禁：旧守卫代码上预期失败（跑红证明）；新控制器接管（步骤④）后移除"]
@@ -528,4 +545,19 @@ async fn governor_mode_caps_session_prompt_tokens() {
         "R3 违例：控制器重放累计 prompt={total} > 顶 {}",
         harness_runtime::PROMPT_CAP
     );
+}
+
+/// R4（加强）：控制器模式下每个非 Verified 回合都要带结构化资产。
+#[tokio::test]
+async fn governor_mode_every_non_verified_turn_carries_artifact() {
+    for fixture in [
+        "7ba3370f_t03_14_symptom.jsonl",
+        "7ba3370f_t15_18_clarification.jsonl",
+        "7ba3370f_t19_22_gitfix.jsonl",
+    ] {
+        let log = replay_session_with(fixture, GovernorMode::On).await;
+        let turns = summarize(&log);
+        let missing = missing_artifact_violations(&turns);
+        assert!(missing.is_empty(), "{fixture} 缺资产：{missing:?}");
+    }
 }

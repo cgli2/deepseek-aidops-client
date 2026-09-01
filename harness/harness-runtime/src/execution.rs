@@ -824,9 +824,6 @@ pub struct Budget {
     /// 进展延展已用次数：常规续期耗尽后，最近窗口只要产生可验证的写入或新证据，
     /// 就继续按窗口延展。排障、测试、审查本来就未必会修改代码，不能把它们误杀。
     pub delivery_extensions: u32,
-    /// 连续“预算耗尽且没有可验证进展”的窗口数：用于增强换路提示，
-    /// 不作为中断未完成任务的依据。
-    pub stagnant_windows: u32,
     step_window: usize,
     tool_window: usize,
     duration_window: Duration,
@@ -883,7 +880,6 @@ impl BudgetManager {
             renewals_used: 0,
             hard_autorenews: 0,
             delivery_extensions: 0,
-            stagnant_windows: 0,
             step_window: max_steps,
             tool_window: max_tool_calls,
             duration_window: max_duration,
@@ -989,7 +985,6 @@ impl BudgetManager {
             // 不能只认代码写入，否则排障/测试/审查等任务会在完成前被错误中断。
             if meaningful_progress {
                 budget.delivery_extensions += 1;
-                budget.stagnant_windows = 0;
                 Self::extend_window(budget);
                 let progress = if write_delta > 0 {
                     format!("{write_delta} 次成功的代码修改")
@@ -1002,7 +997,6 @@ impl BudgetManager {
                     evidence_digest(state)
                 ));
             }
-            budget.stagnant_windows += 1;
             return None;
         }
         budget.renewals_used += 1;
@@ -1022,7 +1016,7 @@ impl BudgetManager {
         })
     }
 
-    /// 按一个窗口延展步数/工具/时长预算（续期、交付延展、自动接续共用）。
+    /// 按一个窗口延展步数/工具/时长预算（常规续期、交付延展共用）。
     pub fn extend_window(budget: &mut Budget) {
         budget.max_steps = budget.max_steps.saturating_add(budget.step_window);
         budget.max_tool_calls = budget.max_tool_calls.saturating_add(budget.tool_window);
@@ -1552,10 +1546,9 @@ mod tests {
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         budget.renewals_used = budget.max_renewals; // 常规续期耗尽
 
-        // 无写入的空转：不延展，交给收尾；空转窗口开始计数。
+        // 无写入的空转：不延展，交给收尾。
         state.steps = 10;
         assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
-        assert_eq!(budget.stagnant_windows, 1);
 
         // 有写入的活跃交付：自动延展一个窗口。
         let proposal = ActionProposal {
@@ -1571,8 +1564,6 @@ mod tests {
         assert!(msg.unwrap().contains("进展延展"));
         assert!(budget.max_steps > before);
         assert_eq!(budget.delivery_extensions, 1);
-        // 有真实产出后空转计数清零：不会被误判为卡死。
-        assert_eq!(budget.stagnant_windows, 0);
 
         // 持续写入 → 持续延展（不设上限）：未完成但正在产出的任务不被截断。
         state.record_tool_result(&proposal, true, "edit ok");
@@ -1581,10 +1572,9 @@ mod tests {
         assert!(msg2.unwrap().contains("进展延展"));
         assert_eq!(budget.delivery_extensions, 2);
 
-        // 写入停止（空转）→ 不再延展，交给收尾；空转计数重新累计。
+        // 写入停止（空转）→ 不再延展，交给收尾。
         state.steps = 16;
         assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
-        assert_eq!(budget.stagnant_windows, 1);
     }
 
     #[test]
@@ -1605,7 +1595,6 @@ mod tests {
         let message = BudgetManager::diagnose_and_renew(&mut state, &mut budget).unwrap();
         assert!(message.contains("进展延展"));
         assert_eq!(state.write_operations, 0);
-        assert_eq!(budget.stagnant_windows, 0);
     }
 
     #[test]

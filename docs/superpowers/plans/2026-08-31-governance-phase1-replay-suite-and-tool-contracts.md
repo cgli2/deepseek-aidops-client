@@ -1124,3 +1124,25 @@ Checkpoint 判据（全部满足才算完成）：
 1. **回放保真**：模型响应识别规则（带 usage / tool_calls 的 Assistant 事件）可能误分个别事件，导致脚本与请求序列错位；`ReplayLlm` 的耗尽兜底保证不挂死，但红线跑红结论需在 Task 4 Step 3 人工核对失败原因确属守卫行为而非脚本错位。
 2. **服务缺失**：`run_turn` 若依赖回放环境未注册的服务（如 Workspace 索引），在 Task 3 Step 3 按最小 stub 补齐，不引入真实文件系统扫描。
 3. **成功会话漂移**：`success_session_replay_keeps_verified` 若因脚本漂移失败，先修驱动器保真度；该测试是「健康会话不被跑坏」的常设回归，不随步骤④解除。
+
+## 实施记录与验证证据
+
+### 跑红证据（两次复跑一致）
+
+**Task 4 Step 3（首跑）与 Task 8 Step 3（复跑，2026-09-01）均通过** `cargo test -p harness-runtime --test session_replay -- --ignored --test-threads=1` 得到三个红线测试全部 FAILED：
+
+- `red_lines_clarification_loop`（session_replay.rs:424）：`R4 违例: ["turn 1 outcome=Some(SystemFailure) 无锚点资产", "turn 2 …", "turn 3 …", "turn 4 …"]`（4/4 回合无锚点）
+- `red_lines_symptom_task`（session_replay.rs:437）：`R1 违例: ["turn 4 input=\"继续完成任务\"", "turn 6 input=\"继续解决问题\"", "turn 8 input=\"继续\"", "turn 10 input=\"继续\"", "turn 11 input=\"继续\"", "turn 12 input=\"继续完成它\""]`（6 个续跑回合以 NeedsUserInput 收尾；R1 断言先于 R3 触发，R3 灵敏度待步骤④后随套件解封复验）
+- `red_lines_gitfix`（session_replay.rs:452）：`R4 违例: ["turn 1 outcome=Some(NeedsUserInput) 无锚点资产", "turn 2 …", "turn 3 …", "turn 4 outcome=Some(SystemFailure) …"]`
+
+### Task 8 全局验证（2026-09-01）
+
+1. `cargo test -p harness-runtime -p harness-tool -p harness-provider-local -p harness-provider-git`：全绿（provider-git 2、provider-local 12、runtime 168+9+1+1+1+3、tool 14；session_replay 3 passed / 3 ignored）。
+2. `cargo build --workspace`：成功（仅 harness-ui 既有 3 条警告）。
+3. 跑红复跑：与首跑逐字一致（见上）。
+4. spec 状态行已为目标文本。
+
+### 收尾说明
+
+- 本计划执行后期工作区已由外部快照工具建立 git 仓库并配置远程 origin（deepseek-aidops-client）；仓库配置详见提交历史（Initial_commit → d19de24 → bd8f07e 历史缝合）。
+- 平台行为（git 子进程无黑框）留待实机验证，已记入阶段 2 实机清单事项。

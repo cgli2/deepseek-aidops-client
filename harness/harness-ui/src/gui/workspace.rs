@@ -271,16 +271,14 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             .rposition(|m| m.kind == "user" && !m.text.is_empty())
                                             .unwrap_or(0);
                                         // 复制小图标绝对定位到气泡右上角：只注册交互区、不推进
-                                        // 布局游标，因此不占正文首行高度（此前头部行 + 负边距仍会
-                                        // 挤出一行）。图标绘制放在正文之后，保证覆盖在最上层。
-                                        // 首行文字较长时会一直延伸到气泡右缘、与图标重叠（文字
-                                        // 盖住按钮）：这里扩大点击热区，并在绘制阶段为图标加不
-                                        // 透明底座，保证按钮始终清晰可见、可点击。
+                                        // 布局游标，因此不占正文首行高度。图标绘制放在正文之后，
+                                        // 保证覆盖在最上层。采用紧凑小尺寸并紧贴右上角，避免遮挡
+                                        // 首行长文字尾部内容。
                                         let icon_rect = egui::Rect::from_min_size(
-                                            ui.max_rect().right_top() + egui::vec2(-16.0, 3.0),
-                                            egui::vec2(12.0, 12.0),
+                                            ui.max_rect().right_top() + egui::vec2(-14.0, 2.0),
+                                            egui::vec2(10.0, 10.0),
                                         );
-                                        let hit_rect = icon_rect.expand(5.0);
+                                        let hit_rect = icon_rect.expand(2.0);
                                         let copy_resp = ui.interact(
                                             hit_rect,
                                             egui::Id::new(("copy-icon", index)),

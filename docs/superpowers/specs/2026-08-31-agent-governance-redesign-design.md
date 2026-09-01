@@ -70,7 +70,9 @@ docs/ 下 V3–V5、交付改革、中断修复、澄清 ADR 五代文档是"一
 
 ### 4.3 case file（会话级世界模型）
 
-字段：`tried[(tool, 归一化签名, 结果摘要)]`、`eliminated`、`anchors`、`user_signals`、`asked`、`budget_spent(prompt/completion)`、`stack_pos`。
+字段：`tried[(tool, 归一化签名, 结果摘要)]`、`eliminated`、`anchors`、`user_signals`、`asked`、`budget_spent(prompt/completion)`。
+
+> 修订（2026-09-01 阶段 3）：`stack_pos` 不进 CaseFile 投影——栈位是**回合内控制器状态**（fresh governor 从栈顶起，随 pop 推进），非日志可派生的会话事实；由 `TurnGovernor::position()`（已消耗窗口数）提供，A/B 诊断直接读 governor。CaseFile 的 `eliminated` 集合已承载跨回合可见的策略消耗证据。
 
 持久化：单一事实源仍是 SessionLog（jsonl 追加式）。`CaseFile::from_replay(&[SessionEvent])` 确定性重建；轮内增量维护。不引入第二份持久化文件，UI 事件 schema 不变。
 

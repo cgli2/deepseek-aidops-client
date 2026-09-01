@@ -39,6 +39,8 @@ pub const WINDOW_STEPS: usize = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrategyStack {
     frames: Vec<Strategy>,
+    /// 已成功弹出的帧数（= 已消耗窗口数），供 `position()` 报告栈位。
+    consumed: usize,
 }
 
 /// 栈底在头部、栈顶（当前策略）在尾部——与 `Vec::last()/pop()` 的取顶方式一致。
@@ -63,6 +65,7 @@ impl StrategyStack {
             } else {
                 FULL[..5].to_vec()
             },
+            consumed: 0,
         }
     }
 
@@ -74,11 +77,17 @@ impl StrategyStack {
                 Strategy::RuntimeObserve,
                 Strategy::BroadLocate,
             ],
+            consumed: 0,
         }
     }
 
     pub fn current(&self) -> Option<Strategy> {
         self.frames.last().copied()
+    }
+
+    /// 已消耗窗口数（= 已弹帧数）：A/B 诊断用的栈位（spec §4.3）。
+    pub fn position(&self) -> usize {
+        self.consumed
     }
 
     /// 剩余帧数（含当前帧）。
@@ -103,6 +112,7 @@ impl StrategyStack {
         if self.at_bottom() {
             return None;
         }
+        self.consumed += 1;
         self.frames.pop()
     }
 }
@@ -161,5 +171,20 @@ mod tests {
     fn strategy_display_labels_match_spec_naming() {
         assert_eq!(Strategy::PartialDeliver.to_string(), "partial_deliver");
         assert_eq!(Strategy::DegradeGoal.to_string(), "degrade_goal");
+    }
+
+    #[test]
+    fn position_counts_consumed_windows_and_stops_at_bottom() {
+        let mut stack = StrategyStack::for_task(false); // 5 帧，栈底 partial_deliver
+        assert_eq!(stack.position(), 0, "初始栈位为顶");
+        assert!(stack.pop().is_some());
+        assert_eq!(stack.position(), 1);
+        assert!(stack.pop().is_some());
+        assert_eq!(stack.position(), 2);
+        while stack.pop().is_some() {}
+        assert!(stack.at_bottom());
+        let bottom_pos = stack.position();
+        assert_eq!(stack.pop(), None, "栈底不可弹出");
+        assert_eq!(stack.position(), bottom_pos, "栈底 pop 不再推进栈位");
     }
 }

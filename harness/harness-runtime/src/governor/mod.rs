@@ -84,6 +84,11 @@ impl TurnGovernor {
         self.stack.current()
     }
 
+    /// 已消耗窗口数（栈位）：A/B 诊断用（spec §4.3）。
+    pub fn position(&self) -> usize {
+        self.stack.position()
+    }
+
     pub fn eliminated(&self) -> &BTreeSet<String> {
         &self.eliminated
     }

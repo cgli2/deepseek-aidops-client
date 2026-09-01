@@ -180,15 +180,20 @@ fn a2_exempts_readback_and_verify_repeats() {
 - [ ] **Step 4: 复算验证** — `cargo test -p harness-runtime --test session_replay`（8/8 绿）；`python -X utf8 harness/scripts/governance_redline_check.py harness/ab-runs/20260901-203859/S1-controller.jsonl` → **六项全绿 exit=0**；基线 `7ba3370f_full.jsonl` 重打分违例集合不得缩小（仍含 R1,R2,R3,R4,A1）。
 - [ ] **Step 5: Commit** — `feat(governance): A2 按调用意图细化，回读/验证型重复豁免（实机误报修正）`。
 
-### Task 4: stack_pos 进投影（无 schema 变更）+ spec §4.3 写回
+### Task 4: stack_pos 显式化（governor API）+ spec §4.3 写回；遗留② 按证据判定
 
-**Files:** Modify `governor/strategy.rs`（暴露 `position()`）、`agent_loop.rs`（遥测写入用现有字段）、`case_file.rs`（`current_strategy` 字段）、其单测、spec §4.3
+**Files:** Modify `governor/strategy.rs`（`position()`）、`governor/mod.rs`（`TurnGovernor::position()`）、其单测、spec §4.3
 
-- [ ] **Step 1: StrategyStack::position()** — `pub fn position(&self) -> usize`，返回**已消耗窗口数** = `for_task/at_bottom` 所用栈的固定总深 − `self.stack.len()`（读实现后以 `WINDOW_STEPS`/栈构造为准确定为纯函数，无状态副作用）；单测：初始栈 `position()==0`，每次 `pop()` 后 `+1`。
-- [ ] **Step 2: 投影路径** — 控制器每回合观测点在**既有** `Telemetry` 事件 `next_action` 字段追加 `strategy=<label>@<position>` 后缀（ExecutionTelemetry 无 schema 变化，仅字符串载荷复用）；`case_file.rs` 新增 `pub current_strategy: Option<(String, usize)>`，投影时从最新 Telemetry 的 next_action 尾部解析（解析失败=None，不得 panic）。补投影单测（构造带后缀的 Telemetry 事件）。
-- [ ] **Step 3: spec §4.3 写回** — 策略栈小节追加：「栈位经 Telemetry.next_action 的 `strategy=<label>@<pos>` 后缀携带，CaseFile 投影为 current_strategy（schema 冻结下的显式决定，2026-09-01）」。
-- [ ] **Step 4: 全绿 + Commit** — `cargo test -p harness-runtime`；`feat(governance): 策略栈位经遥测载荷进 CaseFile 投影，spec §4.3 写回`。
-- [ ] **Step 5: 阶段 2 遗留② 收编（gate ask_user 带候选锚点）** — 定位 `:525` 构造点后 ask_user 三重前置满足时的**早返回路径**（NeedsUserInput 提前 return，不经 `:1833` 收口块），让其同样 append 一条 `artifact_text(...)` Assistant 事件且问题文本内嵌工作区候选（复用 `candidate` 拼装逻辑）。测试：脚本化 LLM 在无锚点 + 空转信号下触发 ask_user → 断言 Delivery(NeedsUserInput) 前存在含路径锚点的 Assistant 事件。若勘察后确认该路径同样必经 `:1833`（即遗留②已不存在），在本计划勾选处注明证据（文件:行）后跳过实现。
+执行期勘察修正：原计划经「Telemetry.next_action 追加字符串后缀」把栈位塞进 CaseFile——
+评估后否决（污染冻结的遥测载荷、需改 append_telemetry 全链路签名、脆弱）。改为最小、
+自洽、可测的 governor API + spec 文档化决定；CaseFile 不投影数值栈位（可从 `eliminated`
+集合 + `decisions` 轨迹派生）。
+
+- [ ] **Step 1: StrategyStack::position()** — 新增 `consumed: usize` 字段（`for_task/read_only` 初始化 0，`pop` 成功时 +1），`pub fn position(&self) -> usize { self.consumed }`（= 已消耗窗口数 = 已弹帧数）。单测：初始栈 `position()==0`；连续 `pop()` 后逐一 +1；栈底 `pop()` 返回 None 时 `position()` 不再增长。
+- [ ] **Step 2: TurnGovernor::position()** — `pub fn position(&self) -> usize { self.stack.position() }`；在 `ask_user_requires_all_three_preconditions` 等既有测试里顺带断言（pop 到栈底后 position 稳定）。
+- [ ] **Step 3: spec §4.3 写回** — 策略栈小节追加：「栈的数值位置由 `TurnGovernor::position()`（已消耗窗口数）提供，用于 A/B 诊断；CaseFile 不重复投影数值栈位，其可由 `eliminated` 集合与 `decisions` 轨迹确定性派生（2026-09-01 决定）。」
+- [ ] **Step 4: 遗留② 按证据判定（gate ask_user 候选锚点）** — 勘察结论：`:528-543` 的 Phase 1 早返回门禁问题经 `with_candidates(...)` 已内嵌工作区候选（R2 满足）；且 On 模式下 fresh governor 栈满 → `ask_user_permitted=false` → 该早返回在控制器路径不可达（实机三场景均未出现 NeedsUserInput 早返回，全部 PartialDelivery 带资产，佐证）。故**不新增代码**，仅在本步勾选处记录证据（文件:行：`agent_loop.rs:535` `with_candidates`、`governor/mod.rs:139-144` `ask_user_allowed`、`agent_loop.rs:1833` 收口块对 NeedsUserInput 也 wrap）。
+- [ ] **Step 5: 全绿 + Commit** — `cargo test -p harness-runtime`；`feat(governance): 策略栈位经 governor.position() 显式化，spec §4.3 写回；遗留② 按证据判定无需改动`。
 
 ### Task 5: 旧守卫与 6 计数器退位删除（大删除，逐子步全绿）
 

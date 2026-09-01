@@ -88,7 +88,7 @@ use harness_core::error::Result;
 use harness_core::types::UserInput;
 use harness_core::AppContext;
 use harness_llm::{ChunkStream, LlmProvider, Message, ToolCall, ToolSchema};
-use harness_runtime::AgentLoop;
+use harness_runtime::{AgentLoop, GovernorMode};
 use harness_session::SessionLog;
 use harness_tool::{DynTool, ToolRegistry};
 
@@ -153,7 +153,7 @@ impl DynTool for ReplayTool {
 const KNOWN_TOOLS: [&str; 7] = ["search", "edit", "fs", "shell", "plan", "memory", "delegate"];
 
 /// 重放一个会话：逐回合新建 AppContext，共享同一个内存 SessionLog（历史跨回合累积）。
-async fn replay_session(fixture: &str) -> Arc<SessionLog> {
+async fn replay_session_with(fixture: &str, mode: GovernorMode) -> Arc<SessionLog> {
     let turns = load_fixture(fixture);
     let log = SessionLog::new();
     let mut all_results: HashMap<String, ToolResult> = HashMap::new();
@@ -199,6 +199,7 @@ async fn replay_session(fixture: &str) -> Arc<SessionLog> {
         regs.push(ctx.provide(tools));
         regs.push(ctx.provide(hook));
         let _ = AgentLoop::new()
+            .with_governor(mode)
             .run_turn(
                 &ctx,
                 UserInput {
@@ -210,6 +211,10 @@ async fn replay_session(fixture: &str) -> Arc<SessionLog> {
         drop(regs);
     }
     log
+}
+
+async fn replay_session(fixture: &str) -> Arc<SessionLog> {
+    replay_session_with(fixture, GovernorMode::Legacy).await
 }
 
 #[tokio::test]
@@ -462,5 +467,24 @@ async fn success_session_replay_keeps_verified() {
             .iter()
             .any(|t| t.outcome == Some(DeliveryOutcome::Verified)),
         "成功会话重放后应仍有 Verified 交付: {turns:?}"
+    );
+}
+
+/// A/B 冒烟：控制器模式下澄清死循环段被门禁拒绝后仍能每回合收尾（不挂死），
+/// 且不出现门禁复读文案（R1/R2 前提）。
+/// 断言边界：旧 outcome 链的 SystemFailure/Interrupted 收敛为 ExhaustedWithArtifact
+/// 由 T9 的 `governor_mode_*` 测试负责，此处不预先要求。
+#[tokio::test]
+async fn governor_mode_terminates_clarification_loop_without_asking() {
+    let log =
+        replay_session_with("7ba3370f_t15_18_clarification.jsonl", GovernorMode::On).await;
+    let turns = summarize(&log);
+    assert_eq!(turns.len(), 4, "四个回合都要走完");
+    assert!(r1_violations(&turns).is_empty(), "R1: {:?}", r1_violations(&turns));
+    assert!(r2_violations(&turns).is_empty(), "R2: {:?}", r2_violations(&turns));
+    assert!(
+        !turns.iter().any(|t| t.assistant_text.contains("[需要澄清]")),
+        "控制器模式下门禁复读文案不得出现：{:?}",
+        turns.iter().map(|t| &t.assistant_text).collect::<Vec<_>>()
     );
 }

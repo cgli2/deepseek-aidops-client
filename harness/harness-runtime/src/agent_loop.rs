@@ -24,7 +24,8 @@ use crate::execution::{
     ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
-use crate::governor::is_continuation_request;
+use crate::case_file::CaseFile;
+use crate::governor::{is_continuation_request, TurnGovernor};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
 /// 治理路径选择（spec §5 步骤④：新控制器接管决策走 A/B）。
@@ -122,6 +123,33 @@ fn is_search_like(name: &str) -> bool {
 /// 搜索缓存键：工具名 + 归一化参数（Debug 表示即可，足以区分不同查询）。
 fn search_cache_key(name: &str, args: &impl std::fmt::Debug) -> String {
     format!("{}::{:?}", name, args)
+}
+
+/// 控制器模式下澄清提问是否被允许（spec §4.2 三重前置）；Legacy 一律允许，
+/// 使 A/B 两条路径的旧行为逐字一致。
+fn ask_user_permitted(
+    governor: Option<&TurnGovernor>,
+    case: &CaseFile,
+    input_text: &str,
+    question: &str,
+) -> bool {
+    match governor {
+        None => true,
+        Some(gov) => gov.ask_user_allowed(case, input_text, question),
+    }
+}
+
+/// 给问题补上工作区派生的候选列表（R2 硬前置）。无可派生候选时原样返回，
+/// 由 `ask_user_permitted` 按「开放模板」拒绝。
+fn with_candidates(question: &str, goal: &crate::GoalContract) -> String {
+    let mut candidates: Vec<String> = goal.entities.clone();
+    candidates.extend(goal.navigation.iter().cloned());
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return question.to_string();
+    }
+    format!("{}（候选：{}）", question, candidates.join("、"))
 }
 
 /// 从追加日志逆向找到最近的未完成根任务。若最近一回合本身也是“继续”，继续
@@ -486,6 +514,16 @@ impl AgentLoop {
             goal_execution.goal.resolve_against(index);
         }
 
+        // 步骤②/④：Case File 是 SessionLog 的只读投影（不构成第二事实源）。
+        // grounded 判据与 :508 索引构建条件同源，不引入新的猜测逻辑。
+        // 只有控制器模式才建 TurnGovernor；Legacy 下 governor 恒为 None，
+        // 三处门禁的 ask_user_permitted 直接返回 true，旧行为逐字保持。
+        let case_file = CaseFile::from_replay(&history);
+        let read_only = matches!(intent.kind, crate::IntentKind::Investigation);
+        let grounded = workspace_index.is_some() && goal_execution.goal.has_locatable_signal();
+        let governor =
+            (self.governor == GovernorMode::On).then(|| TurnGovernor::new(&case_file, grounded, read_only));
+
         if let Some(clar) = crate::IntentProfile::requires_clarification(
             &goal_execution.goal,
             intent.is_task,
@@ -493,13 +531,15 @@ impl AgentLoop {
         ) {
             // Phase 1 信号驱动门禁：已落地或纯提问都不会到这里；能到这里说明是真·盲任务，
             // 且 `clar` 已经是单个带上下文的定位问题（不发清单、不靠词表猜用户措辞）。
-            let question = clar.question;
+            let question = with_candidates(&clar.question, &goal_execution.goal);
             // 重复澄清熔断：用户已经回答过一次、而重新编译后问的还是同一个问题，
             // 说明他没有这个维度的信息（或认为原描述已足够）。继续追问只会制造
             // 死循环——此时带着已有信息直接执行，比再问一遍更有用。
             let repeated = is_clarification_reply
                 && last_assistant_text(&history).as_deref() == Some(question.as_str());
-            if !repeated {
+            let permitted =
+                ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question);
+            if !repeated && permitted {
                 // 澄清不是失败后的补救，而是执行前门禁：不请求模型、不暴露工具、不开始
                 // 目录搜索。问题被补全后，下一条用户消息会与本轮根请求合并再编译。
                 log.append(SessionEvent::TurnStart {
@@ -548,7 +588,8 @@ impl AgentLoop {
         if goal_execution.goal.has_locatable_signal() {
             if let Some(root) = &workspace_root {
                 if let Some(clar) = goal_execution.inspect_for_clarification(root) {
-                    let question = clar.question;
+                    let question = with_candidates(&clar.question, &goal_execution.goal);
+                    if ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question) {
                     let item_id = ledger
                         .current_item()
                         .map(|item| item.id.clone())
@@ -580,6 +621,7 @@ impl AgentLoop {
                     );
                     log.append(SessionEvent::TurnEnd { id: log.gen_id() });
                     return Ok(());
+                    }
                 }
             }
         }
@@ -593,7 +635,11 @@ impl AgentLoop {
         // 问题仍进入精准定位流程，避免把“未命中名称”误判为无法执行。
         if let Some(grounding) = &workspace_grounding {
             if !goal_execution.goal.code_entities.is_empty() && grounding.needs_user_input() {
-                let question = grounding.user_question(&goal_execution.goal);
+                let question = with_candidates(
+                    &grounding.user_question(&goal_execution.goal),
+                    &goal_execution.goal,
+                );
+                if ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question) {
                 let item_id = ledger
                     .current_item()
                     .map(|item| item.id.clone())
@@ -625,6 +671,7 @@ impl AgentLoop {
                 );
                 log.append(SessionEvent::TurnEnd { id: log.gen_id() });
                 return Ok(());
+                }
             }
         }
 
@@ -2795,5 +2842,44 @@ mod tests {
         assert_eq!(parse_governor_mode(Some("TRUE")), GovernorMode::On);
         assert_eq!(parse_governor_mode(Some("legacy")), GovernorMode::Legacy);
         assert_eq!(parse_governor_mode(Some("")), GovernorMode::Legacy);
+    }
+
+    #[test]
+    fn ask_user_gate_blocks_questions_under_controller() {
+        let case = CaseFile::default();
+        // legacy（governor=None）一律允许——旧行为逐字保持。
+        assert!(ask_user_permitted(None, &case, "改一下", "目标是谁（候选：a、b）"));
+        assert!(ask_user_permitted(None, &case, "继续", "目标是谁？"));
+
+        // 控制器：栈顶不满足深度前置。
+        let gov = TurnGovernor::new(&case, false, false);
+        assert!(
+            !ask_user_permitted(Some(&gov), &case, "这个问题解决了吗？", "目标是谁（候选：a、b）"),
+            "还有多层策略未试，禁止把负担丢回用户"
+        );
+
+        // 降到栈底后仍要拒续跑式回复；正常输入 + 带候选问题放行。
+        let mut gov = TurnGovernor::new(&case, false, false);
+        while !gov.stack.allow_ask_user() {
+            gov.stack.pop();
+        }
+        assert!(!ask_user_permitted(Some(&gov), &case, "继续", "目标是谁（候选：a、b）"));
+        assert!(ask_user_permitted(Some(&gov), &case, "目标在哪", "目标是谁（候选：a、b）"));
+    }
+
+    #[test]
+    fn with_candidates_appends_workspace_candidates() {
+        // GoalContract 无 Default（仅 compile），用 compile 后显式设字段。
+        let mut goal = crate::GoalContract::compile("占位输入");
+        goal.entities = vec!["GitCli".into(), "WorktreeGuard".into()];
+        goal.navigation.clear();
+        let q = with_candidates("工作区里没找到目标实体", &goal);
+        assert!(q.contains("候选："), "{q}");
+        assert!(q.contains("GitCli") && q.contains("WorktreeGuard"), "{q}");
+        // 无候选可派生时不硬凑：开放模板问题会被 gate 直接拒绝（R2 禁开放模板）。
+        let mut empty = crate::GoalContract::compile("占位输入");
+        empty.entities.clear();
+        empty.navigation.clear();
+        assert_eq!(with_candidates("问题", &empty), "问题");
     }
 }

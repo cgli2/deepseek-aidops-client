@@ -344,6 +344,9 @@ pub struct ExecutionState {
     pub tool_calls: usize,
     pub successful_tool_results: usize,
     pub failed_tool_results: usize,
+    /// 写工具尝试次数（无论成功与否）。一旦模型已经尝试写入，Runtime 就已经获得
+    /// “这是变更任务”的结构化事实；即使自然语言分类漏判，也不能再走只读直答出口。
+    pub write_attempts: usize,
     /// 成功的写入/编辑次数：区分“正在产出交付”与“空转探索”的关键信号，
     /// 供续期耗尽后的交付延展判定使用。
     pub write_operations: usize,
@@ -374,6 +377,7 @@ impl ExecutionState {
             tool_calls: 0,
             successful_tool_results: 0,
             failed_tool_results: 0,
+            write_attempts: 0,
             write_operations: 0,
             changed_criteria: HashSet::new(),
             evidence: HashMap::new(),
@@ -393,11 +397,16 @@ impl ExecutionState {
         // 是明确的负证据。若把它当作成功，状态机会错误进入 Inspect，随后模型便会
         // 用不同关键词反复搜索直至预算耗尽。
         let effective_ok = ok && !proposal.is_search_miss(summary);
+        // 先于 ok 判定记录尝试。失败 edit 后运行一次 cargo check 只能证明旧基线可编译，
+        // 不能把“零写入”洗成已交付。
+        let is_write = proposal.signature.starts_with("edit:")
+            || proposal.signature.contains("\"op\":\"write\"");
+        if is_write {
+            self.write_attempts += 1;
+        }
         if effective_ok {
             self.successful_tool_results += 1;
             // 归一化签名里 edit 工具以 "edit:" 开头；fs 写入的 JSON 参数含 "op":"write"。
-            let is_write = proposal.signature.starts_with("edit:")
-                || proposal.signature.contains("\"op\":\"write\"");
             if is_write {
                 self.write_operations += 1;
                 self.changed_criteria
@@ -558,6 +567,9 @@ impl ExecutionState {
             self.strategy,
             StrategyKind::Transformative | StrategyKind::Verification
         ) || self.solve_mode == SolveMode::AtomicDelivery
+            // 语言分类只是路由提示，工具事实才是硬边界。任何写入尝试都会关闭
+            // read_only_verified 捷径，直到至少一次写入真正成功且随后验证通过。
+            || self.write_attempts > 0
     }
 
     pub fn can_complete(&self) -> bool {
@@ -1699,6 +1711,40 @@ mod tests {
             CompletionJudge::evaluate(&state, &budget, false),
             Completion::Complete
         );
+    }
+
+    #[test]
+    fn failed_write_then_green_build_cannot_verify_unchanged_baseline() {
+        // 模拟自然语言分类漏判为 Direct/OpenEnded 的最坏情况：结构化工具事实仍须兜底。
+        let contract = TaskContract::from_input("收紧当前控件");
+        let budget = BudgetManager::for_contract(&contract, StrategyKind::Direct);
+        let mut state = ExecutionState::new(contract, StrategyKind::Direct);
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"ui.rs\"}".into(),
+            question: "调整控件".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let build = ActionProposal {
+            signature: "shell:{\"command\":\"cargo check\"}".into(),
+            question: "编译检查".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        state.record_tool_result(&edit, false, "old_text matched 0");
+        state.record_tool_result(&build, true, "Finished dev profile");
+
+        assert_eq!(state.write_attempts, 1);
+        assert_eq!(state.write_operations, 0);
+        assert!(state.verification_evidence.is_empty());
+        assert!(!state.can_complete());
+        assert!(matches!(
+            CompletionJudge::evaluate(&state, &budget, false),
+            Completion::Converge(_)
+        ));
+        let report = state.delivery_report(DeliveryOutcome::Verified, None);
+        assert!(!report.criteria[0].satisfied);
     }
 
     #[test]

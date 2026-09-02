@@ -1576,7 +1576,7 @@ impl AgentLoop {
             let mut claim_recovery_requested = false;
             if let Some(correction) = unsupported_runtime_claim_correction(
                 &assistant_text,
-                controlled_delivery,
+                controlled_delivery || execution.write_attempts > 0,
                 execution.write_operations,
                 sandbox_denial_observed,
                 access_denial_observed,
@@ -2545,6 +2545,7 @@ fn unsupported_runtime_claim_correction(
     .iter()
     .any(|marker| compact.contains(marker));
     let claims_change_applied = [
+        "已完成",
         "已经落实",
         "已落实修改",
         "修改已完成",
@@ -3008,6 +3009,16 @@ mod tests {
             false,
         )
         .is_none());
+
+        let correction = unsupported_runtime_claim_correction(
+            "已完成输入框高度与内边距的紧凑化调整。",
+            true,
+            0,
+            false,
+            false,
+        )
+        .expect("‘已完成某项修改’也必须要求成功写操作");
+        assert!(correction.contains("成功写操作计数为 0"), "{correction}");
     }
 
     #[test]

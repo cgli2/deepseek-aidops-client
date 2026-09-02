@@ -34,17 +34,17 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
             // ── 输入卡片：圆角 + 细边框 + 阴影浮起，卡片自身提供 chrome ──
             let card_frame = egui::Frame::default()
                 .fill(pal.panel)
-                .rounding(egui::Rounding::same(14.0))
+                .rounding(egui::Rounding::same(12.0))
                 .stroke(egui::Stroke::new(1.0_f32, pal.border))
                 .inner_margin(egui::Margin {
-                    left: 14.0,
-                    right: 10.0,
-                    top: 12.0,
-                    bottom: 8.0,
+                    left: 12.0,
+                    right: 8.0,
+                    top: 8.0,
+                    bottom: 6.0,
                 })
                 .shadow(egui::epaint::Shadow {
-                    offset: egui::vec2(0.0, 6.0),
-                    blur: 18.0,
+                    offset: egui::vec2(0.0, 4.0),
+                    blur: 14.0,
                     spread: 0.0,
                     color: egui::Color32::from_black_alpha(if state.dark { 0x44 } else { 0x14 }),
                 });
@@ -76,12 +76,12 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     if let Some(index) = remove {
                         state.attachments.remove(index);
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                 }
                 // 文本编辑区：去掉自身边框/背景，由卡片提供 chrome。
                 // TextEdit 本身没有最大高度约束，需由 ScrollArea 提供固定上限。
                 // 关闭滚动到光标时的补间动画，防止长文本输入时卡片位置逐帧来回变化。
-                const COMPOSER_MAX_H: f32 = 125.0;
+                const COMPOSER_MAX_H: f32 = 96.0;
                 let response = egui::ScrollArea::vertical()
                     .id_salt("composer-input-scroll")
                     .max_height(COMPOSER_MAX_H)
@@ -94,7 +94,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             !state.optimizing,
                             egui::TextEdit::multiline(&mut state.input)
                                 .desired_width(f32::INFINITY)
-                                .desired_rows(3)
+                                .desired_rows(2)
                                 .font(egui::FontId::proportional(13.5))
                                 .frame(false)
                                 .margin(egui::Margin::same(0.0))

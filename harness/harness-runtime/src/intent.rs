@@ -27,9 +27,12 @@ pub enum IntentKind {
 /// 封闭的结构化（位置/顺序）动作集——V5 §4.1 已裁定可进 L0。
 /// 这类动作跨领域恒定：不可能出现"某个新说法"击穿它，故保留为机制层唯一允许的
 /// 动作词表（与 D5"开放集合迁出机制层"不冲突，因为它本就是封闭集）。
-const STRUCTURAL_ACTIONS: [&str; 17] = [
+const STRUCTURAL_ACTIONS: [&str; 25] = [
     "位置", "顺序", "对调", "互换", "调换", "交换", "前后", "移到", "置顶", "反转", "移动", "挪",
     "上移", "下移", "左移", "右移", "重排",
+    // 标量大小/高低调整同样是封闭的结构动作。此前“把输入框高度调小”没有代码符号、
+    // 路径或 X→Y 写法，会误落到 OpenEnded，进而绕过变更任务的写入与验证门禁。
+    "调小", "调大", "缩小", "放大", "降低", "提高", "减小", "增大",
 ];
 
 /// 封闭的疑问引导词——只覆盖"以疑问方式开头/结尾"这一**语言结构**特征，
@@ -283,6 +286,14 @@ mod tests {
         assert_eq!(profile.kind, IntentKind::AtomicRegression);
         assert!(profile.has_structural_action);
         assert!(!profile.is_explicit_question);
+    }
+
+    #[test]
+    fn scalar_adjustment_is_atomic_regression() {
+        let profile = IntentProfile::compile("把当前\n输入框高度调小一点，目前占用太高点");
+        assert_eq!(profile.kind, IntentKind::AtomicRegression);
+        assert!(profile.has_structural_action);
+        assert!(profile.is_task);
     }
 
     #[test]

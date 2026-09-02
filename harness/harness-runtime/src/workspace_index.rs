@@ -274,10 +274,8 @@ impl WorkspaceIndex {
     /// 有依据的零先验判定。两者共用同一次扫描，避免为判定而重复读工作区。
     pub fn adjudicate(&self, candidates: &[String], limit: usize) -> Adjudication {
         let graded = self.grade_all(candidates);
-        let all_absent = !candidates.is_empty()
-            && graded
-                .iter()
-                .all(|item| item.grade == AnchorGrade::Absent);
+        let all_absent =
+            !candidates.is_empty() && graded.iter().all(|item| item.grade == AnchorGrade::Absent);
         let mut keep: Vec<GradedCandidate> = graded
             .into_iter()
             .filter(|item| item.grade.is_locatable())
@@ -505,15 +503,19 @@ pub fn collect_source_files(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
-            if [
-                ".git",
-                "node_modules",
-                "target",
-                "dist",
-                "build",
-                ".harness",
-            ]
-            .contains(&name)
+            // 隐藏目录默认都是工具状态、缓存或编辑器元数据。旧实现遗漏了这一层，
+            // `.pnpm-store` 会按字典序先于源码被递归，并填满 320 个索引名额，最终
+            // 让目标裁决把包管理缓存误当成用户项目源码。
+            if name.starts_with('.')
+                || [
+                    ".git",
+                    "node_modules",
+                    "target",
+                    "dist",
+                    "build",
+                    ".harness",
+                ]
+                .contains(&name)
             {
                 continue;
             }
@@ -645,11 +647,9 @@ mod tests {
         // 这里没有任何停用词表参与判断。
         let graded = index.grade(&"export".to_string());
         assert_eq!(graded.grade, AnchorGrade::Stopword);
-        assert!(
-            !index
-                .select_anchors(&["export".to_string(), "apiKey".to_string()], 8)
-                .contains(&"export".to_string())
-        );
+        assert!(!index
+            .select_anchors(&["export".to_string(), "apiKey".to_string()], 8)
+            .contains(&"export".to_string()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -662,6 +662,38 @@ mod tests {
         let candidates: Vec<String> = vec!["订单编号".into(), "创建时间".into(), "订单".into()];
         assert!(index.all_absent(&candidates));
         assert!(index.select_anchors(&candidates, 8).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_cache_directories_do_not_consume_the_source_index() {
+        let root = temp_root("hidden-cache");
+        std::fs::create_dir_all(root.join(".pnpm-store/v11/projects/cache/src")).unwrap();
+        std::fs::create_dir_all(root.join(".harness-memory/skills")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0..12 {
+            std::fs::write(
+                root.join(format!(
+                    ".pnpm-store/v11/projects/cache/src/noise_{index}.ts"
+                )),
+                "export const cacheOnlyTarget = true;",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join(".harness-memory/skills/state.json"),
+            r#"{"cacheOnlyTarget":true}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/App.vue"), "const projectTarget = true;").unwrap();
+
+        let index = WorkspaceIndex::build_with_limit(&root, 4);
+        assert_eq!(index.file_count(), 1, "缓存目录不应占用索引名额");
+        assert_eq!(index.count("cacheOnlyTarget"), 0);
+        assert_eq!(index.count("projectTarget"), 1);
+        let matched = index.match_paths(&["App".into()], 4);
+        assert_eq!(matched.len(), 1, "实际 {matched:?}");
+        assert_eq!(matched[0].replace('\\', "/"), "src/App.vue");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -771,7 +803,10 @@ mod tests {
         let first_scans = first.scan_count();
         assert!(first_scans > 0, "首轮必须现场扫描，实际 {first_scans}");
         first.save(&root);
-        assert!(root.join(".harness/learned.json").exists(), "应写出学习沉淀文件");
+        assert!(
+            root.join(".harness/learned.json").exists(),
+            "应写出学习沉淀文件"
+        );
 
         // 第二轮：命中缓存，现场扫描应为 0，裁决完全一致。
         let second = WorkspaceIndex::load_or_build(&root);

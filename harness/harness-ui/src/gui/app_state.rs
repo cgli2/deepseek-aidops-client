@@ -172,6 +172,9 @@ pub(super) struct AppState {
     pub(super) tree_open: bool,
     /// 文件树根节点（懒构建）。
     pub(super) tree_root: Option<crate::preview::FileTreeNode>,
+    /// 当前文件树对应的项目根。文件树缓存必须与 active_project 成对校验，
+    /// 不能仅凭 tree_root.is_some() 认为缓存仍然有效。
+    pub(super) tree_workspace: String,
     /// 文件树展开路径集合。
     pub(super) tree_expanded: std::collections::HashSet<String>,
     /// 文件树上次刷新时间（节流）。
@@ -385,6 +388,7 @@ impl AppState {
             preview_highlight: None,
             tree_open: false,
             tree_root: None,
+            tree_workspace: String::new(),
             tree_expanded: std::collections::HashSet::new(),
             tree_last_refresh: None,
             // Git 变更初始状态
@@ -944,6 +948,7 @@ impl AppState {
                 let _ = self.host.settings.set("workspace.root", &path);
                 self.host.sink.switch_workspace(root);
                 self.active_project = path;
+                self.invalidate_project_views();
                 self.projects = self.host.settings.projects();
             }
         }
@@ -1044,10 +1049,45 @@ impl AppState {
         trace("[session] history pruned");
     }
 
+    /// 清空所有绑定具体项目根的 UI 状态。文件树开关保持不变：若用户已经打开
+    /// 文件树，切换项目后的同一帧会基于新 active_project 自动重建，而不是关闭面板。
+    fn invalidate_project_views(&mut self) {
+        self.preview_open = false;
+        self.preview_animating = false;
+        self.preview_path = None;
+        self.preview_content = None;
+        self.preview_diff = None;
+        self.preview_tracked = false;
+        self.preview_error = None;
+        self.preview_truncated = false;
+        self.preview_rx = None;
+        self.pending_preview = None;
+        self.pending_copy = None;
+        self.preview_cache.clear();
+        self.preview_highlight = None;
+        self.tree_root = None;
+        self.tree_workspace.clear();
+        self.tree_expanded.clear();
+        self.tree_last_refresh = None;
+        self.tree_show_git = false;
+        // 旧 Git 请求结果不能在切换后覆盖新项目。
+        self.git_generation = self.git_generation.wrapping_add(1);
+        self.git_rx = None;
+        self.git_loaded = false;
+        self.git_error = None;
+        self.git_changes.clear();
+        self.git_branch.clear();
+        self.git_workspace.clear();
+    }
+
     /// 侧栏项目切换：换工作区根 + 重载该项目会话历史 + 清空输入框 + 气泡提示
     ///（对齐 Codex/Cursor 的上下文切换交互）。忙碌时拒绝以避免回合穿插写错日志。
     pub(super) fn switch_project(&mut self, path: &str) {
-        if path == self.active_project || self.busy {
+        if path == self.active_project {
+            return;
+        }
+        if self.host.sink.any_busy() {
+            self.note = "当前有后台任务运行，项目切换将在任务结束后可用".into();
             return;
         }
         let p = std::path::PathBuf::from(path);
@@ -1060,28 +1100,8 @@ impl AppState {
         let _ = self.host.settings.add_project(&p);
         // 反向通道：Workspace 换根 + SessionLog 重载新项目目录的最近会话。
         self.host.sink.switch_workspace(&p);
-        // 清空旧项目的预览与文件树缓存（基准根统一从 settings 读取）。
-        self.preview_open = false;
-        self.preview_animating = false;
-        self.preview_path = None;
-        self.preview_content = None;
-        self.preview_diff = None;
-        self.preview_error = None;
-        self.preview_rx = None;
-        self.preview_cache.clear();
-        self.tree_open = false;
-        self.tree_root = None;
-        self.tree_expanded.clear();
-        self.tree_show_git = false;
-        // 旧 Git 请求结果不能在切换后覆盖新项目；下一次打开面板会按新根刷新。
-        self.git_generation = self.git_generation.wrapping_add(1);
-        self.git_rx = None;
-        self.git_loaded = false;
-        self.git_error = None;
-        self.git_changes.clear();
-        self.git_branch.clear();
-        self.git_workspace.clear();
         self.active_project = path.to_string();
+        self.invalidate_project_views();
         self.projects = self.host.settings.projects();
         // 视图复位：poll_log 下帧从 0 重放，右侧消息流刷新为该项目历史。
         self.last_event = 0;

@@ -47,24 +47,70 @@ pub fn normalize_question(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// 锚点扩展名集合（与阶段 1 `has_path_anchor` 保持一致）。
-const ANCHOR_EXTENSIONS: [&str; 7] = [".rs", ".toml", ".md", ".json", ".py", ".ts", ".slint"];
-
-/// 从锚点 token 上剥除的句读/括号尾缀。
-const ANCHOR_TRIM_END: [char; 12] = [
-    '，', '。', '；', '、', '）', '】', '！', '"', '\'', ',', ';', ')',
+/// 锚点扩展名集合（与工作区索引支持的常见源码/配置类型保持一致）。
+const ANCHOR_EXTENSIONS: [&str; 25] = [
+    ".rs", ".toml", ".md", ".json", ".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte",
+    ".slint", ".go", ".java", ".kt", ".kts", ".cs", ".c", ".h", ".cpp", ".hpp", ".html", ".css",
+    ".yaml", ".yml",
 ];
 
-/// 从自由文本抽取精确锚点：含 `/` 或 `\` 且含源码扩展名的空白分隔 token。
+/// 这些目录里的路径是依赖、缓存或 Harness 自身状态，不是任务交付锚点。
+const IGNORED_ANCHOR_COMPONENTS: [&str; 10] = [
+    ".git",
+    ".harness",
+    ".harness-memory",
+    ".pnpm-store",
+    ".pytest_cache",
+    "node_modules",
+    "__pycache__",
+    "target",
+    "dist",
+    "build",
+];
+
+/// 从自由文本抽取精确锚点：先按列表标点拆分，再过滤缓存/依赖目录。
+///
+/// 旧实现只按空白拆分，`【资产】锚点：[a.rs、b.ts]` 会整体变成一个新锚点；
+/// 下一次收尾又把该字符串包一层，导致资产文本递归增长。
 pub fn extract_anchors(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|tok| tok.trim_end_matches(ANCHOR_TRIM_END.as_ref()))
-        .filter(|tok| {
-            (tok.contains('/') || tok.contains('\\'))
-                && ANCHOR_EXTENSIONS.iter().any(|ext| tok.contains(ext))
-        })
-        .map(|tok| tok.to_string())
-        .collect()
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '，' | '。'
+                    | '；'
+                    | '、'
+                    | '！'
+                    | ','
+                    | ';'
+                    | '['
+                    | ']'
+                    | '【'
+                    | '】'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '<'
+                    | '>'
+                    | '"'
+                    | '\''
+                    | '`'
+            )
+    })
+    .map(|tok| tok.trim_matches(|c: char| matches!(c, ':' | '-' | '=')))
+    .filter(|tok| {
+        (tok.contains('/') || tok.contains('\\'))
+            && ANCHOR_EXTENSIONS.iter().any(|ext| tok.contains(ext))
+    })
+    .map(|tok| tok.replace('\\', "/"))
+    .filter(|tok| {
+        let lower = tok.to_ascii_lowercase();
+        !lower
+            .split('/')
+            .any(|part| IGNORED_ANCHOR_COMPONENTS.contains(&part))
+    })
+    .collect()
 }
 
 /// 工具结果摘要：仅保留前 160 字符，控制 case file 体积（投影会被频繁重建）。
@@ -103,10 +149,10 @@ impl CaseFile {
                     );
                 }
                 SessionEvent::ToolResult { result, .. } => {
-                    let (tool, signature) = self.pending_calls.remove(&result.call_id).unwrap_or((
-                        "unknown".into(),
-                        format!("unknown:{}", result.call_id),
-                    ));
+                    let (tool, signature) = self
+                        .pending_calls
+                        .remove(&result.call_id)
+                        .unwrap_or(("unknown".into(), format!("unknown:{}", result.call_id)));
                     self.tried.push(TriedEntry {
                         tool,
                         signature,
@@ -213,7 +259,11 @@ mod tests {
     fn from_replay_is_deterministic_and_accumulates_usage() {
         let events = vec![turn("消除 git 黑框"), usage(120, 30), usage(200, 40)];
         let a = CaseFile::from_replay(&events);
-        assert_eq!(a, CaseFile::from_replay(&events), "同一事件流必须得到同一投影");
+        assert_eq!(
+            a,
+            CaseFile::from_replay(&events),
+            "同一事件流必须得到同一投影"
+        );
         assert_eq!(a.prompt_tokens, 320);
         assert_eq!(a.completion_tokens, 70);
         assert_eq!(a.user_signals, vec!["消除 git 黑框".to_string()]);
@@ -266,6 +316,15 @@ mod tests {
                 .all(|a| a.contains('/') || a.contains('\\')),
             "{:?}",
             case.anchors
+        );
+    }
+
+    #[test]
+    fn anchors_split_artifact_lists_and_ignore_generated_state() {
+        let text = "【资产】锚点：[.harness-memory/facts.json、.pnpm-store/v11/src/api.ts、src/App.vue]; docs/fix.md";
+        assert_eq!(
+            extract_anchors(text),
+            vec!["src/App.vue".to_string(), "docs/fix.md".to_string()]
         );
     }
 

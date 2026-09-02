@@ -23,7 +23,10 @@ impl WindowDelta {
 pub fn delta_between(window_base: &CaseFile, now: &CaseFile) -> WindowDelta {
     WindowDelta {
         new_anchors: now.anchors.len().saturating_sub(window_base.anchors.len()),
-        new_eliminations: now.eliminated.len().saturating_sub(window_base.eliminated.len()),
+        new_eliminations: now
+            .eliminated
+            .len()
+            .saturating_sub(window_base.eliminated.len()),
         write_increment: 0,
         new_user_signals: now
             .user_signals
@@ -43,10 +46,22 @@ pub fn artifact_text(
     suggested_patch: &str,
     candidate_question: Option<&str>,
 ) -> String {
+    const MAX_ARTIFACT_ANCHORS: usize = 8;
     let anchors = if case.anchors.is_empty() {
         "无（本回合未产生任何工具命中或路径证据）".to_string()
     } else {
-        case.anchors.iter().cloned().collect::<Vec<_>>().join("; ")
+        let visible = case
+            .anchors
+            .iter()
+            .take(MAX_ARTIFACT_ANCHORS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let remaining = case.anchors.len().saturating_sub(visible.len());
+        if remaining == 0 {
+            visible.join("; ")
+        } else {
+            format!("{}; …另有 {remaining} 个锚点已省略", visible.join("; "))
+        }
     };
     let hypothesis = if hypothesis.trim().is_empty() {
         "待形成（尚未收敛出可验证的根因假设）"
@@ -96,7 +111,11 @@ mod tests {
             new_user_signals: 4,
         };
         assert_eq!(delta.gain(), 10);
-        assert_eq!(WindowDelta::default().gain(), 0, "无增益即 0，控制器据此换路");
+        assert_eq!(
+            WindowDelta::default().gain(),
+            0,
+            "无增益即 0，控制器据此换路"
+        );
     }
 
     #[test]
@@ -144,5 +163,16 @@ mod tests {
         assert!(text.contains("harness/src/lib.rs"), "{text}");
         assert!(text.contains("门禁在澄清出口未去重"), "{text}");
         assert!(text.contains("是否只修 src/lib.rs？"), "{text}");
+    }
+
+    #[test]
+    fn artifact_bounds_anchor_output() {
+        let anchors = (0..20)
+            .map(|index| format!("src/file_{index}.rs"))
+            .collect::<Vec<_>>();
+        let refs = anchors.iter().map(String::as_str).collect::<Vec<_>>();
+        let text = artifact_text(&case_with(&refs, 1), "h", "p", None);
+        assert!(text.contains("另有 12 个锚点已省略"), "{text}");
+        assert!(!text.contains("src/file_8.rs"), "{text}");
     }
 }

@@ -211,6 +211,50 @@ struct CapThenResumeLlm {
     requests: Mutex<Vec<Vec<Message>>>,
 }
 
+/// 首次请求在产生真实工具证据的同时触达 prompt 窗口边界。Runtime 应在同一个
+/// 用户请求内压缩断点并自动续跑，而不是要求用户再输入一次“继续”。
+struct ProgressAtCapLlm {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl LlmProvider for ProgressAtCapLlm {
+    fn name(&self) -> &'static str {
+        "progress-at-cap-test"
+    }
+
+    fn tools(&self) -> Vec<harness_llm::ToolSchema> {
+        vec![]
+    }
+
+    fn stream(&self, messages: Vec<Message>) -> ChunkStream {
+        self.requests.lock().unwrap().push(messages);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunk = if call == 0 {
+            Chunk {
+                tool_calls: vec![ToolCall {
+                    id: "cap-call-1".into(),
+                    name: "echo".into(),
+                    args: serde_json::json!({"text":"new evidence"}),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens: harness_runtime::PROMPT_CAP,
+                    completion_tokens: 1,
+                    total_tokens: harness_runtime::PROMPT_CAP + 1,
+                }),
+                ..Default::default()
+            }
+        } else {
+            Chunk {
+                text: Some("工具执行完成".into()),
+                ..Default::default()
+            }
+        };
+        Box::pin(futures::stream::iter(vec![Ok(chunk)]))
+    }
+}
+
 #[async_trait]
 impl LlmProvider for CapThenResumeLlm {
     fn name(&self) -> &'static str {
@@ -436,6 +480,53 @@ async fn continuation_gets_a_fresh_prompt_budget_after_previous_turn_hit_cap() {
             .iter()
             .any(|message| message.content.contains("[续跑任务]"))
     }));
+}
+
+#[tokio::test]
+async fn prompt_cap_auto_renews_after_tool_progress_without_user_continuation() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(ProgressAtCapLlm {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(vec![]),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "执行 echo 工具并返回结果".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        llm.calls.load(Ordering::SeqCst),
+        2,
+        "有工具证据时应在同一用户请求内自动续跑"
+    );
+    let events = log.replay();
+    assert!(!events.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("【执行预算暂停】"))
+    )));
+    let requests = llm.requests.lock().unwrap();
+    assert!(requests[1]
+        .iter()
+        .any(|message| message.content.contains("[预算窗口续期 1/4·最小断点]")));
+    assert!(requests[1]
+        .iter()
+        .all(|message| message.tool_call_id.as_deref() != Some("cap-call-1")));
 }
 
 #[tokio::test]

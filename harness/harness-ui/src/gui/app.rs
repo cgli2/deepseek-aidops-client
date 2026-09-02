@@ -86,7 +86,7 @@ impl eframe::App for AppState {
         }
         if chrome_actions.toggle_tree {
             self.tree_open = !self.tree_open;
-            if self.tree_open && self.tree_root.is_none() {
+            if self.tree_open && self.tree_needs_reload() {
                 self.build_tree();
             }
         }

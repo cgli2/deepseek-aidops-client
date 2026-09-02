@@ -18,13 +18,13 @@ use harness_session::{
 use harness_tool::ToolRegistry;
 use tokio_util::sync::CancellationToken;
 
+use crate::case_file::CaseFile;
 use crate::events::{PreStep, TurnStopping};
 use crate::execution::{
     ActionGate, ActionProposal, BudgetManager, Completion, CompletionJudge, DomainPolicy,
     ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
-use crate::case_file::CaseFile;
 use crate::governor::{artifact_text, is_continuation_request, Decision, TurnGovernor};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
@@ -103,8 +103,7 @@ static SEARCH_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, ToolResult>>,
 > = std::sync::OnceLock::new();
 
-fn search_memo(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, ToolResult>> {
+fn search_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, ToolResult>> {
     SEARCH_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -509,7 +508,11 @@ impl AgentLoop {
         let workspace_index = (!goal_execution.goal.candidates.is_empty()
             || !goal_execution.goal.code_entities.is_empty()
             || goal_execution.goal.transformation.is_some())
-        .then(|| workspace_root.as_ref().map(|root| WorkspaceIndex::load_or_build(root)))
+        .then(|| {
+            workspace_root
+                .as_ref()
+                .map(|root| WorkspaceIndex::load_or_build(root))
+        })
         .flatten();
         if let Some(index) = &workspace_index {
             goal_execution.goal.resolve_against(index);
@@ -522,8 +525,8 @@ impl AgentLoop {
         let case_file = CaseFile::from_replay(&history);
         let read_only = matches!(intent.kind, crate::IntentKind::Investigation);
         let grounded = workspace_index.is_some() && goal_execution.goal.has_locatable_signal();
-        let mut governor =
-            (self.governor == GovernorMode::On).then(|| TurnGovernor::new(&case_file, grounded, read_only));
+        let mut governor = (self.governor == GovernorMode::On)
+            .then(|| TurnGovernor::new(&case_file, grounded, read_only));
 
         if let Some(clar) = crate::IntentProfile::requires_clarification(
             &goal_execution.goal,
@@ -591,6 +594,56 @@ impl AgentLoop {
                 if let Some(clar) = goal_execution.inspect_for_clarification(root) {
                     let question = with_candidates(&clar.question, &goal_execution.goal);
                     if ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question) {
+                        let item_id = ledger
+                            .current_item()
+                            .map(|item| item.id.clone())
+                            .unwrap_or_else(|| "user-objective".to_owned());
+                        let reason = format!("{CLARIFICATION_REASON_PREFIX}{question}");
+                        ledger.block(&item_id, reason.clone());
+                        log.append(SessionEvent::TurnStart {
+                            id: log.gen_id(),
+                            input: input_text,
+                        });
+                        log.append(SessionEvent::Assistant {
+                            id: log.gen_id(),
+                            chunk: Chunk {
+                                text: Some(format!("[需要澄清] {question}")),
+                                ..Default::default()
+                            },
+                        });
+                        log.append(SessionEvent::Delivery {
+                            id: log.gen_id(),
+                            report: execution
+                                .delivery_report(DeliveryOutcome::NeedsUserInput, Some(reason)),
+                        });
+                        append_telemetry(
+                            &log,
+                            &execution,
+                            &goal_execution,
+                            &ledger,
+                            "Inspect 观察与期望终态不一致，等待用户确认意图",
+                        );
+                        log.append(SessionEvent::TurnEnd { id: log.gen_id() });
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // 把本轮裁决学到的命中统计写回 `.harness/learned.json`，供后续回合复用。
+        if let (Some(index), Some(root)) = (&workspace_index, &workspace_root) {
+            let _ = index.save(root);
+        }
+
+        // 仅将含有明确代码实体（如 appCode）的请求作为硬确认门禁。普通自然语言
+        // 问题仍进入精准定位流程，避免把“未命中名称”误判为无法执行。
+        if let Some(grounding) = &workspace_grounding {
+            if !goal_execution.goal.code_entities.is_empty() && grounding.needs_user_input() {
+                let question = with_candidates(
+                    &grounding.user_question(&goal_execution.goal),
+                    &goal_execution.goal,
+                );
+                if ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question) {
                     let item_id = ledger
                         .current_item()
                         .map(|item| item.id.clone())
@@ -618,60 +671,10 @@ impl AgentLoop {
                         &execution,
                         &goal_execution,
                         &ledger,
-                        "Inspect 观察与期望终态不一致，等待用户确认意图",
+                        "工作区与目标实体不匹配，等待用户确认",
                     );
                     log.append(SessionEvent::TurnEnd { id: log.gen_id() });
                     return Ok(());
-                    }
-                }
-            }
-        }
-
-        // 把本轮裁决学到的命中统计写回 `.harness/learned.json`，供后续回合复用。
-        if let (Some(index), Some(root)) = (&workspace_index, &workspace_root) {
-            let _ = index.save(root);
-        }
-
-        // 仅将含有明确代码实体（如 appCode）的请求作为硬确认门禁。普通自然语言
-        // 问题仍进入精准定位流程，避免把“未命中名称”误判为无法执行。
-        if let Some(grounding) = &workspace_grounding {
-            if !goal_execution.goal.code_entities.is_empty() && grounding.needs_user_input() {
-                let question = with_candidates(
-                    &grounding.user_question(&goal_execution.goal),
-                    &goal_execution.goal,
-                );
-                if ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question) {
-                let item_id = ledger
-                    .current_item()
-                    .map(|item| item.id.clone())
-                    .unwrap_or_else(|| "user-objective".to_owned());
-                let reason = format!("{CLARIFICATION_REASON_PREFIX}{question}");
-                ledger.block(&item_id, reason.clone());
-                log.append(SessionEvent::TurnStart {
-                    id: log.gen_id(),
-                    input: input_text,
-                });
-                log.append(SessionEvent::Assistant {
-                    id: log.gen_id(),
-                    chunk: Chunk {
-                        text: Some(format!("[需要澄清] {question}")),
-                        ..Default::default()
-                    },
-                });
-                log.append(SessionEvent::Delivery {
-                    id: log.gen_id(),
-                    report: execution
-                        .delivery_report(DeliveryOutcome::NeedsUserInput, Some(reason)),
-                });
-                append_telemetry(
-                    &log,
-                    &execution,
-                    &goal_execution,
-                    &ledger,
-                    "工作区与目标实体不匹配，等待用户确认",
-                );
-                log.append(SessionEvent::TurnEnd { id: log.gen_id() });
-                return Ok(());
                 }
             }
         }
@@ -834,10 +837,26 @@ impl AgentLoop {
         let mut provider_error_summary = String::new();
         let mut cancelled = false;
         let mut delivery_verified = false;
+        // 工具错误事实来自结构化 ToolResult，绝不允许模型凭空把普通补丁冲突、
+        // 阶段门禁或“根本没调用写工具”改写成沙箱/权限拒绝。
+        let mut sandbox_denial_observed = case_file.tried.iter().any(|entry| {
+            entry.summary.contains("[sandbox denied]")
+                || entry.summary.contains("sandbox policy denied")
+        });
+        let mut access_denial_observed = case_file
+            .tried
+            .iter()
+            .any(|entry| entry.summary.contains("[access-policy denied]"));
+        let mut claim_correction_notified = false;
         let mut budget_exhausted = false;
         let mut absolute_budget_hit = false;
         // Fix1：断点后进展基线。硬熔断时比较“写入+证据”与基线的增量，有进展才自动续跑。
         let mut hard_baseline = execution.write_operations + execution.evidence.len();
+        // prompt 安全边界同样是“执行窗口”而不是人工交互边界。窗口内出现可验证进展时，
+        // 先压缩为最小断点再自动续期；连续无进展或续期封顶才真正暂停并交回用户。
+        // 这避免大上下文任务每 3~4 次模型往返就要求用户手工输入“继续”。
+        let mut prompt_baseline = hard_baseline;
+        let mut prompt_autorenews = 0u32;
         let mut convergence_notified = false;
         let mut goal_correction_notified = false;
         // 预算续期耗尽后只给一次最终收尾窗口（2 步）；窗口也用尽则强制停止。
@@ -848,6 +867,8 @@ impl AgentLoop {
 
         /// Fix1：硬熔断自动续跑硬上限，超过则强制交回用户，防止失控。
         const MAX_HARD_AUTORENEWS: u32 = 8;
+        /// 单个用户请求内的 prompt 窗口续期上限；每次续期仍受 300k 窗口边界约束。
+        const MAX_PROMPT_AUTORENEWS: u32 = 4;
         let mut empty_response_retries = 0usize;
         let mut length_recovery_pending = false;
         while debt > 0 {
@@ -856,6 +877,27 @@ impl AgentLoop {
             // 放在 steps 自增与 StepStart 之前，避免留下"开了步却没请求"的空步骤。
             if let Some(gov) = governor.as_ref() {
                 if gov.should_stop_before_request(turn_prompt_tokens, last_prompt_tokens) {
+                    let progress_now = execution.write_operations + execution.evidence.len();
+                    let progress_since_window = progress_now.saturating_sub(prompt_baseline);
+                    if prompt_autorenews < MAX_PROMPT_AUTORENEWS && progress_since_window > 0 {
+                        prompt_autorenews += 1;
+                        prompt_baseline = progress_now;
+                        turn_prompt_tokens = 0;
+                        last_prompt_tokens = 0;
+                        messages = compact_for_prompt_renewal(
+                            messages,
+                            &execution.compact_checkpoint(),
+                            prompt_autorenews,
+                            MAX_PROMPT_AUTORENEWS,
+                        );
+                        log.append(SessionEvent::Thinking {
+                            id: log.gen_id(),
+                            text: format!(
+                                "执行上下文已压缩，预算窗口自动续期 {prompt_autorenews}/{MAX_PROMPT_AUTORENEWS}…"
+                            ),
+                        });
+                        continue;
+                    }
                     budget_exhausted = true;
                     log.append(SessionEvent::Assistant {
                         id: log.gen_id(),
@@ -879,8 +921,7 @@ impl AgentLoop {
                 // Fix1：硬熔断不再一律打断等用户。若本窗口产生了可验证进展
                 // （写入或新证据），自动发放新探索窗口继续推进，避免把任务切碎成
                 // 十几次人工“继续”。连续无进展或达到自动续跑上限才交回用户。
-                let progress_since_window = (execution.write_operations
-                    + execution.evidence.len())
+                let progress_since_window = (execution.write_operations + execution.evidence.len())
                     .saturating_sub(hard_baseline);
                 if !cancelled
                     && budget.hard_autorenews < MAX_HARD_AUTORENEWS
@@ -999,9 +1040,10 @@ impl AgentLoop {
                         let mut scoped_msgs = pre_input.clone();
                         // 把全局目标提示替换为该组作用域版本；找不到（如被 PreStep 改写）
                         // 则退化为全局提示，仍正确只是聚焦弱一些。
-                        if let Some(pos) = scoped_msgs.iter().position(|m| {
-                            m.role == Role::System && m.content == goal_prompt
-                        }) {
+                        if let Some(pos) = scoped_msgs
+                            .iter()
+                            .position(|m| m.role == Role::System && m.content == goal_prompt)
+                        {
                             scoped_msgs[pos] = Message::system(scoped_prompt);
                         }
                         streams.push(llm.stream_with_options(
@@ -1284,10 +1326,14 @@ impl AgentLoop {
 
                     if let Some(policy) = ctx.try_get::<harness_core::AccessPolicy>() {
                         if !policy.allows(&tc.name, &tc.args) {
+                            access_denial_observed = true;
                             let denied = ToolResult {
                                 call_id: tc.id.clone(),
                                 ok: false,
-                                content: format!("访问权限“{}”拒绝了该工具调用", policy.mode()),
+                                content: format!(
+                                    "[access-policy denied] 访问权限“{}”拒绝了该工具调用",
+                                    policy.mode()
+                                ),
                                 continuation_debt: 0,
                             };
                             log.append(SessionEvent::ToolResult {
@@ -1361,7 +1407,7 @@ impl AgentLoop {
                                 Ok(Err(error)) => ToolResult {
                                     call_id: tc.id.clone(),
                                     ok: false,
-                                    content: format!("tool execution failed: {error}"),
+                                    content: format_tool_dispatch_error(error),
                                     continuation_debt: 0,
                                 },
                                 Err(_) => ToolResult {
@@ -1383,6 +1429,10 @@ impl AgentLoop {
                     match joined {
                         Some(results) => {
                             for ((tc, sig, proposal, action), res) in pending.iter().zip(results) {
+                                sandbox_denial_observed |=
+                                    res.content.contains("[sandbox denied]");
+                                access_denial_observed |=
+                                    res.content.contains("[access-policy denied]");
                                 // 钩子（PostToolUse）：审计 / 后处理挂钩点。
                                 let _ = hook.run(&HookPayload {
                                     event: HookEvent::PostToolUse,
@@ -1523,6 +1573,31 @@ impl AgentLoop {
                     messages.push(Message::user(leak));
                 }
             }
+            let mut claim_recovery_requested = false;
+            if let Some(correction) = unsupported_runtime_claim_correction(
+                &assistant_text,
+                controlled_delivery,
+                execution.write_operations,
+                sandbox_denial_observed,
+                access_denial_observed,
+            ) {
+                // 每次无证据声明都必须阻断完成裁决；用户可见的校正只展示一次，
+                // 后续重复则继续通过内部恢复提示纠偏，避免刷屏。
+                claim_recovery_requested = true;
+                if !claim_correction_notified {
+                    claim_correction_notified = true;
+                    log.append(SessionEvent::Assistant {
+                        id: log.gen_id(),
+                        chunk: Chunk {
+                            text: Some(format!("[事实校正] {correction}")),
+                            ..Default::default()
+                        },
+                    });
+                }
+                loop_recovery_prompts.push(format!(
+                    "[运行时事实校正] {correction} 不得重复无证据结论；继续调用当前阶段允许的工具，成功写盘并验证后才能声称已落实。"
+                ));
+            }
             let should_recover_empty = empty_response_reason.is_some()
                 && assistant_text.trim().is_empty()
                 && assistant_tools.is_empty();
@@ -1599,7 +1674,7 @@ impl AgentLoop {
                     debt = 0;
                     hard_stop = true;
                 }
-            } else if step_had_tools && !hard_stop {
+            } else if (step_had_tools || claim_recovery_requested) && !hard_stop {
                 debt += 1;
             }
             log.append(SessionEvent::StepEnd {
@@ -1609,6 +1684,8 @@ impl AgentLoop {
 
             if should_recover_empty {
                 // 恢复重试已经重新记账，不能再被“本步没有工具”误判为完成。
+            } else if claim_recovery_requested {
+                // 事实校正已经发放一次续跑；本步正文不能作为完成结论继续裁决。
             } else if controlled_delivery {
                 match goal_execution.evaluate_completion(step_had_tools) {
                     GoalCompletion::Complete => {
@@ -2395,6 +2472,36 @@ fn apply_context_budget(messages: Vec<Message>) -> Vec<Message> {
     result
 }
 
+/// prompt 窗口续期只保留本回合仍有效的系统约束和执行状态检查点。
+///
+/// 旧工具原文已经折叠进 `ExecutionState` 的证据摘要；继续携带它们不仅会再次消耗
+/// 近一个完整上下文，还会让模型回头重做已经完成的定位。历史压缩摘要和旧续期断点
+/// 也不再保留，防止每次续期递归叠加。
+fn compact_for_prompt_renewal(
+    messages: Vec<Message>,
+    checkpoint: &str,
+    renewal: u32,
+    max_renewals: u32,
+) -> Vec<Message> {
+    let mut seen = HashSet::new();
+    let mut compacted = messages
+        .into_iter()
+        .filter(|message| {
+            message.role == Role::System
+                && !message.content.starts_with("[较早会话已按上下文预算压缩")
+                && !message.content.starts_with("[预算窗口续期")
+        })
+        .filter(|message| seen.insert(message.content.clone()))
+        .collect::<Vec<_>>();
+    compacted.push(Message::system(format!(
+        "[预算窗口续期 {renewal}/{max_renewals}·最小断点]\n{checkpoint}\n旧工具输出已从请求上下文移除，但其证据结论仍有效。不要重新扫描缓存、依赖或生成目录；直接推进第一个未满足验收项。"
+    )));
+    compacted.push(Message::user(
+        "自动续期继续执行：若已有足够证据就完成修改与验证；若没有新增信息，立即基于现有证据收尾，不要重复探索。",
+    ));
+    compacted
+}
+
 fn message_chars(message: &Message) -> usize {
     message.content.chars().count()
         + message
@@ -2402,6 +2509,65 @@ fn message_chars(message: &Message) -> usize {
             .iter()
             .map(|call| call.name.len() + call.args.to_string().chars().count())
             .sum::<usize>()
+}
+
+/// 给工具错误打上互斥来源标签，避免模型把 edit 文本冲突、普通 IO 错误和真正的
+/// 沙箱拒绝混为一谈。用户与模型都能据此审计失败来自哪一层。
+fn format_tool_dispatch_error(error: harness_core::Error) -> String {
+    match error {
+        harness_core::Error::SandboxDenied(reason) => format!("[sandbox denied] {reason}"),
+        harness_core::Error::Io(error) => format!("[tool io error] {error}"),
+        other => format!("[tool error] {other}"),
+    }
+}
+
+/// 检查模型正文中的运行时事实声明。这里只拦截可由 Runtime 确定真假的两类说法：
+/// “沙箱/权限拒绝”必须有对应 ToolResult，“已落实/已写入”必须有成功写操作计数。
+fn unsupported_runtime_claim_correction(
+    text: &str,
+    change_required: bool,
+    write_operations: usize,
+    sandbox_denial_observed: bool,
+    access_denial_observed: bool,
+) -> Option<String> {
+    let compact = text.split_whitespace().collect::<String>().to_lowercase();
+    let claims_sandbox_denial = (compact.contains("沙箱") || compact.contains("sandbox"))
+        && ["拦截", "拒绝", "阻止", "无法写", "denied", "blocked"]
+            .iter()
+            .any(|marker| compact.contains(marker));
+    let claims_access_denial = [
+        "权限拒绝",
+        "权限拦截",
+        "没有写入权限",
+        "无写入权限",
+        "permissiondenied",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker));
+    let claims_change_applied = [
+        "已经落实",
+        "已落实修改",
+        "修改已完成",
+        "代码已写入",
+        "已经写入代码",
+        "成功落盘",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker));
+
+    let mut facts = Vec::new();
+    if claims_sandbox_denial && !sandbox_denial_observed {
+        facts.push("没有任何带 [sandbox denied] 标签的工具结果，不能归因为沙箱拦截");
+    }
+    if claims_access_denial && !access_denial_observed {
+        facts.push(
+            "没有任何带 [access-policy denied] 标签的工具结果，不能归因为访问权限拒绝",
+        );
+    }
+    if change_required && claims_change_applied && write_operations == 0 {
+        facts.push("当前成功写操作计数为 0，不能声称修改已经落实或代码已经落盘");
+    }
+    (!facts.is_empty()).then(|| facts.join("；"))
 }
 
 /// 结构化系统提示词：语言跟随、工具契约、长周期工作流、安全边界。
@@ -2416,6 +2582,8 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 定位代码/文本位置一律优先用 search（一次调用返回文件:行号:内容）；严禁用 shell findstr/dir/grep 全仓扫描或编写临时扫描脚本来找代码。\n\
 - 严禁在正文里输出任何形式的工具调用标记（DSML、XML invoke、tool_calls 文本等）；调用工具必须走 function calling 通道。\n\
 - 问候、提问、普通对话直接回答，不使用工具。\n\
+- 不得虚构沙箱、权限、网络或工具失败原因；只有对应 ToolResult 明确返回时才能引用。execution gate、old_text 失配和 sandbox denied 是不同故障，必须按原始标签准确陈述。\n\
+- 变更任务只有成功执行写工具并获得验证后才能说“已落实/已修改/已写入”；只给方案、代码块或修改建议不等于落盘。\n\
 \n\
 ## 复杂任务工作流\n\
 - 只有多个独立交付物、范围不明确或高风险任务才调用 plan；单点、范围明确的修复直接执行“定位 → 修改 → 验证”，不要为计划本身增加往返。\n\
@@ -2777,6 +2945,72 @@ mod tests {
     }
 
     #[test]
+    fn prompt_renewal_keeps_constraints_but_drops_tool_history_and_old_summaries() {
+        let messages = vec![
+            Message::system("system-contract"),
+            Message::system("system-contract"),
+            Message::system("[较早会话已按上下文预算压缩，共省略 99 条消息]"),
+            Message::user("old request"),
+            Message::assistant("old answer"),
+            Message::tool("call-1", "very large tool result"),
+        ];
+        let compacted = compact_for_prompt_renewal(messages, "目标：修复问题", 1, 4);
+        assert_eq!(
+            compacted
+                .iter()
+                .filter(|message| message.content == "system-contract")
+                .count(),
+            1,
+            "重复系统约束应去重"
+        );
+        assert!(compacted.iter().all(|message| message.role != Role::Tool));
+        assert!(compacted
+            .iter()
+            .all(|message| !message.content.contains("较早会话已按上下文预算压缩")));
+        assert!(compacted
+            .iter()
+            .any(|message| message.content.contains("目标：修复问题")));
+    }
+
+    #[test]
+    fn tool_errors_keep_sandbox_and_io_provenance_distinct() {
+        let sandbox = format_tool_dispatch_error(harness_core::Error::SandboxDenied(
+            "path is outside workspace".into(),
+        ));
+        assert!(sandbox.starts_with("[sandbox denied]"), "{sandbox}");
+
+        let io = format_tool_dispatch_error(harness_core::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "old_text must match exactly once",
+        )));
+        assert!(io.starts_with("[tool io error]"), "{io}");
+        assert!(!io.contains("sandbox"), "{io}");
+    }
+
+    #[test]
+    fn unsupported_runtime_claims_require_structured_evidence() {
+        let correction = unsupported_runtime_claim_correction(
+            "此前因为沙箱拦截，但三项修改已经落实。",
+            true,
+            0,
+            false,
+            false,
+        )
+        .expect("无证据沙箱归因和零写入完成声明都必须被拦截");
+        assert!(correction.contains("不能归因为沙箱拦截"), "{correction}");
+        assert!(correction.contains("成功写操作计数为 0"), "{correction}");
+
+        assert!(unsupported_runtime_claim_correction(
+            "沙箱明确拒绝了写入，但修改随后已经落实。",
+            true,
+            1,
+            true,
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn repeat_guard_blocks_success_retries_but_allows_retry_after_a_write() {
         let mut guard = ToolRepeatGuard::default();
         let sig = "shell:{\"cmd\":\"status\"}";
@@ -2913,7 +3147,9 @@ mod tests {
         // 步骤④接管后默认控制器；HARNESS_GOVERNOR=legacy/off/0 是步骤⑤删除前的逃生门。
         assert_eq!(AgentLoop::new().governor_mode(), GovernorMode::On);
         assert_eq!(
-            AgentLoop::new().with_governor(GovernorMode::Legacy).governor_mode(),
+            AgentLoop::new()
+                .with_governor(GovernorMode::Legacy)
+                .governor_mode(),
             GovernorMode::Legacy
         );
         // 解析函数独立可测，不依赖真实进程环境（edition 2024 下 env 写入是 unsafe）。
@@ -2931,13 +3167,23 @@ mod tests {
     fn ask_user_gate_blocks_questions_under_controller() {
         let case = CaseFile::default();
         // legacy（governor=None）一律允许——旧行为逐字保持。
-        assert!(ask_user_permitted(None, &case, "改一下", "目标是谁（候选：a、b）"));
+        assert!(ask_user_permitted(
+            None,
+            &case,
+            "改一下",
+            "目标是谁（候选：a、b）"
+        ));
         assert!(ask_user_permitted(None, &case, "继续", "目标是谁？"));
 
         // 控制器：栈顶不满足深度前置。
         let gov = TurnGovernor::new(&case, false, false);
         assert!(
-            !ask_user_permitted(Some(&gov), &case, "这个问题解决了吗？", "目标是谁（候选：a、b）"),
+            !ask_user_permitted(
+                Some(&gov),
+                &case,
+                "这个问题解决了吗？",
+                "目标是谁（候选：a、b）"
+            ),
             "还有多层策略未试，禁止把负担丢回用户"
         );
 
@@ -2946,8 +3192,18 @@ mod tests {
         while !gov.stack.allow_ask_user() {
             gov.stack.pop();
         }
-        assert!(!ask_user_permitted(Some(&gov), &case, "继续", "目标是谁（候选：a、b）"));
-        assert!(ask_user_permitted(Some(&gov), &case, "目标在哪", "目标是谁（候选：a、b）"));
+        assert!(!ask_user_permitted(
+            Some(&gov),
+            &case,
+            "继续",
+            "目标是谁（候选：a、b）"
+        ));
+        assert!(ask_user_permitted(
+            Some(&gov),
+            &case,
+            "目标在哪",
+            "目标是谁（候选：a、b）"
+        ));
     }
 
     #[test]

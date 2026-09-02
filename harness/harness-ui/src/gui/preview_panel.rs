@@ -62,13 +62,9 @@ impl AppState {
         let git = self.host.git.clone();
         // 回传请求路径：poll_preview 据此丢弃过期结果（快速切换文件时防污染）。
         let req_path = path.clone();
-        // 基准根统一从 settings 读取（switch_project 已更新），避免 Arc 字段不可变。
-        let ws_root = self
-            .host
-            .settings
-            .get("workspace.root")
-            .filter(|p| std::path::Path::new(p).is_dir())
-            .unwrap_or_else(|| self.host.workspace_root.clone());
+        // 当前选中的项目是 UI 文件浏览的唯一事实源。settings 只负责持久化，
+        // 不能在切换路径中反向充当运行时状态，否则写入异常时会回读旧项目。
+        let ws_root = self.active_workspace_root();
         let handle = self.host.rt.handle();
         let (tx, rx) = std::sync::mpsc::channel::<crate::preview::PreviewLoadResult>();
         self.preview_rx = Some(rx);
@@ -491,12 +487,7 @@ impl AppState {
     /// 异步刷新 Git 变更（分支名 + 变更文件列表，含状态码）。
     pub(super) fn refresh_git_changes(&mut self) {
         let git = self.host.git.clone();
-        let workspace = self
-            .host
-            .settings
-            .get("workspace.root")
-            .filter(|path| std::path::Path::new(path).is_dir())
-            .unwrap_or_else(|| self.host.workspace_root.clone());
+        let workspace = self.active_workspace_root();
         self.git_generation = self.git_generation.wrapping_add(1);
         let generation = self.git_generation;
         self.git_workspace = workspace.clone();
@@ -531,12 +522,7 @@ impl AppState {
         };
         let Ok(update) = rx.try_recv() else { return };
         self.git_rx = None;
-        let current_workspace = self
-            .host
-            .settings
-            .get("workspace.root")
-            .filter(|path| std::path::Path::new(path).is_dir())
-            .unwrap_or_else(|| self.host.workspace_root.clone());
+        let current_workspace = self.active_workspace_root();
         if update.generation != self.git_generation || update.workspace != current_workspace {
             return;
         }
@@ -600,13 +586,7 @@ impl AppState {
     pub(super) fn build_tree(&mut self) {
         let fs = self.host.fs.clone();
         let git = self.host.git.clone();
-        // 基准根统一从 settings 读取（与 load_preview 一致）。
-        let root = self
-            .host
-            .settings
-            .get("workspace.root")
-            .filter(|p| std::path::Path::new(p).is_dir())
-            .unwrap_or_else(|| self.host.workspace_root.clone());
+        let root = self.active_workspace_root();
         let root_for_name = root.clone();
         let handle = self.host.rt.handle();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::preview::FileTreeNode>>();
@@ -625,18 +605,24 @@ impl AppState {
         });
         if let Ok(nodes) = rx.recv() {
             self.tree_root = Some(crate::preview::FileTreeNode {
-                name: root_for_name,
+                name: root_for_name.clone(),
                 path: String::new(),
                 is_dir: true,
                 dirty: false,
                 children: nodes,
             });
+            self.tree_workspace = root_for_name;
             self.tree_last_refresh = Some(std::time::Instant::now());
         }
     }
 
     /// 渲染文件树。
     pub(super) fn render_tree(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        // 防御性校验：即使未来新增项目切换入口忘了手工清缓存，只要树记录的
+        // workspace 与当前项目不一致，就必须在展示前重建，绝不显示旧项目内容。
+        if self.tree_needs_reload() {
+            self.build_tree();
+        }
         // 标题栏
         let head_h = if cfg!(target_os = "macos") {
             32.0
@@ -676,7 +662,8 @@ impl AppState {
                             if self.tree_show_git {
                                 self.tree_show_git = false;
                             } else {
-                                let need_refresh = self
+                                let need_refresh = self.tree_needs_reload()
+                                    || self
                                     .tree_last_refresh
                                     .map(|t| t.elapsed().as_secs() > 5)
                                     .unwrap_or(true);
@@ -1003,6 +990,34 @@ impl AppState {
         // 简化：直接重建树（对中小仓库足够快）。
         self.build_tree();
     }
+
+    /// 当前项目根。active_project 属于当前帧的运行时状态；持久化设置和启动根
+    /// 只在它失效时作为兼容回退。
+    fn active_workspace_root(&self) -> String {
+        if std::path::Path::new(&self.active_project).is_dir() {
+            self.active_project.clone()
+        } else {
+            self.host.workspace_root.clone()
+        }
+    }
+
+    pub(super) fn tree_needs_reload(&self) -> bool {
+        let active = self.active_workspace_root();
+        self.tree_root.is_none() || !same_workspace(&self.tree_workspace, &active)
+    }
+}
+
+/// Windows 路径大小写不敏感；同时统一分隔符，避免同一目录仅因展示形式不同
+/// 被误判为另一个项目。其他平台保持大小写敏感语义。
+fn same_workspace(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| value.trim_end_matches(['/', '\\']).replace('\\', "/");
+    let left = normalize(left);
+    let right = normalize(right);
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left == right
+    }
 }
 
 /// 递归列出目录（深度限制），构建文件树节点。忽略 .git/target/node_modules 等。
@@ -1075,4 +1090,34 @@ async fn list_dir_recursive(
         }
     }
     nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_workspace;
+
+    #[test]
+    fn workspace_identity_normalizes_separators_and_trailing_slashes() {
+        assert!(same_workspace(
+            "F:\\workspace\\project-a\\",
+            "F:/workspace/project-a"
+        ));
+    }
+
+    #[test]
+    fn workspace_identity_rejects_a_previous_project() {
+        assert!(!same_workspace(
+            "F:/workspace/project-a",
+            "F:/workspace/project-b"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_identity_is_case_insensitive_on_windows() {
+        assert!(same_workspace(
+            "F:/Workspace/Project-A",
+            "f:/workspace/project-a"
+        ));
+    }
 }

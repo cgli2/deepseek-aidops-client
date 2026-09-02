@@ -439,6 +439,13 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                             if r.clicked() {
                                                 state.permission = mode.to_string();
                                                 state.perm_menu_open = false;
+                                                // 展示值必须与运行时 AccessPolicy 立即同步。
+                                                // 旧实现要等下一次发送消息才生效，任务运行中
+                                                // 切换后会出现 UI 与实际权限短暂不一致。
+                                                state
+                                                    .host
+                                                    .sink
+                                                    .set_permission(state.permission.clone());
                                                 let _ = state
                                                     .host
                                                     .settings

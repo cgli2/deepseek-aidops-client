@@ -93,6 +93,32 @@ struct ResumeState {
     report: DeliveryReport,
 }
 
+/// 用户指出“刚才只给方案/没有真正修改”时，语义上仍是在推进上一条未完成任务，
+/// 不能把这句纠错反馈重新编译成一个没有业务对象的新目标。否则 Grounder 会围绕
+/// “修改代码”之类泛词重新定位，最终为了满足写入计数而改到无关文件。
+fn is_execution_correction_request(text: &str) -> bool {
+    let compact = text.split_whitespace().collect::<String>().to_lowercase();
+    [
+        "你只是列出来",
+        "只给了方案",
+        "没有落实",
+        "没有真正改",
+        "还是要实际改",
+        "没有看到你有什么改动",
+        "自己执行修改",
+        "这个功能未实现",
+        "右击文件没有",
+        "右键没有",
+        "并没有生效",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+}
+
+fn is_resumable_follow_up(text: &str) -> bool {
+    is_continuation_request(text) || is_execution_correction_request(text)
+}
+
 const CLARIFICATION_REASON_PREFIX: &str = "需要补充执行信息：";
 
 /// Fix2：搜索/扫描类调用的会话级记忆化缓存。键=工具名+归一化参数；命中即返回
@@ -187,7 +213,7 @@ fn latest_resumable_task(events: &[SessionEvent]) -> Option<ResumeState> {
             SessionEvent::TurnStart { input, .. } => input.clone(),
             _ => unreachable!("turn index was matched above"),
         };
-        if !is_continuation_request(&objective) {
+        if !is_resumable_follow_up(&objective) {
             return Some(ResumeState {
                 objective,
                 report: latest_report.unwrap_or(report),
@@ -412,9 +438,9 @@ impl AgentLoop {
         // 会话正文可以重放，但任务的策略/验收状态不能从一句“继续”重新推断。
         // 只在明确续跑表达式下恢复，普通新请求仍完全按其自身目标执行。
         let history = log.replay();
-        let is_clarification_reply =
-            !is_continuation_request(&input_text) && awaiting_clarification(&history);
-        let resume = (is_continuation_request(&input_text) || is_clarification_reply)
+        let is_follow_up = is_resumable_follow_up(&input_text);
+        let is_clarification_reply = !is_follow_up && awaiting_clarification(&history);
+        let resume = (is_follow_up || is_clarification_reply)
             .then(|| latest_resumable_task(&history))
             .flatten();
         let task_text = match (resume.as_ref(), is_clarification_reply) {
@@ -465,7 +491,10 @@ impl AgentLoop {
         let mut goal_execution = match injected_goal {
             // 注入路径（并发执行器 e2e 等）：直接使用调用方构造的执行体，
             // 不再从草图现建——调用方已保证与 contract 一致。
-            Some(g) => g,
+            Some(mut g) => {
+                g.confirm_injected_targets();
+                g
+            }
             // 默认路径：本地确定性草图回灌同一套 schema 校验门（LLM 可用时其 JSON 覆盖）。
             None => {
                 let mut ge = GoalExecution::from_input_with_sketch(
@@ -505,9 +534,15 @@ impl AgentLoop {
         let workspace_root = ctx
             .try_get::<harness_core::Workspace>()
             .map(|workspace| workspace.root());
-        let workspace_index = (!goal_execution.goal.candidates.is_empty()
-            || !goal_execution.goal.code_entities.is_empty()
-            || goal_execution.goal.transformation.is_some())
+        // 精确旧值不需要先为最多 320 个源码文件构建候选词索引。直接执行字面量
+        // 快速定位；只有没有旧值可搜的开放描述才支付 L1/L2 工作区裁决成本。
+        let exact_literal_grounding = workspace_root.as_ref().and_then(|root| {
+            WorkspaceGrounder::ground_exact_literal(root, &goal_execution.goal)
+        });
+        let workspace_index = (exact_literal_grounding.is_none()
+            && (!goal_execution.goal.candidates.is_empty()
+                || !goal_execution.goal.code_entities.is_empty()
+                || goal_execution.goal.transformation.is_some()))
         .then(|| {
             workspace_root
                 .as_ref()
@@ -524,7 +559,10 @@ impl AgentLoop {
         // 三处门禁的 ask_user_permitted 直接返回 true，旧行为逐字保持。
         let case_file = CaseFile::from_replay(&history);
         let read_only = matches!(intent.kind, crate::IntentKind::Investigation);
-        let grounded = workspace_index.is_some() && goal_execution.goal.has_locatable_signal();
+        let grounded = exact_literal_grounding
+            .as_ref()
+            .is_some_and(|grounding| !grounding.literal_hits.is_empty())
+            || (workspace_index.is_some() && goal_execution.goal.has_locatable_signal());
         let mut governor = (self.governor == GovernorMode::On)
             .then(|| TurnGovernor::new(&case_file, grounded, read_only));
 
@@ -579,9 +617,11 @@ impl AgentLoop {
         }
 
         // 复用上面已经建好的索引做扫描，避免把工作区读第二遍。
-        let workspace_grounding = workspace_index
-            .as_ref()
-            .map(|index| WorkspaceGrounder::ground_with(index, &goal_execution.goal));
+        let workspace_grounding = exact_literal_grounding.or_else(|| {
+            workspace_index
+                .as_ref()
+                .map(|index| WorkspaceGrounder::ground_with(index, &goal_execution.goal))
+        });
         if let Some(grounding) = &workspace_grounding {
             goal_execution.apply_grounding(grounding);
         }
@@ -635,10 +675,19 @@ impl AgentLoop {
             let _ = index.save(root);
         }
 
-        // 仅将含有明确代码实体（如 appCode）的请求作为硬确认门禁。普通自然语言
-        // 问题仍进入精准定位流程，避免把“未命中名称”误判为无法执行。
+        // 仅将含有明确代码实体（如 appCode）或明确旧值的请求作为硬确认门禁。
+        // 普通自然语言问题仍进入精准定位流程，避免把“未命中名称”误判为无法执行；
+        // 但用户逐字给出的旧值完整扫描仍缺席时，再搜索同义词只会偏离目标。
         if let Some(grounding) = &workspace_grounding {
-            if !goal_execution.goal.code_entities.is_empty() && grounding.needs_user_input() {
+            let has_exact_old_value = goal_execution
+                .goal
+                .transformation
+                .as_ref()
+                .and_then(|value| value.from_value.as_deref())
+                .is_some();
+            if (!goal_execution.goal.code_entities.is_empty() || has_exact_old_value)
+                && grounding.needs_user_input()
+            {
                 let question = with_candidates(
                     &grounding.user_question(&goal_execution.goal),
                     &goal_execution.goal,
@@ -863,14 +912,16 @@ impl AgentLoop {
         let mut final_window_armed = false;
         // 上游可能正常结束却没有正文/工具调用（例如网关截断、reasoning-only 帧）。
         // 这不是完成；允许有限恢复重试，避免把占位文本污染会话上下文。
-        const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
+        // 首次空响应后改用最小检查点重试一次。没有备用 Provider 可切换时，继续把
+        // 同一目标请求第三遍只会制造截图中的“连续 3 次空响应”伪熔断。
+        const MAX_EMPTY_RESPONSE_RETRIES: usize = 1;
 
         /// Fix1：硬熔断自动续跑硬上限，超过则强制交回用户，防止失控。
         const MAX_HARD_AUTORENEWS: u32 = 8;
         /// 单个用户请求内的 prompt 窗口续期上限；每次续期仍受 300k 窗口边界约束。
         const MAX_PROMPT_AUTORENEWS: u32 = 4;
         let mut empty_response_retries = 0usize;
-        let mut length_recovery_pending = false;
+        let mut empty_recovery_pending = false;
         while debt > 0 {
             // R3 前置：本执行回合到顶后暂停，不再向模型发请求。下一条用户消息会新建
             // 回合预算，并通过 resume 断点继续；历史成本只做审计，不会把会话永久锁死。
@@ -1002,10 +1053,10 @@ impl AgentLoop {
             };
             let request_options = if execution.solve_mode
                 == crate::execution::SolveMode::AtomicDelivery
-                || length_recovery_pending
+                || empty_recovery_pending
             {
                 RequestOptions {
-                    max_output_tokens: Some(if length_recovery_pending {
+                    max_output_tokens: Some(if empty_recovery_pending {
                         1_024
                     } else {
                         1_536
@@ -1254,10 +1305,7 @@ impl AgentLoop {
                         });
                     }
 
-                    if !locate_step_gate.allows(
-                        execution.solve_mode != crate::execution::SolveMode::OpenEnded,
-                        &sig,
-                    ) {
+                    if !locate_step_gate.allows(true, &sig) {
                         let blocked = ToolResult {
                                 call_id: tc.id.clone(),
                                 ok: false,
@@ -1574,10 +1622,12 @@ impl AgentLoop {
                 }
             }
             let mut claim_recovery_requested = false;
+            let completion_ready = execution.can_complete() && goal_execution.can_conclude();
             if let Some(correction) = unsupported_runtime_claim_correction(
                 &assistant_text,
                 controlled_delivery || execution.write_attempts > 0,
                 execution.write_operations,
+                completion_ready,
                 sandbox_denial_observed,
                 access_denial_observed,
             ) {
@@ -1617,7 +1667,7 @@ impl AgentLoop {
                 });
             }
             if !should_recover_empty {
-                length_recovery_pending = false;
+                empty_recovery_pending = false;
                 messages.insert(
                     messages.len().saturating_sub(assistant_tools.len()),
                     Message::assistant_with_tools_and_reasoning(
@@ -1636,30 +1686,21 @@ impl AgentLoop {
             // tool_call 缺对应 tool 消息，续跑必 400。
             if should_recover_empty && !hard_stop {
                 let reason = empty_response_reason.as_deref().unwrap_or("unknown");
-                // `length` 不是普通空响应：完整历史重试只会进一步扩大请求。改为
-                // 紧凑检查点 + 一次短恢复，让模型直接收敛到下一步或最终结论。
-                let retry_limit = if reason == "length" {
-                    1
-                } else {
-                    MAX_EMPTY_RESPONSE_RETRIES
-                };
+                // 任意 finish_reason 的空响应都不能原样重试。`stop` 同样可能来自网关
+                // 截断或上下文污染；继续携带完整历史只会稳定复现同一个空结果。
+                let retry_limit = MAX_EMPTY_RESPONSE_RETRIES;
                 if empty_response_retries < retry_limit {
                     empty_response_retries += 1;
                     debt += 1;
-                    if reason == "length" {
-                        // 原实现保留所有系统消息再追加 checkpoint；技能、事实和契约叠加后
-                        // 仍可能超上下文。恢复请求只保留可执行的当前任务快照。
-                        messages.clear();
-                        messages.push(Message::system(format!(
-                            "[长度恢复·最小快照]\n{}\n只允许：输出一个下一步工具调用，或给出含阻塞原因的最终结论；禁止重新规划、泛搜和复述历史。",
-                            execution.compact_checkpoint()
-                        )));
-                        messages.push(Message::user(&input_text));
-                        length_recovery_pending = true;
-                    }
-                    messages.push(Message::user(format!(
-                        "[恢复请求] 上一次模型响应为空（finish_reason={reason}），没有生成正文或工具调用；这不代表任务完成。请基于现有上下文继续：若需要信息或执行操作，调用恰当工具；否则给出可验证的完整答复。不要只输出思考过程。自动重试第 {empty_response_retries}/{retry_limit} 次。"
-                    )));
+                    messages = compact_for_empty_recovery(
+                        messages,
+                        &execution.compact_checkpoint(),
+                        &goal_execution.render_for_model(),
+                        reason,
+                        empty_response_retries,
+                        retry_limit,
+                    );
+                    empty_recovery_pending = true;
                 } else {
                     log.append(SessionEvent::Assistant {
                         id: log.gen_id(),
@@ -1822,8 +1863,16 @@ impl AgentLoop {
                     "llm provider error（流读取已终止，未获有效模型回答）: {provider_error_summary}"
                 )),
             )
-        } else if delivery_verified {
+        } else if delivery_verified && execution.can_complete() {
             (harness_session::DeliveryOutcome::Verified, None)
+        } else if delivery_verified {
+            (
+                harness_session::DeliveryOutcome::PartialDelivery,
+                Some(
+                    "求解图已到终态，但执行证据没有覆盖全部验收项；已拒绝 Verified"
+                        .into(),
+                ),
+            )
         } else if terminal_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("需要用户确认"))
@@ -2502,6 +2551,38 @@ fn compact_for_prompt_renewal(
     compacted
 }
 
+/// 空响应恢复与普通预算续期不同：它必须把导致空响应的对话/工具历史全部移除，
+/// 但保留本回合系统约束、目标图和运行时检查点。这样重试请求在语义上连续，字节上
+/// 却不是原请求重放；已有写入与证据也不会丢失或被重复执行。
+fn compact_for_empty_recovery(
+    messages: Vec<Message>,
+    checkpoint: &str,
+    goal_state: &str,
+    reason: &str,
+    attempt: usize,
+    max_attempts: usize,
+) -> Vec<Message> {
+    let mut seen = HashSet::new();
+    let mut compacted = messages
+        .into_iter()
+        .filter(|message| {
+            message.role == Role::System
+                && !message.content.starts_with("[较早会话已按上下文预算压缩")
+                && !message.content.starts_with("[预算窗口续期")
+                && !message.content.starts_with("[空响应恢复")
+                && !message.content.starts_with("[V4 唯一目标求解图")
+        })
+        .filter(|message| seen.insert(message.content.clone()))
+        .collect::<Vec<_>>();
+    compacted.push(Message::system(format!(
+        "[空响应恢复 {attempt}/{max_attempts}·最小快照]\nfinish_reason={reason}\n{checkpoint}\n{goal_state}\n旧对话与工具原文已移除，运行时记录的证据和阶段仍有效。禁止重新规划、重复搜索或扩大范围。"
+    )));
+    compacted.push(Message::user(
+        "继续当前唯一下一动作：需要执行时只返回一个当前阶段允许的工具调用；证据已经充分时给出简短、可验证的最终答复。不得只输出思考过程。",
+    ));
+    compacted
+}
+
 fn message_chars(message: &Message) -> usize {
     message.content.chars().count()
         + message
@@ -2527,6 +2608,7 @@ fn unsupported_runtime_claim_correction(
     text: &str,
     change_required: bool,
     write_operations: usize,
+    completion_ready: bool,
     sandbox_denial_observed: bool,
     access_denial_observed: bool,
 ) -> Option<String> {
@@ -2565,8 +2647,14 @@ fn unsupported_runtime_claim_correction(
             "没有任何带 [access-policy denied] 标签的工具结果，不能归因为访问权限拒绝",
         );
     }
-    if change_required && claims_change_applied && write_operations == 0 {
-        facts.push("当前成功写操作计数为 0，不能声称修改已经落实或代码已经落盘");
+    if change_required && claims_change_applied {
+        if write_operations == 0 {
+            facts.push("当前成功写操作计数为 0，不能声称修改已经落实或代码已经落盘");
+        } else if !completion_ready {
+            facts.push(
+                "虽然已有部分写操作，但全部验收项尚未完成并验证，不能声称整个任务已完成",
+            );
+        }
     }
     (!facts.is_empty()).then(|| facts.join("；"))
 }
@@ -2974,6 +3062,39 @@ mod tests {
     }
 
     #[test]
+    fn empty_recovery_replaces_the_failed_prompt_with_one_resumable_snapshot() {
+        let messages = vec![
+            Message::system("system-contract"),
+            Message::system("[V4 唯一目标求解图]\n旧状态"),
+            Message::user("old request"),
+            Message::assistant("old answer"),
+            Message::tool("call-1", "very large tool result"),
+        ];
+        let compacted = compact_for_empty_recovery(
+            messages,
+            "目标：修改菜单文字\n下一步：读取 composer.rs",
+            "[V4 唯一目标求解图]\n新状态",
+            "stop",
+            1,
+            1,
+        );
+        assert!(compacted.iter().all(|message| message.role != Role::Tool));
+        assert!(compacted
+            .iter()
+            .all(|message| !message.content.contains("old answer")));
+        assert!(compacted
+            .iter()
+            .all(|message| !message.content.contains("旧状态")));
+        let snapshot = compacted
+            .iter()
+            .find(|message| message.content.contains("[空响应恢复 1/1·最小快照]"))
+            .expect("应生成一次最小恢复快照");
+        assert!(snapshot.content.contains("finish_reason=stop"));
+        assert!(snapshot.content.contains("读取 composer.rs"));
+        assert!(snapshot.content.contains("新状态"));
+    }
+
+    #[test]
     fn tool_errors_keep_sandbox_and_io_provenance_distinct() {
         let sandbox = format_tool_dispatch_error(harness_core::Error::SandboxDenied(
             "path is outside workspace".into(),
@@ -2996,6 +3117,7 @@ mod tests {
             0,
             false,
             false,
+            false,
         )
         .expect("无证据沙箱归因和零写入完成声明都必须被拦截");
         assert!(correction.contains("不能归因为沙箱拦截"), "{correction}");
@@ -3005,6 +3127,7 @@ mod tests {
             "沙箱明确拒绝了写入，但修改随后已经落实。",
             true,
             1,
+            true,
             true,
             false,
         )
@@ -3016,9 +3139,21 @@ mod tests {
             0,
             false,
             false,
+            false,
         )
         .expect("‘已完成某项修改’也必须要求成功写操作");
         assert!(correction.contains("成功写操作计数为 0"), "{correction}");
+
+        let correction = unsupported_runtime_claim_correction(
+            "代码已经写入，任务已完成。",
+            true,
+            1,
+            false,
+            false,
+            false,
+        )
+        .expect("只有部分写入、验收未闭环时不得宣布完成");
+        assert!(correction.contains("全部验收项尚未完成"), "{correction}");
     }
 
     #[test]
@@ -3126,6 +3261,47 @@ mod tests {
             ["migration test passed again"]
         );
         assert!(resume_instruction(&resumed).contains("不要重新创建计划"));
+    }
+
+    #[test]
+    fn execution_correction_recovers_the_original_unfinished_goal() {
+        let incomplete = || DeliveryReport {
+            outcome: DeliveryOutcome::PartialDelivery,
+            criteria: vec![harness_session::DeliveryCriterion {
+                id: "user-objective".into(),
+                description: "文件树右键把文件加入附件".into(),
+                satisfied: false,
+                evidence: vec![],
+            }],
+            verification: vec![],
+            reason: Some("尚未写入".into()),
+        };
+        let events = vec![
+            SessionEvent::TurnStart {
+                id: 1,
+                input: "增加文件树右键菜单，把选定文件添加到对话框附件".into(),
+            },
+            SessionEvent::Delivery {
+                id: 2,
+                report: incomplete(),
+            },
+            SessionEvent::TurnEnd { id: 3 },
+            SessionEvent::TurnStart {
+                id: 4,
+                input: "你只是列出来怎么修改，但是没有落实到真正的改动".into(),
+            },
+            SessionEvent::Delivery {
+                id: 5,
+                report: incomplete(),
+            },
+        ];
+
+        assert!(is_resumable_follow_up("我提供不了，你自己执行修改。"));
+        let resumed = latest_resumable_task(&events).expect("should recover original goal");
+        assert_eq!(
+            resumed.objective,
+            "增加文件树右键菜单，把选定文件添加到对话框附件"
+        );
     }
 
     #[test]

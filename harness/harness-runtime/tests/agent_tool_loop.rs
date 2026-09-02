@@ -143,6 +143,7 @@ fn scripted_call(id: &str, name: &str, args: serde_json::Value) -> Option<ToolCa
 struct EmptyThenTextLlm {
     calls: AtomicUsize,
     requests: Mutex<Vec<Vec<Message>>>,
+    finish_reason: &'static str,
 }
 
 struct ToolCallsWithoutPayloadLlm {
@@ -328,7 +329,7 @@ impl LlmProvider for EmptyThenTextLlm {
         let chunk = if call == 0 {
             Chunk {
                 empty_response: true,
-                finish_reason: Some("length".into()),
+                finish_reason: Some(self.finish_reason.into()),
                 ..Default::default()
             }
         } else {
@@ -393,6 +394,9 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
     let llm = Arc::new(EmptyThenTextLlm {
         calls: AtomicUsize::new(0),
         requests: Mutex::new(vec![]),
+        // 截图中的真实故障是 finish_reason=stop。它也必须换成紧凑检查点，
+        // 不能只有 length 才压缩后重试。
+        finish_reason: "stop",
     });
     let hook: Arc<dyn Hook> = Arc::new(AllowHook);
     let mut registrations = vec![];
@@ -417,7 +421,10 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
     assert_eq!(requests.len(), 2);
     assert!(requests[1]
         .iter()
-        .any(|message| message.content.contains("[恢复请求]")));
+        .any(|message| message.content.contains("[空响应恢复 1/1·最小快照]")));
+    assert!(requests[1]
+        .iter()
+        .all(|message| message.role != harness_llm::Role::Tool));
     let events = log.replay();
     assert!(events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("恢复后的完整答复"))));
     assert!(!events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref().is_some_and(|text| text.contains("返回了空内容")))));
@@ -680,6 +687,62 @@ async fn concrete_problem_replay_starts_with_locate_not_shell_verification() {
                 && telemetry.phase == "locate"
                 && telemetry.allowed_tools == vec!["search"]
     )));
+}
+
+#[tokio::test]
+async fn quoted_menu_shortening_starts_from_the_grounded_file_not_repository_search() {
+    let root = std::env::temp_dir().join(format!(
+        "harness-quoted-menu-grounding-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/composer.rs"),
+        "ui.button(\"添加到对话框附件\");",
+    )
+    .unwrap();
+
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(OptionsCaptureLlm {
+        options: Mutex::new(vec![]),
+    });
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(ToolRegistry::new());
+    let _d = ctx.provide(hook);
+    let _e = ctx.provide(harness_core::Workspace::new(root.clone()));
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "弹出菜单应包含“📎 添加到对话框附件”，文字精简一下，“添加到对话”"
+                    .into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let options = llm.options.lock().unwrap();
+    assert!(!options.is_empty());
+    assert_eq!(
+        options[0].allowed_tools.as_deref(),
+        Some(["fs".into(), "search".into()].as_slice()),
+        "运行时已从旧文案直接落到 composer.rs，首步应读取候选而非从仓库根搜索"
+    );
+    assert_eq!(options[0].reasoning_effort.as_deref(), Some("none"));
+    assert!(log.replay().iter().any(|event| matches!(event,
+        SessionEvent::Telemetry { telemetry, .. }
+            if telemetry.intent == "AtomicRegression"
+                && telemetry.phase == "inspect"
+                && telemetry.active_work_item.contains("添加到对话")
+    )));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

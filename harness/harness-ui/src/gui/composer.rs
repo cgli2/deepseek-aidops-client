@@ -863,7 +863,7 @@ fn native_paste_shortcut_pressed() -> bool {
     false
 }
 
-fn add_attachment(state: &mut AppState, path: std::path::PathBuf) {
+pub(super) fn add_attachment(state: &mut AppState, path: std::path::PathBuf) {
     if state
         .attachments
         .iter()

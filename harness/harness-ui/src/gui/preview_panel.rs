@@ -716,6 +716,7 @@ impl AppState {
                     } else if let Some(root) = &self.tree_root.clone() {
                         let mut clicked_path: Option<String> = None;
                         let mut toggle_path: Option<String> = None;
+                        let mut attachment_path: Option<String> = None;
                         self.render_tree_node(
                             ui,
                             root,
@@ -723,6 +724,7 @@ impl AppState {
                             pal,
                             &mut clicked_path,
                             &mut toggle_path,
+                            &mut attachment_path,
                         );
                         if let Some(path) = clicked_path {
                             self.pending_preview = Some(path);
@@ -735,6 +737,16 @@ impl AppState {
                                 // 懒加载子节点
                                 self.expand_tree_node();
                             }
+                        }
+                        if let Some(path) = attachment_path {
+                            let absolute = tree_attachment_path(&self.active_workspace_root(), &path);
+                            let display_name = absolute
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("文件")
+                                .to_string();
+                            super::composer::add_attachment(self, absolute);
+                            self.note = format!("已添加附件：{display_name}");
                         }
                     } else {
                         ui.add_space(20.0);
@@ -861,6 +873,7 @@ impl AppState {
         pal: &Palette,
         clicked_path: &mut Option<String>,
         toggle_path: &mut Option<String>,
+        attachment_path: &mut Option<String>,
     ) {
         let row_h = 24.0;
         let indent = depth as f32 * 14.0;
@@ -963,7 +976,15 @@ impl AppState {
             }
             if expanded {
                 for child in &node.children {
-                    self.render_tree_node(ui, child, depth + 1, pal, clicked_path, toggle_path);
+                    self.render_tree_node(
+                        ui,
+                        child,
+                        depth + 1,
+                        pal,
+                        clicked_path,
+                        toggle_path,
+                        attachment_path,
+                    );
                 }
             }
         } else {
@@ -982,6 +1003,12 @@ impl AppState {
             if resp.clicked() {
                 *clicked_path = Some(node.path.clone());
             }
+            resp.context_menu(|ui| {
+                if ui.button("📎 添加到对话框附件").clicked() {
+                    *attachment_path = Some(node.path.clone());
+                    ui.close_menu();
+                }
+            });
         }
     }
 
@@ -1004,6 +1031,15 @@ impl AppState {
     pub(super) fn tree_needs_reload(&self) -> bool {
         let active = self.active_workspace_root();
         self.tree_root.is_none() || !same_workspace(&self.tree_workspace, &active)
+    }
+}
+
+fn tree_attachment_path(workspace_root: &str, node_path: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(node_path);
+    if path.is_absolute() {
+        path
+    } else {
+        std::path::Path::new(workspace_root).join(path)
     }
 }
 
@@ -1094,7 +1130,16 @@ async fn list_dir_recursive(
 
 #[cfg(test)]
 mod tests {
-    use super::same_workspace;
+    use super::{same_workspace, tree_attachment_path};
+
+    #[test]
+    fn tree_attachment_uses_the_active_workspace_for_relative_nodes() {
+        let path = tree_attachment_path("C:/workspace/project-a", "src/main.rs");
+        assert_eq!(
+            path,
+            std::path::Path::new("C:/workspace/project-a").join("src/main.rs")
+        );
+    }
 
     #[test]
     fn workspace_identity_normalizes_separators_and_trailing_slashes() {

@@ -9,6 +9,48 @@ use crate::intent::{IntentKind, IntentProfile};
 use harness_llm::ToolCall;
 use harness_session::{DeliveryCriterion, DeliveryOutcome, DeliveryReport};
 
+/// 判断 edit 是否真正改变了非注释产物。它不是完整语法分析器，只负责挡住最危险的
+/// 假绿：在任意源码文件里加一行注释来满足“发生过写入”的计数。无法解析或整文件
+/// 写入时保守视为实质变更，避免误伤未知工具 schema。
+pub(crate) fn edit_has_substantive_delta(signature: &str) -> bool {
+    let Some(raw) = signature.strip_prefix("edit:") else {
+        return true;
+    };
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return true;
+    };
+    let (Some(old_text), Some(new_text)) = (
+        args.get("old_text").and_then(|value| value.as_str()),
+        args.get("new_text").and_then(|value| value.as_str()),
+    ) else {
+        return true;
+    };
+    fn without_comment_only_lines(value: &str) -> String {
+        value
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.is_empty()
+                    && !line.starts_with("//")
+                    && !line.starts_with('#')
+                    && !line.starts_with("/*")
+                    && !line.starts_with('*')
+                    && !line.starts_with("<!--")
+                    && !line.starts_with("-->")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    without_comment_only_lines(old_text) != without_comment_only_lines(new_text)
+}
+
+fn objective_allows_comment_only_change(objective: &str) -> bool {
+    let lower = objective.to_lowercase();
+    ["注释", "文档", "说明文字", "readme", "markdown", "doc comment"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyKind {
     Direct,
@@ -31,7 +73,56 @@ pub enum SolveMode {
     GuidedInvestigation,
     FastDiagnosis,
     ScopedDelivery,
+    /// 多交付面或高风险目标：按独立验收面分阶段推进，每个阶段形成可恢复检查点。
+    StagedDelivery,
     OpenEnded,
+}
+
+/// 任务形状只使用契约中已经存在的结构化事实，不用业务词表猜“这是不是大任务”。
+/// 它决定规划展开到哪一层：精确变换直达下一动作；多验收面/高风险才展开阶段图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskClarity {
+    Exact,
+    Groundable,
+    Discovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskScale {
+    Atomic,
+    Scoped,
+    Staged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskShape {
+    pub clarity: TaskClarity,
+    pub scale: TaskScale,
+}
+
+impl TaskShape {
+    pub fn for_contract(contract: &TaskContract) -> Self {
+        let intent = IntentProfile::compile(&contract.objective);
+        let clarity = if intent.has_transformation_contract || intent.has_structural_action {
+            TaskClarity::Exact
+        } else if intent.has_code_entity || intent.navigation_present {
+            TaskClarity::Groundable
+        } else {
+            TaskClarity::Discovery
+        };
+        let scale = if clarity == TaskClarity::Exact
+            && contract.risk != RiskLevel::High
+            && contract.acceptance_criteria.len() == 1
+            && contract.objective.chars().count() <= 500
+        {
+            TaskScale::Atomic
+        } else if contract.risk == RiskLevel::High || contract.acceptance_criteria.len() > 1 {
+            TaskScale::Staged
+        } else {
+            TaskScale::Scoped
+        };
+        Self { clarity, scale }
+    }
 }
 
 /// 工具调用的运行时阶段。它是实际执行状态的投影，不接受模型的计划文本推动。
@@ -73,11 +164,10 @@ impl SolvePlan {
     pub fn for_contract(contract: &TaskContract, strategy: StrategyKind) -> Self {
         let text = contract.objective.as_str();
         let intent = IntentProfile::compile(text);
+        let shape = TaskShape::for_contract(contract);
         // 交付面数量由验收项（契约真实单元）给出，而非机制层词表数 UI 名词。
         let extra_surfaces = contract.acceptance_criteria.len().saturating_sub(1).min(4);
-        let is_atomic_regression = contract.risk != RiskLevel::High
-            && contract.acceptance_criteria.len() == 1
-            && text.chars().count() <= 500
+        let is_atomic_regression = shape.scale == TaskScale::Atomic
             && intent.kind == IntentKind::AtomicRegression;
         if is_atomic_regression
             && !matches!(
@@ -125,6 +215,28 @@ impl SolvePlan {
                 instructions: "[受控诊断模式] 这是只读诊断请求。先执行一个能区分假设的高信号定位；命中后只读取最短调用链并给出有证据的根因。禁止编辑、委派、目录泛扫和无证据结论；连续两个动作无信息时停止并提出精确问题。".into(),
             };
         }
+        if shape.scale == TaskScale::Staged
+            && matches!(
+                strategy,
+                StrategyKind::Transformative
+                    | StrategyKind::Verification
+                    | StrategyKind::Generative
+            )
+        {
+            let surfaces = contract.acceptance_criteria.len().max(1);
+            return Self {
+                mode: SolveMode::StagedDelivery,
+                // 首窗口只需要完成“共同定位 + 第一个纵向切片”；完整额度随后仍由
+                // GoalExecution 的逐面预算供给，避免大目标一开始就灌满上下文。
+                initial_steps: 10 + extra_surfaces,
+                initial_tool_calls: 12 + extra_surfaces * 2,
+                hard_max_steps: 20 + extra_surfaces * 2,
+                hard_max_tool_calls: 24 + extra_surfaces * 3,
+                instructions: format!(
+                    "[分阶段交付模式] 该目标包含 {surfaces} 个独立验收面或高风险边界。先建立共享入口与依赖关系，只展开当前可闭环的最小纵向切片；每个切片严格执行 Locate → Inspect → Change → Verify，验证后形成检查点再推进下一面。不得同时研究所有模块、不得用全仓扫描代替依赖判断，也不得因第一个面完成而提前交付。遇到会改变产品行为、兼容性或数据边界的歧义时，保留已确认事实并只提出一个决策问题。"
+                ),
+            };
+        }
         if matches!(
             strategy,
             StrategyKind::Transformative | StrategyKind::Verification
@@ -160,7 +272,7 @@ impl SolvePlan {
             initial_tool_calls: 32,
             hard_max_steps: 36,
             hard_max_tool_calls: 48,
-            instructions: "[探索模式] 先列出可验证假设并按信息增益选择下一步；每个阶段结束时压缩已确认事实，避免重复探索。".into(),
+            instructions: "[渐进探索模式] 当前请求尚未形成精确变换或稳定交付边界。先分离已知事实、可由工作区验证的未知项、以及只有用户能决定的语义；按概率和成本排列有限假设，每次只执行一个能改变下一步决策的高信息增益动作。最多完成一轮受限定位后重新评估：证据足以推出可观察终态则收敛为范围受限交付；不同解释会改变产品行为、兼容性或数据边界时，只提出一个带证据的决策问题。禁止用全仓扫描掩盖目标不清，也禁止在验收条件未形成前进行大面积写入。".into(),
         }
     }
 }
@@ -196,6 +308,7 @@ impl TaskContract {
     /// 但 Runtime 始终至少拥有一个可判定的交付标准。
     pub fn from_input(input: &str) -> Self {
         let objective = input.trim().to_string();
+        let exact_transformation = crate::goal_execution::extract_exact_transformation(input);
         let listed_items: Vec<String> = input
             .lines()
             .filter_map(|line| {
@@ -241,6 +354,9 @@ impl TaskContract {
                 constraints.push(format!("遵守用户包含“{marker}”的范围约束"));
             }
         }
+        if exact_transformation.is_some() {
+            constraints.push("只改变目标值，保持周边行为与调用关系不变".into());
+        }
         // 风险分级（取证修正）：“删除”常作为功能描述出现（如“导入、删除、启用、
         // 禁用”），单独出现不应升级为 High；High 仅限真正危险的变更面。
         let risk = if ["生产", "部署", "权限", "凭据", "数据库"]
@@ -279,10 +395,27 @@ impl TaskContract {
                     description,
                 })
                 .collect()
+        } else if let Some(transformation) = &exact_transformation {
+            let from = transformation
+                .from_value
+                .as_deref()
+                .map(|value| format!("「{value}」"))
+                .unwrap_or_else(|| "目标位置当前值".into());
+            vec![Criterion {
+                // 保持单交付面稳定 id，避免已有工具调用/续跑报告因描述细化而失联。
+                id: "user-objective".into(),
+                description: format!(
+                    "将 {from} 精确变更为「{}」，且不改变周边行为",
+                    transformation.to_value
+                ),
+            }]
         } else {
             vec![Criterion {
                 id: "user-objective".into(),
-                description: "用户要求的交付物已完成并经过与风险相称的验证".into(),
+                // 验收项必须保留用户真正要求的可观察结果。旧的通用占位语句让
+                // 任意成功 edit + cargo check 都能被映射到同一个空洞 criterion，
+                // 最终出现“改了无关文件但 Verified”的假绿。
+                description: format!("完成用户目标并验证可观察结果：{objective}"),
             }]
         };
         Self {
@@ -298,14 +431,17 @@ impl TaskContract {
     }
 
     pub fn render_for_model(&self, strategy: StrategyKind, budget: &Budget) -> String {
+        let shape = TaskShape::for_contract(self);
         let constraints = if self.constraints.is_empty() {
             "无额外显式约束".to_string()
         } else {
             self.constraints.join("；")
         };
         format!(
-            "[本回合执行契约]\n目标：{}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期（最多续期 {} 次，用尽后必须基于现有证据收尾）。执行准则：最小路径优先——先直接定位与目标直接相关的最小文件集，禁止全仓库泛扫与重复读取已读文件；每次探索必须消除具体不确定性或决定下一步，范围明确的小任务在首次定位后转入修改与验证，范围未知或调查型任务可保留必要取证；多项任务中每次工具调用只推进当前未满足的一项验收，验证证据也只计入该项；同一工具调用未带来新信息时立即换路或收尾；交付目标达成即停止，不做重复确认与打磨。",
+            "[本回合执行契约]\n目标：{}\n任务形状：清晰度={:?}，规模={:?}\n策略：{:?}\n验收：{}\n约束：{}\n进展检查点：每 {} 个步骤或 {} 次工具调用评估一次并按需续期（最多续期 {} 次，用尽后必须基于现有证据收尾）。执行准则：最小路径优先——先直接定位与目标直接相关的最小文件集，禁止全仓库泛扫与重复读取已读文件；每次探索必须消除具体不确定性或决定下一步，范围明确的小任务在首次定位后转入修改与验证，范围未知或调查型任务可保留必要取证；多项任务中每次工具调用只推进当前未满足的一项验收，验证证据也只计入该项；同一工具调用未带来新信息时立即换路或收尾；交付目标达成即停止，不做重复确认与打磨。",
             self.objective,
+            shape.clarity,
+            shape.scale,
             strategy,
             self.acceptance_criteria
                 .iter()
@@ -401,13 +537,16 @@ impl ExecutionState {
         // 不能把“零写入”洗成已交付。
         let is_write = proposal.signature.starts_with("edit:")
             || proposal.signature.contains("\"op\":\"write\"");
+        let substantive_write = !is_write
+            || edit_has_substantive_delta(&proposal.signature)
+            || objective_allows_comment_only_change(&self.contract.objective);
         if is_write {
             self.write_attempts += 1;
         }
         if effective_ok {
             self.successful_tool_results += 1;
             // 归一化签名里 edit 工具以 "edit:" 开头；fs 写入的 JSON 参数含 "op":"write"。
-            if is_write {
+            if is_write && substantive_write {
                 self.write_operations += 1;
                 self.changed_criteria
                     .extend(proposal.supports.iter().cloned());
@@ -473,7 +612,10 @@ impl ExecutionState {
             return ToolPhase::Verify;
         }
         match self.solve_mode {
-            SolveMode::AtomicDelivery | SolveMode::ScopedDelivery | SolveMode::FastDiagnosis => {
+            SolveMode::AtomicDelivery
+            | SolveMode::ScopedDelivery
+            | SolveMode::StagedDelivery
+            | SolveMode::FastDiagnosis => {
                 if self.write_operations > 0 {
                     let all_change_surfaces_written = self
                         .contract
@@ -593,6 +735,23 @@ impl ExecutionState {
         outcome: DeliveryOutcome,
         reason: Option<String>,
     ) -> DeliveryReport {
+        // `GoalExecution` 与 `ExecutionState` 是两套互相校验的投影。任何一侧没有
+        // 满足验收，都不能输出 outcome=Verified、criterion.satisfied=false 的
+        // 自相矛盾报告。这里作为最终落盘前的 fail-closed 防线。
+        let inconsistent_verified = outcome == DeliveryOutcome::Verified && !self.can_complete();
+        let outcome = if inconsistent_verified {
+            DeliveryOutcome::PartialDelivery
+        } else {
+            outcome
+        };
+        let reason = if inconsistent_verified {
+            Some(
+                "求解图声称完成，但执行证据未覆盖全部验收项；已拒绝 Verified，任务仍未完成"
+                    .into(),
+            )
+        } else {
+            reason
+        };
         let read_only_verified = outcome == DeliveryOutcome::Verified
             && !self.requires_verification()
             && self.can_complete();
@@ -1132,6 +1291,24 @@ impl ActionGate {
                 budget.hard_max_tool_calls
             ));
         }
+        // 开放式请求也只获得一轮有界发现窗口。SearchTool 自身已经按
+        // dir → crate → workspace 扩展作用域；连续换关键词超过三次不再增加合理的
+        // 定位覆盖，只会把“不清晰”伪装成“还没搜够”。此时必须基于已有证据收敛
+        // 目标或提出一个决策问题。
+        if state.solve_mode == SolveMode::OpenEnded
+            && proposal.signature.starts_with("search:")
+            && state
+                .evidence
+                .keys()
+                .filter(|signature| signature.starts_with("search:"))
+                .count()
+                >= 3
+        {
+            return GateDecision::Deny(
+                "渐进探索最多允许三条独立搜索证据；请停止换关键词，基于现有结果收敛为具体目标，或提出一个会改变实现方向的决策问题"
+                    .into(),
+            );
+        }
         // V4 的阶段、搜索锚点和 AlreadySatisfied 语义全部由 SolveGraph 判定。
         // 这些旧原子规则仅服务 authorize() 的 legacy 路径，避免第二状态机否决
         // SolveGraph 已经授权的验证或局部假设切换。
@@ -1292,6 +1469,17 @@ mod tests {
     }
 
     #[test]
+    fn generic_acceptance_criterion_preserves_the_observable_user_goal() {
+        let objective = "文件树右键可以把选定文件添加到对话框附件";
+        let contract = TaskContract::from_input(objective);
+        assert!(contract.acceptance_criteria[0].description.contains(objective));
+        assert_ne!(
+            contract.acceptance_criteria[0].description,
+            "用户要求的交付物已完成并经过与风险相称的验证"
+        );
+    }
+
+    #[test]
     fn diagnosis_uses_a_bounded_read_only_solve_mode() {
         let contract = TaskContract::from_input("为什么会话窗口里的短文本自动换行？请分析根因");
         let strategy = GeneralDomainPolicy.select_strategy(&contract);
@@ -1360,6 +1548,30 @@ mod tests {
     }
 
     #[test]
+    fn quoted_shortening_gets_an_exact_acceptance_contract() {
+        let contract = TaskContract::from_input(
+            "弹出菜单应包含“📎 添加到对话框附件”，文字精简一下，“添加到对话”",
+        );
+        let shape = TaskShape::for_contract(&contract);
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
+
+        assert_eq!(shape.clarity, TaskClarity::Exact);
+        assert_eq!(shape.scale, TaskScale::Atomic);
+        assert_eq!(plan.mode, SolveMode::AtomicDelivery);
+        assert_eq!(contract.acceptance_criteria[0].id, "user-objective");
+        assert!(contract.acceptance_criteria[0]
+            .description
+            .contains("添加到对话框附件"));
+        assert!(contract.acceptance_criteria[0]
+            .description
+            .contains("添加到对话"));
+        assert!(contract
+            .constraints
+            .iter()
+            .any(|constraint| constraint.contains("周边行为")));
+    }
+
+    #[test]
     fn stale_state_after_mutation_is_atomic_regression() {
         // 配置保存后界面仍显示旧状态 = 明确的"改为"变更契约 → 单点回归，短窗口。
         let contract = TaskContract::from_input(
@@ -1376,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_surface_fields_use_scoped_plan_and_scaled_budget() {
+    fn multi_surface_fields_use_staged_plan_and_scaled_budget() {
         let contract = TaskContract::from_input(
             "应用档案，列表、新增、编辑没有把appCode和subAppCode展示出来，页面上看不到。",
         );
@@ -1385,7 +1597,7 @@ mod tests {
         let plan = SolvePlan::for_contract(&contract, strategy);
 
         assert_eq!(strategy, StrategyKind::Transformative);
-        assert_eq!(plan.mode, SolveMode::ScopedDelivery);
+        assert_eq!(plan.mode, SolveMode::StagedDelivery);
 
         let mut budget = BudgetManager::for_contract(&contract, strategy);
         BudgetManager::cap_initial_step_window(&mut budget, plan.initial_steps);
@@ -1393,7 +1605,56 @@ mod tests {
         BudgetManager::cap_hard_limits(&mut budget, plan.hard_max_steps, plan.hard_max_tool_calls);
         assert_eq!(budget.hard_max_steps, 24);
         assert_eq!(budget.hard_max_tool_calls, 30);
-        assert!(plan.instructions.contains("多交付面"));
+        assert!(plan.instructions.contains("分阶段交付模式"));
+    }
+
+    #[test]
+    fn multi_surface_goal_uses_staged_vertical_slices() {
+        let contract = TaskContract::from_input(
+            "实现附件能力\n- 本地文件上传\n- 云文件导入\n- 旧接口兼容",
+        );
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
+        assert_eq!(TaskShape::for_contract(&contract).scale, TaskScale::Staged);
+        assert_eq!(plan.mode, SolveMode::StagedDelivery);
+        assert!(plan.instructions.contains("最小纵向切片"));
+        assert!(plan.instructions.contains("检查点"));
+    }
+
+    #[test]
+    fn unclear_goal_uses_progressive_discovery_instead_of_unbounded_search() {
+        let contract = TaskContract::from_input("优化一下菜单体验");
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Direct);
+        assert_eq!(TaskShape::for_contract(&contract).clarity, TaskClarity::Discovery);
+        assert_eq!(plan.mode, SolveMode::OpenEnded);
+        assert!(plan.instructions.contains("高信息增益"));
+        assert!(plan.instructions.contains("禁止用全仓扫描掩盖目标不清"));
+        assert!(plan.instructions.contains("一个带证据的决策问题"));
+    }
+
+    #[test]
+    fn progressive_discovery_stops_keyword_rotation_after_three_searches() {
+        let contract = TaskContract::from_input("优化一下菜单体验");
+        let mut state = ExecutionState::new(contract, StrategyKind::Direct);
+        let budget = BudgetManager::for_contract(&state.contract, state.strategy);
+        for index in 0..3 {
+            let probe = ActionProposal {
+                signature: format!("search:{{\"pattern\":\"probe-{index}\"}}"),
+                question: format!("验证假设 {index}"),
+                supports: vec!["user-objective".into()],
+                estimated_cost: 1,
+            };
+            state.record_tool_result(&probe, true, &format!("src/menu-{index}.rs"));
+        }
+        let fourth = ActionProposal {
+            signature: "search:{\"pattern\":\"probe-4\"}".into(),
+            question: "继续换关键词".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert!(matches!(
+            ActionGate::authorize(&fourth, &state, &budget),
+            GateDecision::Deny(reason) if reason.contains("最多允许三条")
+        ));
     }
 
     #[test]
@@ -1744,7 +2005,42 @@ mod tests {
             Completion::Converge(_)
         ));
         let report = state.delivery_report(DeliveryOutcome::Verified, None);
+        assert_eq!(report.outcome, DeliveryOutcome::PartialDelivery);
         assert!(!report.criteria[0].satisfied);
+        assert!(report.reason.unwrap().contains("拒绝 Verified"));
+    }
+
+    #[test]
+    fn comment_only_edit_cannot_satisfy_a_functional_goal() {
+        let contract = TaskContract::from_input(
+            "文件树右键可以把选定文件添加到对话框附件",
+        );
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: concat!(
+                "edit:{\"path\":\"gui/theme.rs\",",
+                "\"old_text\":\"//! Theme tokens.\",",
+                "\"new_text\":\"//! Theme tokens.\\n// Modern refined palette.\"}"
+            )
+            .into(),
+            question: "apply change".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let build = ActionProposal {
+            signature: "shell:{\"command\":\"cargo check\"}".into(),
+            question: "compile".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        state.record_tool_result(&edit, true, "updated gui/theme.rs");
+        state.record_tool_result(&build, true, "Finished dev profile");
+
+        assert_eq!(state.write_attempts, 1);
+        assert_eq!(state.write_operations, 0);
+        assert!(state.verification_evidence.is_empty());
+        assert!(!state.can_complete());
     }
 
     #[test]

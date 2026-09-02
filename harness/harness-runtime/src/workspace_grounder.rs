@@ -75,6 +75,69 @@ impl WorkspaceGrounding {
 pub struct WorkspaceGrounder;
 
 impl WorkspaceGrounder {
+    /// 精确变换快速通道：用户已经给出旧值时，直接逐文件查找该字面量，不构建
+    /// n-gram 候选索引、也不计算工作区词频。命中即得到可读取候选；完整扫描仍无
+    /// 命中则形成可靠 mismatch，交给调用方询问工作区/分支，而不是再换关键词。
+    pub fn ground_exact_literal(root: &Path, goal: &GoalContract) -> Option<WorkspaceGrounding> {
+        let literal = goal
+            .transformation
+            .as_ref()
+            .and_then(|value| value.from_value.as_deref())?;
+        if !root.is_dir() {
+            return Some(Self::empty());
+        }
+
+        let needle = crate::workspace_index::squash(literal);
+        if needle.chars().count() < 2 {
+            return Some(Self::empty());
+        }
+        let mut paths = Vec::new();
+        let mut truncated = false;
+        crate::workspace_index::collect_source_files(
+            root,
+            &mut paths,
+            crate::workspace_index::DEFAULT_MAX_FILES,
+            &mut truncated,
+        );
+        let mut literal_hits = Vec::new();
+        let mut scanned_files = 0usize;
+        for absolute in paths {
+            let Ok(content) = std::fs::read_to_string(&absolute) else {
+                continue;
+            };
+            scanned_files += 1;
+            if crate::workspace_index::squash(&content).contains(&needle) {
+                literal_hits.push(
+                    absolute
+                        .strip_prefix(root)
+                        .unwrap_or(&absolute)
+                        .display()
+                        .to_string(),
+                );
+                // 原子替换先读取首个权威候选确认上下文；若它不是目标，Inspect 阶段
+                // 才在已命中目录内继续。不要为了统计所有重复文案预读完整工作区。
+                break;
+            }
+        }
+        let status = if !literal_hits.is_empty() {
+            GroundingStatus::Grounded
+        } else if !truncated {
+            GroundingStatus::Mismatch
+        } else {
+            GroundingStatus::Unavailable
+        };
+        Some(WorkspaceGrounding {
+            status,
+            scanned_files,
+            // 命中后主动停止不是完整扫描；只有零命中时该标记才参与 mismatch 解释。
+            complete_scan: !truncated && literal_hits.is_empty(),
+            entity_hits: Vec::new(),
+            navigation_hits: Vec::new(),
+            zero_prior: literal_hits.is_empty(),
+            literal_hits,
+        })
+    }
+
     pub fn ground(root: &Path, goal: &GoalContract) -> WorkspaceGrounding {
         if !root.is_dir() {
             return Self::empty();
@@ -364,6 +427,28 @@ mod tests {
         let grounding = WorkspaceGrounder::ground(&root, &goal);
         assert_eq!(grounding.status, GroundingStatus::Grounded);
         assert_eq!(grounding.literal_hits, vec!["src\\menu.ts"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn quoted_shortening_grounds_the_old_literal_without_bruteforce() {
+        let root = std::env::temp_dir().join(format!(
+            "grounder-quoted-literal-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/composer.rs"),
+            "ui.button(\"添加到对话框附件\");",
+        )
+        .unwrap();
+        let goal = GoalContract::compile(
+            "弹出菜单应包含“📎 添加到对话框附件”，文字精简一下，“添加到对话”",
+        );
+        let grounding = WorkspaceGrounder::ground_exact_literal(&root, &goal)
+            .expect("双引号旧值应进入精确字面量通道");
+        assert_eq!(grounding.status, GroundingStatus::Grounded);
+        assert_eq!(grounding.literal_hits, vec!["src\\composer.rs"]);
         let _ = fs::remove_dir_all(&root);
     }
 }

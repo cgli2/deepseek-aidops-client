@@ -279,6 +279,15 @@ mod tests {
     }
 
     #[test]
+    fn quoted_shortening_is_atomic_regression() {
+        let profile = IntentProfile::compile(
+            "弹出菜单应包含“📎 添加到对话框附件”，文字精简一下，“添加到对话”",
+        );
+        assert_eq!(profile.kind, IntentKind::AtomicRegression);
+        assert!(profile.has_transformation_contract);
+    }
+
+    #[test]
     fn structural_action_is_atomic_regression() {
         // 用户已说清"交换两个字段的顺序"，验收标准内含在描述里。
         let input = "系统管理->模型管理，把模型名称字段和 API KEY 字段位置顺序互换一下";

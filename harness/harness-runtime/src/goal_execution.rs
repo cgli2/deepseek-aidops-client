@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::execution::{ActionProposal, TaskContract};
+use crate::execution::{edit_has_substantive_delta, ActionProposal, TaskContract};
 use crate::intent::{inspect_diff, Clarification, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior};
 use crate::target_extract::{
     extract_acronyms, extract_code_symbols, extract_form_field_order, extract_navigation,
@@ -512,6 +512,10 @@ pub struct GoalExecution {
     /// Grounder 或定向搜索给出的候选文件。候选存在时应直接读取，不能再要求
     /// 模型重新支付一次 search 成本。
     pub target_files: Vec<String>,
+    /// 可以承载写入的强证据目标。工作区实体匹配只产生软候选；只有明确字面量、
+    /// 导航命中或定向 search 命中的具体文件才能进入这里。这样弱相关文件被读取后
+    /// 也不会自动获得编辑资格。
+    pub confirmed_target_files: Vec<String>,
     /// 诊断/解释任务只允许定位和读取，读取证据不会把工作项推进到 Change。
     pub read_only: bool,
     pub no_information_count: usize,
@@ -570,11 +574,26 @@ impl GoalExecution {
             items,
             anchor_dirs: Vec::new(),
             target_files: Vec::new(),
+            confirmed_target_files: Vec::new(),
             read_only: IntentProfile::compile(&contract.objective).kind
                 == IntentKind::Investigation,
             no_information_count: 0,
             correction_count: 0,
             step_attributed: Vec::new(),
+        }
+    }
+
+    /// 调用方显式注入的求解图已经是结构化执行输入，其面级 candidate_targets
+    /// 等价于人工/编排器确认的写作用域，不应再要求模型重复 search。普通自然语言
+    /// Grounder 不走此入口，弱实体命中仍然不能获得写权限。
+    pub fn confirm_injected_targets(&mut self) {
+        let targets = self
+            .items
+            .values()
+            .flat_map(|item| item.candidate_targets.iter().cloned())
+            .collect::<Vec<_>>();
+        for target in targets {
+            self.add_target_file(&target, true);
         }
     }
 
@@ -642,15 +661,15 @@ impl GoalExecution {
 
     /// 将确定性工作区扫描结果提升为求解图状态，而不只是塞进提示词。
     pub fn apply_grounding(&mut self, grounding: &WorkspaceGrounding) {
-        let candidates = if !grounding.literal_hits.is_empty() {
-            &grounding.literal_hits
+        let (candidates, confirmed) = if !grounding.literal_hits.is_empty() {
+            (&grounding.literal_hits, true)
         } else if grounding.entity_hits.is_empty() {
-            &grounding.navigation_hits
+            (&grounding.navigation_hits, true)
         } else {
-            &grounding.entity_hits
+            (&grounding.entity_hits, false)
         };
         for path in candidates {
-            self.add_target_file(path);
+            self.add_target_file(path, confirmed);
         }
         if !self.target_files.is_empty() {
             for item in self.items.values_mut() {
@@ -1358,6 +1377,11 @@ impl GoalExecution {
             Some(WorkItemState::Pending | WorkItemState::Locating) => &["search"],
             Some(WorkItemState::Located | WorkItemState::Inspecting) => &["fs", "search"],
             Some(WorkItemState::ReadyToChange) if self.read_only => &["fs", "search"],
+            // 弱实体命中只能提示“先读哪里”，不能直接授权写入。读完仍没有定向搜索
+            // 证据时回到 search/fs，避免为满足写计数而随便改一个软候选。
+            Some(WorkItemState::ReadyToChange) if self.confirmed_target_files.is_empty() => {
+                &["fs", "search"]
+            }
             Some(WorkItemState::ReadyToChange) => &["edit", "fs"],
             Some(WorkItemState::Satisfied | WorkItemState::Changed) if statically_provable => {
                 &["fs", "shell"]
@@ -1413,9 +1437,10 @@ impl GoalExecution {
             WorkItemState::ReadyToChange if self.read_only => {
                 "基于已确认的最短调用链形成证据结论；如仍有一个关键缺口，只读取对应候选。".into()
             }
-            WorkItemState::ReadyToChange => {
-                "对已确认文件执行一次最小编辑；若内容已满足目标，先读取确认后进入验证。".into()
-            }
+            WorkItemState::ReadyToChange if self.confirmed_target_files.is_empty() =>
+                "当前文件仅为弱匹配候选；执行一次带目录约束的高信号 search，确认具体实现文件后再编辑。".into(),
+            WorkItemState::ReadyToChange =>
+                "对已确认文件执行一次最小编辑；若内容已满足目标，先读取确认后进入验证。".into(),
             WorkItemState::Satisfied => {
                 "当前内容已经满足期望值；禁止重复编辑，运行最小验证。".into()
             }
@@ -1515,7 +1540,7 @@ impl GoalExecution {
         {
             return Err(format!("受控交付禁止目录枚举；{}", self.next_action_hint()));
         }
-        if self.anchor_dirs.is_empty() || !matches!(call.name.as_str(), "search" | "fs" | "edit") {
+        if !matches!(call.name.as_str(), "search" | "fs" | "edit") {
             return Ok(());
         }
         let path = match call.name.as_str() {
@@ -1524,16 +1549,58 @@ impl GoalExecution {
             _ => None,
         };
         let Some(path) = path else {
+            if call.name == "search" && self.anchor_dirs.is_empty() {
+                return Ok(());
+            }
             return Err(format!(
                 "已定位共享目录 [{}]；{} 调用必须显式提供该目录内的 path/dir，禁止回到工作区根泛搜。",
                 self.anchor_dirs.join("、"), call.name
             ));
         };
         let normalized = path.replace('\\', "/").trim_start_matches("./").to_owned();
+        // 已有锚点时仍允许在另一个明确子目录中执行定向搜索，以便从错误锚点恢复；
+        // 但禁止重新回到工作区根泛搜。旧实现把正确的 UI 子项目搜索也一并拒绝，
+        // 导致错误定位后永久锁死。
+        if call.name == "search" {
+            let broad_root = normalized.is_empty()
+                || normalized == "."
+                || normalized == "/"
+                || (normalized.len() == 2 && normalized.ends_with(':'));
+            if !self.anchor_dirs.is_empty() && broad_root {
+                return Err(format!(
+                    "已有定位锚点 [{}]，禁止回到工作区根泛搜；请指定新的候选子目录进行定向换路。",
+                    self.anchor_dirs.join("、")
+                ));
+            }
+            return Ok(());
+        }
         let exact_target = self
             .target_files
             .iter()
             .any(|target| normalize_path(target) == normalized);
+        let exact_confirmed_target = self
+            .confirmed_target_files
+            .iter()
+            .any(|target| normalize_path(target) == normalized);
+        if call.name == "edit" {
+            return if exact_confirmed_target {
+                Ok(())
+            } else {
+                Err(format!(
+                    "编辑目标 {path} 尚未被定向搜索或明确字面量确认；只能修改已确认文件 [{}]。请先用一次有目录约束的 search 建立目标相关性证据。",
+                    self.confirmed_target_files.join("、")
+                ))
+            };
+        }
+        if self.anchor_dirs.is_empty() {
+            return if exact_target {
+                Ok(())
+            } else {
+                Err(format!(
+                    "读取目标 {path} 不在工作区给出的候选文件中；请先用定向 search 定位实现入口。"
+                ))
+            };
+        }
         if exact_target
             || self
                 .anchor_dirs
@@ -1588,14 +1655,19 @@ impl GoalExecution {
         let is_read = action.tool == "fs" && !proposal.signature.contains("\"op\":\"write\"");
         let is_write = action.tool == "edit" || proposal.signature.contains("\"op\":\"write\"");
         let is_verify = action.phase == SolvePhase::Verify || is_verification(&proposal.signature);
-        let effective_ok = ok && !proposal.is_search_miss(summary);
+        let substantive_write = !is_write
+            || edit_has_substantive_delta(&proposal.signature)
+            || ["注释", "文档", "说明文字", "readme", "markdown", "doc comment"]
+                .iter()
+                .any(|marker| self.goal.objective.to_lowercase().contains(marker));
+        let effective_ok = ok && !proposal.is_search_miss(summary) && substantive_write;
         let previous_target_count = self.target_files.len();
         if effective_ok && is_search {
             self.record_targets_from_search(summary);
         }
         if let Some(path) = &action.target_path {
             if effective_ok && matches!(action.tool.as_str(), "fs" | "edit") {
-                self.add_target_file(path);
+                self.add_target_file(path, action.tool == "edit");
             }
         }
         let already_satisfied = is_read
@@ -1765,9 +1837,9 @@ impl GoalExecution {
             let candidate = candidate.replace('\\', "/");
             match candidate.rsplit_once('/') {
                 Some((dir, file)) if file.contains('.') && !dir.is_empty() => {
-                    self.add_target_file(&candidate);
+                    self.add_target_file(&candidate, true);
                 }
-                None if candidate.contains('.') => self.add_target_file(&candidate),
+                None if candidate.contains('.') => self.add_target_file(&candidate, true),
                 _ => {}
             }
             if self.target_files.len() >= 8 {
@@ -1776,7 +1848,7 @@ impl GoalExecution {
         }
     }
 
-    fn add_target_file(&mut self, path: &str) {
+    fn add_target_file(&mut self, path: &str, confirmed: bool) {
         let normalized = normalize_path(path);
         if normalized.is_empty() {
             return;
@@ -1787,6 +1859,17 @@ impl GoalExecution {
             .any(|item| normalize_path(item) == normalized)
         {
             self.target_files.push(normalized.clone());
+        }
+        if confirmed
+            && !self
+                .confirmed_target_files
+                .iter()
+                .any(|item| normalize_path(item) == normalized)
+        {
+            self.confirmed_target_files.push(normalized.clone());
+        }
+        if !confirmed {
+            return;
         }
         if let Some((dir, _)) = normalized.rsplit_once('/') {
             let anchor = format!("{dir}/");
@@ -2064,7 +2147,74 @@ pub(crate) fn extract_exact_transformation(input: &str) -> Option<ExactTransform
             to_value,
         });
     }
+
+    // 第二条确定性路径：用户经常直接给出两个引用字面量表达“旧值、改动说明、新值”，
+    // 例如：`应包含“添加到对话框附件”，文字精简一下，“添加到对话”`。这类请求
+    // 已经同时给出了可定位旧值和可验收新值，不能退化为对“菜单/附件/对话”的开放式
+    // n-gram 全库探索。这里只接受成对引号 + 两者之间的显式变换关系；普通引用两个
+    // 名词不会被误判为替换。
+    let quoted = extract_quoted_literals(input);
+    if quoted.len() >= 2 {
+        let old = &quoted[quoted.len() - 2];
+        let new = &quoted[quoted.len() - 1];
+        let relation = &input[old.end..new.start];
+        const QUOTED_TRANSFORM_RELATIONS: [&str; 8] = [
+            "精简", "简化", "缩短", "改写", "替换", "改成", "变成", "→",
+        ];
+        if QUOTED_TRANSFORM_RELATIONS
+            .iter()
+            .any(|marker| relation.contains(marker))
+            && old.value != new.value
+            && old.value.chars().count() <= 80
+            && new.value.chars().count() <= 80
+        {
+            return Some(ExactTransformation {
+                from_value: Some(old.value.clone()),
+                to_value: new.value.clone(),
+            });
+        }
+    }
     None
+}
+
+#[derive(Debug)]
+struct QuotedLiteral {
+    /// 内容之前/之后的字节边界，用于只检查两个字面量之间是否存在变换关系。
+    start: usize,
+    end: usize,
+    value: String,
+}
+
+/// 提取成对的排版引号内容。ASCII `'`/`"` 很容易出现在代码片段和缩写中，
+/// 不作为这条自然语言契约的结构信号；显式“修改为”路径仍覆盖普通 ASCII 写法。
+fn extract_quoted_literals(input: &str) -> Vec<QuotedLiteral> {
+    let mut open: Option<(char, usize)> = None;
+    let mut out = Vec::new();
+    for (index, ch) in input.char_indices() {
+        if let Some((closing, content_start)) = open {
+            if ch == closing {
+                let value = input[content_start..index].trim().to_string();
+                if !value.is_empty() {
+                    out.push(QuotedLiteral {
+                        start: content_start,
+                        end: index + ch.len_utf8(),
+                        value,
+                    });
+                }
+                open = None;
+            }
+            continue;
+        }
+        let closing = match ch {
+            '“' => '”',
+            '‘' => '’',
+            '「' => '」',
+            '『' => '』',
+            _ => continue,
+        };
+        open = Some((closing, index + ch.len_utf8()));
+    }
+    out
 }
 
 fn normalize_path(path: &str) -> String {
@@ -2103,6 +2253,27 @@ mod tests {
             !with_nothing.has_locatable_signal(),
             "完全提取不到信号时应如实报告，避免 Agent 盲搜"
         );
+    }
+
+    #[test]
+    fn quoted_shortening_compiles_to_exact_transformation() {
+        let goal = GoalContract::compile(
+            "弹出菜单应包含“📎 添加到对话框附件”，文字精简一下，“添加到对话”",
+        );
+        assert_eq!(
+            goal.transformation,
+            Some(ExactTransformation {
+                from_value: Some("📎 添加到对话框附件".into()),
+                to_value: "添加到对话".into(),
+            })
+        );
+        assert_eq!(goal.expected_values[0].value, "添加到对话");
+    }
+
+    #[test]
+    fn unrelated_quoted_literals_are_not_treated_as_replacement() {
+        let goal = GoalContract::compile("菜单同时包含“打开”和“关闭”两个操作");
+        assert!(goal.transformation.is_none());
     }
 
     #[test]
@@ -2576,6 +2747,7 @@ mod tests {
             items: Default::default(),
             anchor_dirs: vec![],
             target_files: files.clone(),
+            confirmed_target_files: files.clone(),
             read_only: false,
             no_information_count: 0,
             correction_count: 0,
@@ -3192,6 +3364,123 @@ mod tests {
             args: serde_json::json!({"op": "read", "path": "web/src/pages/profile.tsx"}),
         };
         assert!(plan.allows_tool_call(&read, &proposal).is_ok());
+    }
+
+    #[test]
+    fn weak_grounding_cannot_authorize_an_unrelated_edit() {
+        let contract = TaskContract::from_input(
+            "文件树右键可以把选定文件添加到对话框附件",
+        );
+        let mut plan = GoalExecution::from_contract(&contract);
+        plan.apply_grounding(&WorkspaceGrounding {
+            status: crate::workspace_grounder::GroundingStatus::Grounded,
+            scanned_files: 10,
+            complete_scan: true,
+            entity_hits: vec!["harness/harness-ui/src/gui/theme.rs".into()],
+            navigation_hits: vec![],
+            literal_hits: vec![],
+            zero_prior: false,
+        });
+        assert!(plan.confirmed_target_files.is_empty());
+
+        let read_proposal = ActionProposal {
+            signature: "fs:{\"op\":\"read\",\"path\":\"harness/harness-ui/src/gui/theme.rs\"}".into(),
+            question: "inspect soft candidate".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        plan.record_result(&read_proposal, true, "theme palette source");
+        assert_eq!(plan.allowed_tools(), vec!["fs", "search"]);
+
+        let edit = ToolCall {
+            id: "bad-edit".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "harness/harness-ui/src/gui/theme.rs",
+                "old_text": "palette",
+                "new_text": "palette // changed"
+            }),
+        };
+        let edit_proposal = ActionProposal {
+            signature: "edit:{\"path\":\"harness/harness-ui/src/gui/theme.rs\"}".into(),
+            question: "unrelated write".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert!(plan.allows_tool_call(&edit, &edit_proposal).is_err());
+    }
+
+    #[test]
+    fn comment_only_edit_does_not_advance_a_functional_work_item() {
+        let contract = TaskContract::from_input("实现文件树右键附件菜单");
+        let mut plan = GoalExecution::from_contract(&contract);
+        plan.apply_grounding(&WorkspaceGrounding {
+            status: crate::workspace_grounder::GroundingStatus::Grounded,
+            scanned_files: 1,
+            complete_scan: true,
+            entity_hits: vec![],
+            navigation_hits: vec![],
+            literal_hits: vec!["gui/theme.rs".into()],
+            zero_prior: false,
+        });
+        let read = ActionProposal {
+            signature: "fs:{\"op\":\"read\",\"path\":\"gui/theme.rs\"}".into(),
+            question: "inspect".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        plan.record_result(&read, true, "//! Theme tokens.");
+        let edit = ActionProposal {
+            signature: concat!(
+                "edit:{\"path\":\"gui/theme.rs\",",
+                "\"old_text\":\"//! Theme tokens.\",",
+                "\"new_text\":\"//! Theme tokens.\\n// unrelated polish\"}"
+            )
+            .into(),
+            question: "change".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert_eq!(
+            plan.record_result(&edit, true, "updated gui/theme.rs"),
+            EvidenceKind::NoInformation
+        );
+        assert_eq!(
+            plan.items["user-objective"].state,
+            WorkItemState::ReadyToChange
+        );
+        assert!(!plan.can_conclude());
+    }
+
+    #[test]
+    fn scoped_search_can_escape_a_stale_anchor_without_reopening_root_scan() {
+        let contract = TaskContract::from_input("修复文件树右键菜单");
+        let mut plan = GoalExecution::from_contract(&contract);
+        let locate = ActionProposal {
+            signature: "search:{\"dir\":\"harness/harness-runtime\",\"pattern\":\"menu\"}".into(),
+            question: "first hypothesis".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        plan.record_result(
+            &locate,
+            true,
+            "共 1 条命中（格式：相对路径:行号: 内容）：\nharness/harness-runtime/src/menu.rs:10: menu",
+        );
+
+        let scoped = ToolCall {
+            id: "switch-scope".into(),
+            name: "search".into(),
+            args: serde_json::json!({"dir": "harness/harness-ui", "pattern": "context_menu"}),
+        };
+        assert!(plan.allows_tool_call(&scoped, &locate).is_ok());
+
+        let broad = ToolCall {
+            id: "broad-root".into(),
+            name: "search".into(),
+            args: serde_json::json!({"dir": ".", "pattern": "menu"}),
+        };
+        assert!(plan.allows_tool_call(&broad, &locate).is_err());
     }
 
     #[test]

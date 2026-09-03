@@ -97,6 +97,7 @@ impl DynTool for StaticTool {
 
 struct ScriptedLlm {
     calls: AtomicUsize,
+    initial_text_steps: usize,
     script: Vec<Option<ToolCall>>,
     options: Mutex<Vec<RequestOptions>>,
 }
@@ -118,7 +119,14 @@ impl LlmProvider for ScriptedLlm {
     fn stream_with_options(&self, _messages: Vec<Message>, options: RequestOptions) -> ChunkStream {
         self.options.lock().unwrap().push(options);
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
-        let chunk = match self.script.get(index).cloned().flatten() {
+        if index < self.initial_text_steps {
+            return Box::pin(futures::stream::iter(vec![Ok(Chunk {
+                text: Some("我先定位这个问题".into()),
+                ..Default::default()
+            })]));
+        }
+        let script_index = index - self.initial_text_steps;
+        let chunk = match self.script.get(script_index).cloned().flatten() {
             Some(call) => Chunk {
                 tool_calls: vec![call],
                 ..Default::default()
@@ -431,7 +439,7 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
 }
 
 #[tokio::test]
-async fn continuation_gets_a_fresh_prompt_budget_after_previous_turn_hit_cap() {
+async fn prompt_cap_auto_continues_when_the_next_step_is_clear() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
     let llm = Arc::new(CapThenResumeLlm {
@@ -456,36 +464,18 @@ async fn continuation_gets_a_fresh_prompt_budget_after_previous_turn_hit_cap() {
         .await
         .unwrap();
 
-    assert_eq!(llm.calls.load(Ordering::SeqCst), 1, "首回合应在边界暂停");
-    let first_turn = log.replay();
-    assert!(first_turn.iter().any(|event| matches!(event,
+    let calls = llm.calls.load(Ordering::SeqCst);
+    assert!(calls > 1, "下一步明确时应在同一用户请求内自动续跑");
+    assert!(calls <= 20, "无进展自动续跑仍必须受硬预算约束");
+    let events = log.replay();
+    assert!(!events.iter().any(|event| matches!(event,
         SessionEvent::Assistant { chunk, .. }
-            if chunk.text.as_deref().is_some_and(|text| text.contains("【执行预算暂停】"))
+            if chunk.text.as_deref().is_some_and(|text| text.contains("下一条“继续”") || text.contains("是否按以下理解继续"))
     )));
-    assert!(!first_turn.iter().any(|event| matches!(event,
-        SessionEvent::Assistant { chunk, .. }
-            if chunk.text.as_deref().is_some_and(|text| text.contains("是否按以下理解继续"))
-    )));
-
-    AgentLoop::new()
-        .run_turn(
-            &ctx,
-            UserInput {
-                text: "继续".into(),
-                attachments: vec![],
-            },
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        llm.calls.load(Ordering::SeqCst) >= 2,
-        "历史累计已触顶时，明确续跑仍必须真正请求模型"
-    );
     assert!(llm.requests.lock().unwrap().iter().skip(1).any(|request| {
         request
             .iter()
-            .any(|message| message.content.contains("[续跑任务]"))
+            .any(|message| message.content.contains("[预算窗口续期 1/4·最小断点]"))
     }));
 }
 
@@ -573,7 +563,7 @@ async fn missing_tool_payload_stops_once_instead_of_three_empty_retries() {
 }
 
 #[tokio::test]
-async fn unverified_text_only_step_gets_one_convergence_follow_up() {
+async fn unverified_text_only_step_keeps_advancing_without_user_follow_up() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
     let llm = Arc::new(TextThenTextLlm {
@@ -581,7 +571,7 @@ async fn unverified_text_only_step_gets_one_convergence_follow_up() {
         requests: Mutex::new(vec![]),
     });
     let hook: Arc<dyn Hook> = Arc::new(AllowHook);
-    let _a = ctx.provide(log);
+    let _a = ctx.provide(log.clone());
     let provider: Arc<dyn LlmProvider> = llm.clone();
     let _b = ctx.provide(provider);
     let _c = ctx.provide(ToolRegistry::new());
@@ -599,10 +589,18 @@ async fn unverified_text_only_step_gets_one_convergence_follow_up() {
         .unwrap();
 
     let requests = llm.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2, "未验证的正文不能在首步结束回合");
+    assert!(requests.len() > 2, "未验证的正文不能结束明确任务");
+    assert!(requests.len() <= 20, "持续无进展时仍必须由硬预算终止");
     assert!(requests[1]
         .iter()
         .any(|message| message.content.contains("[V4 目标状态校正]")));
+    assert!(requests.iter().skip(2).any(|request| request
+        .iter()
+        .any(|message| message.content.contains("[自动推进]"))));
+    assert!(!log.replay().iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("下一条“继续”") || text.contains("是否按以下理解继续"))
+    )));
 }
 
 #[tokio::test]
@@ -720,8 +718,7 @@ async fn quoted_menu_shortening_starts_from_the_grounded_file_not_repository_sea
         .run_turn(
             &ctx,
             UserInput {
-                text: "弹出菜单应包含“📎 添加到对话框附件”，文字精简一下，“添加到对话”"
-                    .into(),
+                text: "弹出菜单应包含“📎 添加到对话框附件”，文字精简一下，“添加到对话”".into(),
                 attachments: vec![],
             },
         )
@@ -789,11 +786,12 @@ async fn grounded_candidate_replay_skips_redundant_search() {
 }
 
 #[tokio::test]
-async fn exact_menu_rename_uses_four_tools_without_bruteforce() {
+async fn premature_text_then_menu_rename_finishes_in_one_user_turn() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
     let llm = Arc::new(ScriptedLlm {
         calls: AtomicUsize::new(0),
+        initial_text_steps: 1,
         script: vec![
             scripted_call(
                 "s",
@@ -854,7 +852,7 @@ async fn exact_menu_rename_uses_four_tools_without_bruteforce() {
         .await
         .unwrap();
 
-    assert_eq!(llm.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 6);
     let phases = log
         .replay()
         .iter()
@@ -878,6 +876,7 @@ async fn v4_already_satisfied_replay_verifies_without_editing() {
     let log = SessionLog::new();
     let llm = Arc::new(ScriptedLlm {
         calls: AtomicUsize::new(0),
+        initial_text_steps: 0,
         script: vec![
             scripted_call("s", "search", serde_json::json!({"pattern": "version"})),
             scripted_call(

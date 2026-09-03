@@ -46,9 +46,16 @@ pub(crate) fn edit_has_substantive_delta(signature: &str) -> bool {
 
 fn objective_allows_comment_only_change(objective: &str) -> bool {
     let lower = objective.to_lowercase();
-    ["注释", "文档", "说明文字", "readme", "markdown", "doc comment"]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    [
+        "注释",
+        "文档",
+        "说明文字",
+        "readme",
+        "markdown",
+        "doc comment",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,8 +174,8 @@ impl SolvePlan {
         let shape = TaskShape::for_contract(contract);
         // 交付面数量由验收项（契约真实单元）给出，而非机制层词表数 UI 名词。
         let extra_surfaces = contract.acceptance_criteria.len().saturating_sub(1).min(4);
-        let is_atomic_regression = shape.scale == TaskScale::Atomic
-            && intent.kind == IntentKind::AtomicRegression;
+        let is_atomic_regression =
+            shape.scale == TaskScale::Atomic && intent.kind == IntentKind::AtomicRegression;
         if is_atomic_regression
             && !matches!(
                 strategy,
@@ -600,6 +607,26 @@ impl ExecutionState {
         }
     }
 
+    /// 将运行时已经从磁盘产物复核出的静态证据同步到执行投影。
+    ///
+    /// SolveGraph 与 ExecutionState 都参与最终完成裁决；只更新前者会出现“求解图
+    /// 已无下一步，但执行投影仍缺验证”的死区，迫使用户反复输入“继续”。
+    pub fn record_static_verification(&mut self, criterion_id: &str, evidence: impl Into<String>) {
+        if !self
+            .contract
+            .acceptance_criteria
+            .iter()
+            .any(|criterion| criterion.id == criterion_id)
+        {
+            return;
+        }
+        self.verification_evidence
+            .entry(criterion_id.to_string())
+            .or_default()
+            .push(evidence.into());
+        self.satisfied_criteria.insert(criterion_id.to_string());
+    }
+
     /// 动态白名单只由已获得的证据/写入/验证状态推进。高精确任务不再把
     /// plan、delegate 或无关工具 schema 暴露给模型，且 dispatch 前还会二次校验。
     pub fn tool_phase(&self) -> ToolPhase {
@@ -745,10 +772,7 @@ impl ExecutionState {
             outcome
         };
         let reason = if inconsistent_verified {
-            Some(
-                "求解图声称完成，但执行证据未覆盖全部验收项；已拒绝 Verified，任务仍未完成"
-                    .into(),
-            )
+            Some("求解图声称完成，但执行证据未覆盖全部验收项；已拒绝 Verified，任务仍未完成".into())
         } else {
             reason
         };
@@ -1472,7 +1496,9 @@ mod tests {
     fn generic_acceptance_criterion_preserves_the_observable_user_goal() {
         let objective = "文件树右键可以把选定文件添加到对话框附件";
         let contract = TaskContract::from_input(objective);
-        assert!(contract.acceptance_criteria[0].description.contains(objective));
+        assert!(contract.acceptance_criteria[0]
+            .description
+            .contains(objective));
         assert_ne!(
             contract.acceptance_criteria[0].description,
             "用户要求的交付物已完成并经过与风险相称的验证"
@@ -1574,9 +1600,8 @@ mod tests {
     #[test]
     fn stale_state_after_mutation_is_atomic_regression() {
         // 配置保存后界面仍显示旧状态 = 明确的"改为"变更契约 → 单点回归，短窗口。
-        let contract = TaskContract::from_input(
-            "配置保存后对话框仍显示旧状态，把刷新时机改为提交后立即",
-        );
+        let contract =
+            TaskContract::from_input("配置保存后对话框仍显示旧状态，把刷新时机改为提交后立即");
         let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
         assert_eq!(plan.mode, SolveMode::AtomicDelivery);
 
@@ -1610,9 +1635,8 @@ mod tests {
 
     #[test]
     fn multi_surface_goal_uses_staged_vertical_slices() {
-        let contract = TaskContract::from_input(
-            "实现附件能力\n- 本地文件上传\n- 云文件导入\n- 旧接口兼容",
-        );
+        let contract =
+            TaskContract::from_input("实现附件能力\n- 本地文件上传\n- 云文件导入\n- 旧接口兼容");
         let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
         assert_eq!(TaskShape::for_contract(&contract).scale, TaskScale::Staged);
         assert_eq!(plan.mode, SolveMode::StagedDelivery);
@@ -1624,7 +1648,10 @@ mod tests {
     fn unclear_goal_uses_progressive_discovery_instead_of_unbounded_search() {
         let contract = TaskContract::from_input("优化一下菜单体验");
         let plan = SolvePlan::for_contract(&contract, StrategyKind::Direct);
-        assert_eq!(TaskShape::for_contract(&contract).clarity, TaskClarity::Discovery);
+        assert_eq!(
+            TaskShape::for_contract(&contract).clarity,
+            TaskClarity::Discovery
+        );
         assert_eq!(plan.mode, SolveMode::OpenEnded);
         assert!(plan.instructions.contains("高信息增益"));
         assert!(plan.instructions.contains("禁止用全仓扫描掩盖目标不清"));
@@ -1673,7 +1700,11 @@ mod tests {
         // 用真实分面需求驱动，而不是造一个人工数字：这同时证明 agent_loop 的接线顺序
         // （先 cap 后 provision）在多面任务上确实抬高了熔断线。
         let demand = crate::GoalExecution::from_contract(&contract).required_budget();
-        assert!(demand.surfaces >= 4, "应切出多个交付面，实际 {}", demand.surfaces);
+        assert!(
+            demand.surfaces >= 4,
+            "应切出多个交付面，实际 {}",
+            demand.surfaces
+        );
         assert!(
             demand.steps > capped_steps,
             "该多面任务的分面需求 {} 步应高于计划常量 {} 步（这正是饥饿区间）",
@@ -1975,6 +2006,28 @@ mod tests {
     }
 
     #[test]
+    fn static_disk_verification_updates_the_completion_projection() {
+        let contract = TaskContract::from_input("修复一个确定的界面回归");
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"ui.rs\"}".into(),
+            question: "最小修复".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        state.record_tool_result(&edit, true, "updated ui.rs");
+        assert!(!state.can_complete());
+        state.record_static_verification("user-objective", "ui.rs:12 已包含目标值");
+
+        assert!(state.can_complete());
+        assert_eq!(
+            state.verification_evidence.get("user-objective"),
+            Some(&vec!["ui.rs:12 已包含目标值".into()])
+        );
+    }
+
+    #[test]
     fn failed_write_then_green_build_cannot_verify_unchanged_baseline() {
         // 模拟自然语言分类漏判为 Direct/OpenEnded 的最坏情况：结构化工具事实仍须兜底。
         let contract = TaskContract::from_input("收紧当前控件");
@@ -2012,9 +2065,7 @@ mod tests {
 
     #[test]
     fn comment_only_edit_cannot_satisfy_a_functional_goal() {
-        let contract = TaskContract::from_input(
-            "文件树右键可以把选定文件添加到对话框附件",
-        );
+        let contract = TaskContract::from_input("文件树右键可以把选定文件添加到对话框附件");
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         let edit = ActionProposal {
             signature: concat!(
@@ -2094,8 +2145,9 @@ mod tests {
 
     #[test]
     fn atomic_gate_blocks_broad_second_search_and_pre_change_verification() {
-        let contract =
-            TaskContract::from_input("输入优化加了 loading 之后结果没有变化，把 loading 状态改为初始值");
+        let contract = TaskContract::from_input(
+            "输入优化加了 loading 之后结果没有变化，把 loading 状态改为初始值",
+        );
         let budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         assert_eq!(state.solve_mode, SolveMode::AtomicDelivery);
@@ -2150,8 +2202,9 @@ mod tests {
 
     #[test]
     fn dynamic_tool_whitelist_follows_verified_execution_evidence() {
-        let contract =
-            TaskContract::from_input("输入优化加了 loading 之后结果没有变化，把 loading 状态改为初始值");
+        let contract = TaskContract::from_input(
+            "输入优化加了 loading 之后结果没有变化，把 loading 状态改为初始值",
+        );
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         assert_eq!(state.tool_phase(), ToolPhase::Locate);
         assert_eq!(state.allowed_tools(), vec!["search"]);

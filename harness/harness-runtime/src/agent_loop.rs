@@ -536,9 +536,9 @@ impl AgentLoop {
             .map(|workspace| workspace.root());
         // 精确旧值不需要先为最多 320 个源码文件构建候选词索引。直接执行字面量
         // 快速定位；只有没有旧值可搜的开放描述才支付 L1/L2 工作区裁决成本。
-        let exact_literal_grounding = workspace_root.as_ref().and_then(|root| {
-            WorkspaceGrounder::ground_exact_literal(root, &goal_execution.goal)
-        });
+        let exact_literal_grounding = workspace_root
+            .as_ref()
+            .and_then(|root| WorkspaceGrounder::ground_exact_literal(root, &goal_execution.goal));
         let workspace_index = (exact_literal_grounding.is_none()
             && (!goal_execution.goal.candidates.is_empty()
                 || !goal_execution.goal.code_entities.is_empty()
@@ -922,6 +922,8 @@ impl AgentLoop {
         const MAX_PROMPT_AUTORENEWS: u32 = 4;
         let mut empty_response_retries = 0usize;
         let mut empty_recovery_pending = false;
+        let controlled_delivery_turn = goal_executor_enabled()
+            && execution.solve_mode != crate::execution::SolveMode::OpenEnded;
         while debt > 0 {
             // R3 前置：本执行回合到顶后暂停，不再向模型发请求。下一条用户消息会新建
             // 回合预算，并通过 resume 断点继续；历史成本只做审计，不会把会话永久锁死。
@@ -930,7 +932,10 @@ impl AgentLoop {
                 if gov.should_stop_before_request(turn_prompt_tokens, last_prompt_tokens) {
                     let progress_now = execution.write_operations + execution.evidence.len();
                     let progress_since_window = progress_now.saturating_sub(prompt_baseline);
-                    if prompt_autorenews < MAX_PROMPT_AUTORENEWS && progress_since_window > 0 {
+                    if prompt_autorenews < MAX_PROMPT_AUTORENEWS
+                        && (progress_since_window > 0
+                            || (controlled_delivery_turn && goal_execution.can_auto_advance()))
+                    {
                         prompt_autorenews += 1;
                         prompt_baseline = progress_now;
                         turn_prompt_tokens = 0;
@@ -950,17 +955,14 @@ impl AgentLoop {
                         continue;
                     }
                     budget_exhausted = true;
-                    log.append(SessionEvent::Assistant {
+                    log.append(SessionEvent::Thinking {
                         id: log.gen_id(),
-                        chunk: Chunk {
-                            text: Some(format!(
-                                "【执行预算暂停】本回合 prompt tokens {} + 预计增量 {} ≥ 安全边界 {}。任务尚未标记完成；下一条“继续”会从当前断点恢复，并获得新的回合预算。",
-                                turn_prompt_tokens,
-                                last_prompt_tokens,
-                                crate::governor::PROMPT_CAP
-                            )),
-                            ..Default::default()
-                        },
+                        text: format!(
+                            "执行预算已到安全边界（prompt tokens {} + 预计增量 {} ≥ {}），当前回合停止；不要求用户输入“继续”。",
+                            turn_prompt_tokens,
+                            last_prompt_tokens,
+                            crate::governor::PROMPT_CAP
+                        ),
                     });
                     break;
                 }
@@ -974,36 +976,41 @@ impl AgentLoop {
                 // 十几次人工“继续”。连续无进展或达到自动续跑上限才交回用户。
                 let progress_since_window = (execution.write_operations + execution.evidence.len())
                     .saturating_sub(hard_baseline);
+                let deterministic_retry = progress_since_window == 0
+                    && budget.hard_autorenews == 0
+                    && controlled_delivery_turn
+                    && goal_execution.can_auto_advance();
                 if !cancelled
                     && budget.hard_autorenews < MAX_HARD_AUTORENEWS
-                    && progress_since_window > 0
+                    && (progress_since_window > 0 || deterministic_retry)
                 {
                     BudgetManager::arm_hard_continuation(&mut budget);
                     budget.hard_autorenews += 1;
                     hard_baseline = execution.write_operations + execution.evidence.len();
                     messages.push(Message::user(&format!(
-                        "[自动续跑·第{}次] 本窗口完成 {} 项可验证进展（写入/新证据），已自动发放新探索窗口，无需人工“继续”。围绕未满足的验收条件继续推进。",
+                        "[自动续跑·第{}次] 本窗口新增 {} 项可验证进展；下一步仍可直接执行，已自动发放新窗口，无需人工“继续”。围绕未满足的验收条件继续推进。",
                         budget.hard_autorenews, progress_since_window
                     )));
                     continue;
                 }
                 absolute_budget_hit = true;
                 hard_stop = true;
-                let terminal_reason = goal_execution.actionable_terminal_reason().unwrap_or_else(
-                    || {
-                        "运行时未获得足以继续定位的目标证据；请确认当前工作区、分支或目标模块路径。"
-                            .into()
-                    },
-                );
-                log.append(SessionEvent::Assistant {
+                let terminal_reason =
+                    goal_execution
+                        .actionable_terminal_reason()
+                        .unwrap_or_else(|| {
+                            if goal_execution.can_auto_advance() {
+                                "明确的下一步在安全执行窗口内仍未成功完成".into()
+                            } else {
+                                "运行时未获得足以继续定位的目标证据".into()
+                            }
+                        });
+                log.append(SessionEvent::Thinking {
                     id: log.gen_id(),
-                    chunk: Chunk {
-                        text: Some(format!(
-                            "[需要处理] 已停止继续探索（{} 步 / {} 次工具调用）。{}",
-                            budget.hard_max_steps, budget.hard_max_tool_calls, terminal_reason
-                        )),
-                        ..Default::default()
-                    },
+                    text: format!(
+                        "已到安全执行上限（{} 步 / {} 次工具调用）：{}",
+                        budget.hard_max_steps, budget.hard_max_tool_calls, terminal_reason
+                    ),
                 });
                 break;
             }
@@ -1044,8 +1051,7 @@ impl AgentLoop {
             // 原子任务以低推理、短输出请求模型：工具门禁只能减少后续回合，只有这里
             // 能抑制首个 tool call 前的隐藏长思考与 `omitted` token 消耗。非原子任务
             // 完全保留用户的模型设置和默认输出预算。
-            let controlled_delivery = goal_executor_enabled()
-                && execution.solve_mode != crate::execution::SolveMode::OpenEnded;
+            let controlled_delivery = controlled_delivery_turn;
             let runtime_allowed_tools = if controlled_delivery {
                 goal_execution.allowed_tools()
             } else {
@@ -1056,11 +1062,7 @@ impl AgentLoop {
                 || empty_recovery_pending
             {
                 RequestOptions {
-                    max_output_tokens: Some(if empty_recovery_pending {
-                        1_024
-                    } else {
-                        1_536
-                    }),
+                    max_output_tokens: Some(if empty_recovery_pending { 1_024 } else { 1_536 }),
                     // DeepSeek/OpenAI 兼容端使用 `none` 表示关闭；`off` 是旧目录
                     // 的内部别名，直接透传会被网关以 HTTP 400 拒绝并中断整个回合。
                     reasoning_effort: Some("none".into()),
@@ -1483,8 +1485,7 @@ impl AgentLoop {
                     match joined {
                         Some(results) => {
                             for ((tc, sig, proposal, action), res) in pending.iter().zip(results) {
-                                sandbox_denial_observed |=
-                                    res.content.contains("[sandbox denied]");
+                                sandbox_denial_observed |= res.content.contains("[sandbox denied]");
                                 access_denial_observed |=
                                     res.content.contains("[access-policy denied]");
                                 // 钩子（PostToolUse）：审计 / 后处理挂钩点。
@@ -1534,6 +1535,8 @@ impl AgentLoop {
                                         for (id, proof) in
                                             goal_execution.settle_static_convergence(root)
                                         {
+                                            execution
+                                                .record_static_verification(&id, proof.clone());
                                             ledger.add_evidence(&id, proof.clone());
                                             ledger.verify(&id);
                                             append_telemetry(
@@ -1740,11 +1743,16 @@ impl AgentLoop {
                         delivery_verified = true;
                         debt = 0;
                     }
-                    GoalCompletion::Correct(hint) if !goal_correction_notified && !hard_stop => {
-                        goal_correction_notified = true;
-                        messages.push(Message::user(format!(
-                            "[V4 目标状态校正] 当前回复没有满足求解图终态。{hint}"
-                        )));
+                    GoalCompletion::Correct(hint) if !hard_stop => {
+                        let correction = if goal_correction_notified {
+                            format!(
+                                "[自动推进] 当前任务仍未验收。{hint} 下一步不需要用户决策，直接执行并验证，不要等待用户回复。"
+                            )
+                        } else {
+                            goal_correction_notified = true;
+                            format!("[V4 目标状态校正] 当前回复没有满足求解图终态。{hint}")
+                        };
+                        messages.push(Message::user(correction));
                         debt += 1;
                     }
                     GoalCompletion::Terminal(reason) => {
@@ -1831,6 +1839,19 @@ impl AgentLoop {
                     Decision::Degrade => messages.push(Message::user(
                         "[降至栈底] 请交付可验证的子目标：停止扩大探索，把已确认的部分整理为结构化交付（已完成、证据锚点、未完成原因、下一步）。",
                     )),
+                    Decision::Terminate(_)
+                        if controlled_delivery
+                            && !hard_stop
+                            && goal_execution.can_auto_advance() =>
+                    {
+                        if debt == 0 {
+                            messages.push(Message::user(format!(
+                                "[自动推进] 下一步无需用户决策：{} 直接执行并完成验证，不要等待用户回复。",
+                                goal_execution.next_action_hint()
+                            )));
+                            debt += 1;
+                        }
+                    }
                     Decision::Terminate(_) => break,
                     Decision::Continue => {}
                 }
@@ -1876,10 +1897,7 @@ impl AgentLoop {
         } else if delivery_verified {
             (
                 harness_session::DeliveryOutcome::PartialDelivery,
-                Some(
-                    "求解图已到终态，但执行证据没有覆盖全部验收项；已拒绝 Verified"
-                        .into(),
-                ),
+                Some("求解图已到终态，但执行证据没有覆盖全部验收项；已拒绝 Verified".into()),
             )
         } else if terminal_reason
             .as_deref()
@@ -2064,7 +2082,8 @@ fn concise_incomplete_status(
         );
     }
     if reason.is_some_and(|text| text.contains("llm provider error")) {
-        return "未完成：模型服务在执行过程中返回错误。\n下一步：恢复模型服务后重试本次任务。".into();
+        return "未完成：模型服务在执行过程中返回错误。\n下一步：恢复模型服务后重试本次任务。"
+            .into();
     }
     if successful_writes > 0 {
         return "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。".into();
@@ -2074,7 +2093,8 @@ fn concise_incomplete_status(
     }
     match phase {
         crate::goal_execution::SolvePhase::Locate => {
-            "未完成：缺少“定位实现文件”步骤。\n下一步：用目标中的明确文字或符号做一次限定范围搜索。".into()
+            "未完成：缺少“定位实现文件”步骤。\n下一步：用目标中的明确文字或符号做一次限定范围搜索。"
+                .into()
         }
         crate::goal_execution::SolvePhase::Inspect => {
             "未完成：缺少“确认修改位置”步骤。\n下一步：读取已命中文件的相关代码区间。".into()
@@ -2722,17 +2742,13 @@ fn unsupported_runtime_claim_correction(
         facts.push("没有任何带 [sandbox denied] 标签的工具结果，不能归因为沙箱拦截");
     }
     if claims_access_denial && !access_denial_observed {
-        facts.push(
-            "没有任何带 [access-policy denied] 标签的工具结果，不能归因为访问权限拒绝",
-        );
+        facts.push("没有任何带 [access-policy denied] 标签的工具结果，不能归因为访问权限拒绝");
     }
     if change_required && claims_change_applied {
         if write_operations == 0 {
             facts.push("当前成功写操作计数为 0，不能声称修改已经落实或代码已经落盘");
         } else if !completion_ready {
-            facts.push(
-                "虽然已有部分写操作，但全部验收项尚未完成并验证，不能声称整个任务已完成",
-            );
+            facts.push("虽然已有部分写操作，但全部验收项尚未完成并验证，不能声称整个任务已完成");
         }
     }
     (!facts.is_empty()).then(|| facts.join("；"))
@@ -3135,7 +3151,8 @@ mod tests {
             status,
             "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。"
         );
-        for internal_label in ["【资产】", "锚点：", "假设：", "补丁建议：", "问项："] {
+        for internal_label in ["【资产】", "锚点：", "假设：", "补丁建议：", "问项："]
+        {
             assert!(!status.contains(internal_label));
         }
     }

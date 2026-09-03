@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::execution::{edit_has_substantive_delta, ActionProposal, TaskContract};
-use crate::intent::{inspect_diff, Clarification, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior};
+use crate::intent::{
+    inspect_diff, Clarification, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior,
+};
 use crate::target_extract::{
     extract_acronyms, extract_code_symbols, extract_form_field_order, extract_navigation,
     segment_candidates, FormFieldOrder,
@@ -124,14 +126,11 @@ impl GoalContract {
     pub fn has_locatable_signal(&self) -> bool {
         !self.entities.is_empty()
             || !self.navigation.is_empty()
-            || self
-                .transformation
-                .as_ref()
-                .is_some_and(|value| {
-                    let from = value.from_value.as_deref().unwrap_or("").trim();
-                    let to = value.to_value.trim();
-                    !from.is_empty() || !to.is_empty()
-                })
+            || self.transformation.as_ref().is_some_and(|value| {
+                let from = value.from_value.as_deref().unwrap_or("").trim();
+                let to = value.to_value.trim();
+                !from.is_empty() || !to.is_empty()
+            })
     }
 
     /// **Phase 2**：对已完成定位的候选文件做一次轻量静态核对，产出 `ObservedBehavior`。
@@ -150,7 +149,11 @@ impl GoalContract {
             .transformation
             .iter()
             .map(|value| value.to_value.trim().to_string())
-            .chain(self.expected_values.iter().map(|value| value.value.trim().to_string()))
+            .chain(
+                self.expected_values
+                    .iter()
+                    .map(|value| value.value.trim().to_string()),
+            )
             .filter(|value| !value.is_empty())
             .collect();
         if expected.is_empty() || target_files.is_empty() {
@@ -716,9 +719,7 @@ impl GoalExecution {
             .filter(|item| {
                 !matches!(
                     item.state,
-                    WorkItemState::Verified
-                        | WorkItemState::Failed
-                        | WorkItemState::NeedsUserInput
+                    WorkItemState::Verified | WorkItemState::Failed | WorkItemState::NeedsUserInput
                 )
             })
             .collect()
@@ -735,9 +736,7 @@ impl GoalExecution {
             .filter(|item| {
                 !matches!(
                     item.state,
-                    WorkItemState::Verified
-                        | WorkItemState::Failed
-                        | WorkItemState::NeedsUserInput
+                    WorkItemState::Verified | WorkItemState::Failed | WorkItemState::NeedsUserInput
                 ) && item.depends_on.iter().all(|dep| {
                     // 依赖项不存在视为已满足（容错，避免因为草图引用瑕疵而哑火）。
                     self.items
@@ -836,10 +835,7 @@ impl GoalExecution {
     /// 占用 == Σ 每面预算，而非 Σ × 并行度。
     pub fn required_budget_parallel(&self) -> SurfaceBudgetDemand {
         let surfaces = self.active_surfaces();
-        let steps: usize = surfaces
-            .iter()
-            .map(|item| item.phase_budget.total())
-            .sum();
+        let steps: usize = surfaces.iter().map(|item| item.phase_budget.total()).sum();
         SurfaceBudgetDemand {
             surfaces: surfaces.len(),
             steps,
@@ -1127,9 +1123,7 @@ impl GoalExecution {
         registry.missing_coverage_report(|id| {
             self.items
                 .get(id)
-                .map(|item| {
-                    matches!(item.state, WorkItemState::Verified | WorkItemState::Changed)
-                })
+                .map(|item| matches!(item.state, WorkItemState::Verified | WorkItemState::Changed))
                 .unwrap_or(false)
         })
     }
@@ -1207,7 +1201,11 @@ impl GoalExecution {
             "[跨面一致性·漏改预警] 以下概念在多个交付面出现，但部分面尚未改动，必须同步：".into(),
         );
         for (symbol, surfaces) in leaks.iter().take(MAX_LEAK_CONCEPTS) {
-            let shown: Vec<&str> = surfaces.iter().map(String::as_str).take(MAX_LEAK_SURFACES).collect();
+            let shown: Vec<&str> = surfaces
+                .iter()
+                .map(String::as_str)
+                .take(MAX_LEAK_SURFACES)
+                .collect();
             let more = if surfaces.len() > shown.len() {
                 format!(" 等 {} 个面", surfaces.len())
             } else {
@@ -1220,7 +1218,10 @@ impl GoalExecution {
             ));
         }
         if leaks.len() > MAX_LEAK_CONCEPTS {
-            lines.push(format!("（另有 {} 个概念略）", leaks.len() - MAX_LEAK_CONCEPTS));
+            lines.push(format!(
+                "（另有 {} 个概念略）",
+                leaks.len() - MAX_LEAK_CONCEPTS
+            ));
         }
         lines.join("\n")
     }
@@ -1490,6 +1491,14 @@ impl GoalExecution {
             .all(|item| item.state == WorkItemState::Verified)
     }
 
+    /// 当前状态是否存在无需用户决策即可执行的下一步。
+    ///
+    /// 只有活动工作项且阶段仍开放工具时才返回 true；NeedsUserInput/Failed/Verified
+    /// 不会进入自动续跑，避免把真正的澄清或终态伪装成内部“继续”。
+    pub fn can_auto_advance(&self) -> bool {
+        self.active_item().is_some() && !self.allowed_tools().is_empty()
+    }
+
     /// 受控任务的唯一完成判定。旧 ExecutionState 只保留统计与 legacy 路径，
     /// 不再与 SolveGraph 竞争控制阶段或终态。
     pub fn evaluate_completion(&self, step_had_tools: bool) -> GoalCompletion {
@@ -1664,9 +1673,16 @@ impl GoalExecution {
         let is_verify = action.phase == SolvePhase::Verify || is_verification(&proposal.signature);
         let substantive_write = !is_write
             || edit_has_substantive_delta(&proposal.signature)
-            || ["注释", "文档", "说明文字", "readme", "markdown", "doc comment"]
-                .iter()
-                .any(|marker| self.goal.objective.to_lowercase().contains(marker));
+            || [
+                "注释",
+                "文档",
+                "说明文字",
+                "readme",
+                "markdown",
+                "doc comment",
+            ]
+            .iter()
+            .any(|marker| self.goal.objective.to_lowercase().contains(marker));
         let effective_ok = ok && !proposal.is_search_miss(summary) && substantive_write;
         let previous_target_count = self.target_files.len();
         let previous_confirmed_target_count = self.confirmed_target_files.len();
@@ -2196,9 +2212,8 @@ pub(crate) fn extract_exact_transformation(input: &str) -> Option<ExactTransform
         let old = &quoted[quoted.len() - 2];
         let new = &quoted[quoted.len() - 1];
         let relation = &input[old.end..new.start];
-        const QUOTED_TRANSFORM_RELATIONS: [&str; 8] = [
-            "精简", "简化", "缩短", "改写", "替换", "改成", "变成", "→",
-        ];
+        const QUOTED_TRANSFORM_RELATIONS: [&str; 8] =
+            ["精简", "简化", "缩短", "改写", "替换", "改成", "变成", "→"];
         if QUOTED_TRANSFORM_RELATIONS
             .iter()
             .any(|marker| relation.contains(marker))
@@ -2284,7 +2299,10 @@ mod tests {
         );
 
         let with_literal = GoalContract::compile("后台管理->多端拼装，菜单名称修改为智能体装配");
-        assert!(with_literal.has_locatable_signal(), "明确旧值也是可定位信号");
+        assert!(
+            with_literal.has_locatable_signal(),
+            "明确旧值也是可定位信号"
+        );
 
         let with_nothing = GoalContract::compile("嗯");
         assert!(
@@ -2374,6 +2392,7 @@ mod tests {
     fn two_failed_locates_request_user_input() {
         let contract = TaskContract::from_input("修复登录按钮无反应");
         let mut plan = GoalExecution::from_contract(&contract);
+        assert!(plan.can_auto_advance());
         let proposal = ActionProposal {
             signature: "search:{\"pattern\":\"login\"}".into(),
             question: "locate".into(),
@@ -2383,6 +2402,10 @@ mod tests {
         plan.record_result(&proposal, false, "no match");
         plan.record_result(&proposal, false, "no match");
         assert!(plan.actionable_terminal_reason().is_some());
+        assert!(
+            !plan.can_auto_advance(),
+            "真正需要用户补充信息时必须停止自动推进"
+        );
     }
 
     #[test]
@@ -2405,7 +2428,11 @@ mod tests {
         // 不再因共享预算而被前面的面耗尽饿死（V5 §2.2 的根因）。
         let contract = TaskContract::from_input("列表、新增、编辑都需要展示 appCode");
         let plan = GoalExecution::from_contract(&contract);
-        assert!(plan.items.len() >= 2, "应拆出多个交付面，实际 {}", plan.items.len());
+        assert!(
+            plan.items.len() >= 2,
+            "应拆出多个交付面，实际 {}",
+            plan.items.len()
+        );
         for item in plan.items.values() {
             assert_eq!(
                 item.phase_budget,
@@ -2578,11 +2605,10 @@ mod tests {
             1,
             "已满足且产物可复核的面应静态收敛，实际 {settled:?}"
         );
-        assert!(
-            plan.items
-                .values()
-                .all(|item| item.state == WorkItemState::Verified)
-        );
+        assert!(plan
+            .items
+            .values()
+            .all(|item| item.state == WorkItemState::Verified));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2634,7 +2660,10 @@ mod tests {
         let id = plan.items.keys().next().cloned().unwrap();
 
         // 白名单内的声明：合法，且只影响判据严格程度。
-        assert!(plan.declare_surface_kind(&id, "UI"), "白名单值应判为合法声明");
+        assert!(
+            plan.declare_surface_kind(&id, "UI"),
+            "白名单值应判为合法声明"
+        );
         assert_eq!(plan.items[&id].kind, SurfaceKind::Ui);
 
         // 白名单外的声明：判为非法，回落 Unknown，并留下痕迹。
@@ -2751,7 +2780,13 @@ mod tests {
         //   S3) required_budget 供水 ≥ 各面预算之和（线性），旧常数下则不足。
         //   S4) 全部静态可证面凭磁盘产物免 shell 结案；behavior 面必须实际执行。
         let root = scratch_workspace("v5-audit");
-        let markers = ["GRID_LABEL", "GRID_SORTABLE", "API_TOKEN", "SCHEMA_AGE", "UI_SUBMIT"];
+        let markers = [
+            "GRID_LABEL",
+            "GRID_SORTABLE",
+            "API_TOKEN",
+            "SCHEMA_AGE",
+            "UI_SUBMIT",
+        ];
         let files: Vec<String> = (0..markers.len())
             .map(|i| format!("src/surface_{i}.rs"))
             .collect();
@@ -2766,7 +2801,8 @@ mod tests {
         }
 
         let goal = GoalContract {
-            objective: "多交付面任务：列标签、列可排序、接口带 token、schema 加 age、界面加提交按钮".into(),
+            objective:
+                "多交付面任务：列标签、列可排序、接口带 token、schema 加 age、界面加提交按钮".into(),
             navigation: vec![],
             entities: vec![],
             candidates: vec![],
@@ -2776,7 +2812,10 @@ mod tests {
             expected_state: String::new(),
             expected_values: markers
                 .iter()
-                .map(|m| ExpectedValue { key: "目标值".into(), value: (*m).to_string() })
+                .map(|m| ExpectedValue {
+                    key: "目标值".into(),
+                    value: (*m).to_string(),
+                })
                 .collect(),
             transformation: None,
         };
@@ -2809,7 +2848,11 @@ mod tests {
                     phase_attempts: PhaseAttempts::default(),
                     phase_budget: PhaseBudget::default(),
                     // 前 4 个面是界面/字段/签名类（静态可证）；第 5 个是运行时行为（必须执行）。
-                    kind: if i < 4 { SurfaceKind::Ui } else { SurfaceKind::Behavior },
+                    kind: if i < 4 {
+                        SurfaceKind::Ui
+                    } else {
+                        SurfaceKind::Behavior
+                    },
                     depends_on: vec![],
                     risk: SurfaceRisk::default(),
                 },
@@ -2865,8 +2908,7 @@ mod tests {
     // ===== S5：G2 DAG 全并行 + 预算守恒 + 环检测；G5 风险分层并发准入 =====
 
     fn three_surface_plan() -> GoalExecution {
-        let contract =
-            TaskContract::from_input("- 列表展示\n- 详情展示\n- 新增表单");
+        let contract = TaskContract::from_input("- 列表展示\n- 详情展示\n- 新增表单");
         GoalExecution::from_contract(&contract)
     }
 
@@ -2887,7 +2929,10 @@ mod tests {
              "budget":{"locate":2,"inspect":2,"change":2,"verify":2},"convergence":"statically_provable"}
         ]}"#;
         let plan2 = GoalExecution::from_input_with_sketch(&contract, Some(json));
-        assert!(plan2.detect_cycle().is_none(), "环草图必须回落为无环静态模板");
+        assert!(
+            plan2.detect_cycle().is_none(),
+            "环草图必须回落为无环静态模板"
+        );
         assert_eq!(plan2.items.len(), 2);
     }
 
@@ -2939,18 +2984,10 @@ mod tests {
     #[test]
     fn same_file_write_conflicts_are_serialized_into_one_group() {
         let mut plan = three_surface_plan();
-        plan.items
-            .get_mut("item-1")
-            .unwrap()
-            .candidate_targets = vec!["shared.tsx".into()];
-        plan.items
-            .get_mut("item-2")
-            .unwrap()
-            .candidate_targets = vec!["shared.tsx".into(), "other.tsx".into()];
-        plan.items
-            .get_mut("item-3")
-            .unwrap()
-            .candidate_targets = vec!["alone.tsx".into()];
+        plan.items.get_mut("item-1").unwrap().candidate_targets = vec!["shared.tsx".into()];
+        plan.items.get_mut("item-2").unwrap().candidate_targets =
+            vec!["shared.tsx".into(), "other.tsx".into()];
+        plan.items.get_mut("item-3").unwrap().candidate_targets = vec!["alone.tsx".into()];
         let groups = plan.parallel_write_groups();
         // item-1 与 item-2 共享 shared.tsx → 同组；item-3 独立一组。
         let shared_group = groups
@@ -3009,7 +3046,9 @@ mod tests {
         let plan = GoalExecution::from_input_with_sketch(&contract, Some("not json {"));
         assert_eq!(plan.items.len(), 2, "非法草图必须回落为静态模板");
         assert!(
-            plan.items.values().all(|item| item.kind == SurfaceKind::Undeclared),
+            plan.items
+                .values()
+                .all(|item| item.kind == SurfaceKind::Undeclared),
             "回落后面类别保持默认未声明"
         );
     }
@@ -3029,8 +3068,14 @@ mod tests {
         let appcode = report.iter().find(|(symbol, _)| symbol == "appCode");
         assert!(appcode.is_some(), "appCode 跨面但未全改应被报漏改");
         let missing = &appcode.unwrap().1;
-        assert!(missing.contains(&"item-2".to_string()), "item-2 漏改应被标记");
-        assert!(missing.contains(&"item-3".to_string()), "item-3 漏改应被标记");
+        assert!(
+            missing.contains(&"item-2".to_string()),
+            "item-2 漏改应被标记"
+        );
+        assert!(
+            missing.contains(&"item-3".to_string()),
+            "item-3 漏改应被标记"
+        );
         assert!(
             !missing.contains(&"item-1".to_string()),
             "已完成的面不应出现在漏改列表"
@@ -3072,11 +3117,26 @@ mod tests {
                 .to_string(),
             deliverables: vec!["email 字段端到端贯通".to_string()],
             acceptance_criteria: vec![
-                Criterion { id: "item-1".into(), description: "UI 列表展示 email".into() },
-                Criterion { id: "item-2".into(), description: "Schema 增加 email 字段".into() },
-                Criterion { id: "item-3".into(), description: "API 响应包含 email".into() },
-                Criterion { id: "item-4".into(), description: "on_click 后刷新 email".into() },
-                Criterion { id: "item-5".into(), description: "legacy 面处理 email".into() },
+                Criterion {
+                    id: "item-1".into(),
+                    description: "UI 列表展示 email".into(),
+                },
+                Criterion {
+                    id: "item-2".into(),
+                    description: "Schema 增加 email 字段".into(),
+                },
+                Criterion {
+                    id: "item-3".into(),
+                    description: "API 响应包含 email".into(),
+                },
+                Criterion {
+                    id: "item-4".into(),
+                    description: "on_click 后刷新 email".into(),
+                },
+                Criterion {
+                    id: "item-5".into(),
+                    description: "legacy 面处理 email".into(),
+                },
             ],
             inferred_surface_criteria: false,
             scope: vec![],
@@ -3105,8 +3165,10 @@ mod tests {
         // 控制概念集以避免目标文案的 L1 切分噪声污染漏改报告。
         plan.goal.candidates = vec!["email".to_string()];
         plan.goal.code_entities = vec![];
-        plan.goal.expected_values =
-            vec![ExpectedValue { key: "目标值".into(), value: "email".into() }];
+        plan.goal.expected_values = vec![ExpectedValue {
+            key: "目标值".into(),
+            value: "email".into(),
+        }];
         // 每个面绑定自己的产物文件（机制层只认"email 在哪些文件出现"）。
         for (id, rel) in &files {
             plan.items.get_mut(id).unwrap().candidate_targets = vec![rel.clone()];
@@ -3184,8 +3246,10 @@ mod tests {
         let mut run = GoalExecution::from_contract(&contract);
         run.goal.candidates = vec!["email".to_string()];
         run.goal.code_entities = vec![];
-        run.goal.expected_values =
-            vec![ExpectedValue { key: "目标值".into(), value: "email".into() }];
+        run.goal.expected_values = vec![ExpectedValue {
+            key: "目标值".into(),
+            value: "email".into(),
+        }];
         for (id, rel) in &files {
             run.items.get_mut(id).unwrap().candidate_targets = vec![rel.clone()];
         }
@@ -3235,7 +3299,11 @@ mod tests {
                     item.state = WorkItemState::Verified;
                 }
             }
-            if run.items.values().all(|i| matches!(i.state, WorkItemState::Verified)) {
+            if run
+                .items
+                .values()
+                .all(|i| matches!(i.state, WorkItemState::Verified))
+            {
                 break;
             }
         }
@@ -3269,9 +3337,18 @@ mod tests {
             objective: "为 User 增加 email 字段，在 UI、Schema、API 展示".to_string(),
             deliverables: vec!["email 贯通".into()],
             acceptance_criteria: vec![
-                Criterion { id: "item-1".into(), description: "UI 展示 email".into() },
-                Criterion { id: "item-2".into(), description: "Schema 加 email".into() },
-                Criterion { id: "item-3".into(), description: "API 含 email".into() },
+                Criterion {
+                    id: "item-1".into(),
+                    description: "UI 展示 email".into(),
+                },
+                Criterion {
+                    id: "item-2".into(),
+                    description: "Schema 加 email".into(),
+                },
+                Criterion {
+                    id: "item-3".into(),
+                    description: "API 含 email".into(),
+                },
             ],
             inferred_surface_criteria: false,
             scope: vec![],
@@ -3406,9 +3483,7 @@ mod tests {
 
     #[test]
     fn weak_grounding_cannot_authorize_an_unrelated_edit() {
-        let contract = TaskContract::from_input(
-            "文件树右键可以把选定文件添加到对话框附件",
-        );
+        let contract = TaskContract::from_input("文件树右键可以把选定文件添加到对话框附件");
         let mut plan = GoalExecution::from_contract(&contract);
         plan.apply_grounding(&WorkspaceGrounding {
             status: crate::workspace_grounder::GroundingStatus::Grounded,
@@ -3422,7 +3497,8 @@ mod tests {
         assert!(plan.confirmed_target_files.is_empty());
 
         let read_proposal = ActionProposal {
-            signature: "fs:{\"op\":\"read\",\"path\":\"harness/harness-ui/src/gui/theme.rs\"}".into(),
+            signature: "fs:{\"op\":\"read\",\"path\":\"harness/harness-ui/src/gui/theme.rs\"}"
+                .into(),
             question: "inspect soft candidate".into(),
             supports: vec!["user-objective".into()],
             estimated_cost: 1,
@@ -3474,7 +3550,10 @@ mod tests {
             estimated_cost: 1,
         };
         let result = "共 1 条命中（格式：相对路径:行号: 内容）：\nui/src/gui/settings_view.rs:482: \"新建项目\" => {";
-        assert_eq!(plan.record_result(&proposal, true, result), EvidenceKind::TargetFound);
+        assert_eq!(
+            plan.record_result(&proposal, true, result),
+            EvidenceKind::TargetFound
+        );
         assert_eq!(
             plan.confirmed_target_files,
             vec!["ui/src/gui/settings_view.rs".to_string()]
@@ -3746,10 +3825,7 @@ mod tests {
         );
         assert_eq!(plan.active_item().unwrap().state, WorkItemState::Satisfied);
         // 已满足仍必须验证：不得直接结案。
-        assert!(
-            !plan.can_conclude(),
-            "已满足只是免去修改，验证不能免"
-        );
+        assert!(!plan.can_conclude(), "已满足只是免去修改，验证不能免");
         // S4：版本号是可逐字复核的产物断言（0.2.2 @ Cargo.toml），因此验证阶段除 shell
         // 之外还放开 fs —— 读一眼产物就能收敛，不必去跑一条它证明不了的命令。
         assert_eq!(plan.allowed_tools(), vec!["fs", "shell"]);
@@ -3893,7 +3969,11 @@ mod tests {
             ("item-2", "b.tsx"),
             ("item-3", "c.tsx"),
         ] {
-            plan.items.get_mut(id).unwrap().candidate_targets.push(path.into());
+            plan.items
+                .get_mut(id)
+                .unwrap()
+                .candidate_targets
+                .push(path.into());
         }
         plan.goal.code_entities.push("appCode".into());
         plan.items.get_mut("item-1").unwrap().state = WorkItemState::Verified;
@@ -3917,7 +3997,11 @@ mod tests {
                 ("item-2", "b.tsx"),
                 ("item-3", "c.tsx"),
             ] {
-                plan.items.get_mut(id).unwrap().candidate_targets.push(path.into());
+                plan.items
+                    .get_mut(id)
+                    .unwrap()
+                    .candidate_targets
+                    .push(path.into());
             }
             plan.goal.code_entities.push("appCode".into());
             plan.items.get_mut("item-1").unwrap().state = WorkItemState::Verified;
@@ -3951,7 +4035,11 @@ mod tests {
             ("item-2", "b.tsx"),
             ("item-3", "c.tsx"),
         ] {
-            plan.items.get_mut(id).unwrap().candidate_targets.push(path.into());
+            plan.items
+                .get_mut(id)
+                .unwrap()
+                .candidate_targets
+                .push(path.into());
         }
         let rendered = plan.render_for_model();
         assert!(
@@ -3997,26 +4085,26 @@ mod tests {
         let mut plan = three_surface_plan();
         for id in ["item-1", "item-2", "item-3"] {
             plan.items.get_mut(id).unwrap().state = WorkItemState::ReadyToChange;
-            plan.items
-                .get_mut(id)
-                .unwrap()
-                .candidate_targets = vec![format!("{id}.tsx")];
+            plan.items.get_mut(id).unwrap().candidate_targets = vec![format!("{id}.tsx")];
         }
         plan.goal.code_entities.push("appCode".into());
         // 单面作用域：必须退化为全局提示（含全部交付面、并行计划、跨面清单），
         // 不得被截断为仅 scope 内面。concept_coverage_checklist 现已字节确定（见
         // concept_coverage_checklist_is_byte_deterministic），故此处用结构标记断言退化。
         let single = plan.render_for_model_scoped(&["item-2".to_string()]);
-        assert!(single.contains("[V4 唯一目标求解图]"), "单面作用域应含全局标题");
+        assert!(
+            single.contains("[V4 唯一目标求解图]"),
+            "单面作用域应含全局标题"
+        );
         for id in ["item-1", "item-2", "item-3"] {
-            assert!(single.contains(id), "单面作用域应仍列出全部交付面 {id}（未截断）");
+            assert!(
+                single.contains(id),
+                "单面作用域应仍列出全部交付面 {id}（未截断）"
+            );
         }
         assert!(single.contains("[并行执行计划]"), "单面作用域应含并行计划");
         assert!(single.contains("跨面一致性"), "单面作用域应含跨面清单");
-        assert!(
-            !single.contains("本轮聚焦"),
-            "单面作用域不应带聚焦标记"
-        );
+        assert!(!single.contains("本轮聚焦"), "单面作用域不应带聚焦标记");
         // 多面作用域：含聚焦标记、工作项列表只列 scope 内面、仍含并行计划与跨面清单。
         let scoped = plan.render_for_model_scoped(&["item-1".to_string(), "item-2".to_string()]);
         assert!(scoped.contains("本轮聚焦"), "多面作用域应含聚焦标记");

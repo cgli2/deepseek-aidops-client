@@ -61,6 +61,33 @@ pub fn stream_chat(
     crate::dsml::filter_stream(inner_stream_chat(provider_label, base_url, api_key, body))
 }
 
+/// 将用户配置的地址解析为实际请求端点。
+///
+/// 用户给的是「完整端点」时（已以 `/chat/completions` 或其他 action 段结尾，
+/// 如 `https://ark.cn-beijing.volces.com/api/plan/v3/images/generations`），
+/// 原样使用，不再拼接片段；只有形如 `https://host/v1` 的基础地址才追加
+/// `/chat/completions`，避免出现 `/api/v3/images/generations/chat/completions`
+/// 这类拼接导致的 404 InvalidAction。
+fn resolve_endpoint(base_url: &str) -> String {
+    const FULL_ENDPOINT_SUFFIXES: [&str; 6] = [
+        "/chat/completions",
+        "/completions",
+        "/generations",
+        "/embeddings",
+        "/responses",
+        "/messages",
+    ];
+    let trimmed = base_url.trim_end_matches('/');
+    if FULL_ENDPOINT_SUFFIXES
+        .iter()
+        .any(|suffix| trimmed.ends_with(suffix))
+    {
+        trimmed.to_string()
+    } else {
+        format!("{}/chat/completions", trimmed)
+    }
+}
+
 fn inner_stream_chat(
     provider_label: &'static str,
     base_url: String,
@@ -78,7 +105,7 @@ fn inner_stream_chat(
 
         let request = {
             let mut req = client
-                .post(format!("{}/chat/completions", base_url.trim_end_matches('/')))
+                .post(resolve_endpoint(&base_url))
                 .header("Content-Type", "application/json")
                 .header("Accept", "text/event-stream")
                 .json(&body);
@@ -102,7 +129,16 @@ fn inner_stream_chat(
         if !resp.status().is_success() {
             let status = resp.status();
             let txt = resp.text().await.unwrap_or_default();
-            yield Err(Error::Llm(format!("{provider_label} HTTP {status}: {txt}")));
+            let endpoint = resolve_endpoint(&base_url);
+            let hint = if txt.contains("MissingParameter")
+                && txt.contains("prompt")
+                && endpoint.ends_with("/generations")
+            {
+                "；当前地址是生成类端点，要求顶层 `prompt` 参数，但本 Provider 发送的是 OpenAI Chat Completions 请求体（`messages`）。请改用模型的 `/chat/completions` 对话端点；图像生成端点不能作为聊天模型地址"
+            } else {
+                ""
+            };
+            yield Err(Error::Llm(format!("{provider_label} HTTP {status}: {txt}{hint}")));
             return;
         }
 

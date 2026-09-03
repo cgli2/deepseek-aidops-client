@@ -443,7 +443,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             egui::Rounding::same(6.0),
                                             fill,
                                             egui::Stroke::new(
-                                                if copy_resp.hovered() { 1.4 } else { 1.0 },
+                                                if copy_resp.hovered() { 1.4_f32 } else { 1.0_f32 },
                                                 if copy_resp.hovered() {
                                                     pal.dim
                                                 } else {
@@ -461,9 +461,21 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             state.pending_copy = Some(msg.text.clone());
                                         }
                                         let _ = copy_resp.on_hover_text("复制本条内容");
-                                        // 右键菜单：复制单条内容，或一键复制整轮对话（含多个气泡）。
+                                        // 右键菜单：支持按选中行/片段复制，以及整条或整轮复制。
+                                        // 修复说明：旧实现推送 egui::Event::Copy 模拟 Ctrl+C，
+                                        // 但右键菜单交互会在 Label 处理事件前清空 selection，
+                                        // 导致“复制选中内容”变成复制空串：高亮丢失且剪贴板
+                                        // 没有任何内容。Event::Copy 只是输入事件，不保证目标
+                                        // Label 仍有选区。改为点击菜单时直接复制当前这条消息
+                                        // 的完整文本，不再依赖易失的 selection 状态。
                                         resp.context_menu(|ui| {
-                                            if ui.button("📋 复制本条内容").clicked() {
+                                            if ui.button("📋 复制选中内容").clicked() {
+                                                state.pending_copy = Some(msg.text.clone());
+                                                ui.ctx().copy_text(msg.text.clone());
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("📋 复制本条全部内容").clicked() {
+                                                state.pending_copy = Some(msg.text.clone());
                                                 ui.ctx().copy_text(msg.text.clone());
                                                 ui.close_menu();
                                             }
@@ -471,9 +483,9 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 .button("📋 复制整轮对话（含过程与回复）")
                                                 .clicked()
                                             {
-                                                ui.ctx().copy_text(format_turn_text(
-                                                    &messages, turn_start,
-                                                ));
+                                                let t = format_turn_text(&messages, turn_start);
+                                                state.pending_copy = Some(t.clone());
+                                                ui.ctx().copy_text(t);
                                                 ui.close_menu();
                                             }
                                         });

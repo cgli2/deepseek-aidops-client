@@ -361,20 +361,22 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                         }
                                                     }
                                                 }
-                                                ui.separator();
-                                                ui.horizontal(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new("自定义")
-                                                            .size(11.5)
-                                                            .color(pal.dim),
-                                                    );
-                                                    ui.add(
-                                                        egui::TextEdit::singleline(&mut state.f_provider)
-                                                            .desired_width(140.0)
-                                                            .hint_text("输入其他厂商"),
-                                                    );
-                                                });
                                             });
+                                        // 自定义厂商输入框必须放在 ComboBox 弹层之外：
+                                        // 旧实现将其嵌在 show_ui 闭包内，点击输入框会先命中下拉项并
+                                        // 触发 ComboBox 自身的开合逻辑，焦点被下拉吞掉，用户无法输入。
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("自定义")
+                                                    .size(11.5)
+                                                    .color(pal.dim),
+                                            );
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.f_provider)
+                                                    .desired_width(140.0)
+                                                    .hint_text("输入其他厂商"),
+                                            );
+                                        });
                                         field_label(ui, &pal, "API 地址");
                                         ui.add(
                                             egui::TextEdit::singleline(&mut state.f_base)

@@ -18,6 +18,25 @@ const PROVIDER_PRESETS: &[(&str, &str)] = &[
     ("ollama", "http://localhost:11434/v1"),
 ];
 
+fn panel_size(page: &str, system_page: bool, screen: egui::Vec2) -> (f32, f32) {
+    if page == "新建项目" {
+        (
+            (screen.x - 320.0).clamp(460.0, 560.0),
+            (screen.y - 40.0).clamp(140.0, 220.0),
+        )
+    } else if system_page {
+        (
+            (screen.x - 180.0).clamp(700.0, 860.0),
+            (screen.y - 100.0).clamp(520.0, 680.0),
+        )
+    } else {
+        (
+            (screen.x - 320.0).clamp(520.0, 660.0),
+            (screen.y - 56.0).clamp(534.0, 914.0),
+        )
+    }
+}
+
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
     // ── 设置弹层 ─────────────────────────────────────────────
     // ── 设置模态：全屏半透明遮罩 + 居中圆角面板（替代默认 Window 标题栏样式）──
@@ -48,17 +67,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
             page.as_str()
         };
         let screen = ctx.screen_rect();
-        // 系统管理采用紧凑、稳定的双栏尺寸；内容多少不再改变弹窗大小。
-        let panel_w = if system_page {
-            (screen.width() - 180.0).clamp(700.0, 860.0)
-        } else {
-            (screen.width() - 320.0).clamp(520.0, 660.0)
-        };
-        let panel_h = if system_page {
-            (screen.height() - 100.0).clamp(520.0, 680.0)
-        } else {
-            (screen.height() - 56.0).clamp(534.0, 914.0)
-        };
+        // 系统管理采用紧凑、稳定的双栏尺寸；新建项目等简易单页采用紧凑高度。
+        let (panel_w, panel_h) = panel_size(&page, system_page, screen.size());
         let scroll_h = panel_h - 94.0;
         // 内容变化（插件行、提示文字、滚动条）不能影响面板位置；否则居中锚点会
         // 和自动尺寸互相反馈，在 Windows 上表现为持续抖动。
@@ -1353,5 +1363,24 @@ if state.mem_tab == "code" {
         state.modal_open_last_frame = true;
     } else {
         state.modal_open_last_frame = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panel_size;
+
+    #[test]
+    fn new_project_dialog_uses_a_compact_bounded_height() {
+        let screen = egui::vec2(1_440.0, 900.0);
+        let (new_project_w, new_project_h) = panel_size("新建项目", false, screen);
+        let (_, regular_h) = panel_size("插件管理", false, screen);
+
+        assert_eq!(new_project_w, 560.0);
+        assert_eq!(new_project_h, 220.0);
+        assert!(new_project_h < regular_h);
+
+        let (_, short_screen_h) = panel_size("新建项目", false, egui::vec2(800.0, 170.0));
+        assert_eq!(short_screen_h, 140.0);
     }
 }

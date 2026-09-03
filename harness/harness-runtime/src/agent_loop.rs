@@ -1863,7 +1863,8 @@ impl AgentLoop {
         let terminal_reason = goal_execution.actionable_terminal_reason();
         let (raw_outcome, raw_reason) = if provider_error_seen {
             // provider 流错误优先级最高：错误文本非模型回答，绝不可 Verified；
-            // On 模式下游出口收口会把 SystemFailure 再包成 PartialDelivery + 四要素资产。
+            // On 模式下游出口会把 SystemFailure 收口为 PartialDelivery；内部诊断资产
+            // 只写遥测，用户看到的是简短的缺失步骤。
             (
                 harness_session::DeliveryOutcome::SystemFailure,
                 Some(format!(
@@ -1938,8 +1939,8 @@ impl AgentLoop {
         };
         // 出口收口（spec §4.2）：控制器模式下只剩两个出口。Verified 即 Delivered；
         // 用户取消保持 Cancelled（强行改判会剥夺取消语义，且它不是治理失败）；
-        // 其余一律收敛为 PartialDelivery + R4 四要素资产，且资产以 Assistant 事件
-        // 对用户可见——「失败也留资产」若不落到会话流就等于没留。
+        // 其余一律收敛为 PartialDelivery。R4 四要素是内部诊断资产，写入 Telemetry；
+        // 用户只看到“缺少哪一步 + 下一步”，避免把锚点、假设和门禁术语直接倾倒到 UI。
         let (outcome, reason) = if self.governor == GovernorMode::On
             && !matches!(
                 raw_outcome,
@@ -1965,18 +1966,28 @@ impl AgentLoop {
                 &goal_execution.next_action_hint(),
                 candidate.as_deref(),
             );
+            append_telemetry(
+                &log,
+                &execution,
+                &goal_execution,
+                &ledger,
+                &format!("内部终止资产：{}", artifact.replace('\n', " | ")),
+            );
+            let status = concise_incomplete_status(
+                &raw_outcome,
+                raw_reason.as_deref(),
+                execution.write_operations,
+                execution.write_attempts,
+                goal_execution.phase(),
+            );
             log.append(SessionEvent::Assistant {
                 id: log.gen_id(),
                 chunk: Chunk {
-                    text: Some(artifact.clone()),
+                    text: Some(status.clone()),
                     ..Default::default()
                 },
             });
-            let original = raw_reason.unwrap_or_else(|| format!("{raw_outcome:?}"));
-            (
-                DeliveryOutcome::PartialDelivery,
-                Some(format!("{artifact}\n原始结论：{original}")),
-            )
+            (DeliveryOutcome::PartialDelivery, Some(status))
         } else {
             (raw_outcome, raw_reason)
         };
@@ -2029,6 +2040,54 @@ impl AgentLoop {
         );
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });
         Ok(())
+    }
+}
+
+fn concise_incomplete_status(
+    outcome: &DeliveryOutcome,
+    reason: Option<&str>,
+    successful_writes: usize,
+    write_attempts: usize,
+    phase: crate::goal_execution::SolvePhase,
+) -> String {
+    if *outcome == DeliveryOutcome::NeedsUserInput {
+        let detail = reason
+            .unwrap_or("需要补充目标范围或预期结果")
+            .replace(['\r', '\n'], " ");
+        let detail = detail
+            .trim()
+            .trim_start_matches("需要用户确认")
+            .trim_start_matches(['：', ':', '；', ';', ' ']);
+        return format!(
+            "需要你的确认：{}",
+            detail.chars().take(180).collect::<String>()
+        );
+    }
+    if reason.is_some_and(|text| text.contains("llm provider error")) {
+        return "未完成：模型服务在执行过程中返回错误。\n下一步：恢复模型服务后重试本次任务。".into();
+    }
+    if successful_writes > 0 {
+        return "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。".into();
+    }
+    if write_attempts > 0 {
+        return "未完成：缺少“写入修改”步骤，之前的编辑没有成功落盘。\n下一步：修正编辑内容并确认目标文件确实发生变化。".into();
+    }
+    match phase {
+        crate::goal_execution::SolvePhase::Locate => {
+            "未完成：缺少“定位实现文件”步骤。\n下一步：用目标中的明确文字或符号做一次限定范围搜索。".into()
+        }
+        crate::goal_execution::SolvePhase::Inspect => {
+            "未完成：缺少“确认修改位置”步骤。\n下一步：读取已命中文件的相关代码区间。".into()
+        }
+        crate::goal_execution::SolvePhase::Change => {
+            "未完成：缺少“写入修改”步骤。\n下一步：对已确认文件执行最小编辑。".into()
+        }
+        crate::goal_execution::SolvePhase::Verify => {
+            "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。".into()
+        }
+        crate::goal_execution::SolvePhase::Conclude => {
+            "未完成：验收证据不完整。\n下一步：补充尚未通过的验收项证据。".into()
+        }
     }
 }
 
@@ -3061,6 +3120,38 @@ mod tests {
         assert_eq!(messages[2].tool_calls[0].id, "call-1");
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(messages[4].role, Role::User);
+    }
+
+    #[test]
+    fn incomplete_delivery_names_only_the_missing_step() {
+        let status = concise_incomplete_status(
+            &DeliveryOutcome::PartialDelivery,
+            Some("已有修改，但尚未获得覆盖全部验收项的验证证据"),
+            1,
+            1,
+            crate::goal_execution::SolvePhase::Conclude,
+        );
+        assert_eq!(
+            status,
+            "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。"
+        );
+        for internal_label in ["【资产】", "锚点：", "假设：", "补丁建议：", "问项："] {
+            assert!(!status.contains(internal_label));
+        }
+    }
+
+    #[test]
+    fn provider_failure_is_summarized_without_dumping_gateway_details() {
+        let status = concise_incomplete_status(
+            &DeliveryOutcome::SystemFailure,
+            Some("llm provider error: HTTP 400 invalid_tool_call_history messages[9]"),
+            0,
+            0,
+            crate::goal_execution::SolvePhase::Change,
+        );
+        assert!(status.contains("模型服务"));
+        assert!(!status.contains("messages[9]"));
+        assert!(!status.contains("HTTP 400"));
     }
 
     #[test]

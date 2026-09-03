@@ -340,11 +340,15 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                     .color(color),
                                             );
                                             if let Some(reason) = &delivery.reason {
-                                                ui.label(
-                                                    egui::RichText::new(reason)
-                                                        .size(10.0)
-                                                        .color(pal.dim),
-                                                );
+                                                // Runtime 的最终 assistant 文本通常已经是同一条
+                                                // 简明状态；避免在交付徽标下原样重复一遍。
+                                                if reason.trim() != msg.text.trim() {
+                                                    ui.label(
+                                                        egui::RichText::new(reason)
+                                                            .size(10.0)
+                                                            .color(pal.dim),
+                                                    );
+                                                }
                                             }
                                         }
                                         #[cfg(target_os = "macos")]

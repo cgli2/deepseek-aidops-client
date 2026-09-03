@@ -25,6 +25,7 @@ use crate::execution::{
     ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
+use crate::intent::ClarificationKind;
 use crate::governor::{artifact_text, is_continuation_request, Decision, TurnGovernor};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
@@ -178,6 +179,37 @@ fn with_candidates(question: &str, goal: &crate::GoalContract) -> String {
     format!("{}（候选：{}）", question, candidates.join("、"))
 }
 
+fn clarification_prompt(kind: ClarificationKind, context: &str) -> String {
+    match kind {
+        ClarificationKind::Locate => concat!(
+            "我还无法确定要处理的位置。\n",
+            "请选择一种方式回复：\n",
+            "1. 提供页面、目录或文件路径\n",
+            "2. 提供一个界面文字或代码符号\n",
+            "3. 只做分析，不修改代码"
+        )
+        .into(),
+        ClarificationKind::ObserveMismatch => {
+            let context = context.replace(['\r', '\n'], " ");
+            format!(
+                "当前实现与描述不一致，需要确认目标：{}\n请选择一种方式回复：\n1. 按描述中的目标值修改\n2. 保持当前实现，只分析原因\n3. 补充正确的目标值",
+                context.chars().take(120).collect::<String>()
+            )
+        }
+    }
+}
+
+fn workspace_scope_prompt() -> String {
+    concat!(
+        "我没有在当前项目中找到相关实现。\n",
+        "请选择一种方式回复：\n",
+        "1. 就在当前项目，请继续从现有菜单入口定位\n",
+        "2. 在其他项目或分支，请告诉我名称\n",
+        "3. 只需要改造方案，不修改代码"
+    )
+    .into()
+}
+
 /// 从追加日志逆向找到最近的未完成根任务。若最近一回合本身也是“继续”，继续
 /// 向前穿透，直到命中真实目标；这使连续多次续跑始终继承同一契约与策略。
 fn latest_resumable_task(events: &[SessionEvent]) -> Option<ResumeState> {
@@ -231,12 +263,9 @@ fn awaiting_clarification(events: &[SessionEvent]) -> bool {
         .iter()
         .rev()
         .find_map(|event| match event {
-            SessionEvent::Delivery { report, .. } => Some(
-                report
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.starts_with(CLARIFICATION_REASON_PREFIX)),
-            ),
+            SessionEvent::Delivery { report, .. } => {
+                Some(report.outcome == DeliveryOutcome::NeedsUserInput)
+            }
             _ => None,
         })
         .unwrap_or(false)
@@ -248,6 +277,36 @@ fn last_assistant_text(events: &[SessionEvent]) -> Option<String> {
         SessionEvent::Assistant { chunk, .. } => chunk.text.clone(),
         _ => None,
     })
+}
+
+/// 允许用户直接回复 1/2/3。选项文字来自 Runtime 自己刚渲染的提示，不让模型猜数字
+/// 含义；选择“只分析”时补上问句信号，确保重新编译为只读调查而不是变更任务。
+fn resolve_numbered_reply(input: &str, events: &[SessionEvent]) -> String {
+    let choice = input
+        .trim()
+        .trim_end_matches(['.', '。', '、'])
+        .to_string();
+    if !matches!(choice.as_str(), "1" | "2" | "3") {
+        return input.to_string();
+    }
+    let Some(prompt) = last_assistant_text(events) else {
+        return input.to_string();
+    };
+    let prefix = format!("{choice}. ");
+    let Some(option) = prompt
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+    else {
+        return input.to_string();
+    };
+    if option.contains("只做分析")
+        || option.contains("只需要改造方案")
+        || option.contains("只分析原因")
+    {
+        format!("{option}。这是只读分析请求，应该如何设计？")
+    } else {
+        option.to_string()
+    }
 }
 
 fn resume_instruction(resume: &ResumeState) -> String {
@@ -443,9 +502,15 @@ impl AgentLoop {
         let resume = (is_follow_up || is_clarification_reply)
             .then(|| latest_resumable_task(&history))
             .flatten();
+        let clarification_answer = is_clarification_reply
+            .then(|| resolve_numbered_reply(&input_text, &history))
+            .unwrap_or_else(|| input_text.clone());
         let task_text = match (resume.as_ref(), is_clarification_reply) {
             (Some(state), true) => {
-                format!("原始需求：{}\n用户补充：{}", state.objective, input_text)
+                format!(
+                    "原始需求：{}\n用户补充：{}",
+                    state.objective, clarification_answer
+                )
             }
             (Some(state), false) => state.objective.clone(),
             (None, _) => input_text.clone(),
@@ -574,11 +639,12 @@ impl AgentLoop {
             // Phase 1 信号驱动门禁：已落地或纯提问都不会到这里；能到这里说明是真·盲任务，
             // 且 `clar` 已经是单个带上下文的定位问题（不发清单、不靠词表猜用户措辞）。
             let question = with_candidates(&clar.question, &goal_execution.goal);
+            let user_prompt = clarification_prompt(clar.kind, &question);
             // 重复澄清熔断：用户已经回答过一次、而重新编译后问的还是同一个问题，
             // 说明他没有这个维度的信息（或认为原描述已足够）。继续追问只会制造
             // 死循环——此时带着已有信息直接执行，比再问一遍更有用。
             let repeated = is_clarification_reply
-                && last_assistant_text(&history).as_deref() == Some(question.as_str());
+                && last_assistant_text(&history).as_deref() == Some(user_prompt.as_str());
             let permitted =
                 ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question);
             if !repeated && permitted {
@@ -591,7 +657,7 @@ impl AgentLoop {
                 log.append(SessionEvent::Assistant {
                     id: log.gen_id(),
                     chunk: Chunk {
-                        text: Some(question),
+                        text: Some(user_prompt),
                         ..Default::default()
                     },
                 });
@@ -633,6 +699,7 @@ impl AgentLoop {
             if let Some(root) = &workspace_root {
                 if let Some(clar) = goal_execution.inspect_for_clarification(root) {
                     let question = with_candidates(&clar.question, &goal_execution.goal);
+                    let user_prompt = clarification_prompt(clar.kind, &question);
                     if ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question) {
                         let item_id = ledger
                             .current_item()
@@ -647,7 +714,7 @@ impl AgentLoop {
                         log.append(SessionEvent::Assistant {
                             id: log.gen_id(),
                             chunk: Chunk {
-                                text: Some(format!("[需要澄清] {question}")),
+                                text: Some(user_prompt),
                                 ..Default::default()
                             },
                         });
@@ -706,7 +773,7 @@ impl AgentLoop {
                     log.append(SessionEvent::Assistant {
                         id: log.gen_id(),
                         chunk: Chunk {
-                            text: Some(format!("[需要澄清] {question}")),
+                            text: Some(workspace_scope_prompt()),
                             ..Default::default()
                         },
                     });
@@ -1590,13 +1657,10 @@ impl AgentLoop {
                             // 给出可回答的工作区问题。不能再把“没有目标证据”交回
                             // 给模型进行第 N 轮同义词搜索。
                             if let Some(reason) = goal_execution.actionable_terminal_reason() {
-                                if reason.contains("需要用户确认工作区或目标路径") {
-                                    log.append(SessionEvent::Assistant {
+                                if goal_execution.needs_user_input() {
+                                    log.append(SessionEvent::Thinking {
                                         id: log.gen_id(),
-                                        chunk: Chunk {
-                                            text: Some(format!("[需要澄清] {reason}")),
-                                            ..Default::default()
-                                        },
+                                        text: format!("等待用户选择：{reason}"),
                                     });
                                     debt = 0;
                                     hard_stop = true;
@@ -1756,15 +1820,22 @@ impl AgentLoop {
                         debt += 1;
                     }
                     GoalCompletion::Terminal(reason) => {
-                        log.append(SessionEvent::Assistant {
-                            id: log.gen_id(),
-                            chunk: Chunk {
-                                text: Some(format!("[需要澄清] {reason}")),
-                                ..Default::default()
-                            },
-                        });
-                        debt = 0;
-                        hard_stop = true;
+                        // 仅当真正存在意图分岔或需要用户决策时才中断并向用户索取澄清；
+                        // 若下一步可自执行（确定性下一步），运行时静默自动推进。
+                        if goal_execution.can_auto_advance() && !hard_stop {
+                            messages.push(Message::user(format!(
+                                "[自动静默推进] 下一步无需用户确认，直接执行：{}",
+                                goal_execution.next_action_hint()
+                            )));
+                            debt += 1;
+                        } else {
+                            log.append(SessionEvent::Thinking {
+                                id: log.gen_id(),
+                                text: format!("等待用户选择：{reason}"),
+                            });
+                            debt = 0;
+                            hard_stop = true;
+                        }
                     }
                     GoalCompletion::Continue | GoalCompletion::Correct(_) => {}
                 }
@@ -1899,10 +1970,7 @@ impl AgentLoop {
                 harness_session::DeliveryOutcome::PartialDelivery,
                 Some("求解图已到终态，但执行证据没有覆盖全部验收项；已拒绝 Verified".into()),
             )
-        } else if terminal_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("需要用户确认"))
-        {
+        } else if goal_execution.needs_user_input() {
             (
                 harness_session::DeliveryOutcome::NeedsUserInput,
                 terminal_reason,
@@ -2005,7 +2073,14 @@ impl AgentLoop {
                     ..Default::default()
                 },
             });
-            (DeliveryOutcome::PartialDelivery, Some(status))
+            let normalized_outcome = if raw_outcome == DeliveryOutcome::NeedsUserInput
+                && !is_follow_up
+            {
+                DeliveryOutcome::NeedsUserInput
+            } else {
+                DeliveryOutcome::PartialDelivery
+            };
+            (normalized_outcome, Some(status))
         } else {
             (raw_outcome, raw_reason)
         };
@@ -2069,17 +2144,7 @@ fn concise_incomplete_status(
     phase: crate::goal_execution::SolvePhase,
 ) -> String {
     if *outcome == DeliveryOutcome::NeedsUserInput {
-        let detail = reason
-            .unwrap_or("需要补充目标范围或预期结果")
-            .replace(['\r', '\n'], " ");
-        let detail = detail
-            .trim()
-            .trim_start_matches("需要用户确认")
-            .trim_start_matches(['：', ':', '；', ';', ' ']);
-        return format!(
-            "需要你的确认：{}",
-            detail.chars().take(180).collect::<String>()
-        );
+        return workspace_scope_prompt();
     }
     if reason.is_some_and(|text| text.contains("llm provider error")) {
         return "未完成：模型服务在执行过程中返回错误。\n下一步：恢复模型服务后重试本次任务。"
@@ -3172,6 +3237,38 @@ mod tests {
     }
 
     #[test]
+    fn clarification_is_a_short_choice_and_hides_internal_diagnostics() {
+        let status = concise_incomplete_status(
+            &DeliveryOutcome::NeedsUserInput,
+            Some("完成用户目标（门禁校正：读取 model_catalog.rs 不在候选文件中）"),
+            0,
+            0,
+            crate::goal_execution::SolvePhase::Locate,
+        );
+        assert_eq!(status, workspace_scope_prompt());
+        assert!(status.contains("1. "));
+        assert!(status.contains("2. "));
+        assert!(status.contains("3. "));
+        for internal in ["门禁", "候选文件", "model_catalog.rs", "完成用户目标"] {
+            assert!(!status.contains(internal));
+        }
+    }
+
+    #[test]
+    fn numbered_analysis_choice_is_resolved_without_model_guessing() {
+        let events = vec![SessionEvent::Assistant {
+            id: 1,
+            chunk: Chunk {
+                text: Some(workspace_scope_prompt()),
+                ..Default::default()
+            },
+        }];
+        let resolved = resolve_numbered_reply("3", &events);
+        assert!(resolved.contains("只需要改造方案"));
+        assert!(resolved.ends_with('？'));
+    }
+
+    #[test]
     fn context_budget_keeps_latest_turn_and_compacts_old_history() {
         let mut messages = vec![Message::system("system")];
         for index in 0..14 {
@@ -3468,7 +3565,7 @@ mod tests {
             SessionEvent::Delivery {
                 id: 2,
                 report: DeliveryReport {
-                    outcome: DeliveryOutcome::Blocked,
+                    outcome: DeliveryOutcome::NeedsUserInput,
                     criteria: vec![],
                     verification: vec![],
                     reason: Some(format!("{CLARIFICATION_REASON_PREFIX}缺少具体对象")),

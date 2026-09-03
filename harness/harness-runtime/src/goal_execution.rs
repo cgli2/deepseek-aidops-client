@@ -2007,24 +2007,19 @@ impl GoalExecution {
         self.render_with_filter(|item| scope.contains(&item.id), Some(scope))
     }
 
-    pub fn actionable_terminal_reason(&self) -> Option<String> {
-        let waiting = self
-            .items
+    /// 是否确实缺少只能由用户补充的信息。
+    ///
+    /// 用户提示由 Agent Loop 统一渲染；这里仅暴露结构化状态，避免把内部证据、
+    /// 门禁原因和整段目标拼接进面向用户的澄清文字。
+    pub fn needs_user_input(&self) -> bool {
+        self.items
             .values()
-            .filter(|item| item.state == WorkItemState::NeedsUserInput)
-            .map(|item| {
-                format!(
-                    "{}（{}）",
-                    item.description,
-                    item.evidence.last().cloned().unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>();
-        if !waiting.is_empty() {
-            return Some(format!(
-                "需要用户确认工作区或目标路径：{}。已停止无效搜索；请提供正确子项目、分支或页面实现目录。",
-                waiting.join("；")
-            ));
+            .any(|item| item.state == WorkItemState::NeedsUserInput)
+    }
+
+    pub fn actionable_terminal_reason(&self) -> Option<String> {
+        if self.needs_user_input() {
+            return Some("当前工作区中没有找到可确认的目标实现入口".into());
         }
         let changed = self
             .items
@@ -2401,7 +2396,10 @@ mod tests {
         };
         plan.record_result(&proposal, false, "no match");
         plan.record_result(&proposal, false, "no match");
-        assert!(plan.actionable_terminal_reason().is_some());
+        assert!(plan.needs_user_input());
+        let reason = plan.actionable_terminal_reason().unwrap();
+        assert!(!reason.contains("门禁校正"));
+        assert!(!reason.contains("修复登录按钮"));
         assert!(
             !plan.can_auto_advance(),
             "真正需要用户补充信息时必须停止自动推进"
@@ -3444,10 +3442,7 @@ mod tests {
         assert_eq!(plan.active_item().unwrap().state, WorkItemState::Pending);
         plan.record_result(&locate, true, "未找到匹配（pattern=\"appCode\"）。");
         assert!(plan.active_item().is_none());
-        assert!(plan
-            .actionable_terminal_reason()
-            .unwrap()
-            .contains("需要用户确认"));
+        assert!(plan.needs_user_input());
     }
 
     #[test]
@@ -3733,10 +3728,7 @@ mod tests {
         plan.record_result(&proposal, true, hit);
         plan.record_result(&proposal, true, hit);
         assert!(plan.active_item().is_none(), "有限假设耗尽后必须停止");
-        assert!(plan
-            .actionable_terminal_reason()
-            .unwrap()
-            .contains("需要用户确认"));
+        assert!(plan.needs_user_input());
     }
 
     #[test]

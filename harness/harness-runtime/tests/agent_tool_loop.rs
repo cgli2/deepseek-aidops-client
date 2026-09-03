@@ -636,11 +636,75 @@ async fn ambiguous_delivery_is_clarified_before_model_or_tool_calls() {
     let events = log.replay();
     assert!(events.iter().any(|event| matches!(event,
         SessionEvent::Assistant { chunk, .. }
-            if chunk.text.as_deref().is_some_and(|text| text.contains("定位"))
+            if chunk.text.as_deref().is_some_and(|text| text.contains("请选择一种方式回复") && text.contains("1. ") && text.contains("3. "))
     )));
     assert!(events.iter().any(|event| matches!(event,
         SessionEvent::Delivery { report, .. }
             if report.reason.as_deref().is_some_and(|reason| reason.starts_with("需要补充执行信息："))
+    )));
+}
+
+#[tokio::test]
+async fn exhausted_location_emits_one_clean_choice_and_preserves_needs_input() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(ScriptedLlm {
+        calls: AtomicUsize::new(0),
+        initial_text_steps: 0,
+        script: vec![
+            scripted_call(
+                "s1",
+                "search",
+                serde_json::json!({"pattern": "大模型管理"}),
+            ),
+            scripted_call(
+                "s2",
+                "search",
+                serde_json::json!({"pattern": "系统管理"}),
+            ),
+            None,
+        ],
+        options: Mutex::new(vec![]),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(Arc::new(StaticTool {
+        name: "search",
+        output: "未找到匹配。",
+    }));
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm;
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "在系统管理->大模型管理增加图片和视频接口配置".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    let prompts = events
+        .iter()
+        .filter(|event| matches!(event,
+            SessionEvent::Assistant { chunk, .. }
+                if chunk.text.as_deref().is_some_and(|text| text.contains("请选择一种方式回复"))
+        ))
+        .count();
+    assert_eq!(prompts, 1, "同一澄清不能在循环内外重复输出");
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. }
+            if report.outcome == harness_session::DeliveryOutcome::NeedsUserInput
+    )));
+    assert!(!events.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("门禁校正") || text.contains("候选文件"))
     )));
 }
 

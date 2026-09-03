@@ -1077,6 +1077,12 @@ impl AgentLoop {
             // dispatch 主体（字节不变）；单写冲突组（最常见）仍走原单一流路径，零回归。
             // 融合只改变"模型回合"的来源（N 个流并发 I/O），门禁 / 写冲突串行 /
             // repeat_guard / 预算硬上限全部沿用原串行逻辑，协议配对由后续 join_all 保证。
+            // 记录本步 assistant 在持久上下文中的固定插入点。工具执行期间会先把
+            // Tool 结果以及控制器的恢复提示追加到 messages；不能再用“末尾减去
+            // tool_call 数量”倒推位置，因为中间只要多出一条 user 提示，就会把
+            // assistant 插到 Tool 结果之后，下一轮 OpenAI 请求随即以
+            // invalid_tool_call_history 拒绝。
+            let assistant_history_index = messages.len();
             let mut s: harness_llm::ChunkStream = if controlled_delivery {
                 let groups: Vec<Vec<String>> = goal_execution
                     .parallel_write_groups()
@@ -1668,8 +1674,9 @@ impl AgentLoop {
             }
             if !should_recover_empty {
                 empty_recovery_pending = false;
-                messages.insert(
-                    messages.len().saturating_sub(assistant_tools.len()),
+                insert_assistant_at_step_boundary(
+                    &mut messages,
+                    assistant_history_index,
                     Message::assistant_with_tools_and_reasoning(
                         assistant_text,
                         assistant_tools,
@@ -2252,6 +2259,19 @@ fn messages_from_events(events: &[SessionEvent]) -> Vec<Message> {
         _ => true,
     });
     apply_context_budget(compress_stale_tool_results(messages))
+}
+
+/// 把本步 assistant 放在该步产生的 Tool 结果和控制器 follow-up 之前。
+///
+/// `step_boundary` 在请求模型前采集，因此不依赖本步实际产生了多少条 Tool/user
+/// 消息；即使门禁、并发去重或概念覆盖提醒额外追加消息，协议顺序仍保持为
+/// assistant(tool_calls) -> tool results -> follow-ups。
+fn insert_assistant_at_step_boundary(
+    messages: &mut Vec<Message>,
+    step_boundary: usize,
+    assistant: Message,
+) {
+    messages.insert(step_boundary.min(messages.len()), assistant);
 }
 
 /// 陈旧工具结果渐进压缩：仅最近 `RECENT_FULL` 条工具输出保留完整（已被
@@ -3015,6 +3035,32 @@ mod tests {
         assert_eq!(messages[2].tool_calls.len(), 1);
         assert_eq!(messages[2].tool_calls[0].id, "c1");
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn assistant_tool_declaration_stays_before_results_when_followups_are_appended() {
+        let mut messages = vec![Message::system("system"), Message::user("change it")];
+        let step_boundary = messages.len();
+        messages.push(Message::tool("call-1", "ok"));
+        messages.push(Message::user("[控制器提醒] 继续验证"));
+
+        insert_assistant_at_step_boundary(
+            &mut messages,
+            step_boundary,
+            Message::assistant_with_tools(
+                "",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "fs".into(),
+                    args: serde_json::json!({"op":"read","path":"a.rs"}),
+                }],
+            ),
+        );
+
+        assert_eq!(messages[2].role, Role::Assistant);
+        assert_eq!(messages[2].tool_calls[0].id, "call-1");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(messages[4].role, Role::User);
     }
 
     #[test]

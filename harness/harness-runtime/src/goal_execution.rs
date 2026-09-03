@@ -1313,7 +1313,7 @@ impl GoalExecution {
         } else {
             ("推进当前交付面", "产生可复用的新证据")
         };
-        let phase = self.phase();
+        let phase = action_phase(call, item.state, &proposal.signature);
         let hypothesis_id = item
             .hypotheses
             .get(item.active_hypothesis)
@@ -1427,7 +1427,11 @@ impl GoalExecution {
             }
             WorkItemState::Located | WorkItemState::Inspecting => format!(
                 "直接读取候选文件 [{}] 中与当前验收项相关的最小区间。",
-                self.target_files
+                if self.confirmed_target_files.is_empty() {
+                    &self.target_files
+                } else {
+                    &self.confirmed_target_files
+                }
                     .iter()
                     .take(4)
                     .cloned()
@@ -1520,7 +1524,10 @@ impl GoalExecution {
         proposal: &ActionProposal,
     ) -> Result<(), String> {
         let allowed = self.allowed_tools();
-        let phase = self.phase();
+        let phase = self
+            .active_item()
+            .map(|item| action_phase(call, item.state, &proposal.signature))
+            .unwrap_or_else(|| self.phase());
         if let Some(item) = self.active_item() {
             if item.phase_attempts.get(phase) >= item.phase_budget.get(phase) {
                 return Err(format!(
@@ -1662,6 +1669,7 @@ impl GoalExecution {
                 .any(|marker| self.goal.objective.to_lowercase().contains(marker));
         let effective_ok = ok && !proposal.is_search_miss(summary) && substantive_write;
         let previous_target_count = self.target_files.len();
+        let previous_confirmed_target_count = self.confirmed_target_files.len();
         if effective_ok && is_search {
             self.record_targets_from_search(summary);
         }
@@ -1680,7 +1688,10 @@ impl GoalExecution {
                 .all(|expected| summary.contains(&expected.value));
         let kind = if is_search && !effective_ok {
             EvidenceKind::HypothesisRejected
-        } else if is_search && self.target_files.len() > previous_target_count {
+        } else if is_search
+            && (self.target_files.len() > previous_target_count
+                || self.confirmed_target_files.len() > previous_confirmed_target_count)
+        {
             EvidenceKind::TargetFound
         } else if is_search {
             EvidenceKind::NoInformation
@@ -1827,6 +1838,7 @@ impl GoalExecution {
     fn record_targets_from_search(&mut self, summary: &str) {
         // Local Search 的标准格式为“相对路径:行号: 内容”。只采纳代码文件的
         // 父目录；结果中的普通文本、绝对临时路径或冒号后的源码均不会成为锚点。
+        let mut captured = 0usize;
         for line in summary.lines().skip(1).take(12) {
             let Some((candidate, rest)) = line.split_once(':') else {
                 continue;
@@ -1838,11 +1850,17 @@ impl GoalExecution {
             match candidate.rsplit_once('/') {
                 Some((dir, file)) if file.contains('.') && !dir.is_empty() => {
                     self.add_target_file(&candidate, true);
+                    captured = captured.saturating_add(1);
                 }
-                None if candidate.contains('.') => self.add_target_file(&candidate, true),
+                None if candidate.contains('.') => {
+                    self.add_target_file(&candidate, true);
+                    captured = captured.saturating_add(1);
+                }
                 _ => {}
             }
-            if self.target_files.len() >= 8 {
+            // Grounder 可能已塞入较多软候选；搜索结果必须仍能把命中文件提升为
+            // 强证据，不能因为 target_files 预先达到上限而被整体丢弃。
+            if captured >= 8 {
                 break;
             }
         }
@@ -2049,6 +2067,26 @@ fn is_verification(signature: &str) -> bool {
         && ["test", "check", "build", "pytest", "tsc "]
             .iter()
             .any(|marker| signature.to_ascii_lowercase().contains(marker))
+}
+
+/// 阶段预算按动作语义计费，而不是只看工作项当前状态。
+///
+/// ReadyToChange 状态下仍会允许 `fs/search` 补强目标证据；这些只读动作属于 inspect，
+/// 绝不能消耗 change 预算，否则若干次读取后第一次真正的 edit 就会被拒绝。
+fn action_phase(call: &ToolCall, state: WorkItemState, signature: &str) -> SolvePhase {
+    match call.name.as_str() {
+        "search" if matches!(state, WorkItemState::Pending | WorkItemState::Locating) => {
+            SolvePhase::Locate
+        }
+        "search" => SolvePhase::Inspect,
+        "fs" if matches!(state, WorkItemState::Satisfied | WorkItemState::Changed) => {
+            SolvePhase::Verify
+        }
+        "fs" => SolvePhase::Inspect,
+        "edit" => SolvePhase::Change,
+        "shell" if is_verification(signature) => SolvePhase::Verify,
+        _ => phase_for_signature(signature),
+    }
 }
 
 fn phase_for_signature(signature: &str) -> SolvePhase {
@@ -3408,6 +3446,103 @@ mod tests {
             estimated_cost: 1,
         };
         assert!(plan.allows_tool_call(&edit, &edit_proposal).is_err());
+    }
+
+    #[test]
+    fn targeted_search_promotes_an_existing_soft_candidate() {
+        let contract = TaskContract::from_input("缩小新建项目弹窗高度");
+        let mut plan = GoalExecution::from_contract(&contract);
+        plan.apply_grounding(&WorkspaceGrounding {
+            status: crate::workspace_grounder::GroundingStatus::Grounded,
+            scanned_files: 20,
+            complete_scan: true,
+            entity_hits: vec![
+                "runtime/src/memory.rs".into(),
+                "runtime/src/execution.rs".into(),
+                "ui/src/gui/settings_view.rs".into(),
+            ],
+            navigation_hits: vec![],
+            literal_hits: vec![],
+            zero_prior: false,
+        });
+        assert!(plan.confirmed_target_files.is_empty());
+
+        let proposal = ActionProposal {
+            signature: "search:{\"dir\":\"ui\",\"pattern\":\"新建项目\"}".into(),
+            question: "locate dialog".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let result = "共 1 条命中（格式：相对路径:行号: 内容）：\nui/src/gui/settings_view.rs:482: \"新建项目\" => {";
+        assert_eq!(plan.record_result(&proposal, true, result), EvidenceKind::TargetFound);
+        assert_eq!(
+            plan.confirmed_target_files,
+            vec!["ui/src/gui/settings_view.rs".to_string()]
+        );
+        let hint = plan.next_action_hint();
+        assert!(hint.contains("ui/src/gui/settings_view.rs"));
+        assert!(!hint.contains("runtime/src/memory.rs"));
+    }
+
+    #[test]
+    fn inspect_reads_do_not_consume_the_first_real_edit_budget() {
+        let contract = TaskContract::from_input("缩小新建项目弹窗高度");
+        let mut plan = GoalExecution::from_contract(&contract);
+        plan.apply_grounding(&WorkspaceGrounding {
+            status: crate::workspace_grounder::GroundingStatus::Grounded,
+            scanned_files: 1,
+            complete_scan: true,
+            entity_hits: vec![],
+            navigation_hits: vec![],
+            literal_hits: vec!["ui/src/gui/settings_view.rs".into()],
+            zero_prior: false,
+        });
+
+        for index in 0..2 {
+            let call = ToolCall {
+                id: format!("read-{index}"),
+                name: "fs".into(),
+                args: serde_json::json!({
+                    "op": "read",
+                    "path": "ui/src/gui/settings_view.rs",
+                    "start_line": index * 80 + 1,
+                    "end_line": index * 80 + 80
+                }),
+            };
+            let proposal = ActionProposal {
+                signature: format!(
+                    "fs:{{\"end_line\":{},\"op\":\"read\",\"path\":\"ui/src/gui/settings_view.rs\",\"start_line\":{}}}",
+                    index * 80 + 80,
+                    index * 80 + 1
+                ),
+                question: "inspect dialog layout".into(),
+                supports: vec!["user-objective".into()],
+                estimated_cost: 1,
+            };
+            let action = plan.action_spec(&call, &proposal).expect("read action");
+            assert_eq!(action.phase, SolvePhase::Inspect);
+            plan.record_action_result(&action, &proposal, true, "dialog layout source");
+        }
+
+        assert_eq!(plan.items["user-objective"].phase_attempts.change, 0);
+        let edit = ToolCall {
+            id: "edit-1".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "ui/src/gui/settings_view.rs",
+                "old_text": "panel_h = 534.0",
+                "new_text": "panel_h = 240.0"
+            }),
+        };
+        let proposal = ActionProposal {
+            signature: "edit:{\"new_text\":\"panel_h = 240.0\",\"old_text\":\"panel_h = 534.0\",\"path\":\"ui/src/gui/settings_view.rs\"}".into(),
+            question: "shrink dialog".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let action = plan.action_spec(&edit, &proposal).expect("edit action");
+        assert_eq!(action.phase, SolvePhase::Change);
+        assert!(plan.allows_tool_call(&edit, &proposal).is_ok());
     }
 
     #[test]

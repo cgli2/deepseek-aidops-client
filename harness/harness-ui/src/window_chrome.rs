@@ -143,12 +143,21 @@ pub struct ChromeActions {
 fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, 6.0, colors.border.gamma_multiply(0.35));
+        ui.painter()
+            .rect_filled(rect, 6.0, colors.border.gamma_multiply(0.35));
     }
-    let stroke = Stroke::new(1.35_f32, if response.hovered() { colors.text } else { colors.dim });
+    let stroke = Stroke::new(
+        1.35_f32,
+        if response.hovered() {
+            colors.text
+        } else {
+            colors.dim
+        },
+    );
     let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 13.0));
     ui.painter().rect_stroke(icon, 2.0, stroke);
-    ui.painter().vline(icon.left() + 4.5, icon.y_range(), stroke);
+    ui.painter()
+        .vline(icon.left() + 4.5, icon.y_range(), stroke);
     response.on_hover_text(if expanded { "收起" } else { "展开" })
 }
 

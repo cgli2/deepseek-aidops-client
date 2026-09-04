@@ -46,9 +46,7 @@ fn cjk_ngrams(s: &str, n: usize) -> Vec<String> {
         } else if ('\u{4e00}'..='\u{9fff}').contains(&c) {
             // CJK 连续段：n-gram
             let start = i;
-            while i < chars.len()
-                && ('\u{4e00}'..='\u{9fff}').contains(&chars[i])
-            {
+            while i < chars.len() && ('\u{4e00}'..='\u{9fff}').contains(&chars[i]) {
                 i += 1;
             }
             let seg: Vec<char> = chars[start..i].to_vec();
@@ -342,12 +340,16 @@ impl NativeSkillLibrary {
 
     /// 只返回已启用的技能（match_skills 用）。
     fn enabled_skills(&self) -> Vec<Skill> {
-        self.all_skills().into_iter().filter(|s| s.enabled).collect()
+        self.all_skills()
+            .into_iter()
+            .filter(|s| s.enabled)
+            .collect()
     }
 
     /// 写回某个技能的完整信息（启用状态变更时用）。
     fn write_skill(&self, skill: &Skill) -> harness_core::error::Result<()> {
-        let body = serde_json::to_string_pretty(skill).map_err(harness_core::error::Error::Serde)?;
+        let body =
+            serde_json::to_string_pretty(skill).map_err(harness_core::error::Error::Serde)?;
         std::fs::write(self.skill_path(&skill.id), body).map_err(harness_core::error::Error::Io)?;
         *self.cache.lock().unwrap() = None;
         Ok(())

@@ -970,9 +970,11 @@ mod tests {
             SessionEvent::Delivery { report, .. }
                 if report.outcome == DeliveryOutcome::Interrupted
         )));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "hi")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "hi"))
+        );
 
         // 复用同一文件继续追加，二次恢复可见新事件。
         resumed.append(SessionEvent::TurnStart {
@@ -980,10 +982,12 @@ mod tests {
             input: "again".into(),
         });
         let resumed2 = SessionLog::open_latest(&dir);
-        assert!(resumed2
-            .replay()
-            .iter()
-            .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "again")));
+        assert!(
+            resumed2
+                .replay()
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "again"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1026,18 +1030,20 @@ mod tests {
         // 点击恢复历史会话 A，可继续追加。
         let name_a = file_a.file_name().unwrap().to_str().unwrap().to_string();
         assert!(log.switch_to_file(&dir, &name_a));
-        assert!(log
-            .replay()
-            .iter()
-            .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "第一个问题")));
+        assert!(
+            log.replay().iter().any(
+                |e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "第一个问题")
+            )
+        );
         log.append(SessionEvent::TurnStart {
             id: log.gen_id(),
             input: "追加消息".into(),
         });
-        assert!(log
-            .replay()
-            .iter()
-            .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "追加消息")));
+        assert!(
+            log.replay()
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TurnStart { input, .. } if input == "追加消息"))
+        );
 
         // 删除会话：活跃文件不受影响。
         let metas = list_sessions(&dir);

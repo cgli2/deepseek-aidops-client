@@ -25,6 +25,7 @@ DeepSeek-AIOps 的原生 Rust 编码代理（移植 dsh 微内核「一切皆插
 - **多模型接入**：DeepSeek / OpenAI / Anthropic / Local / Replay（离线回放），SSE 流式 + Function Calling 工具分片累积。
 - **模型可见工具**：`fs`（工作区读写/列表，拒绝越界路径）、`edit`（唯一精确替换）、`bash`（平台沙箱内执行，默认 30 秒超时）；工具结果自动回填继续推理，单回合最多 32 步防失控。
 - **系统级能力（借鉴 Codex）**：记忆（`.harness-memory/` 文件持久化）、钩子（`pre_tool_use` 可阻断危险调用，fail-closed）、Git CLI 集成 + Worktree RAII 守卫。
+- **长时程自主编排（LHA）**：每个交互回合进入持久化 DAG，具备 WAL 恢复、租约看门狗、全局 Token/RPM/TPM 预算、独立质量门、MVCC 工件库和不可逆操作 HITL 检查点；GUI 与 CLI 均可查看和操作。
 - **进程外边界**：ACP stdio JSON-RPC 服务器 + SDK 客户端。
 - **会话真相源**：`<工作区>/.harness/sessions/*.jsonl`，fork/resume/replay 全派生自它。
 
@@ -227,6 +228,12 @@ DEEPSEEK_API_KEY=sk-... cargo run -p harness-bin
 
 # TUI / GUI 形态（对应 feature 需先编入）
 cargo run -p harness-bin --features tui -- --tui
+
+# 长时程控制面（当前工作区由 HARNESS_WORKSPACE 或设置中的 workspace.root 决定）
+cargo run -p harness-bin -- lh status
+cargo run -p harness-bin -- lh submit "完成构建、测试并修复所有失败"
+cargo run -p harness-bin -- lh approve <checkpoint-id> "已核对影子工件"
+cargo run -p harness-bin -- lh reject <checkpoint-id> "风险不可接受"
 ```
 
 直接运行发布包：
@@ -242,6 +249,7 @@ $env:HARNESS_WORKSPACE = "D:\path\to\project"          # 可选；默认是启�
 - **配置数据库**：macOS 使用 `~/Library/Application Support/com.clotee.aidops/settings.db`；Windows/Linux 默认存放在可执行文件旁边 `DeepSeekAIOps/settings.db`，不可写时回退平台目录或当前目录。旧版 Windows 数据会在首次启动时自动迁移（含密钥文件），迁移记录写入 `harness_gui_trace.log`。
 - **密钥文件**：`settings.key`（AES-256-GCM 本地密钥）与 `settings.db` 同目录，首次保存密钥时生成。
 - **会话日志**：按项目隔离，`<工作区>/.harness/sessions/*.jsonl`。
+- **长时程控制面**：按项目隔离，`<工作区>/.harness/long-horizon/`（DAG WAL、预算、黑板、HITL 决策与内容寻址工件库）。
 - **启动诊断**：macOS 写入上述 Application Support 目录；其他平台写到可执行文件旁的 `harness_gui_trace.log`。
 
 ### 钩子配置示例（借鉴 Codex Hooks）

@@ -16,9 +16,15 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 base64 = "0.22"
 # 工具调用签名归一化（execution.rs）需要操作 JSON 参数。
 serde_json = { workspace = true }
+sha2 = "0.10"
+blake3 = "1.8.7"
+tree-sitter = "0.27.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 
 [dev-dependencies]
 harness-provider-hook = { path = "../harness-provider-hook" }

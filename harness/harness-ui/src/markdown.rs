@@ -97,7 +97,11 @@ pub fn to_job(md: &str, theme: &MdTheme, max_width: f32) -> LayoutJob {
                         _ => "• ".into(),
                     };
                     let indent = "  ".repeat(depth + 1);
-                    append_str(&mut job, &format!("{indent}{marker}"), &list_marker_fmt(theme));
+                    append_str(
+                        &mut job,
+                        &format!("{indent}{marker}"),
+                        &list_marker_fmt(theme),
+                    );
                 }
                 Tag::CodeBlock(_) => {
                     block_break!();
@@ -428,7 +432,10 @@ mod tests {
             assert!(sizes.iter().any(|size| (*size - expected).abs() < 0.01));
         }
         assert!(sizes.iter().any(|size| (*size - BODY_SIZE).abs() < 0.01));
-        assert!(HEADING_SIZES[0] - BODY_SIZE <= 5.0, "一级标题比正文大 4.5px，属合理层次");
+        assert!(
+            HEADING_SIZES[0] - BODY_SIZE <= 5.0,
+            "一级标题比正文大 4.5px，属合理层次"
+        );
     }
     /// 回归：非文件路径的行内代码不拆分（保持文本原位），
     /// 只有文件路径才拆成 FilePath chip。避免行内代码被拆成独立块导致不合理换行。
@@ -447,7 +454,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(file_paths, vec!["src/gui.rs"], "should only extract file path");
+        assert_eq!(
+            file_paths,
+            vec!["src/gui.rs"],
+            "should only extract file path"
+        );
         // 所有 Job block 的文本拼起来应包含行内代码内容（未被丢弃）
         let job_text: String = blocks
             .iter()
@@ -457,8 +468,14 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(job_text.contains("OK"), "inline code OK should stay in text");
-        assert!(job_text.contains("exit 0"), "inline code exit 0 should stay in text");
+        assert!(
+            job_text.contains("OK"),
+            "inline code OK should stay in text"
+        );
+        assert!(
+            job_text.contains("exit 0"),
+            "inline code exit 0 should stay in text"
+        );
         assert!(job_text.contains("文件在"), "prefix text should be kept");
     }
 

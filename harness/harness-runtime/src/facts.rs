@@ -123,11 +123,7 @@ fn msvc_toolchain_name() -> Option<String> {
             msvc = Some(name.to_string());
         }
     }
-    if default_is_gnu {
-        msvc
-    } else {
-        None
-    }
+    if default_is_gnu { msvc } else { None }
 }
 
 #[cfg(test)]

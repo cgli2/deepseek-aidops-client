@@ -485,25 +485,31 @@ mod managed_tests {
     #[test]
     fn runtime_configuration_validates_and_switches_provider() {
         let managed = ManagedLlm::new(ReplayLlm::new(vec![]), "演示模式");
-        assert!(managed
-            .configure_deepseek("bad".into(), "deepseek-chat".into(), "key".into(), None)
-            .is_err());
-        assert!(managed
-            .configure_deepseek(
-                "https://api.deepseek.com".into(),
-                "".into(),
-                "key".into(),
-                None
-            )
-            .is_err());
-        assert!(managed
-            .configure_deepseek(
-                "https://api.deepseek.com".into(),
-                "deepseek-chat".into(),
-                "".into(),
-                None
-            )
-            .is_err());
+        assert!(
+            managed
+                .configure_deepseek("bad".into(), "deepseek-chat".into(), "key".into(), None)
+                .is_err()
+        );
+        assert!(
+            managed
+                .configure_deepseek(
+                    "https://api.deepseek.com".into(),
+                    "".into(),
+                    "key".into(),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            managed
+                .configure_deepseek(
+                    "https://api.deepseek.com".into(),
+                    "deepseek-chat".into(),
+                    "".into(),
+                    None
+                )
+                .is_err()
+        );
         managed
             .configure_deepseek(
                 "https://api.deepseek.com/".into(),
@@ -522,15 +528,17 @@ mod managed_tests {
         let managed = ManagedLlm::new(ReplayLlm::new(vec![]), "演示模式");
 
         // 非法地址：拒绝
-        assert!(managed
-            .configure_provider(
-                "openai".into(),
-                "bad".into(),
-                "deepseek-v4".into(),
-                "k".into(),
-                None
-            )
-            .is_err());
+        assert!(
+            managed
+                .configure_provider(
+                    "openai".into(),
+                    "bad".into(),
+                    "deepseek-v4".into(),
+                    "k".into(),
+                    None
+                )
+                .is_err()
+        );
 
         // 合法 openai 厂商：成功并替换 provider
         managed

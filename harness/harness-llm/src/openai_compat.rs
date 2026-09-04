@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use async_stream::stream;
 use futures::StreamExt;
 use harness_core::error::Error;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{Chunk, ChunkStream, Message, Role, ToolCall, ToolSchema, Usage};
 
@@ -555,14 +555,15 @@ pub fn messages_json(msgs: &[Message]) -> Vec<Value> {
                 }
             }
             if !m.tool_calls.is_empty() {
-                value["tool_calls"] = json!(m
-                    .tool_calls
-                    .iter()
-                    .map(|t| json!({
-                        "id": t.id, "type": "function",
-                        "function": { "name": t.name, "arguments": t.args.to_string() }
-                    }))
-                    .collect::<Vec<_>>());
+                value["tool_calls"] = json!(
+                    m.tool_calls
+                        .iter()
+                        .map(|t| json!({
+                            "id": t.id, "type": "function",
+                            "function": { "name": t.name, "arguments": t.args.to_string() }
+                        }))
+                        .collect::<Vec<_>>()
+                );
             }
             if let Some(id) = &m.tool_call_id {
                 value["tool_call_id"] = json!(id);
@@ -894,8 +895,10 @@ mod tests {
             }]}}]}),
             &mut tools,
         );
-        assert!(finish_stream_tool_calls(tools)
-            .unwrap_err()
-            .contains("不是完整 JSON"));
+        assert!(
+            finish_stream_tool_calls(tools)
+                .unwrap_err()
+                .contains("不是完整 JSON")
+        );
     }
 }

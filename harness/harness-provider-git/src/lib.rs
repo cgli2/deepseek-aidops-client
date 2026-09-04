@@ -8,8 +8,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use harness_capability::git::{Git, GitChange, GitStatus, Worktree};
-use harness_core::error::{Error, Result};
 use harness_core::Workspace;
+use harness_core::error::{Error, Result};
 
 /// git CLI Provider。
 pub struct GitCli {
@@ -44,7 +44,9 @@ impl GitCli {
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
-        let out = git_command(&self.repo(), args).output().map_err(Error::Io)?;
+        let out = git_command(&self.repo(), args)
+            .output()
+            .map_err(Error::Io)?;
         if !out.status.success() {
             return Err(Error::Git(format!(
                 "git {} failed: {}",

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use harness_capability::search::{Search, SearchHit, SearchRequest};
-use harness_core::error::Result;
 use harness_core::Workspace;
+use harness_core::error::Result;
 
 /// 本地搜索 Provider（实现 `Search`）：工作区内大小写不敏感子串扫描。
 ///
@@ -33,9 +33,9 @@ const SKIP_DIRS: &[&str] = &[
 
 /// 常见二进制扩展名：内容搜索对它们无意义，直接跳过。
 const BINARY_EXTS: &[&str] = &[
-    "exe", "dll", "so", "dylib", "pdb", "ico", "icns", "png", "jpg", "jpeg", "gif", "webp",
-    "bmp", "pdf", "zip", "gz", "tar", "7z", "rar", "wasm", "bin", "ttf", "otf", "woff",
-    "woff2", "mp3", "mp4", "pyc", "class", "jar",
+    "exe", "dll", "so", "dylib", "pdb", "ico", "icns", "png", "jpg", "jpeg", "gif", "webp", "bmp",
+    "pdf", "zip", "gz", "tar", "7z", "rar", "wasm", "bin", "ttf", "otf", "woff", "woff2", "mp3",
+    "mp4", "pyc", "class", "jar",
 ];
 
 /// 单次搜索最多扫描的文件数：兜底超大仓库，避免一次调用变成全仓 I/O。
@@ -93,7 +93,9 @@ impl Search for LocalSearch {
         let max = req.max_results.clamp(1, 200);
         let joined = tokio::task::spawn_blocking(move || scan(&base, &root, &pattern, max))
             .await
-            .map_err(|e| harness_core::error::Error::Runtime(format!("search task panicked: {e}")))?;
+            .map_err(|e| {
+                harness_core::error::Error::Runtime(format!("search task panicked: {e}"))
+            })?;
         Ok(joined?)
     }
 }
@@ -176,10 +178,18 @@ mod tests {
         let root = std::env::temp_dir().join(format!("harness-search-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"), "fn needle_one() {}\nfn needle_two() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "fn needle_one() {}\nfn needle_two() {}\n",
+        )
+        .unwrap();
         std::fs::write(root.join("src/b.rs"), "// NEEDLE_ONE again\n").unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
-        std::fs::write(root.join("target/skip.rs"), "needle_one should be skipped\n").unwrap();
+        std::fs::write(
+            root.join("target/skip.rs"),
+            "needle_one should be skipped\n",
+        )
+        .unwrap();
 
         let search = LocalSearch::new(root.clone());
         let hits = search

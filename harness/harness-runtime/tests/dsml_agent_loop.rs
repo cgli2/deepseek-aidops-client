@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_capability::hook::Hook;
-use harness_core::{error::Result, types::UserInput, AppContext};
+use harness_core::{AppContext, error::Result, types::UserInput};
 use harness_llm::{
-    dsml, Chunk, ChunkStream, LlmProvider, Message, ToolCall, ToolResult, ToolSchema,
+    Chunk, ChunkStream, LlmProvider, Message, ToolCall, ToolResult, ToolSchema, dsml,
 };
 use harness_provider_hook::NullHook;
 use harness_runtime::AgentLoop;
@@ -127,21 +127,31 @@ async fn dsml_text_becomes_executed_tool_and_context_stays_clean() {
 
     // 2) 日志含 ToolCall/ToolResult/Thinking/StepStart，Turn/Step 生命周期完整。
     let events = log.replay();
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::ToolCall { call, .. } if call.name == "shell")));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::ToolResult { result, .. } if result.ok)));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::Thinking { text, .. } if text == "thinking-secret")));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::StepStart { step: 1, .. })));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::StepEnd { step: 2, .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ToolCall { call, .. } if call.name == "shell"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ToolResult { result, .. } if result.ok))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Thinking { text, .. } if text == "thinking-secret"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::StepStart { step: 1, .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::StepEnd { step: 2, .. }))
+    );
 
     // 3) 回复正文不含 DSML 裸标记，且包含收尾总结（debt 续跑生效）。
     let assistant: String = events

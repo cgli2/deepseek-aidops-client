@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_stream::stream;
 use futures::StreamExt;
 use harness_core::error::Error;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::openai_compat;
 use crate::{Chunk, ChunkStream, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolSchema};
@@ -304,13 +304,16 @@ fn role_name(role: Role) -> &'static str {
 fn image_content_block(data_url: &str) -> Option<Value> {
     let (header, data) = data_url.split_once(',')?;
     let media_type = header.strip_prefix("data:")?.strip_suffix(";base64")?;
-    matches!(media_type, "image/jpeg" | "image/png" | "image/gif" | "image/webp")
-        .then(|| {
-            json!({
-                "type": "image",
-                "source": { "type": "base64", "media_type": media_type, "data": data },
-            })
+    matches!(
+        media_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    )
+    .then(|| {
+        json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data },
         })
+    })
 }
 
 #[cfg(test)]

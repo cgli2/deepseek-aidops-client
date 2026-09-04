@@ -9,6 +9,7 @@ harness-core = { path = "../harness-core" }
 harness-runtime = { path = "../harness-runtime" }
 harness-session = { path = "../harness-session" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

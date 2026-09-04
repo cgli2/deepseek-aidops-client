@@ -569,7 +569,11 @@ impl CouncilOrchestrator {
             );
             log.append(SessionEvent::Delivery {
                 id: log.gen_id(),
-                report: council_delivery_report(&tasks, DeliveryOutcome::SystemFailure, Some(failed)),
+                report: council_delivery_report(
+                    &tasks,
+                    DeliveryOutcome::SystemFailure,
+                    Some(failed),
+                ),
             });
         }
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });

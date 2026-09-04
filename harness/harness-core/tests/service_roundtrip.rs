@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use harness_core::ui_input::UiInputSink;
 use harness_core::AppContext;
+use harness_core::ui_input::UiInputSink;
 
 struct DummySink {
     flag: bool,

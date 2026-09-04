@@ -7,12 +7,12 @@
 pub mod sensors;
 pub mod strategy;
 
-pub use sensors::{artifact_text, delta_between, WindowDelta};
+pub use sensors::{WindowDelta, artifact_text, delta_between};
 pub use strategy::{Strategy, StrategyStack, WINDOW_STEPS};
 
 use std::collections::BTreeSet;
 
-use crate::case_file::{normalize_question, CaseFile};
+use crate::case_file::{CaseFile, normalize_question};
 
 /// 单次执行回合 prompt tokens 安全边界（spec §3 R3）。
 ///
@@ -190,7 +190,11 @@ mod tests {
         let case = CaseFile::default();
         let mut gov = TurnGovernor::new(&case, true, false);
         for step in 1..WINDOW_STEPS {
-            assert_eq!(gov.observe(&case, step, 0), Decision::Continue, "step {step}");
+            assert_eq!(
+                gov.observe(&case, step, 0),
+                Decision::Continue,
+                "step {step}"
+            );
         }
     }
 
@@ -198,8 +202,15 @@ mod tests {
     fn zero_gain_at_window_end_switches_strategy() {
         let case = CaseFile::default();
         let mut gov = TurnGovernor::new(&case, true, false);
-        assert_eq!(gov.observe(&case, WINDOW_STEPS, 0), Decision::SwitchStrategy);
-        assert_eq!(gov.current_strategy(), Some(Strategy::BroadLocate), "grounded_change 已弹出");
+        assert_eq!(
+            gov.observe(&case, WINDOW_STEPS, 0),
+            Decision::SwitchStrategy
+        );
+        assert_eq!(
+            gov.current_strategy(),
+            Some(Strategy::BroadLocate),
+            "grounded_change 已弹出"
+        );
     }
 
     #[test]
@@ -211,7 +222,10 @@ mod tests {
         assert_eq!(gov.current_strategy(), Some(Strategy::GroundedChange));
         // 第二个满窗：锚点没变（已被新基线吸收）→ 零增益 → 换路。
         // 若基线未吸收上一窗的增益，这里会误判 gain=1 而给 grounded_change 续命。
-        assert_eq!(gov.observe(&now, WINDOW_STEPS * 2, 0), Decision::SwitchStrategy);
+        assert_eq!(
+            gov.observe(&now, WINDOW_STEPS * 2, 0),
+            Decision::SwitchStrategy
+        );
         assert_eq!(gov.current_strategy(), Some(Strategy::BroadLocate));
     }
 
@@ -228,7 +242,10 @@ mod tests {
         // 只读栈：broad_locate → runtime_observe →（栈底）partial_deliver
         let case = CaseFile::default();
         let mut gov = TurnGovernor::new(&case, false, true);
-        assert_eq!(gov.observe(&case, WINDOW_STEPS, 0), Decision::SwitchStrategy);
+        assert_eq!(
+            gov.observe(&case, WINDOW_STEPS, 0),
+            Decision::SwitchStrategy
+        );
         assert_eq!(gov.current_strategy(), Some(Strategy::RuntimeObserve));
         assert_eq!(gov.observe(&case, WINDOW_STEPS * 2, 0), Decision::Degrade);
         assert!(gov.stack.at_bottom());
@@ -260,9 +277,18 @@ mod tests {
     fn prompt_ceiling_blocks_request_before_it_is_issued() {
         let gov = TurnGovernor::new(&CaseFile::default(), true, false);
         assert!(!gov.should_stop_before_request(PROMPT_CAP - 10, 0));
-        assert!(gov.should_stop_before_request(PROMPT_CAP - 10, 10), "累计+增量下界到顶");
-        assert!(gov.should_stop_before_request(PROMPT_CAP, 0), "已到顶即停，不得再探索");
-        assert!(gov.should_stop_before_request(PROMPT_CAP + 1, 0), "超顶同样拦死");
+        assert!(
+            gov.should_stop_before_request(PROMPT_CAP - 10, 10),
+            "累计+增量下界到顶"
+        );
+        assert!(
+            gov.should_stop_before_request(PROMPT_CAP, 0),
+            "已到顶即停，不得再探索"
+        );
+        assert!(
+            gov.should_stop_before_request(PROMPT_CAP + 1, 0),
+            "超顶同样拦死"
+        );
     }
 
     #[test]
@@ -270,25 +296,41 @@ mod tests {
         let case = CaseFile::default();
         let mut gov = TurnGovernor::new(&case, false, false);
         let q = "目标模块是哪个（候选：harness-tool、harness-runtime）";
-        assert!(!gov.ask_user_allowed(&case, "这个问题解决了吗？", q), "前置①栈深不满足");
+        assert!(
+            !gov.ask_user_allowed(&case, "这个问题解决了吗？", q),
+            "前置①栈深不满足"
+        );
 
         while !gov.stack.allow_ask_user() {
             gov.stack.pop();
         }
         assert!(gov.ask_user_allowed(&case, "目标在哪", q));
-        assert!(!gov.ask_user_allowed(&case, "继续", q), "R1：续跑回复永不问用户");
+        assert!(
+            !gov.ask_user_allowed(&case, "继续", q),
+            "R1：续跑回复永不问用户"
+        );
         assert!(
             !gov.ask_user_allowed(&case, "目标在哪", "目标模块是哪个？"),
             "R2：开放模板问题一律禁止"
         );
         let mut asked = case.clone();
         asked.asked.insert(normalize_question(q));
-        assert!(!gov.ask_user_allowed(&asked, "目标在哪", q), "R2：同一问题不得问第二次");
+        assert!(
+            !gov.ask_user_allowed(&asked, "目标在哪", q),
+            "R2：同一问题不得问第二次"
+        );
     }
 
     #[test]
     fn continuation_prefix_list_is_single_sourced() {
-        for text in ["继续", "接着做", "续跑一下", "恢复任务", "Continue please", "RESUME"] {
+        for text in [
+            "继续",
+            "接着做",
+            "续跑一下",
+            "恢复任务",
+            "Continue please",
+            "RESUME",
+        ] {
             assert!(is_continuation_request(text), "{text}");
         }
         assert!(!is_continuation_request("这个问题解决了吗？"));

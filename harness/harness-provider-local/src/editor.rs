@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use harness_capability::editor::Editor;
-use harness_core::error::Result;
 use harness_core::Workspace;
+use harness_core::error::Result;
 
 /// 本地 Editor Provider（实现 `Editor`）。返回 `Arc<dyn Editor>`。
 /// 根目录共享 `Arc<Workspace>`：项目切换后操作立即落在新工作区。
@@ -138,20 +138,23 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "gamma beta");
         std::fs::write(&path, "x x").unwrap();
-        assert!(editor
-            .apply(
-                std::path::Path::new("sample.txt"),
-                r#"{"old_text":"x","new_text":"y"}"#
-            )
-            .await
-            .is_err());
+        assert!(
+            editor
+                .apply(
+                    std::path::Path::new("sample.txt"),
+                    r#"{"old_text":"x","new_text":"y"}"#
+                )
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(root);
     }
 
     #[tokio::test]
     async fn edit_zero_match_returns_disk_region_with_line_numbers() {
-        let root = std::env::temp_dir().join(format!("harness-editor-mismatch-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("harness-editor-mismatch-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("target.rs");
         // 磁盘现状是 v2；模型凭记忆发来 v1 的 old_text
@@ -166,7 +169,10 @@ mod tests {
             .expect_err("matched 0 必须报错");
         let msg = format!("{err}");
         assert!(msg.contains("matched 0"), "{msg}");
-        assert!(msg.contains("println!(\"v2\")"), "报告必须回读磁盘现状: {msg}");
+        assert!(
+            msg.contains("println!(\"v2\")"),
+            "报告必须回读磁盘现状: {msg}"
+        );
         assert!(msg.contains("2|"), "报告必须带行号: {msg}");
         // 文件未被修改
         assert_eq!(
@@ -193,14 +199,18 @@ mod tests {
             .expect_err("matched 2 必须报错");
         let msg = format!("{err}");
         assert!(msg.contains("matched 2"), "{msg}");
-        assert!(msg.contains("1") && msg.contains("3"), "报告必须给出命中行号: {msg}");
+        assert!(
+            msg.contains("1") && msg.contains("3"),
+            "报告必须给出命中行号: {msg}"
+        );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(root);
     }
 
     #[tokio::test]
     async fn edit_zero_match_without_anchor_suggests_reread() {
-        let root = std::env::temp_dir().join(format!("harness-editor-noanchor-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("harness-editor-noanchor-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("a.txt");
         std::fs::write(&path, "alpha\nbeta\n").unwrap();

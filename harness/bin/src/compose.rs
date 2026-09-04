@@ -33,15 +33,21 @@ use harness_llm::LlmProvider;
 use harness_provider_aidops::AidopsBackend;
 use harness_provider_git::GitCli;
 use harness_provider_hook::ShellHook;
-use harness_provider_local::{LocalBash, LocalEditor, LocalFs, LocalLsp, LocalSearch, PollingFileWatcher};
+use harness_provider_local::{
+    LocalBash, LocalEditor, LocalFs, LocalLsp, LocalSearch, PollingFileWatcher,
+};
 use harness_provider_memory::FileMemory;
 use harness_provider_sandbox::Sandbox;
 use harness_provider_wasm::WasmPluginRuntime;
 use harness_session::SessionLog;
-use harness_tool::{BashTool, DelegateTool, EditTool, FsTool, MemoryTool, PlanTool, SearchTool, ToolRegistry};
+use harness_tool::{
+    BashTool, DelegateTool, EditTool, FsTool, MemoryTool, PlanTool, SearchTool, ToolRegistry,
+};
 use harness_ui::Ui;
 
-use harness_runtime::{DeterministicCompaction, InProcessSubagent, SessionController};
+use harness_runtime::{
+    DeterministicCompaction, InProcessSubagent, LongHorizonManager, SessionController,
+};
 
 use harness_ui::ConsoleUi;
 #[cfg(feature = "gui")]
@@ -91,6 +97,10 @@ impl Plugin for HarnessPlugin {
         // 共享 Workspace：GUI 侧栏切换项目后，shell/fs/editor 立即落在新工作区。
         let workspace = harness_core::Workspace::new(cwd.clone());
         regs.push(ctx.provide(workspace.clone()));
+        // 每个工作区按需打开一个持久化长任务控制面。SessionController、Scheduler
+        // 与 ACP 共用该服务；工作区切换后会自动选择对应的独立 WAL/Vault。
+        let long_horizon = Arc::new(LongHorizonManager::from_env());
+        regs.push(ctx.provide(long_horizon.clone()));
         let shell: Arc<dyn Shell> = LocalBash::with_workspace(sandbox.clone(), workspace.clone());
         regs.push(ctx.provide(shell.clone()));
         let fs: Arc<dyn Fs> = LocalFs::with_workspace(workspace.clone());
@@ -114,7 +124,10 @@ impl Plugin for HarnessPlugin {
                 .map(str::trim)
                 .is_some_and(|v| !v.is_empty());
         let initial_status = if key_configured {
-            format!("{} / {} / 已配置 Key", self.config.llm.provider, self.config.llm.model)
+            format!(
+                "{} / {} / 已配置 Key",
+                self.config.llm.provider, self.config.llm.model
+            )
         } else {
             format!("演示模式 / 未配置 API Key（当前不会调用真实模型）")
         };
@@ -295,6 +308,7 @@ impl Plugin for HarnessPlugin {
             wiki.clone(),
             code.clone(),
             wasm_plugins,
+            long_horizon,
         );
         regs.push(ctx.provide(ui.clone()));
 
@@ -373,18 +387,9 @@ fn make_llm(cfg: &Config) -> Arc<dyn LlmProvider> {
         // 其他厂商走通用 OpenAI 兼容实现——避免用户选了非 deepseek 模型，
         // 启动初始请求与报错却仍挂在 "DeepSeek" provider 上。
         return if cfg.llm.provider.trim() == "deepseek" {
-            harness_llm::DeepSeek::new(
-                cfg.llm.base_url.clone(),
-                key,
-                cfg.llm.model.clone(),
-                None,
-            )
+            harness_llm::DeepSeek::new(cfg.llm.base_url.clone(), key, cfg.llm.model.clone(), None)
         } else {
-            harness_llm::OpenAI::with_endpoint(
-                cfg.llm.base_url.clone(),
-                key,
-                cfg.llm.model.clone(),
-            )
+            harness_llm::OpenAI::with_endpoint(cfg.llm.base_url.clone(), key, cfg.llm.model.clone())
         };
     }
     if cfg!(feature = "local-llm") {
@@ -409,6 +414,7 @@ fn make_ui(
     wiki: Arc<dyn WikiStore>,
     code: Arc<dyn CodeGraph>,
     wasm_plugins: Arc<WasmPluginRuntime>,
+    long_horizon: Arc<LongHorizonManager>,
 ) -> Arc<dyn Ui> {
     #[cfg(feature = "tui")]
     if profile == Profile::Tui {
@@ -445,6 +451,7 @@ fn make_ui(
             trellis,
             fs.clone(),
             git.clone(),
+            long_horizon,
         ));
     }
     Arc::new(ConsoleUi)

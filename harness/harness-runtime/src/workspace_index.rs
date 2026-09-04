@@ -647,9 +647,11 @@ mod tests {
         // 这里没有任何停用词表参与判断。
         let graded = index.grade(&"export".to_string());
         assert_eq!(graded.grade, AnchorGrade::Stopword);
-        assert!(!index
-            .select_anchors(&["export".to_string(), "apiKey".to_string()], 8)
-            .contains(&"export".to_string()));
+        assert!(
+            !index
+                .select_anchors(&["export".to_string(), "apiKey".to_string()], 8)
+                .contains(&"export".to_string())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

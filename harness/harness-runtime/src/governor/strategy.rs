@@ -154,7 +154,10 @@ mod tests {
             assert_eq!(stack.pop(), Some(expected));
         }
         assert_eq!(stack.current(), Some(Strategy::DegradeGoal));
-        assert!(stack.allow_ask_user(), "仅剩 degrade_goal + partial_deliver");
+        assert!(
+            stack.allow_ask_user(),
+            "仅剩 degrade_goal + partial_deliver"
+        );
     }
 
     #[test]

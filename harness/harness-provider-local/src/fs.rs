@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use harness_capability::fs::Fs;
-use harness_core::error::Result;
 use harness_core::Workspace;
+use harness_core::error::Result;
 
 /// 本地 FS Provider（实现 `Fs`）。返回 `Arc<dyn Fs>`。
 /// 根目录共享 `Arc<Workspace>`：项目切换后操作立即落在新工作区。
@@ -39,7 +39,9 @@ pub(crate) fn normalize_for_sandbox(p: &Path) -> PathBuf {
         match cur.parent() {
             Some(parent) if parent != cur => {
                 if parent.exists() {
-                    let mut out = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+                    let mut out = parent
+                        .canonicalize()
+                        .unwrap_or_else(|_| parent.to_path_buf());
                     for part in suffix.iter().rev() {
                         out.push(part);
                     }
@@ -157,10 +159,11 @@ mod tests {
     #[tokio::test]
     async fn rejects_parent_traversal() {
         let fs = LocalFs::new(std::env::temp_dir());
-        assert!(fs
-            .read(std::path::Path::new("../outside.txt"))
-            .await
-            .is_err());
+        assert!(
+            fs.read(std::path::Path::new("../outside.txt"))
+                .await
+                .is_err()
+        );
     }
 
     /// 回归守卫：工作区内「不存在的文件」应返回 file-not-found，
@@ -176,7 +179,10 @@ mod tests {
 
         // 不存在的文件，但在工作区根内：应为 file-not-found（IO 错误），
         // 且绝不能是沙箱越界误判（这是本次修复的核心）。
-        let err = fs.read(std::path::Path::new("missing.txt")).await.unwrap_err();
+        let err = fs
+            .read(std::path::Path::new("missing.txt"))
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("outside workspace"),
@@ -198,7 +204,10 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let fs = LocalFs::new(root.clone());
 
-        let err = fs.read(std::path::Path::new("a/b/missing.rs")).await.unwrap_err();
+        let err = fs
+            .read(std::path::Path::new("a/b/missing.rs"))
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("outside workspace"),

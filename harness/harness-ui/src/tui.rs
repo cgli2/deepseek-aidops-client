@@ -57,13 +57,13 @@ impl Ui for TuiUi {
         let handle = thread::spawn(move || {
             use crossterm::event::{self, Event as CEvent, KeyCode};
             use crossterm::terminal::{
-                disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+                EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
             };
+            use ratatui::Terminal;
             use ratatui::backend::CrosstermBackend;
             use ratatui::layout::{Constraint, Layout};
             use ratatui::style::{Color, Modifier, Style};
             use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-            use ratatui::Terminal;
 
             let _ = enable_raw_mode();
             let mut stdout = std::io::stdout();

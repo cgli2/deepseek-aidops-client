@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
+# 注意：包名是 `harness-bin`，`aidops-desktop` 只是产物名；`cargo -p` 应使用 `-p harness-bin`。
 name = "aidops-desktop"
 path = "src/main.rs"
 
@@ -26,7 +27,9 @@ harness-provider-git = { path = "../harness-provider-git" }
 harness-ui = { path = "../harness-ui" }
 harness-acp = { path = "../harness-acp", optional = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = ["deepseek", "gui", "wasm-tools"]

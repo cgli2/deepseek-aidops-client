@@ -1,4 +1,4 @@
-﻿//! Trellis Provider：spec 驱动开发插件（可开可关）。
+//! Trellis Provider：spec 驱动开发插件（可开可关）。
 //!
 //! 核心思想（源自 mindfold-ai/Trellis）：把"项目规格"当作第一类对象，
 //! 以 *任务状态机*（新任务 / 进行中 / 完成）驱动开发循环。
@@ -68,11 +68,17 @@ impl TrellisControl {
     }
 
     pub fn spec_file(&self) -> String {
-        self.spec_file.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.spec_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn tasks_file(&self) -> String {
-        self.tasks_file.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.tasks_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 更换规格文件路径（空字符串 = 停止注入规格）。
@@ -98,7 +104,10 @@ fn resolve_default(configured: &str, workspace_root: &str, filename: &str) -> St
         return configured.to_string();
     }
     let root = std::path::Path::new(workspace_root);
-    root.join(".harness").join(filename).to_string_lossy().into_owned()
+    root.join(".harness")
+        .join(filename)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Trellis 插件主体：持有配置与共享控制句柄，注册 PreStep 瀑布监听。
@@ -114,11 +123,7 @@ impl TrellisPlugin {
         let spec_file = resolve_default(&config.spec_file, workspace_root, "spec.md");
         let tasks_file = resolve_default(&config.tasks_file, workspace_root, "tasks.json");
         Arc::new(Self {
-            control: Arc::new(TrellisControl::new(
-                config.enabled,
-                spec_file,
-                tasks_file,
-            )),
+            control: Arc::new(TrellisControl::new(config.enabled, spec_file, tasks_file)),
             config,
         })
     }
@@ -146,9 +151,10 @@ impl Plugin for TrellisPlugin {
     fn register(self: Arc<Self>, ctx: &AppContext) -> Vec<Registration> {
         let control = self.control.clone();
         let mut regs = vec![ctx.provide(control.clone())];
-        regs.push(ctx.events().on_waterfall::<PreStep>(Arc::new(
-            TrellisMiddleware { control },
-        )));
+        regs.push(
+            ctx.events()
+                .on_waterfall::<PreStep>(Arc::new(TrellisMiddleware { control })),
+        );
         regs
     }
 }
@@ -190,9 +196,9 @@ impl Waterfall<PreStep> for TrellisMiddleware {
 /// 若规格尚未注入过（以 "## 项目规格" 标记为幂等键），追加一条系统消息。
 fn inject_spec(messages: &[Message], spec: &str) -> Option<Message> {
     const MARK: &str = "## 项目规格";
-    let already = messages.iter().any(|m| {
-        m.role == Role::System && m.content.contains(MARK)
-    });
+    let already = messages
+        .iter()
+        .any(|m| m.role == Role::System && m.content.contains(MARK));
     if already {
         return None;
     }
@@ -250,5 +256,8 @@ fn sync_tasks(tasks_file: &str, user_text: &str) {
         }
     }
 
-    let _ = fs::write(&path, serde_json::to_string_pretty(&tasks).unwrap_or_default());
+    let _ = fs::write(
+        &path,
+        serde_json::to_string_pretty(&tasks).unwrap_or_default(),
+    );
 }

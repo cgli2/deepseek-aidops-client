@@ -82,20 +82,37 @@ impl HandlerTable {
     /// `next` 自增计数器从「父表最大订阅 id + 1」起步，避免与继承来的订阅 id 碰撞（碰撞会导致
     /// 子表 `remove` 误删父表继承来的订阅）。
     pub(crate) fn inherit_from(parent: &HandlerTable) -> Self {
-        let clone_bucket = |b: &Mutex<HashMap<TypeId, Vec<(SubId, Arc<dyn Any + Send + Sync>)>>>| {
-            b.lock()
-                .map(|g| g.clone())
-                .unwrap_or_default()
-        };
+        let clone_bucket = |b: &Mutex<
+            HashMap<TypeId, Vec<(SubId, Arc<dyn Any + Send + Sync>)>>,
+        >| { b.lock().map(|g| g.clone()).unwrap_or_default() };
         let emit = clone_bucket(&parent.emit);
         let parallel = clone_bucket(&parent.parallel);
         let serial = clone_bucket(&parent.serial);
         let waterfall = clone_bucket(&parent.waterfall);
         let max_id = [
-            emit.values().flatten().map(|(id, _)| *id).max().unwrap_or(0),
-            parallel.values().flatten().map(|(id, _)| *id).max().unwrap_or(0),
-            serial.values().flatten().map(|(id, _)| *id).max().unwrap_or(0),
-            waterfall.values().flatten().map(|(id, _)| *id).max().unwrap_or(0),
+            emit.values()
+                .flatten()
+                .map(|(id, _)| *id)
+                .max()
+                .unwrap_or(0),
+            parallel
+                .values()
+                .flatten()
+                .map(|(id, _)| *id)
+                .max()
+                .unwrap_or(0),
+            serial
+                .values()
+                .flatten()
+                .map(|(id, _)| *id)
+                .max()
+                .unwrap_or(0),
+            waterfall
+                .values()
+                .flatten()
+                .map(|(id, _)| *id)
+                .max()
+                .unwrap_or(0),
         ]
         .into_iter()
         .max()

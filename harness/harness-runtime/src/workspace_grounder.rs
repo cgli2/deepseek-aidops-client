@@ -50,10 +50,26 @@ impl WorkspaceGrounding {
             "[工作区确认]\n状态：{:?}\n已扫描源码文件：{}（{}）\n精确旧值命中：{}\n字段/实体命中：{}\n导航命中：{}\n命中文件已作为执行候选；有候选时直接读取，不要重复搜索或目录枚举。{}",
             self.status,
             self.scanned_files,
-            if self.complete_scan { "完整扫描" } else { "达到扫描上限，仅作候选" },
-            if self.literal_hits.is_empty() { "无".into() } else { self.literal_hits.join("、") },
-            if self.entity_hits.is_empty() { "无".into() } else { self.entity_hits.join("、") },
-            if self.navigation_hits.is_empty() { "无".into() } else { self.navigation_hits.join("、") },
+            if self.complete_scan {
+                "完整扫描"
+            } else {
+                "达到扫描上限，仅作候选"
+            },
+            if self.literal_hits.is_empty() {
+                "无".into()
+            } else {
+                self.literal_hits.join("、")
+            },
+            if self.entity_hits.is_empty() {
+                "无".into()
+            } else {
+                self.entity_hits.join("、")
+            },
+            if self.navigation_hits.is_empty() {
+                "无".into()
+            } else {
+                self.navigation_hits.join("、")
+            },
             zero_prior_note,
         )
     }
@@ -66,8 +82,16 @@ impl WorkspaceGrounding {
         format!(
             "当前工作区扫描了 {} 个源码文件，未找到目标实体 [{}] 或导航入口 [{}]。请确认正确的项目、子目录或分支；在确认前不继续进行泛搜。",
             self.scanned_files,
-            if goal.entities.is_empty() { "未提取".into() } else { goal.entities.join("、") },
-            if goal.navigation.is_empty() { "未提取".into() } else { goal.navigation.join(" → ") },
+            if goal.entities.is_empty() {
+                "未提取".into()
+            } else {
+                goal.entities.join("、")
+            },
+            if goal.navigation.is_empty() {
+                "未提取".into()
+            } else {
+                goal.navigation.join(" → ")
+            },
         )
     }
 }
@@ -184,14 +208,12 @@ impl WorkspaceGrounder {
 
         // 零先验只在"候选确实全部缺席"时成立。这与"扫描没命中"是两回事：
         // 后者可能只是命名习惯不同（camelCase vs 下划线），前者才是真的没有。
-        let zero_prior =
-            hits.is_empty() && (goal.candidates.is_empty() || adjudication.all_absent);
+        let zero_prior = hits.is_empty() && (goal.candidates.is_empty() || adjudication.all_absent);
         let status = if !hits.literal_hits.is_empty() || !hits.entity_hits.is_empty() {
             GroundingStatus::Grounded
         } else if !hits.navigation_hits.is_empty() {
             GroundingStatus::NavigationOnly
-        } else if !index.truncated()
-            && (!goal.code_entities.is_empty() || source_literal.is_some())
+        } else if !index.truncated() && (!goal.code_entities.is_empty() || source_literal.is_some())
         {
             // 严格判定只看代码符号与明确旧值。中文片段和缩写太泛——"模型管理"没命中
             // 不代表仓库里没有这个页面，据此报"工作区不匹配"会误伤中文项目。
@@ -244,16 +266,23 @@ impl WorkspaceGrounder {
         let mut hits = RawHits::default();
         for file in index.files() {
             if !entity_needles.is_empty()
-                && entity_needles.iter().any(|needle| file.content.contains(needle))
+                && entity_needles
+                    .iter()
+                    .any(|needle| file.content.contains(needle))
             {
                 hits.entity_hits.push(file.relative.clone());
             }
             if !nav_needles.is_empty()
-                && nav_needles.iter().any(|needle| file.content.contains(needle))
+                && nav_needles
+                    .iter()
+                    .any(|needle| file.content.contains(needle))
             {
                 hits.navigation_hits.push(file.relative.clone());
             }
-            if literal.as_ref().is_some_and(|needle| file.content.contains(needle)) {
+            if literal
+                .as_ref()
+                .is_some_and(|needle| file.content.contains(needle))
+            {
                 hits.literal_hits.push(file.relative.clone());
             }
             if hits.entity_hits.len() >= 8
@@ -265,7 +294,6 @@ impl WorkspaceGrounder {
         }
         hits
     }
-
 }
 
 #[derive(Default, Debug, Clone)]
@@ -310,7 +338,12 @@ mod tests {
             "英文任务应靠工作区命中率定位，实际 {:?}",
             grounding
         );
-        assert!(grounding.entity_hits.iter().any(|hit| hit.contains("model.tsx")));
+        assert!(
+            grounding
+                .entity_hits
+                .iter()
+                .any(|hit| hit.contains("model.tsx"))
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -362,7 +395,10 @@ mod tests {
         let grounding = WorkspaceGrounder::ground(&root, &goal);
         assert_eq!(grounding.status, GroundingStatus::Grounded);
         assert!(
-            grounding.entity_hits.iter().any(|hit| hit.contains("appCode")),
+            grounding
+                .entity_hits
+                .iter()
+                .any(|hit| hit.contains("appCode")),
             "应通过路径降级命中，实际 {:?}",
             grounding.entity_hits
         );
@@ -380,7 +416,12 @@ mod tests {
         let goal = GoalContract::compile("调整模型名称字段的显示");
         let grounding = WorkspaceGrounder::ground(&root, &goal);
         assert_eq!(grounding.status, GroundingStatus::Grounded);
-        assert!(grounding.entity_hits.iter().any(|hit| hit.contains("form.tsx")));
+        assert!(
+            grounding
+                .entity_hits
+                .iter()
+                .any(|hit| hit.contains("form.tsx"))
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -431,10 +472,8 @@ mod tests {
     }
     #[test]
     fn quoted_shortening_grounds_the_old_literal_without_bruteforce() {
-        let root = std::env::temp_dir().join(format!(
-            "grounder-quoted-literal-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("grounder-quoted-literal-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(

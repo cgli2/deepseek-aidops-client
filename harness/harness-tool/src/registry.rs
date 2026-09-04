@@ -76,7 +76,12 @@ fn sanitize_and_limit(input: &str, max_chars: usize) -> String {
         let lower = line.to_ascii_lowercase();
         if lower.contains("api_key") || lower.contains("apikey") || lower.contains("authorization:")
         {
-            append_collapsed_line(&mut output, &mut previous, &mut repeated, "[REDACTED SECRET-BEARING LINE]");
+            append_collapsed_line(
+                &mut output,
+                &mut previous,
+                &mut repeated,
+                "[REDACTED SECRET-BEARING LINE]",
+            );
             continue;
         }
         let mut rest = line;
@@ -100,9 +105,7 @@ fn sanitize_and_limit(input: &str, max_chars: usize) -> String {
         let tail_chars = max_chars.saturating_sub(head_chars);
         let head: String = output.chars().take(head_chars).collect();
         let tail: String = output.chars().skip(count - tail_chars).collect();
-        output = format!(
-            "{head}\n[中间输出已压缩：原始 {count} 字符，保留开头和结尾]\n{tail}"
-        );
+        output = format!("{head}\n[中间输出已压缩：原始 {count} 字符，保留开头和结尾]\n{tail}");
     }
     output
 }

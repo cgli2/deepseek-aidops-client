@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};
@@ -372,11 +372,13 @@ mod tests {
         let parsed: toml::Table = toml::from_str(&text).unwrap();
         assert!(parsed.get("api_key").is_none());
         assert!(parsed.get("reasoning_effort").is_none());
-        assert!(parsed
-            .get("ui")
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get("profile"))
-            .is_none());
+        assert!(
+            parsed
+                .get("ui")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("profile"))
+                .is_none()
+        );
         // api_key_env 作为普通字段仍应写出
         assert!(parsed.get("llm").is_some());
     }

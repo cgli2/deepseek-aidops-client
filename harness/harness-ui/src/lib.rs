@@ -37,9 +37,9 @@ pub use tui::TuiUi;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]
-mod markdown;
-#[cfg(feature = "gui")]
 mod highlight;
+#[cfg(feature = "gui")]
+mod markdown;
 #[cfg(feature = "gui")]
 mod preview;
 #[cfg(feature = "gui")]

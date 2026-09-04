@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use harness_capability::shell::{Shell, ShellOutput, ShellRequest};
-use harness_core::error::Result;
 use harness_core::Workspace;
+use harness_core::error::Result;
 use harness_provider_sandbox::Sandbox;
 
 /// 本地 bash / pwsh Provider（实现 `Shell`）。返回 `Arc<dyn Shell>`，可直接 `ctx.provide`。
@@ -104,7 +104,7 @@ impl Shell for LocalBash {
                     stdout: String::new(),
                     stderr: format!("command timed out after {} ms", req.timeout_ms),
                     exit_code: -1,
-                })
+                });
             }
         };
         Ok(ShellOutput {

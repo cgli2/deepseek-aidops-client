@@ -29,7 +29,10 @@ pub(super) fn draw_icon(
     match icon {
         // 对话气泡 + 内部文本线
         Icon::Chat => {
-            let body = egui::Rect::from_min_size(r.min + egui::vec2(0.5, 0.5), egui::vec2(r.width() - 1.0, r.height() * 0.72));
+            let body = egui::Rect::from_min_size(
+                r.min + egui::vec2(0.5, 0.5),
+                egui::vec2(r.width() - 1.0, r.height() * 0.72),
+            );
             painter.rect(
                 body,
                 egui::Rounding::same(4.0),

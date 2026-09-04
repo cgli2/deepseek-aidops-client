@@ -1,8 +1,8 @@
 //! 会话控制器：每条会话独立 FIFO、独立执行上下文；不同会话可并行运行。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::FutureExt;
 use harness_core::types::UserInput;
@@ -13,8 +13,8 @@ use harness_tool::{PlanTool, ToolRegistry};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_loop::AgentLoop;
-use crate::council::{CouncilOrchestrator, COUNCIL_PREFIX};
+use crate::council::COUNCIL_PREFIX;
+use crate::{run_durable_agent_turn, run_durable_council_turn};
 
 #[derive(Clone)]
 pub struct SessionController {
@@ -242,25 +242,22 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
         let outcome = std::panic::AssertUnwindSafe(async {
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
                 if is_council {
-                    CouncilOrchestrator::default()
-                        .run(
-                            &ctx,
-                            format!("{clean_text}{}", attachment_note(&attachments)),
-                            cancellation,
-                        )
-                        .await
+                    run_durable_council_turn(
+                        &ctx,
+                        format!("{clean_text}{}", attachment_note(&attachments)),
+                        cancellation,
+                    )
+                    .await
                 } else {
-                    AgentLoop::new()
-                        .run_turn_cancellable(
-                            &ctx,
-                            UserInput {
-                                text: clean_text,
-                                attachments,
-                            },
-                            cancellation,
-                            None,
-                        )
-                        .await
+                    run_durable_agent_turn(
+                        &ctx,
+                        UserInput {
+                            text: clean_text,
+                            attachments,
+                        },
+                        cancellation,
+                    )
+                    .await
                 }
             })
             .await

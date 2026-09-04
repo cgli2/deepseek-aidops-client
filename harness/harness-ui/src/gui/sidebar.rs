@@ -42,6 +42,17 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
             if nav_item(
                 ui,
                 &pal,
+                Icon::Chip,
+                "长时程任务",
+                state.sidebar_expanded,
+                true,
+                state.lha_open,
+            ) {
+                state.lha_open = true;
+            }
+            if nav_item(
+                ui,
+                &pal,
                 Icon::Layers,
                 "插件管理",
                 state.sidebar_expanded,

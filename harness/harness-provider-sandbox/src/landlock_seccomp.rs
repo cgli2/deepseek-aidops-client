@@ -43,7 +43,7 @@ impl Sandbox for LandlockSeccomp {
 
 /// landlock：工作区读写 + 根文件系统只读执行，其余路径全部拒绝。
 fn apply_landlock(root: &std::path::Path) -> std::io::Result<()> {
-    use landlock::{Access, AccessFs, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
+    use landlock::{ABI, Access, AccessFs, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr};
 
     fn io(e: impl std::fmt::Display) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
@@ -66,7 +66,7 @@ fn apply_landlock(root: &std::path::Path) -> std::io::Result<()> {
 
 /// seccomp-bpf：默认放行，`ptrace` 返回 EPERM。
 fn apply_seccomp() -> std::io::Result<()> {
-    use seccompiler::{apply_filter, BpfProgram, Filter, SeccompAction, SeccompRule, TargetArch};
+    use seccompiler::{BpfProgram, Filter, SeccompAction, SeccompRule, TargetArch, apply_filter};
     use std::collections::BTreeMap;
 
     #[cfg(target_arch = "x86_64")]

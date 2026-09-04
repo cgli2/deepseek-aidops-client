@@ -5,13 +5,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::execution::{edit_has_substantive_delta, ActionProposal, TaskContract};
+use crate::execution::{ActionProposal, TaskContract, edit_has_substantive_delta};
 use crate::intent::{
-    inspect_diff, Clarification, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior,
+    Clarification, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior, inspect_diff,
 };
 use crate::target_extract::{
-    extract_acronyms, extract_code_symbols, extract_form_field_order, extract_navigation,
-    segment_candidates, FormFieldOrder,
+    FormFieldOrder, extract_acronyms, extract_code_symbols, extract_form_field_order,
+    extract_navigation, segment_candidates,
 };
 use crate::workspace_grounder::WorkspaceGrounding;
 use crate::workspace_index::WorkspaceIndex;
@@ -1570,7 +1570,8 @@ impl GoalExecution {
             }
             return Err(format!(
                 "已定位共享目录 [{}]；{} 调用必须显式提供该目录内的 path/dir，禁止回到工作区根泛搜。",
-                self.anchor_dirs.join("、"), call.name
+                self.anchor_dirs.join("、"),
+                call.name
             ));
         };
         let normalized = path.replace('\\', "/").trim_start_matches("./").to_owned();
@@ -1628,7 +1629,9 @@ impl GoalExecution {
             Err(format!(
                 "当前工作项 {} 已定位到 [{}]，本次 {} 的路径 {} 不在已确认调用链中。请只读取/修改锚点目录，或基于现有证据说明需要切换哪个子项目。",
                 proposal.supports.first().cloned().unwrap_or_default(),
-                self.anchor_dirs.join("、"), call.name, path
+                self.anchor_dirs.join("、"),
+                call.name,
+                path
             ))
         }
     }
@@ -1970,19 +1973,59 @@ impl GoalExecution {
         format!(
             "[V4 唯一目标求解图{focus_label}]\n目标：{}\n期望值：{}\n导航：{}\n实体：{}，代码符号：{}\n候选文件：{}\n已确认目录：{}\n工作项：\n{}\n当前工作项：{}\n当前假设：{}\n阶段预算：locate {}/{} · inspect {}/{} · change {}/{} · verify {}/{}\n下一动作：{}{}{}\n{}\n{}\n规则：每个动作必须满足 ActionContract；命中按 on_hit 迁移，未命中按 on_miss 切换有限假设；有候选文件时直接读取，不得重新泛搜。",
             self.goal.objective,
-            if self.goal.expected_values.is_empty() { "未结构化".into() } else { self.goal.expected_values.iter().map(|item| format!("{}={}", item.key, item.value)).collect::<Vec<_>>().join("、") },
-            if self.goal.navigation.is_empty() { "未提供".into() } else { self.goal.navigation.join(" → ") },
-            if self.goal.entities.is_empty() { "未提取".into() } else { self.goal.entities.join("、") },
-            if self.goal.code_entities.is_empty() { "无".into() } else { self.goal.code_entities.join("、") },
-            if self.target_files.is_empty() { "尚未定位".into() } else { self.target_files.iter().take(8).cloned().collect::<Vec<_>>().join("、") },
-            if self.anchor_dirs.is_empty() { "尚未定位".into() } else { self.anchor_dirs.join("、") },
+            if self.goal.expected_values.is_empty() {
+                "未结构化".into()
+            } else {
+                self.goal
+                    .expected_values
+                    .iter()
+                    .map(|item| format!("{}={}", item.key, item.value))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            },
+            if self.goal.navigation.is_empty() {
+                "未提供".into()
+            } else {
+                self.goal.navigation.join(" → ")
+            },
+            if self.goal.entities.is_empty() {
+                "未提取".into()
+            } else {
+                self.goal.entities.join("、")
+            },
+            if self.goal.code_entities.is_empty() {
+                "无".into()
+            } else {
+                self.goal.code_entities.join("、")
+            },
+            if self.target_files.is_empty() {
+                "尚未定位".into()
+            } else {
+                self.target_files
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("、")
+            },
+            if self.anchor_dirs.is_empty() {
+                "尚未定位".into()
+            } else {
+                self.anchor_dirs.join("、")
+            },
             lines,
-            active.map(|item| format!("{}：{}", item.id, item.description)).unwrap_or_else(|| "无".into()),
+            active
+                .map(|item| format!("{}：{}", item.id, item.description))
+                .unwrap_or_else(|| "无".into()),
             self.active_hypothesis_summary(),
-            active.map(|item| item.phase_attempts.locate).unwrap_or(0), active.map(|item| item.phase_budget.locate).unwrap_or(0),
-            active.map(|item| item.phase_attempts.inspect).unwrap_or(0), active.map(|item| item.phase_budget.inspect).unwrap_or(0),
-            active.map(|item| item.phase_attempts.change).unwrap_or(0), active.map(|item| item.phase_budget.change).unwrap_or(0),
-            active.map(|item| item.phase_attempts.verify).unwrap_or(0), active.map(|item| item.phase_budget.verify).unwrap_or(0),
+            active.map(|item| item.phase_attempts.locate).unwrap_or(0),
+            active.map(|item| item.phase_budget.locate).unwrap_or(0),
+            active.map(|item| item.phase_attempts.inspect).unwrap_or(0),
+            active.map(|item| item.phase_budget.inspect).unwrap_or(0),
+            active.map(|item| item.phase_attempts.change).unwrap_or(0),
+            active.map(|item| item.phase_budget.change).unwrap_or(0),
+            active.map(|item| item.phase_attempts.verify).unwrap_or(0),
+            active.map(|item| item.phase_budget.verify).unwrap_or(0),
             self.next_action_hint(),
             field_order,
             actions,
@@ -2603,10 +2646,11 @@ mod tests {
             1,
             "已满足且产物可复核的面应静态收敛，实际 {settled:?}"
         );
-        assert!(plan
-            .items
-            .values()
-            .all(|item| item.state == WorkItemState::Verified));
+        assert!(
+            plan.items
+                .values()
+                .all(|item| item.state == WorkItemState::Verified)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

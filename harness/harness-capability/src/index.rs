@@ -494,7 +494,11 @@ pub fn install_skill_packs_from(src_root: &Path, packs_root: &Path) -> Result<Ve
 pub fn install_skill_file_into(file: &Path, packs_root: &Path) -> Result<PathBuf> {
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("skill");
     let name = sanitize(stem);
-    let name = if name.is_empty() { "skill".to_string() } else { name };
+    let name = if name.is_empty() {
+        "skill".to_string()
+    } else {
+        name
+    };
     let target = packs_root.join(&name);
     if let Some(parent) = file.parent() {
         if norm_path_str(parent) == norm_path_str(&target) {
@@ -514,7 +518,10 @@ pub fn install_skill_file_into(file: &Path, packs_root: &Path) -> Result<PathBuf
 /// 3. 已注册的包：更新内容但**保留用户设置的 enabled**（幂等更新，不产生副本）；
 /// 4. 目录已不存在的 `pack:` 前缀记录被回收（目录是唯一事实来源）；
 /// 5. `packs_dir` 本身不存在时不扫描也不回收（避免首次启动误删）。
-pub async fn sync_skill_packs(lib: &dyn SkillLibrary, packs_dir: &Path) -> Result<SkillImportReport> {
+pub async fn sync_skill_packs(
+    lib: &dyn SkillLibrary,
+    packs_dir: &Path,
+) -> Result<SkillImportReport> {
     let mut report = SkillImportReport::default();
     if !packs_dir.is_dir() {
         return Ok(report);
@@ -532,7 +539,9 @@ pub async fn sync_skill_packs(lib: &dyn SkillLibrary, packs_dir: &Path) -> Resul
         if name.starts_with('.') || SKIP_DIRS.contains(&name) {
             continue;
         }
-        let Some(mut sk) = parse_skill_pack(&dir) else { continue };
+        let Some(mut sk) = parse_skill_pack(&dir) else {
+            continue;
+        };
         sk.id = format!("{SKILL_PACK_ID_PREFIX}{}", sanitize(name));
         // 约定包落盘时 source_path 存**相对技能库根的路径**（如 `包名/SKILL.md`），
         // 不把磁盘绝对路径写进 JSON：位置由「库根 + 相对路径」决定，工作区搬迁/
@@ -889,10 +898,11 @@ mod tests {
         assert_eq!(sk.verification_rules, vec!["- 测试全部通过".to_string()]);
         // 资源：CHANGELOG.md / 隐藏文件被排除，resources/ 子目录被纳入。
         assert!(sk.resource_files.iter().any(|f| f == "notes.txt"));
-        assert!(sk
-            .resource_files
-            .iter()
-            .any(|f| f == "resources/checklist.txt"));
+        assert!(
+            sk.resource_files
+                .iter()
+                .any(|f| f == "resources/checklist.txt")
+        );
         assert!(sk.resource_files.iter().all(|f| !f.contains("CHANGELOG")));
         assert!(sk.resource_files.iter().all(|f| !f.contains(".hidden")));
         // 来源路径：绝对路径（统一 / 分隔），幂等更新的判定依据。
@@ -907,7 +917,10 @@ mod tests {
     fn discover_skill_packs_finds_nested_and_skips_noise() {
         let root = temp_dir("discover");
         write(&root.join("SKILL.md"), sample_skill_md());
-        write(&root.join("packs").join("sql-review").join("SKILL.md"), "# SQL 审查\n");
+        write(
+            &root.join("packs").join("sql-review").join("SKILL.md"),
+            "# SQL 审查\n",
+        );
         write(
             &root.join("node_modules").join("evil").join("SKILL.md"),
             "# 不应被发现\n",
@@ -973,20 +986,27 @@ mod tests {
     fn install_skill_packs_copies_into_convention_dir() {
         let src = temp_dir("install-src");
         let packs_root = temp_dir("install-root");
-        write(&src.join("release-checklist").join("SKILL.md"), sample_skill_md());
         write(
-            &src.join("release-checklist").join("resources").join("c.txt"),
+            &src.join("release-checklist").join("SKILL.md"),
+            sample_skill_md(),
+        );
+        write(
+            &src.join("release-checklist")
+                .join("resources")
+                .join("c.txt"),
             "ok",
         );
         write(&src.join("sql-review").join("SKILL.md"), "# SQL 审查\n");
 
         let installed = install_skill_packs_from(&src, &packs_root).unwrap();
         assert_eq!(installed.len(), 2);
-        assert!(packs_root
-            .join("release-checklist")
-            .join("resources")
-            .join("c.txt")
-            .exists());
+        assert!(
+            packs_root
+                .join("release-checklist")
+                .join("resources")
+                .join("c.txt")
+                .exists()
+        );
         assert!(packs_root.join("sql-review").join("SKILL.md").exists());
 
         // 重复落盘：目标被整体替换，仍只有两个包目录。
@@ -1017,8 +1037,14 @@ mod tests {
     #[tokio::test]
     async fn sync_skill_packs_defaults_disabled_and_reconciles() {
         let packs_root = temp_dir("sync");
-        write(&packs_root.join("release-checklist").join("SKILL.md"), sample_skill_md());
-        write(&packs_root.join("sql-review").join("SKILL.md"), "# SQL 审查\n");
+        write(
+            &packs_root.join("release-checklist").join("SKILL.md"),
+            sample_skill_md(),
+        );
+        write(
+            &packs_root.join("sql-review").join("SKILL.md"),
+            "# SQL 审查\n",
+        );
         let lib = MemSkillLib::default();
 
         // 1) 首启自动扫描：注册成功但默认未启用。
@@ -1026,7 +1052,10 @@ mod tests {
         assert_eq!(rep.added, 2);
         assert_eq!(rep.updated, 0);
         let all = lib.list_skills().await.unwrap();
-        assert!(all.iter().all(|s| !s.enabled), "自动加载的技能默认不得参与匹配");
+        assert!(
+            all.iter().all(|s| !s.enabled),
+            "自动加载的技能默认不得参与匹配"
+        );
         assert!(lib.match_skills("发布新版本").await.unwrap().is_empty());
         // 约定包以相对技能库根的路径登记，不把磁盘绝对路径写进记录。
         let rc = lib
@@ -1053,7 +1082,13 @@ mod tests {
         std::fs::remove_dir_all(packs_root.join("sql-review")).unwrap();
         let rep3 = sync_skill_packs(&lib, &packs_root).await.unwrap();
         assert_eq!(rep3.deleted, 1);
-        let ids: Vec<String> = lib.list_skills().await.unwrap().iter().map(|s| s.id.clone()).collect();
+        let ids: Vec<String> = lib
+            .list_skills()
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
         assert_eq!(ids, vec![id]);
 
         let _ = std::fs::remove_dir_all(&packs_root);

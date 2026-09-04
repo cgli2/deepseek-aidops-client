@@ -2,8 +2,8 @@
 
 use harness_capability::assets::FactKind;
 
-use super::model::{MemItem, MemRefresh};
 use super::AppState;
+use super::model::{MemItem, MemRefresh};
 
 impl AppState {
     /// 经 `host.rt` 独立 runtime 查询四类资产服务，把结果填充到 `mem_items`。

@@ -237,7 +237,9 @@ mod tests {
         assert!(!messages.iter().any(|message| message["role"] == "tool"));
         assert!(messages.iter().any(|message| {
             message["role"] == "system"
-                && message["content"].as_str().is_some_and(|text| text.contains("旧工具结果"))
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("旧工具结果"))
         }));
     }
 
@@ -252,7 +254,8 @@ mod tests {
             }],
         );
         assistant.reasoning_content = Some("读取文件。".into());
-        let messages = recover_incomplete_thinking_history(&[assistant, Message::tool("call-1", "ok")]);
+        let messages =
+            recover_incomplete_thinking_history(&[assistant, Message::tool("call-1", "ok")]);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].reasoning_content.as_deref(), Some("读取文件。"));
         assert_eq!(messages[1].role, Role::Tool);

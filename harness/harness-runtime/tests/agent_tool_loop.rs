@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_capability::hook::{Hook, HookDecision, HookPayload};
+use harness_core::AppContext;
 use harness_core::error::Result;
 use harness_core::types::UserInput;
-use harness_core::AppContext;
 use harness_llm::{
     Chunk, ChunkStream, LlmProvider, Message, RequestOptions, ToolCall, ToolResult, Usage,
 };
@@ -381,9 +381,11 @@ async fn tool_result_is_sent_back_and_turn_finishes() {
 
     let requests = llm.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests[1]
-        .iter()
-        .any(|m| m.tool_call_id.as_deref() == Some("call-1") && m.content.trim() == "hello"));
+    assert!(
+        requests[1]
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call-1") && m.content.trim() == "hello")
+    );
     assert!(requests[1].iter().any(|m| {
         m.tool_calls.iter().any(|call| call.id == "call-1")
             && m.reasoning_content.as_deref() == Some("先调用 echo 工具取得结果。")
@@ -427,12 +429,16 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
 
     let requests = llm.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests[1]
-        .iter()
-        .any(|message| message.content.contains("[空响应恢复 1/1·最小快照]")));
-    assert!(requests[1]
-        .iter()
-        .all(|message| message.role != harness_llm::Role::Tool));
+    assert!(
+        requests[1]
+            .iter()
+            .any(|message| message.content.contains("[空响应恢复 1/1·最小快照]"))
+    );
+    assert!(
+        requests[1]
+            .iter()
+            .all(|message| message.role != harness_llm::Role::Tool)
+    );
     let events = log.replay();
     assert!(events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("恢复后的完整答复"))));
     assert!(!events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref().is_some_and(|text| text.contains("返回了空内容")))));
@@ -518,12 +524,16 @@ async fn prompt_cap_auto_renews_after_tool_progress_without_user_continuation() 
             if chunk.text.as_deref().is_some_and(|text| text.contains("【执行预算暂停】"))
     )));
     let requests = llm.requests.lock().unwrap();
-    assert!(requests[1]
-        .iter()
-        .any(|message| message.content.contains("[预算窗口续期 1/4·最小断点]")));
-    assert!(requests[1]
-        .iter()
-        .all(|message| message.tool_call_id.as_deref() != Some("cap-call-1")));
+    assert!(
+        requests[1]
+            .iter()
+            .any(|message| message.content.contains("[预算窗口续期 1/4·最小断点]"))
+    );
+    assert!(
+        requests[1]
+            .iter()
+            .all(|message| message.tool_call_id.as_deref() != Some("cap-call-1"))
+    );
 }
 
 #[tokio::test]
@@ -591,12 +601,16 @@ async fn unverified_text_only_step_keeps_advancing_without_user_follow_up() {
     let requests = llm.requests.lock().unwrap();
     assert!(requests.len() > 2, "未验证的正文不能结束明确任务");
     assert!(requests.len() <= 20, "持续无进展时仍必须由硬预算终止");
-    assert!(requests[1]
-        .iter()
-        .any(|message| message.content.contains("[V4 目标状态校正]")));
-    assert!(requests.iter().skip(2).any(|request| request
-        .iter()
-        .any(|message| message.content.contains("[自动推进]"))));
+    assert!(
+        requests[1]
+            .iter()
+            .any(|message| message.content.contains("[V4 目标状态校正]"))
+    );
+    assert!(requests.iter().skip(2).any(|request| {
+        request
+            .iter()
+            .any(|message| message.content.contains("[自动推进]"))
+    }));
     assert!(!log.replay().iter().any(|event| matches!(event,
         SessionEvent::Assistant { chunk, .. }
             if chunk.text.as_deref().is_some_and(|text| text.contains("下一条“继续”") || text.contains("是否按以下理解继续"))
@@ -652,16 +666,8 @@ async fn exhausted_location_emits_one_clean_choice_and_preserves_needs_input() {
         calls: AtomicUsize::new(0),
         initial_text_steps: 0,
         script: vec![
-            scripted_call(
-                "s1",
-                "search",
-                serde_json::json!({"pattern": "大模型管理"}),
-            ),
-            scripted_call(
-                "s2",
-                "search",
-                serde_json::json!({"pattern": "系统管理"}),
-            ),
+            scripted_call("s1", "search", serde_json::json!({"pattern": "大模型管理"})),
+            scripted_call("s2", "search", serde_json::json!({"pattern": "系统管理"})),
             None,
         ],
         options: Mutex::new(vec![]),
@@ -692,10 +698,12 @@ async fn exhausted_location_emits_one_clean_choice_and_preserves_needs_input() {
     let events = log.replay();
     let prompts = events
         .iter()
-        .filter(|event| matches!(event,
-            SessionEvent::Assistant { chunk, .. }
-                if chunk.text.as_deref().is_some_and(|text| text.contains("请选择一种方式回复"))
-        ))
+        .filter(|event| {
+            matches!(event,
+                SessionEvent::Assistant { chunk, .. }
+                    if chunk.text.as_deref().is_some_and(|text| text.contains("请选择一种方式回复"))
+            )
+        })
         .count();
     assert_eq!(prompts, 1, "同一澄清不能在循环内外重复输出");
     assert!(events.iter().any(|event| matches!(event,

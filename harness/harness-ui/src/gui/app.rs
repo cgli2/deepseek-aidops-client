@@ -98,6 +98,7 @@ impl eframe::App for AppState {
         workspace::show_main(self, ctx, pal);
 
         settings_view::show(self, ctx, pal);
+        long_horizon_panel::show(self, ctx, pal);
 
         // ── 会话重命名弹窗 ───────────────────────────────────────
         if let Some(file) = self.renaming.clone() {

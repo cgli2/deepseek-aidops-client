@@ -123,7 +123,10 @@ impl DynTool for SearchTool {
         if tried.len() > 1 {
             out.push_str(&format!("（scope 自动升级：{}）\n", tried.join(" → ")));
         }
-        out.push_str(&format!("共 {} 条命中（格式：相对路径:行号: 内容）：\n", hits.len()));
+        out.push_str(&format!(
+            "共 {} 条命中（格式：相对路径:行号: 内容）：\n",
+            hits.len()
+        ));
         let mut truncated = false;
         for hit in &hits {
             let line = format!("{}:{}: {}\n", hit.path.display(), hit.line, hit.text);
@@ -234,7 +237,11 @@ mod tests {
             ]
         );
         assert!(res.content.contains("scope 自动升级"), "{}", res.content);
-        assert!(res.content.contains("crate-b/src/lib.rs:7"), "{}", res.content);
+        assert!(
+            res.content.contains("crate-b/src/lib.rs:7"),
+            "{}",
+            res.content
+        );
     }
 
     #[tokio::test]

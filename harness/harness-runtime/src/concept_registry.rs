@@ -30,11 +30,7 @@ impl ConceptRegistry {
     /// 单字符符号（几乎必然命中，等于噪声）被排除。
     pub fn seed_from_goal(goal: &GoalContract) -> Self {
         let mut registry = ConceptRegistry::default();
-        for symbol in goal
-            .candidates
-            .iter()
-            .chain(goal.code_entities.iter())
-        {
+        for symbol in goal.candidates.iter().chain(goal.code_entities.iter()) {
             if symbol.chars().count() >= 2 {
                 registry.by_symbol.entry(symbol.clone()).or_default();
             }
@@ -198,10 +194,10 @@ mod tests {
         let mut changed = std::collections::HashSet::new();
         changed.insert("list");
         changed.insert("detail");
-        let a = build(&["list", "detail", "form"])
-            .missing_coverage_report(|id| changed.contains(id));
-        let b = build(&["form", "list", "detail"])
-            .missing_coverage_report(|id| changed.contains(id));
+        let a =
+            build(&["list", "detail", "form"]).missing_coverage_report(|id| changed.contains(id));
+        let b =
+            build(&["form", "list", "detail"]).missing_coverage_report(|id| changed.contains(id));
         assert_eq!(a, b, "register 顺序不应影响报告（必须排序）");
         assert_eq!(a, vec![("appCode".to_string(), vec!["form".to_string()])]);
     }

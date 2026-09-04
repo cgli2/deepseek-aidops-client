@@ -28,9 +28,27 @@ pub const NAV_ACTION_WORDS: &[&str] = &[
 
 /// 顺序/位置类结构动作。同样跨领域通用，属于 L0。
 const ORDER_ACTION_WORDS: &[&str] = &[
-    "互换", "对调", "交换", "调换", "顺序", "位置", "前后", "排序", "放在前面", "排在前面", "放前面",
-    "排前面", "移到前面", "提前", "置顶", "swap", "reorder", "exchange", "move front",
-    "put first", "re-order",
+    "互换",
+    "对调",
+    "交换",
+    "调换",
+    "顺序",
+    "位置",
+    "前后",
+    "排序",
+    "放在前面",
+    "排在前面",
+    "放前面",
+    "排前面",
+    "移到前面",
+    "提前",
+    "置顶",
+    "swap",
+    "reorder",
+    "exchange",
+    "move front",
+    "put first",
+    "re-order",
 ];
 
 /// 并列分隔：用于识别"被一起枚举的若干对象"。
@@ -55,9 +73,44 @@ const RESTATEMENT_MARKERS: &[&str] = &[
 /// 句首虚词/功能词。切分时剥离——它们是语言结构，不是目标的一部分。
 /// 这是**语言适配**（L1）而非语义判断：中英文各一组封闭的语法词。
 const LEAD_FUNCTION_WORDS: &[&str] = &[
-    "the ", "a ", "an ", "of ", "to ", "in ", "on ", "for ", "with ", "and ", "or ", "from ",
-    "into ", "order ", "position ", "请", "把", "将", "即", "等", "和", "与", "及", "在", "是", "的",
-    "了", "让", "使", "给", "对", "从", "到", "帮", "我", "现在", "需要", "希望",
+    "the ",
+    "a ",
+    "an ",
+    "of ",
+    "to ",
+    "in ",
+    "on ",
+    "for ",
+    "with ",
+    "and ",
+    "or ",
+    "from ",
+    "into ",
+    "order ",
+    "position ",
+    "请",
+    "把",
+    "将",
+    "即",
+    "等",
+    "和",
+    "与",
+    "及",
+    "在",
+    "是",
+    "的",
+    "了",
+    "让",
+    "使",
+    "给",
+    "对",
+    "从",
+    "到",
+    "帮",
+    "我",
+    "现在",
+    "需要",
+    "希望",
 ];
 
 /// 句尾赘语。
@@ -110,7 +163,9 @@ pub fn extract_acronyms(input: &str) -> Vec<String> {
         .split(|ch: char| !is_token_char(ch))
         .filter(|token| {
             token.len() >= 2
-                && token.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+                && token
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
                 && token.chars().any(|ch| ch.is_ascii_uppercase())
         })
         .map(str::to_string)
@@ -250,7 +305,9 @@ fn normalize_item(text: &str) -> String {
         }
         for filler in TRAIL_FILLER {
             if current.ends_with(filler) && current.chars().count() > filler.chars().count() {
-                current = current[..current.len() - filler.len()].trim_end().to_string();
+                current = current[..current.len() - filler.len()]
+                    .trim_end()
+                    .to_string();
             }
         }
         if current == before {
@@ -335,7 +392,11 @@ pub fn extract_parallel_items(input: &str) -> Vec<String> {
     // 去掉被其它项包含的重复项（"KEY" 与 "API KEY字段" 同时出现时保留更完整的后者）。
     let contained: Vec<String> = items
         .iter()
-        .filter(|item| items.iter().any(|other| other != *item && other.contains(item.as_str())))
+        .filter(|item| {
+            items
+                .iter()
+                .any(|other| other != *item && other.contains(item.as_str()))
+        })
         .cloned()
         .collect();
     items.retain(|item| !contained.contains(item));
@@ -457,17 +518,25 @@ pub fn extract_form_field_order(input: &str) -> Option<FormFieldOrder> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str =
-        "界面优化，系统管理->模型管理，把模型名称字段，API KEY字段位置顺序互换一下，即把KEY放在排在前面。";
+    const SAMPLE: &str = "界面优化，系统管理->模型管理，把模型名称字段，API KEY字段位置顺序互换一下，即把KEY放在排在前面。";
 
     #[test]
     fn candidates_are_segmented_without_semantic_judgment() {
         let candidates = segment_candidates(SAMPLE);
         // 关键：候选既包含动作片段也包含对象片段——判断谁有用是 L2 的事，
         // 这里不做取舍。
-        assert!(candidates.contains(&"模型名称".to_string()), "{candidates:?}");
-        assert!(candidates.contains(&"界面优化".to_string()), "{candidates:?}");
-        assert!(candidates.contains(&"API KEY".to_string()), "{candidates:?}");
+        assert!(
+            candidates.contains(&"模型名称".to_string()),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.contains(&"界面优化".to_string()),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.contains(&"API KEY".to_string()),
+            "{candidates:?}"
+        );
     }
 
     #[test]
@@ -514,8 +583,14 @@ mod tests {
     #[test]
     fn navigation_drops_the_action_segment() {
         let (navigation, actions) = extract_navigation(SAMPLE);
-        assert!(navigation.contains(&"模型管理".to_string()), "{navigation:?}");
-        assert!(!navigation.iter().any(|n| n.contains("优化")), "{navigation:?}");
+        assert!(
+            navigation.contains(&"模型管理".to_string()),
+            "{navigation:?}"
+        );
+        assert!(
+            !navigation.iter().any(|n| n.contains("优化")),
+            "{navigation:?}"
+        );
         assert!(actions.iter().any(|a| a.contains("优化")), "{actions:?}");
     }
 

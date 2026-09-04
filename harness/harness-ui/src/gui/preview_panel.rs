@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use super::icons::{draw_icon, Icon};
-use super::theme::{palette, Palette};
-use super::widgets::close_button;
 use super::AppState;
+use super::icons::{Icon, draw_icon};
+use super::theme::{Palette, palette};
+use super::widgets::close_button;
 
 impl AppState {
     /// 打开文件预览窗并加载指定文件。
@@ -664,9 +664,9 @@ impl AppState {
                             } else {
                                 let need_refresh = self.tree_needs_reload()
                                     || self
-                                    .tree_last_refresh
-                                    .map(|t| t.elapsed().as_secs() > 5)
-                                    .unwrap_or(true);
+                                        .tree_last_refresh
+                                        .map(|t| t.elapsed().as_secs() > 5)
+                                        .unwrap_or(true);
                                 if need_refresh {
                                     self.build_tree();
                                 }
@@ -739,7 +739,8 @@ impl AppState {
                             }
                         }
                         if let Some(path) = attachment_path {
-                            let absolute = tree_attachment_path(&self.active_workspace_root(), &path);
+                            let absolute =
+                                tree_attachment_path(&self.active_workspace_root(), &path);
                             let display_name = absolute
                                 .file_name()
                                 .and_then(|name| name.to_str())

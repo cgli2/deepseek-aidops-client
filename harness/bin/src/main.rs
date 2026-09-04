@@ -15,7 +15,7 @@ use std::sync::Arc;
 use harness_core::config::Config;
 use harness_core::plugin::compose_plugins;
 use harness_core::types::{Profile, UserInput};
-use harness_runtime::Scheduler;
+use harness_runtime::{LongHorizonManager, Scheduler, run_durable_agent_turn};
 use harness_session::SessionLog;
 use harness_ui::Ui;
 
@@ -30,6 +30,11 @@ async fn main() -> harness_core::error::Result<()> {
             harness_core::update::try_apply_and_relaunch(dir);
         }
     }
+
+    let args: Vec<String> = std::env::args().collect();
+    let lha_requested = matches!(args.get(1).map(String::as_str), Some("lh" | "long-horizon"));
+    attach_parent_console_for_cli(lha_requested);
+    let lha_command = parse_lha_command(&args).map_err(harness_core::error::Error::Runtime)?;
 
     // 先加载配置（含 [ui].profile 与 [llm] key），再推导运行 Profile。
     let mut config = Config::load()?;
@@ -51,7 +56,12 @@ async fn main() -> harness_core::error::Result<()> {
     // 不在 Tokio 运行时启动后修改进程环境（Rust 2024 中这既不安全也会造成
     // 并发读取竞态）。compose 阶段会直接从同一个 SettingsDb 读取 workspace.root，
     // 显式 HARNESS_WORKSPACE 仍由 workspace_root() 保持最高优先级。
-    let profile = parse_profile(&config);
+    // `lh` 是显式终端命令，即使发布包默认 GUI 也不能释放控制台。
+    let profile = if lha_command.is_some() {
+        Profile::Headless
+    } else {
+        parse_profile(&config)
+    };
 
     // 真正启用 GUI（profile 请求 gui 且二进制含 gui 特性）时，若当前附带了控制台，
     // 先隐藏并释放它，保证"打开即 GUI 窗口、无 CMD 黑窗"。
@@ -105,7 +115,8 @@ async fn main() -> harness_core::error::Result<()> {
     // .harness/spec.md 与 .harness/tasks.json，无需手工录入。
     let trellis_cfg = config.trellis.clone();
     let trellis_ws = compose::workspace_root();
-    let trellis_plugin = harness_provider_trellis::TrellisPlugin::new(trellis_cfg, &trellis_ws.to_string_lossy());
+    let trellis_plugin =
+        harness_provider_trellis::TrellisPlugin::new(trellis_cfg, &trellis_ws.to_string_lossy());
     let plugins: Vec<Arc<dyn harness_core::plugin::Plugin>> = vec![
         trellis_plugin,
         Arc::new(HarnessPlugin {
@@ -128,6 +139,10 @@ async fn main() -> harness_core::error::Result<()> {
             .run(ctx, log)
             .await
             .map_err(harness_core::error::Error::Io);
+    }
+
+    if let Some(command) = lha_command {
+        return run_lha_command(&ctx, command).await;
     }
 
     // UI 事件循环。GUI（egui/winit）要求事件循环必须在主线程创建，因此 GUI 直接在主线程
@@ -185,6 +200,121 @@ async fn main() -> harness_core::error::Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LhaCommand {
+    Status,
+    Submit(String),
+    Approve { checkpoint_id: String, note: String },
+    Reject { checkpoint_id: String, note: String },
+}
+
+fn parse_lha_command(args: &[String]) -> std::result::Result<Option<LhaCommand>, String> {
+    if !matches!(args.get(1).map(String::as_str), Some("lh" | "long-horizon")) {
+        return Ok(None);
+    }
+    let usage = "用法: aidops-desktop lh <status|submit|approve|reject> [参数]";
+    match args.get(2).map(String::as_str) {
+        Some("status") if args.len() == 3 => Ok(Some(LhaCommand::Status)),
+        Some("submit") => {
+            let prompt = args.get(3..).unwrap_or_default().join(" ");
+            if prompt.trim().is_empty() {
+                Err(format!("submit 需要任务目标。{usage}"))
+            } else {
+                Ok(Some(LhaCommand::Submit(prompt)))
+            }
+        }
+        Some("approve" | "reject") => {
+            let action = args[2].as_str();
+            let checkpoint_id = args
+                .get(3)
+                .cloned()
+                .filter(|value| !value.trim().is_empty());
+            let Some(checkpoint_id) = checkpoint_id else {
+                return Err(format!("{action} 需要 checkpoint id。{usage}"));
+            };
+            let note = args.get(4..).unwrap_or_default().join(" ");
+            if action == "approve" {
+                Ok(Some(LhaCommand::Approve {
+                    checkpoint_id,
+                    note,
+                }))
+            } else {
+                Ok(Some(LhaCommand::Reject {
+                    checkpoint_id,
+                    note,
+                }))
+            }
+        }
+        _ => Err(usage.into()),
+    }
+}
+
+async fn run_lha_command(
+    ctx: &harness_core::AppContext,
+    command: LhaCommand,
+) -> harness_core::error::Result<()> {
+    let manager =
+        ctx.try_get::<LongHorizonManager>()
+            .ok_or(harness_core::error::Error::ServiceMissing(
+                "LongHorizonManager",
+            ))?;
+    let workspace = ctx
+        .try_get::<harness_core::Workspace>()
+        .ok_or(harness_core::error::Error::ServiceMissing("Workspace"))?;
+    let runtime = manager
+        .runtime_for(workspace.root())
+        .map_err(|error| harness_core::error::Error::Runtime(error.to_string()))?;
+
+    match command {
+        LhaCommand::Status => {
+            let value = serde_json::json!({
+                "workspace": workspace.root(),
+                "tasks": runtime.tasks().map_err(lha_cli_error)?,
+                "decisions": runtime.decisions().map_err(lha_cli_error)?,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        LhaCommand::Submit(prompt) => {
+            let log = ctx.get::<SessionLog>();
+            let cursor = log.replay().len();
+            run_durable_agent_turn(
+                ctx,
+                UserInput {
+                    text: prompt,
+                    attachments: vec![],
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+            let (_, events) = log.replay_from(cursor);
+            println!("{}", serde_json::to_string_pretty(&events)?);
+        }
+        LhaCommand::Approve {
+            checkpoint_id,
+            note,
+        } => {
+            runtime
+                .approve_decision(&checkpoint_id, "cli-operator", &note)
+                .map_err(lha_cli_error)?;
+            println!("approved {checkpoint_id}");
+        }
+        LhaCommand::Reject {
+            checkpoint_id,
+            note,
+        } => {
+            runtime
+                .reject_decision(&checkpoint_id, "cli-operator", &note)
+                .map_err(lha_cli_error)?;
+            println!("rejected {checkpoint_id}");
+        }
+    }
+    Ok(())
+}
+
+fn lha_cli_error(error: harness_runtime::OrchestratorError) -> harness_core::error::Error {
+    harness_core::error::Error::Runtime(error.to_string())
 }
 
 /// 从命令行参数 / 配置推导运行 Profile。
@@ -247,6 +377,22 @@ fn detach_console_if_gui(is_gui: bool) {
     }
 }
 
+/// GUI-subsystem builds do not inherit the caller's console automatically. Explicit CLI
+/// commands attach to the parent console so status JSON and errors remain observable.
+#[cfg(windows)]
+fn attach_parent_console_for_cli(is_cli: bool) {
+    if is_cli {
+        unsafe {
+            let _ = windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console_for_cli(_is_cli: bool) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +401,26 @@ mod tests {
     #[cfg(feature = "gui")]
     fn gui_build_defaults_to_gui_without_distribution_config() {
         assert!(matches!(compiled_default_profile(), Profile::Gui));
+    }
+
+    #[test]
+    fn parses_long_horizon_cli_commands() {
+        let args = ["aidops-desktop", "lh", "status"].map(String::from);
+        assert_eq!(parse_lha_command(&args).unwrap(), Some(LhaCommand::Status));
+
+        let args = ["aidops-desktop", "lh", "submit", "repair", "the", "build"].map(String::from);
+        assert_eq!(
+            parse_lha_command(&args).unwrap(),
+            Some(LhaCommand::Submit("repair the build".into()))
+        );
+
+        let args = ["aidops-desktop", "lh", "reject", "checkpoint-1", "unsafe"].map(String::from);
+        assert_eq!(
+            parse_lha_command(&args).unwrap(),
+            Some(LhaCommand::Reject {
+                checkpoint_id: "checkpoint-1".into(),
+                note: "unsafe".into(),
+            })
+        );
     }
 }

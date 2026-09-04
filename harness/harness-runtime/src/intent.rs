@@ -13,7 +13,7 @@
 //! "能否定位"交由 `GoalContract::has_locatable_signal()`（工作区区分度裁决）给出；
 //! "描述与期望是否一致"交由 Phase 2 的 `inspect_diff`（运行期观察）给出。两者都不靠词表。
 
-use crate::goal_execution::{extract_exact_transformation, GoalContract};
+use crate::goal_execution::{GoalContract, extract_exact_transformation};
 use crate::target_extract::{extract_code_symbols, extract_navigation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,12 +57,12 @@ impl IntentProfile {
         let has_transformation_contract = extract_exact_transformation(input).is_some();
         let navigation_present = !extract_navigation(input).0.is_empty();
         let has_code_entity = !extract_code_symbols(input).is_empty();
-        let has_structural_action = STRUCTURAL_ACTIONS
-            .iter()
-            .any(|word| input.contains(word));
+        let has_structural_action = STRUCTURAL_ACTIONS.iter().any(|word| input.contains(word));
         let is_explicit_question = input.trim_end_matches('。').trim_end().ends_with('?')
             || input.trim_end_matches('。').trim_end().ends_with('？')
-            || QUESTION_LEAD.iter().any(|lead| input.trim().starts_with(lead));
+            || QUESTION_LEAD
+                .iter()
+                .any(|lead| input.trim().starts_with(lead));
 
         // 纯提问不进入任务闸门（Investigation 由 Solve 循环自行定位+读取，不需要
         // 任务式追问）。任何"非纯提问"都视为任务——哪怕暂时没有可定位信号，
@@ -118,7 +118,11 @@ impl IntentProfile {
     ///
     /// 这与 V5 的"工作区做裁判"路线一致：可定位性由 `GoalContract`（区分度裁决）给出，
     /// 而非由机制层词表猜测用户措辞。
-    pub fn requires_clarification(goal: &GoalContract, is_task: bool, input: &str) -> Option<Clarification> {
+    pub fn requires_clarification(
+        goal: &GoalContract,
+        is_task: bool,
+        input: &str,
+    ) -> Option<Clarification> {
         if !is_task {
             return None;
         }
@@ -153,7 +157,10 @@ impl Clarification {
     /// 真·盲任务的定位单问。带上下文（已有的导航/符号线索），不发清单。
     pub fn locate(goal: &GoalContract) -> Self {
         let ctx = if !goal.navigation.is_empty() {
-            format!("（已从导航路径 {} 进入工作区）", goal.navigation.join(" → "))
+            format!(
+                "（已从导航路径 {} 进入工作区）",
+                goal.navigation.join(" → ")
+            )
         } else if !goal.entities.is_empty() {
             format!("（已注意到符号 {}）", goal.entities.join("、"))
         } else {
@@ -238,7 +245,8 @@ pub fn inspect_diff(goal: &GoalContract, observed: &ObservedBehavior) -> Inspect
     }
     if let Some(transformation) = &goal.transformation {
         let to = transformation.to_value.trim();
-        if !to.is_empty() && (observed.found_expected || observed.observed_value.as_deref() == Some(to))
+        if !to.is_empty()
+            && (observed.found_expected || observed.observed_value.as_deref() == Some(to))
         {
             // 代码里已经是期望的 to 值——无需修改，也不追问。
             return InspectVerdict::Aligned;
@@ -250,7 +258,9 @@ pub fn inspect_diff(goal: &GoalContract, observed: &ObservedBehavior) -> Inspect
                     // 当前正是 from——正常待改状态，直接 Change，不追问。
                     return InspectVerdict::Aligned;
                 }
-                if observed.observed_value.is_some() && observed.observed_value.as_deref() != Some(to) {
+                if observed.observed_value.is_some()
+                    && observed.observed_value.as_deref() != Some(to)
+                {
                     // 用户说"把 X 从 from 改成 to"，但当前既不是 from 也不是 to：
                     // 带一个上下文单问，确认意图，而不是盲目按 to 直接改。
                     return InspectVerdict::InferableMismatch(Clarification::observe_mismatch(
@@ -351,15 +361,22 @@ mod tests {
         let mut goal = GoalContract::compile("ModelForm 的校验规则有问题");
         goal.entities.push("ModelForm".into());
         assert!(goal.has_locatable_signal());
-        assert!(IntentProfile::requires_clarification(&goal, true, "ModelForm 的校验规则有问题").is_none());
+        assert!(
+            IntentProfile::requires_clarification(&goal, true, "ModelForm 的校验规则有问题")
+                .is_none()
+        );
     }
 
     #[test]
     fn blind_task_asks_a_single_locate_question() {
         let goal = GoalContract::compile("这个列表的排序逻辑有问题，帮我修一下");
         assert!(!goal.has_locatable_signal());
-        let clar = IntentProfile::requires_clarification(&goal, true, "这个列表的排序逻辑有问题，帮我修一下")
-            .expect("盲任务应问一个定位问题");
+        let clar = IntentProfile::requires_clarification(
+            &goal,
+            true,
+            "这个列表的排序逻辑有问题，帮我修一下",
+        )
+        .expect("盲任务应问一个定位问题");
         assert_eq!(clar.kind, ClarificationKind::Locate);
         // 单问：不应是清单式（无编号列表、无多个问题点）。
         assert!(!clar.question.contains("1.") && !clar.question.contains("\n2"));
@@ -369,7 +386,9 @@ mod tests {
     fn pure_question_asks_no_task_clarification() {
         let goal = GoalContract::compile("为什么列表排序会乱？");
         // 即便目标无法落地，纯提问也不应触发任务式追问（Investigation 自行处理）。
-        assert!(IntentProfile::requires_clarification(&goal, false, "为什么列表排序会乱？").is_none());
+        assert!(
+            IntentProfile::requires_clarification(&goal, false, "为什么列表排序会乱？").is_none()
+        );
     }
 
     #[test]
@@ -379,7 +398,9 @@ mod tests {
         let mut goal = GoalContract::compile("提交按钮点了毫无反应");
         goal.entities.push("提交按钮".into());
         assert!(goal.has_locatable_signal());
-        assert!(IntentProfile::requires_clarification(&goal, true, "提交按钮点了毫无反应").is_none());
+        assert!(
+            IntentProfile::requires_clarification(&goal, true, "提交按钮点了毫无反应").is_none()
+        );
     }
 
     // ---- Phase 2 Inspect 差异比对 ----

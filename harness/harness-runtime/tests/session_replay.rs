@@ -84,7 +84,11 @@ fn fixtures_parse_with_expected_turn_counts() {
     assert!(clarification.iter().all(|t| t.tool_names.is_empty()));
     let gitfix = load_fixture("7ba3370f_t19_22_gitfix.jsonl");
     assert_eq!(gitfix.len(), 4);
-    assert!(gitfix.iter().any(|t| t.tool_names.contains(&"edit".to_string())));
+    assert!(
+        gitfix
+            .iter()
+            .any(|t| t.tool_names.contains(&"edit".to_string()))
+    );
     assert_eq!(load_fixture("success_677bd6e0.jsonl").len(), 5);
 }
 
@@ -93,9 +97,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_capability::hook::{Hook, HookDecision, HookPayload};
+use harness_core::AppContext;
 use harness_core::error::Result;
 use harness_core::types::UserInput;
-use harness_core::AppContext;
 use harness_llm::{ChunkStream, LlmProvider, Message, ToolCall, ToolSchema};
 use harness_runtime::{AgentLoop, GovernorMode};
 use harness_session::SessionLog;
@@ -126,10 +130,15 @@ impl LlmProvider for ReplayLlm {
         vec![]
     }
     fn stream(&self, _msgs: Vec<Message>) -> ChunkStream {
-        let mut chunk = self.queue.lock().unwrap().pop_front().unwrap_or_else(|| Chunk {
-            text: Some("[回放脚本已耗尽] 基于现有证据直接给出结论。".into()),
-            ..Default::default()
-        });
+        let mut chunk = self
+            .queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Chunk {
+                text: Some("[回放脚本已耗尽] 基于现有证据直接给出结论。".into()),
+                ..Default::default()
+            });
         if chunk.usage.is_none() {
             chunk.usage = self.usages.lock().unwrap().pop_front();
         }
@@ -165,7 +174,9 @@ impl DynTool for ReplayTool {
 }
 
 /// fixture 中出现过的工具必须在此登记（DynTool::name 需要 'static）。
-const KNOWN_TOOLS: [&str; 7] = ["search", "edit", "fs", "shell", "plan", "memory", "delegate"];
+const KNOWN_TOOLS: [&str; 7] = [
+    "search", "edit", "fs", "shell", "plan", "memory", "delegate",
+];
 
 /// 重放一个会话：逐回合新建 AppContext，共享同一个内存 SessionLog（历史跨回合累积）。
 async fn replay_session_with(fixture: &str, mode: GovernorMode) -> Arc<SessionLog> {
@@ -235,11 +246,8 @@ async fn replay_session(fixture: &str) -> Arc<SessionLog> {
 
 #[tokio::test]
 async fn clarification_loop_replay_emits_delivery_per_turn() {
-    let log = replay_session_with(
-        "7ba3370f_t15_18_clarification.jsonl",
-        GovernorMode::Legacy,
-    )
-    .await;
+    let log =
+        replay_session_with("7ba3370f_t15_18_clarification.jsonl", GovernorMode::Legacy).await;
     let events = log.replay();
     let turn_starts = events
         .iter()
@@ -333,7 +341,9 @@ fn summarize(log: &SessionLog) -> Vec<TurnSummary> {
 
 fn is_continuation(input: &str) -> bool {
     let t = input.trim();
-    ["继续", "接着", "续", "恢复"].iter().any(|p| t.starts_with(p))
+    ["继续", "接着", "续", "恢复"]
+        .iter()
+        .any(|p| t.starts_with(p))
         || t.to_ascii_lowercase().starts_with("continue")
         || t.to_ascii_lowercase().starts_with("resume")
 }
@@ -360,7 +370,11 @@ fn r2_violations(turns: &[TurnSummary]) -> Vec<String> {
         if t.outcome != Some(DeliveryOutcome::NeedsUserInput) {
             continue;
         }
-        let key: String = t.assistant_text.chars().filter(|c| !c.is_whitespace()).collect();
+        let key: String = t
+            .assistant_text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         if key.is_empty() {
             continue;
         }
@@ -419,10 +433,7 @@ fn r4_violations(turns: &[TurnSummary]) -> Vec<String> {
         .filter(|(_, t)| {
             matches!(
                 t.outcome,
-                Some(
-                    DeliveryOutcome::Interrupted
-                        | DeliveryOutcome::SystemFailure
-                )
+                Some(DeliveryOutcome::Interrupted | DeliveryOutcome::SystemFailure)
             )
         })
         .filter(|(_, t)| !has_path_anchor(&t.telemetry_text))
@@ -506,7 +517,11 @@ async fn red_lines_clarification_loop() {
     let log = replay_session("7ba3370f_t15_18_clarification.jsonl").await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 4);
-    let (r1, r2, r4) = (r1_violations(&turns), r2_violations(&turns), r4_violations(&turns));
+    let (r1, r2, r4) = (
+        r1_violations(&turns),
+        r2_violations(&turns),
+        r4_violations(&turns),
+    );
     assert!(r1.is_empty(), "R1 违例: {r1:?}");
     assert!(r2.is_empty(), "R2 违例: {r2:?}");
     assert!(r4.is_empty(), "R4 违例: {r4:?}");
@@ -552,7 +567,10 @@ async fn red_lines_symptom_task() {
         "R3 对照失效：Legacy 单回合成本 {legacy_tokens} 未超顶，replay 没复现真实成本"
     );
     let a2_legacy = a2_max_cross_turn_repeat(&legacy);
-    assert!(a2_on <= a2_legacy, "A2 退化：控制器 {a2_on} > 旧守卫 {a2_legacy}");
+    assert!(
+        a2_on <= a2_legacy,
+        "A2 退化：控制器 {a2_on} > 旧守卫 {a2_legacy}"
+    );
 }
 
 /// git 修复段（turn 19–22）：R4 + 资产锁（edit matched-0 / length 截断回合也要留资产）。
@@ -592,7 +610,11 @@ fn a2_exempts_readback_and_verify_repeats() {
         mk(&["shell:{\"command\":\"dir /s\"}"]),
         mk(&["shell:{\"command\":\"dir /s\"}"]),
     ];
-    assert_eq!(a2_max_cross_turn_repeat(&loops), 3, "探索型 shell 重复仍须计入");
+    assert_eq!(
+        a2_max_cross_turn_repeat(&loops),
+        3,
+        "探索型 shell 重复仍须计入"
+    );
 }
 
 /// 成功会话回归：重放不得把健康会话跑坏（至少保留一个 Verified 交付）。
@@ -612,14 +634,23 @@ async fn success_session_replay_keeps_verified() {
 /// 且不出现门禁复读文案（R1/R2 前提）。outcome 收口与资产由 red_lines_* 断言。
 #[tokio::test]
 async fn governor_mode_terminates_clarification_loop_without_asking() {
-    let log =
-        replay_session_with("7ba3370f_t15_18_clarification.jsonl", GovernorMode::On).await;
+    let log = replay_session_with("7ba3370f_t15_18_clarification.jsonl", GovernorMode::On).await;
     let turns = summarize(&log);
     assert_eq!(turns.len(), 4, "四个回合都要走完");
-    assert!(r1_violations(&turns).is_empty(), "R1: {:?}", r1_violations(&turns));
-    assert!(r2_violations(&turns).is_empty(), "R2: {:?}", r2_violations(&turns));
     assert!(
-        !turns.iter().any(|t| t.assistant_text.contains("[需要澄清]")),
+        r1_violations(&turns).is_empty(),
+        "R1: {:?}",
+        r1_violations(&turns)
+    );
+    assert!(
+        r2_violations(&turns).is_empty(),
+        "R2: {:?}",
+        r2_violations(&turns)
+    );
+    assert!(
+        !turns
+            .iter()
+            .any(|t| t.assistant_text.contains("[需要澄清]")),
         "控制器模式下门禁复读文案不得出现：{:?}",
         turns.iter().map(|t| &t.assistant_text).collect::<Vec<_>>()
     );

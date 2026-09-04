@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harness_capability::hook::{Hook, HookDecision, HookPayload};
-use harness_core::AppContext;
-use harness_core::error::Result;
 use harness_core::Attachment;
+use harness_core::error::Result;
 use harness_core::ui_input::UiInputSink;
+use harness_core::{AppContext, Workspace};
 use harness_llm::{Chunk, LlmProvider, ReplayLlm};
-use harness_runtime::SessionController;
+use harness_runtime::{LongHorizonManager, SessionController, TaskStatus};
 use harness_session::{SessionEvent, SessionLog};
 use harness_tool::ToolRegistry;
 
@@ -23,11 +23,17 @@ impl Hook for NoopHook {
 
 #[tokio::test]
 async fn submit_writes_turn_events() {
+    let root = std::env::temp_dir().join(format!("lha_controller_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
     let ctx = AppContext::new();
     let log = SessionLog::new();
     // 必须持有 Registration：其 Drop 会从 TypeMap 移除服务（可逆注册）。
     let mut _regs = Vec::new();
     _regs.push(ctx.provide(log.clone()));
+    _regs.push(ctx.provide(Workspace::new(root.clone())));
+    let long_horizon = Arc::new(LongHorizonManager::from_env());
+    _regs.push(ctx.provide(long_horizon.clone()));
 
     let llm: Arc<dyn LlmProvider> = ReplayLlm::new(vec![Chunk {
         text: Some("hi there from replay".into()),
@@ -102,5 +108,20 @@ async fn submit_writes_turn_events() {
         !inputs[2].is_empty(),
         "attachment-only input should be turned into an explicit analysis request, got: {:?}",
         inputs[2]
+    );
+    let runtime = long_horizon.runtime_for(&root).unwrap();
+    let tasks = runtime.tasks().unwrap();
+    assert_eq!(tasks.len(), 3);
+    assert!(tasks.iter().all(|task| !matches!(
+        task.status,
+        TaskStatus::Running { .. } | TaskStatus::Scheduled { .. }
+    )));
+    let board = runtime.blackboard_since(0).unwrap();
+    assert_eq!(
+        board
+            .iter()
+            .filter(|event| event.event_type == "TaskCreated")
+            .count(),
+        3
     );
 }

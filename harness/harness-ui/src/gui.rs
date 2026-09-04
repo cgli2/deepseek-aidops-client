@@ -8,11 +8,12 @@
 use std::sync::{Arc, Mutex};
 
 use harness_capability::assets::{CodeGraph, ConversationMemory, SkillLibrary, WikiStore};
+use harness_core::Config;
+use harness_core::LlmControl;
 use harness_core::event::EventBusView;
 use harness_core::ui_input::UiInputSink;
 use harness_core::update::UpdateStatus;
-use harness_core::Config;
-use harness_core::LlmControl;
+use harness_runtime::LongHorizonManager;
 use harness_session::{CouncilEvent, CouncilTaskState, SessionEvent, SessionLog, SessionMeta};
 
 use crate::Ui;
@@ -23,6 +24,7 @@ mod code_graph;
 mod composer;
 mod fonts;
 mod icons;
+mod long_horizon_panel;
 mod memory_panel;
 mod model;
 mod preview_panel;
@@ -40,17 +42,17 @@ use fonts::install_cjk_fonts;
 #[cfg(target_os = "macos")]
 use fonts::install_macos_ui_style;
 use icons::{
-    draw_brand_logo, draw_icon, draw_paperclip_icon, draw_pencil_icon, draw_trash_icon, Icon,
+    Icon, draw_brand_logo, draw_icon, draw_paperclip_icon, draw_pencil_icon, draw_trash_icon,
 };
 use model::{
     ChatMsg, CouncilTaskUi, CouncilUi, DeliveryUi, ExecutionProjectionUi, MemItem, MemRefresh,
     PluginUiRow,
 };
-use theme::{palette, Palette};
+use theme::{Palette, palette};
 use widgets::{
-    accent_button, close_button, field_label, ghost_button, nav_item, plugin_row_ui,
-    sidebar_control_height, sidebar_icon_button, sidebar_search_field, sidebar_text_button,
-    SidebarActionIcon,
+    SidebarActionIcon, accent_button, close_button, field_label, ghost_button, nav_item,
+    plugin_row_ui, sidebar_control_height, sidebar_icon_button, sidebar_search_field,
+    sidebar_text_button,
 };
 
 // 窗口 / 任务栏图标 RGBA（自动生成，见 scripts/make_icon.py）。eframe 不会自动读 exe 资源，
@@ -130,6 +132,8 @@ pub struct EguiUi {
     fs: Arc<dyn harness_capability::fs::Fs>,
     /// 文件预览：git diff / 跟踪状态查询（零 C 绑定，git CLI 子进程）。
     git: Arc<dyn harness_capability::git::Git>,
+    /// 长时程任务控制面：GUI 只做查询、提交与 HITL 决策，执行仍由 runtime 持久化编排。
+    long_horizon: Arc<LongHorizonManager>,
     /// 独立 tokio runtime（析构安全包装）：记忆面板驱动资产服务的异步查询（原生走文件 IO、
     /// 后端走网络）。注意 GUI 事件循环本身运行在 `#[tokio::main]` 的 runtime 主线程内，
     /// 不可在该线程直接 `block_on` 另一 runtime（会触发 "Cannot start a runtime from
@@ -196,6 +200,7 @@ impl EguiUi {
         trellis: Arc<harness_provider_trellis::TrellisControl>,
         fs: Arc<dyn harness_capability::fs::Fs>,
         git: Arc<dyn harness_capability::git::Git>,
+        long_horizon: Arc<LongHorizonManager>,
     ) -> Self {
         Self {
             sink,
@@ -213,6 +218,7 @@ impl EguiUi {
             trellis,
             fs,
             git,
+            long_horizon,
             rt: UiRuntime::new("harness-ui-mem"),
         }
     }

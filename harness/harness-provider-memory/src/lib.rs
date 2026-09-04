@@ -13,7 +13,7 @@ pub use assets_native::{
     NativeCodeGraph, NativeConversationMemory, NativeSkillLibrary, NativeWikiStore,
 };
 // 索引器实现位于 Definition 层（harness-capability::index），不耦合具体 Provider；此处仅转发。
-pub use harness_capability::index::{bootstrap_assets, IndexStats};
+pub use harness_capability::index::{IndexStats, bootstrap_assets};
 pub use superpowers::{builtin_superpowers, ensure_builtin_skills};
 
 use std::collections::HashMap;

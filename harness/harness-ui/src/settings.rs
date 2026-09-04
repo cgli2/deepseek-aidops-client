@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -98,8 +98,9 @@ impl SettingsDb {
         let _ = conn
             .execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
         // 旧库迁移：model_profiles 表补 enabled 列（默认启用；已存在则忽略错误）。
-        let _ = conn
-            .execute_batch("ALTER TABLE model_profiles ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;");
+        let _ = conn.execute_batch(
+            "ALTER TABLE model_profiles ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
+        );
         Ok(Self {
             conn: Mutex::new(conn),
             path,
@@ -371,7 +372,7 @@ pub(crate) fn app_data_dir() -> Option<PathBuf> {
 fn legacy_unprotect(input: &[u8]) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
     };
     let mut src = CRYPT_INTEGER_BLOB {
         cbData: input.len() as u32,
@@ -450,7 +451,8 @@ mod tests {
         .unwrap();
         assert!(db.model_profiles()[0].enabled);
         // 停用后状态需持久化；重新保存不应丢失其余字段。
-        db.set_model_profile_enabled("deepseek · deepseek-chat", false).unwrap();
+        db.set_model_profile_enabled("deepseek · deepseek-chat", false)
+            .unwrap();
         let row = &db.model_profiles()[0];
         assert!(!row.enabled);
         assert_eq!(row.api_key, "sk-test");

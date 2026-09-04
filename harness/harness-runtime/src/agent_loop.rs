@@ -9,7 +9,7 @@ use harness_capability::assets::{
 };
 use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
-use harness_core::{error::Result, types::UserInput, AppContext};
+use harness_core::{AppContext, error::Result, types::UserInput};
 use harness_llm::{Chunk, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolResult, Usage};
 use harness_session::{
     DeliveryOutcome, DeliveryReport, ExecutionTelemetry, SessionEvent, SessionLog,
@@ -25,8 +25,8 @@ use crate::execution::{
     ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
+use crate::governor::{Decision, TurnGovernor, artifact_text, is_continuation_request};
 use crate::intent::ClarificationKind;
-use crate::governor::{artifact_text, is_continuation_request, Decision, TurnGovernor};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
 /// 治理路径选择（spec §5 步骤④：控制器接管后 A/B 默认 On）。
@@ -282,10 +282,7 @@ fn last_assistant_text(events: &[SessionEvent]) -> Option<String> {
 /// 允许用户直接回复 1/2/3。选项文字来自 Runtime 自己刚渲染的提示，不让模型猜数字
 /// 含义；选择“只分析”时补上问句信号，确保重新编译为只读调查而不是变更任务。
 fn resolve_numbered_reply(input: &str, events: &[SessionEvent]) -> String {
-    let choice = input
-        .trim()
-        .trim_end_matches(['.', '。', '、'])
-        .to_string();
+    let choice = input.trim().trim_end_matches(['.', '。', '、']).to_string();
     if !matches!(choice.as_str(), "1" | "2" | "3") {
         return input.to_string();
     }
@@ -327,8 +324,16 @@ fn resume_instruction(resume: &ResumeState) -> String {
     format!(
         "[续跑任务]\n这是同一任务的后续执行，不要重新创建计划或按本句重新分类。\n原始目标：{}\n已验证：{}\n未完成：{}\n上次停止原因：{}\n从第一个未完成验收项继续；保留已验证项，不重复已完成的定位、修改或验证。",
         resume.objective,
-        if completed.is_empty() { "无".into() } else { completed.join("、") },
-        if remaining.is_empty() { "无".into() } else { remaining.join("；") },
+        if completed.is_empty() {
+            "无".into()
+        } else {
+            completed.join("、")
+        },
+        if remaining.is_empty() {
+            "无".into()
+        } else {
+            remaining.join("；")
+        },
         resume.report.reason.as_deref().unwrap_or("未提供")
     )
 }
@@ -2073,13 +2078,12 @@ impl AgentLoop {
                     ..Default::default()
                 },
             });
-            let normalized_outcome = if raw_outcome == DeliveryOutcome::NeedsUserInput
-                && !is_follow_up
-            {
-                DeliveryOutcome::NeedsUserInput
-            } else {
-                DeliveryOutcome::PartialDelivery
-            };
+            let normalized_outcome =
+                if raw_outcome == DeliveryOutcome::NeedsUserInput && !is_follow_up {
+                    DeliveryOutcome::NeedsUserInput
+                } else {
+                    DeliveryOutcome::PartialDelivery
+                };
             (normalized_outcome, Some(status))
         } else {
             (raw_outcome, raw_reason)
@@ -2105,22 +2109,24 @@ impl AgentLoop {
                     .collect::<Vec<_>>()
                     .join(" | ");
                 let fingerprint = stable_fingerprint(&execution.contract.objective);
-                let card =
-                    MemoryFact {
-                        id: format!("solve-card:{fingerprint}"),
-                        kind: FactKind::Decision,
-                        content: format!(
+                let card = MemoryFact {
+                    id: format!("solve-card:{fingerprint}"),
+                    kind: FactKind::Decision,
+                    content: format!(
                         "[SolveCard]\\n问题：{}\\n工作区：{}\\n有效验证：{}\\n结果：已验证交付。",
-                        execution.contract.objective.chars().take(600).collect::<String>(),
+                        execution
+                            .contract
+                            .objective
+                            .chars()
+                            .take(600)
+                            .collect::<String>(),
                         workspace,
                         evidence,
                     ),
-                        layer: LifecycleLayer::L2,
-                        confidence: 0.9,
-                        source: format!(
-                            "solve-card;workspace={workspace};fingerprint={fingerprint}"
-                        ),
-                    };
+                    layer: LifecycleLayer::L2,
+                    confidence: 0.9,
+                    source: format!("solve-card;workspace={workspace};fingerprint={fingerprint}"),
+                };
                 let _ = conv.remember(card).await;
             }
         }
@@ -3277,9 +3283,11 @@ mod tests {
         }
         messages.push(Message::user("LATEST-QUESTION"));
         let compacted = apply_context_budget(messages);
-        assert!(compacted
-            .iter()
-            .any(|m| m.content.contains("较早会话已按上下文预算压缩")));
+        assert!(
+            compacted
+                .iter()
+                .any(|m| m.content.contains("较早会话已按上下文预算压缩"))
+        );
         assert!(compacted.iter().any(|m| m.content == "LATEST-QUESTION"));
         assert!(compacted.iter().map(message_chars).sum::<usize>() < 105_000);
     }
@@ -3304,12 +3312,16 @@ mod tests {
             "重复系统约束应去重"
         );
         assert!(compacted.iter().all(|message| message.role != Role::Tool));
-        assert!(compacted
-            .iter()
-            .all(|message| !message.content.contains("较早会话已按上下文预算压缩")));
-        assert!(compacted
-            .iter()
-            .any(|message| message.content.contains("目标：修复问题")));
+        assert!(
+            compacted
+                .iter()
+                .all(|message| !message.content.contains("较早会话已按上下文预算压缩"))
+        );
+        assert!(
+            compacted
+                .iter()
+                .any(|message| message.content.contains("目标：修复问题"))
+        );
     }
 
     #[test]
@@ -3330,12 +3342,16 @@ mod tests {
             1,
         );
         assert!(compacted.iter().all(|message| message.role != Role::Tool));
-        assert!(compacted
-            .iter()
-            .all(|message| !message.content.contains("old answer")));
-        assert!(compacted
-            .iter()
-            .all(|message| !message.content.contains("旧状态")));
+        assert!(
+            compacted
+                .iter()
+                .all(|message| !message.content.contains("old answer"))
+        );
+        assert!(
+            compacted
+                .iter()
+                .all(|message| !message.content.contains("旧状态"))
+        );
         let snapshot = compacted
             .iter()
             .find(|message| message.content.contains("[空响应恢复 1/1·最小快照]"))
@@ -3374,15 +3390,17 @@ mod tests {
         assert!(correction.contains("不能归因为沙箱拦截"), "{correction}");
         assert!(correction.contains("成功写操作计数为 0"), "{correction}");
 
-        assert!(unsupported_runtime_claim_correction(
-            "沙箱明确拒绝了写入，但修改随后已经落实。",
-            true,
-            1,
-            true,
-            true,
-            false,
-        )
-        .is_none());
+        assert!(
+            unsupported_runtime_claim_correction(
+                "沙箱明确拒绝了写入，但修改随后已经落实。",
+                true,
+                1,
+                true,
+                true,
+                false,
+            )
+            .is_none()
+        );
 
         let correction = unsupported_runtime_claim_correction(
             "已完成输入框高度与内边距的紧凑化调整。",

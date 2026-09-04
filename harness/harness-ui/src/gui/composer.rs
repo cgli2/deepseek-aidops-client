@@ -498,84 +498,92 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                             .auto_shrink([false, true])
                                             .animated(false)
                                             .show(ui, |ui| {
-                                        // 保存的配置分组：直接复用整套连接信息并立即生效。
-                                        // 仅列出已启用的条目（停用配置在「系统管理 · 模型配置」中管理）。
-                                        let profiles: Vec<_> = state
-                                            .host
-                                            .settings
-                                            .model_profiles()
-                                            .into_iter()
-                                            .filter(|p| p.enabled)
-                                            .collect();
-                                        if !profiles.is_empty() {
-                                            ui.add_space(2.0);
-                                            ui.label(
-                                                egui::RichText::new("保存的配置")
-                                                    .size(10.5)
-                                                    .color(pal.dim),
-                                            );
-                                            for profile in profiles {
-                                                let selected = profile.model == state.f_model
-                                                    && profile.provider == state.f_provider;
-                                                let name = profile.name.clone();
-                                                let resp = ui.selectable_label(
-                                                    selected,
-                                                    egui::RichText::new(&name)
-                                                        .size(12.0)
-                                                        .color(pal.text),
-                                                );
-                                                if resp.clicked() {
-                                                    state.load_profile(&name);
-                                                    state.model_menu_open = false;
-                                                }
-                                            }
-                                        }
-                                        // 上游模型分组：该模型已存为配置则复用其连接信息，
-                                        // 否则仅切换模型名（提交时按 f_model 直接配置）。
-                                        if !state.f_models.is_empty() {
-                                            ui.add_space(2.0);
-                                            ui.label(
-                                                egui::RichText::new("上游模型")
-                                                    .size(10.5)
-                                                    .color(pal.dim),
-                                            );
-                                            let models = state.f_models.clone();
-                                            for model in models {
-                                                let selected = model == state.f_model;
-                                                let resp = ui.selectable_label(
-                                                    selected,
-                                                    egui::RichText::new(&model)
-                                                        .size(12.0)
-                                                        .color(pal.text),
-                                                );
-                                                if resp.clicked() {
-                                                    // 优先匹配启用的配置；均停用时回退任意同名条目。
-                                                    let all = state.host.settings.model_profiles();
-                                                    let matched = all
-                                                        .iter()
-                                                        .find(|p| p.enabled && p.model == model)
-                                                        .or_else(|| {
-                                                            all.iter().find(|p| p.model == model)
-                                                        })
-                                                        .cloned();
-                                                    match matched {
-                                                        Some(p) => {
-                                                            let pname = p.name.clone();
-                                                            state.load_profile(&pname);
-                                                        }
-                                                        None => {
-                                                            state.f_model = model.clone();
-                                                            let _ = state
-                                                                .host
-                                                                .settings
-                                                                .set("llm.model", &state.f_model);
+                                                // 保存的配置分组：直接复用整套连接信息并立即生效。
+                                                // 仅列出已启用的条目（停用配置在「系统管理 · 模型配置」中管理）。
+                                                let profiles: Vec<_> = state
+                                                    .host
+                                                    .settings
+                                                    .model_profiles()
+                                                    .into_iter()
+                                                    .filter(|p| p.enabled)
+                                                    .collect();
+                                                if !profiles.is_empty() {
+                                                    ui.add_space(2.0);
+                                                    ui.label(
+                                                        egui::RichText::new("保存的配置")
+                                                            .size(10.5)
+                                                            .color(pal.dim),
+                                                    );
+                                                    for profile in profiles {
+                                                        let selected = profile.model
+                                                            == state.f_model
+                                                            && profile.provider == state.f_provider;
+                                                        let name = profile.name.clone();
+                                                        let resp = ui.selectable_label(
+                                                            selected,
+                                                            egui::RichText::new(&name)
+                                                                .size(12.0)
+                                                                .color(pal.text),
+                                                        );
+                                                        if resp.clicked() {
+                                                            state.load_profile(&name);
+                                                            state.model_menu_open = false;
                                                         }
                                                     }
-                                                    state.model_menu_open = false;
                                                 }
-                                            }
-                                        }
-                                        }); // ── ScrollArea 列表区结束 ──
+                                                // 上游模型分组：该模型已存为配置则复用其连接信息，
+                                                // 否则仅切换模型名（提交时按 f_model 直接配置）。
+                                                if !state.f_models.is_empty() {
+                                                    ui.add_space(2.0);
+                                                    ui.label(
+                                                        egui::RichText::new("上游模型")
+                                                            .size(10.5)
+                                                            .color(pal.dim),
+                                                    );
+                                                    let models = state.f_models.clone();
+                                                    for model in models {
+                                                        let selected = model == state.f_model;
+                                                        let resp = ui.selectable_label(
+                                                            selected,
+                                                            egui::RichText::new(&model)
+                                                                .size(12.0)
+                                                                .color(pal.text),
+                                                        );
+                                                        if resp.clicked() {
+                                                            // 优先匹配启用的配置；均停用时回退任意同名条目。
+                                                            let all = state
+                                                                .host
+                                                                .settings
+                                                                .model_profiles();
+                                                            let matched = all
+                                                                .iter()
+                                                                .find(|p| {
+                                                                    p.enabled && p.model == model
+                                                                })
+                                                                .or_else(|| {
+                                                                    all.iter()
+                                                                        .find(|p| p.model == model)
+                                                                })
+                                                                .cloned();
+                                                            match matched {
+                                                                Some(p) => {
+                                                                    let pname = p.name.clone();
+                                                                    state.load_profile(&pname);
+                                                                }
+                                                                None => {
+                                                                    state.f_model = model.clone();
+                                                                    let _ =
+                                                                        state.host.settings.set(
+                                                                            "llm.model",
+                                                                            &state.f_model,
+                                                                        );
+                                                                }
+                                                            }
+                                                            state.model_menu_open = false;
+                                                        }
+                                                    }
+                                                }
+                                            }); // ── ScrollArea 列表区结束 ──
                                         ui.add_space(2.0);
                                         ui.separator();
                                         let manage = ui.selectable_label(
@@ -1012,9 +1020,7 @@ fn uuid_like_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        clear_input_if_it_only_contains_paths, is_paste_shortcut, save_rgba_as_png,
-    };
+    use super::{clear_input_if_it_only_contains_paths, is_paste_shortcut, save_rgba_as_png};
     use std::path::PathBuf;
 
     #[test]

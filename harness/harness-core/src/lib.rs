@@ -26,7 +26,7 @@ pub use context::{AppContext, Registration, Service};
 pub use error::{Error, Result};
 pub use event::{Event, EventBusView, Handler, SerialHandler, Waterfall};
 pub use extension::{ExtensionPoint, ExtensionRegistry};
-pub use plugin::{compose_plugins, topo_sort, ComposeGuard, Plugin};
+pub use plugin::{ComposeGuard, Plugin, compose_plugins, topo_sort};
 pub use types::{ApprovalPolicy, Attachment, PermissionPreset, Profile, SandboxMode, UserInput};
 pub use ui_input::{AccessPolicy, LlmControl, UiInputSink};
 pub use update::{Release, UpdateStatus};

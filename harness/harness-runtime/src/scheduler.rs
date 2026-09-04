@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use harness_core::AppContext;
 
-use crate::agent_loop::AgentLoop;
+use crate::run_durable_agent_turn;
 use crate::task::{SessionId, Task};
 
 /// 会话句柄（用于结构化取消 + 等待完成）。
@@ -36,12 +36,12 @@ impl Scheduler {
     pub async fn spawn_session(&self, ctx: AppContext, task: Task) -> SessionId {
         let token = self.cancel.child_token();
         let id = task.session;
-        let loop_ = AgentLoop::new();
         // 克隆一份给句柄（原 token 被 move 进 spawned 任务用于取消监听）。
         let token_for_handle = token.clone();
+        let runner_token = token.clone();
         let handle = self.rt.spawn(async move {
             tokio::select! {
-                r = loop_.run_turn(&ctx, task.input) => { let _ = r; }
+                r = run_durable_agent_turn(&ctx, task.input, runner_token) => { let _ = r; }
                 _ = token.cancelled() => { /* 结构化取消：父取消 → 子取消 */ }
             }
         });

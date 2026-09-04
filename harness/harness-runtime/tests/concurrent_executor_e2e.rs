@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_capability::hook::Hook;
-use harness_core::{error::Result, types::UserInput, AppContext};
+use harness_core::{AppContext, error::Result, types::UserInput};
 use harness_llm::{
     Chunk, ChunkStream, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolResult,
     ToolSchema,
@@ -93,7 +93,8 @@ impl LlmProvider for MultiSurfaceLlm {
             }
         });
         // 退化：找不到聚焦标记（单面作用域退化为全局提示）时，退回首个已知面。
-        let id = focused.unwrap_or_else(|| self.surface_file.keys().next().cloned().unwrap_or_default());
+        let id =
+            focused.unwrap_or_else(|| self.surface_file.keys().next().cloned().unwrap_or_default());
         let file = self
             .surface_file
             .get(&id)
@@ -142,9 +143,7 @@ async fn concurrent_executor_opens_multiple_scoped_streams() {
     });
     let _b = ctx.provide(llm);
     let tools = ToolRegistry::new();
-    tools.register(Arc::new(RecEdit {
-        seen: seen.clone(),
-    }));
+    tools.register(Arc::new(RecEdit { seen: seen.clone() }));
     let _c = ctx.provide(tools);
     let hook: Arc<dyn Hook> = Arc::new(NullHook);
     let _d = ctx.provide(hook);

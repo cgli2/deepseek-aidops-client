@@ -230,10 +230,12 @@ mod tests {
 
         // 父上下文本身应可见该中间件。
         let parent_chain = ctx.events().collect_waterfall::<TestEv>();
-        assert_eq!(parent_chain.len(), 1, "父上下文应注册 1 个 waterfall 中间件");
-        let out = ctx
-            .events()
-            .waterfall(TestEv { v: 1 }, &parent_chain);
+        assert_eq!(
+            parent_chain.len(),
+            1,
+            "父上下文应注册 1 个 waterfall 中间件"
+        );
+        let out = ctx.events().waterfall(TestEv { v: 1 }, &parent_chain);
         assert_eq!(out.v, 2);
 
         // fork 出的子上下文必须同样可见该中间件（核心修复点）。

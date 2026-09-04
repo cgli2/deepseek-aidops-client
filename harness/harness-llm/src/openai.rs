@@ -74,8 +74,19 @@ impl LlmProvider for OpenAI {
 fn supports_vision_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     [
-        "gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "vision", "qwen-vl", "qwen2-vl",
-        "qwen2.5-vl", "qvq", "llava", "minicpm-v", "gemma-3",
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "o1",
+        "o3",
+        "vision",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qvq",
+        "llava",
+        "minicpm-v",
+        "gemma-3",
     ]
     .iter()
     .any(|name| model.contains(name))

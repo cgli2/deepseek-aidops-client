@@ -32,9 +32,20 @@ fn projection_is_deterministic_on_real_logs() {
 
 #[test]
 fn user_signals_match_turn_counts() {
-    assert_eq!(case_of("7ba3370f_t03_14_symptom.jsonl").user_signals.len(), 12);
-    assert_eq!(case_of("7ba3370f_t15_18_clarification.jsonl").user_signals.len(), 4);
-    assert_eq!(case_of("7ba3370f_t19_22_gitfix.jsonl").user_signals.len(), 4);
+    assert_eq!(
+        case_of("7ba3370f_t03_14_symptom.jsonl").user_signals.len(),
+        12
+    );
+    assert_eq!(
+        case_of("7ba3370f_t15_18_clarification.jsonl")
+            .user_signals
+            .len(),
+        4
+    );
+    assert_eq!(
+        case_of("7ba3370f_t19_22_gitfix.jsonl").user_signals.len(),
+        4
+    );
     assert_eq!(case_of("success_677bd6e0.jsonl").user_signals.len(), 5);
     assert_eq!(case_of("7ba3370f_full.jsonl").user_signals.len(), 22);
 }
@@ -43,8 +54,17 @@ fn user_signals_match_turn_counts() {
 fn clarification_segment_repeats_one_question_and_runs_no_tools() {
     // 复盘根因 4（spec §1）：turn 15–18 是同一澄清文案的无限复读。
     let case = case_of("7ba3370f_t15_18_clarification.jsonl");
-    assert!(case.tried.is_empty(), "澄清段不该有任何工具调用：{:?}", case.tried);
-    assert_eq!(case.asked.len(), 1, "四回合复读应折叠为一条 asked：{:?}", case.asked);
+    assert!(
+        case.tried.is_empty(),
+        "澄清段不该有任何工具调用：{:?}",
+        case.tried
+    );
+    assert_eq!(
+        case.asked.len(),
+        1,
+        "四回合复读应折叠为一条 asked：{:?}",
+        case.asked
+    );
 }
 
 #[test]

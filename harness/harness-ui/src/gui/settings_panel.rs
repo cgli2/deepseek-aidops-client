@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use harness_core::update::UpdateStatus;
 
-use super::model::{PluginKind, PluginUiRow, BUILTIN_PLUGINS};
+use super::AppState;
+use super::model::{BUILTIN_PLUGINS, PluginKind, PluginUiRow};
 use super::theme::Palette;
 use super::widgets::{accent_button, field_label, ghost_button};
-use super::AppState;
 
 impl AppState {
     // ── 版本更新：顶部横幅 ─────────────────────────────────────

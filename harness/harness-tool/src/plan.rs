@@ -106,7 +106,13 @@ fn parse_items(call: &ToolCall) -> Vec<PlanItem> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(PlanItem { id, text, status, criterion_ids, evidence })
+            Some(PlanItem {
+                id,
+                text,
+                status,
+                criterion_ids,
+                evidence,
+            })
         })
         .collect()
 }

@@ -1,6 +1,6 @@
 //! Stateless reusable GUI controls.
 
-use super::icons::{draw_icon, Icon};
+use super::icons::{Icon, draw_icon};
 use super::model::{PluginKind, PluginUiRow};
 use super::theme::Palette;
 

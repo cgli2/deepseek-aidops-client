@@ -23,6 +23,7 @@ serde_json = "1"
 harness-capability = { path = "../harness-capability" }
 # 技能管理：导入内置 superpowers 技能集（幂等注册进技能库）。
 harness-provider-memory = { path = "../harness-provider-memory" }
+harness-runtime = { path = "../harness-runtime", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 arboard = "3.6"
 png = "0.18"
@@ -65,4 +66,4 @@ features = ["default-fancy"]
 [features]
 # 默认仅 Ui trait + NullUi（headless）。TUI 是产品默认形态（完成文档 §1），GUI 为可替换实现。
 tui = ["dep:ratatui", "dep:crossterm"]
-gui = ["dep:egui", "dep:eframe", "dep:pulldown-cmark", "dep:syntect", "dep:harness-provider-wasm", "dep:harness-provider-trellis"]
+gui = ["dep:egui", "dep:eframe", "dep:pulldown-cmark", "dep:syntect", "dep:harness-provider-wasm", "dep:harness-provider-trellis", "dep:harness-runtime"]

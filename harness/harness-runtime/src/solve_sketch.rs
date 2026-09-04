@@ -88,7 +88,9 @@ impl SolveSketch {
         let value: serde_json::Value = match serde_json::from_str(json) {
             Ok(value) => value,
             Err(err) => {
-                return SketchValidation::Invalid(vec![format!("SolveSketch JSON 解析失败：{err}")]);
+                return SketchValidation::Invalid(vec![format!(
+                    "SolveSketch JSON 解析失败：{err}"
+                )]);
             }
         };
         let Some(array) = value.get("surfaces").and_then(|value| value.as_array()) else {
@@ -168,9 +170,9 @@ impl SolveSketch {
         if errors.is_empty() {
             let mut color: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
             let mut stack: Vec<String> = Vec::new();
-            let has_cycle = surfaces.iter().any(|surface| {
-                dfs_cycle(&surface.id, &surfaces, &mut color, &mut stack).is_some()
-            });
+            let has_cycle = surfaces
+                .iter()
+                .any(|surface| dfs_cycle(&surface.id, &surfaces, &mut color, &mut stack).is_some());
             if has_cycle {
                 errors.push("SolveSketch 依赖图存在环，已拒绝".into());
             }
@@ -263,7 +265,8 @@ fn dfs_cycle(
         .map(|s| s.depends_on.clone())
         .unwrap_or_default();
     for dep in &deps {
-        if surfaces.iter().any(|s| s.id == *dep) && dfs_cycle(dep, surfaces, color, stack).is_some() {
+        if surfaces.iter().any(|s| s.id == *dep) && dfs_cycle(dep, surfaces, color, stack).is_some()
+        {
             return Some(stack.clone());
         }
     }
@@ -289,7 +292,10 @@ mod tests {
             ]
         }"#;
         let validation = SolveSketch::from_llm_json(json);
-        assert!(matches!(validation, SketchValidation::Valid(_)), "应校验通过");
+        assert!(
+            matches!(validation, SketchValidation::Valid(_)),
+            "应校验通过"
+        );
         let sketch = validation.into_option().unwrap();
         assert_eq!(sketch.surfaces.len(), 2);
         assert_eq!(sketch.surfaces[1].depends_on, vec!["ui".to_string()]);
@@ -365,9 +371,11 @@ mod tests {
         let contract = TaskContract::from_input("- 列表展示\n- 详情展示\n- 新增表单");
         let sketch = SolveSketch::from_contract(&contract);
         assert_eq!(sketch.surfaces.len(), 3);
-        assert!(sketch
-            .surfaces
-            .iter()
-            .all(|s| s.depends_on.is_empty() && s.kind == SurfaceKind::Undeclared));
+        assert!(
+            sketch
+                .surfaces
+                .iter()
+                .all(|s| s.depends_on.is_empty() && s.kind == SurfaceKind::Undeclared)
+        );
     }
 }

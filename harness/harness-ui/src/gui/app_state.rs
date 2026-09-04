@@ -34,6 +34,12 @@ pub(super) struct AppState {
     pub(super) sidebar_expanded: bool,
     pub(super) settings_open: bool,
     pub(super) settings_page: String,
+    /// 长时程任务控制面及其表单状态。
+    pub(super) lha_open: bool,
+    pub(super) lha_prompt: String,
+    pub(super) lha_actor: String,
+    pub(super) lha_decision_note: String,
+    pub(super) lha_note: String,
     // 模型设置表单
     pub(super) f_provider: String,
     pub(super) f_base: String,
@@ -301,6 +307,13 @@ impl AppState {
             sidebar_expanded: true,
             settings_open: false,
             settings_page: "模型配置".into(),
+            lha_open: false,
+            lha_prompt: String::new(),
+            lha_actor: settings
+                .get("operator.name")
+                .unwrap_or_else(|| "desktop-operator".into()),
+            lha_decision_note: String::new(),
+            lha_note: String::new(),
             note: String::new(),
             projects,
             active_project,

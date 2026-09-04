@@ -23,6 +23,8 @@ pub(super) struct DeliveryUi {
 /// Runtime 遥测的轻量 UI 投影。只消费 SessionEvent，UI 不反向改变执行状态。
 #[derive(Clone)]
 pub(super) struct ExecutionProjectionUi {
+    /// 预留：执行器标识（当前运行时摘要行按 intent/phase 渲染，暂未读取）。
+    #[allow(dead_code)]
     pub(super) executor: String,
     pub(super) goal: String,
     pub(super) intent: String,

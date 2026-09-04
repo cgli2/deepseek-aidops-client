@@ -847,8 +847,20 @@ impl ExecutionState {
             self.tool_calls,
             self.successful_tool_results,
             self.failed_tool_results,
-            if self.satisfied_criteria.is_empty() { "暂无".into() } else { self.satisfied_criteria.iter().cloned().collect::<Vec<_>>().join("、") },
-            if evidence.is_empty() { "暂无可复用证据".into() } else { evidence.join("\n") },
+            if self.satisfied_criteria.is_empty() {
+                "暂无".into()
+            } else {
+                self.satisfied_criteria
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("、")
+            },
+            if evidence.is_empty() {
+                "暂无可复用证据".into()
+            } else {
+                evidence.join("\n")
+            },
         )
     }
 }
@@ -1496,9 +1508,11 @@ mod tests {
     fn generic_acceptance_criterion_preserves_the_observable_user_goal() {
         let objective = "文件树右键可以把选定文件添加到对话框附件";
         let contract = TaskContract::from_input(objective);
-        assert!(contract.acceptance_criteria[0]
-            .description
-            .contains(objective));
+        assert!(
+            contract.acceptance_criteria[0]
+                .description
+                .contains(objective)
+        );
         assert_ne!(
             contract.acceptance_criteria[0].description,
             "用户要求的交付物已完成并经过与风险相称的验证"
@@ -1585,16 +1599,22 @@ mod tests {
         assert_eq!(shape.scale, TaskScale::Atomic);
         assert_eq!(plan.mode, SolveMode::AtomicDelivery);
         assert_eq!(contract.acceptance_criteria[0].id, "user-objective");
-        assert!(contract.acceptance_criteria[0]
-            .description
-            .contains("添加到对话框附件"));
-        assert!(contract.acceptance_criteria[0]
-            .description
-            .contains("添加到对话"));
-        assert!(contract
-            .constraints
-            .iter()
-            .any(|constraint| constraint.contains("周边行为")));
+        assert!(
+            contract.acceptance_criteria[0]
+                .description
+                .contains("添加到对话框附件")
+        );
+        assert!(
+            contract.acceptance_criteria[0]
+                .description
+                .contains("添加到对话")
+        );
+        assert!(
+            contract
+                .constraints
+                .iter()
+                .any(|constraint| constraint.contains("周边行为"))
+        );
     }
 
     #[test]

@@ -50,10 +50,7 @@ fn syntax(h: &'static Highlighter, file_name: &str) -> &'static SyntaxReference 
         .unwrap_or("")
         .to_lowercase();
     // 无扩展名的知名文件名（Dockerfile / Makefile 等）按名称匹配。
-    let base = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     h.syn
         .find_syntax_by_extension(&ext)
         .or_else(|| h.syn.find_syntax_by_name(base))
@@ -68,8 +65,13 @@ fn text_format(style: Style, size: f32, code_bg: Color32) -> TextFormat {
         font_id: FontId::monospace(size),
         color,
         background: code_bg,
-        italics: style.font_style.contains(syntect::highlighting::FontStyle::ITALIC),
-        underline: if style.font_style.contains(syntect::highlighting::FontStyle::UNDERLINE) {
+        italics: style
+            .font_style
+            .contains(syntect::highlighting::FontStyle::ITALIC),
+        underline: if style
+            .font_style
+            .contains(syntect::highlighting::FontStyle::UNDERLINE)
+        {
             egui::Stroke::new(1.0_f32, color)
         } else {
             egui::Stroke::NONE

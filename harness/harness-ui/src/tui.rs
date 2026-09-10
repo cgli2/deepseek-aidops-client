@@ -26,7 +26,9 @@ impl TuiUi {
 
 fn push_line(lines: &mut Vec<String>, e: &SessionEvent) {
     match e {
-        SessionEvent::TurnStart { input, .. } => lines.push(format!(">>> {input}")),
+        SessionEvent::TurnStart { input, .. } => {
+            lines.push(format!(">>> {input}"));
+        }
         SessionEvent::Assistant { chunk, .. } => {
             if let Some(t) = &chunk.text {
                 lines.push(t.clone());

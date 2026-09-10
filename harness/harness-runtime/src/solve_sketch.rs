@@ -231,12 +231,19 @@ impl SolveSketch {
 
 fn parse_budget(value: Option<&serde_json::Value>) -> Option<PhaseBudget> {
     let value = value?;
-    let get = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(2) as u8;
+    let defaults = PhaseBudget::default();
+    let get = |key: &str, fallback: u8| {
+        value
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v.min(u8::MAX as u64) as u8)
+            .unwrap_or(fallback)
+    };
     Some(PhaseBudget {
-        locate: get("locate"),
-        inspect: get("inspect"),
-        change: get("change"),
-        verify: get("verify"),
+        locate: get("locate", defaults.locate),
+        inspect: get("inspect", defaults.inspect),
+        change: get("change", defaults.change),
+        verify: get("verify", defaults.verify),
     })
 }
 

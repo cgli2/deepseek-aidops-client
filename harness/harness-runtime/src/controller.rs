@@ -239,6 +239,12 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
             .unwrap_or(&input.text)
             .to_string();
         let attachments = input.attachments;
+        let note = attachment_note(&attachments);
+        let run_text = if note.is_empty() {
+            clean_text.clone()
+        } else {
+            format!("{clean_text}{note}")
+        };
         let outcome = std::panic::AssertUnwindSafe(async {
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
                 if is_council {
@@ -252,7 +258,7 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
                     run_durable_agent_turn(
                         &ctx,
                         UserInput {
-                            text: clean_text,
+                            text: run_text,
                             attachments,
                         },
                         cancellation,

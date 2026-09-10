@@ -62,8 +62,13 @@ impl DeepSeek {
             "tool_choice": "auto",
             "stream_options": { "include_usage": true },
         });
-        // 原子任务的请求级覆盖优先；其他任务继续使用用户持久化的思考档位。
-        if let Some(effort) = effort {
+        // Chat Completions 的思考开关和努力档位是两个不同字段。`reasoning_effort`
+        // 只接受 low/high/max，不能用 none 关闭思考；DeepSeek V4 会默认开启思考，
+        // 因此恢复请求必须显式发送 thinking.type=disabled。
+        if effort == Some("none") {
+            body["thinking"] = json!({ "type": "disabled" });
+        } else if let Some(effort) = effort {
+            body["thinking"] = json!({ "type": "enabled" });
             body["reasoning_effort"] = json!(effort);
         }
         body
@@ -77,7 +82,10 @@ fn thinking_mode_enabled(effort: Option<&str>, model: &str) -> bool {
         // `deepseek-reasoner` enables thinking even when a gateway does not
         // expose a reasoning_effort control. Chat models without an explicit
         // thinking setting retain their ordinary tool transcript unchanged.
-        None => model.to_ascii_lowercase().contains("reasoner"),
+        None => {
+            let model = model.to_ascii_lowercase();
+            model.contains("reasoner") || model.contains("deepseek-v4")
+        }
     }
 }
 
@@ -140,11 +148,8 @@ fn recover_incomplete_thinking_history(msgs: &[Message]) -> Vec<Message> {
 fn normalize_reasoning_effort(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "off" | "none" => Some("none"),
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" => Some("high"),
-        "xhigh" => Some("xhigh"),
+        "minimal" | "low" => Some("low"),
+        "medium" | "high" | "xhigh" => Some("high"),
         "max" => Some("max"),
         _ => None,
     }
@@ -196,12 +201,16 @@ mod tests {
             },
         );
         assert_eq!(body["max_tokens"], 1_536);
-        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
     fn legacy_or_invalid_reasoning_effort_never_reaches_the_gateway() {
         assert_eq!(normalize_reasoning_effort(" OFF "), Some("none"));
+        assert_eq!(normalize_reasoning_effort("minimal"), Some("low"));
+        assert_eq!(normalize_reasoning_effort("medium"), Some("high"));
+        assert_eq!(normalize_reasoning_effort("xhigh"), Some("high"));
         assert_eq!(normalize_reasoning_effort("auto"), None);
         assert_eq!(normalize_reasoning_effort("ultra"), None);
     }

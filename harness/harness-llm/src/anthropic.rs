@@ -282,10 +282,19 @@ fn request_body(
         "messages": messages,
         "tools": tools,
     });
-    // 仅当用户显式设置思考档位时开启扩展思考；预算固定为 max_tokens 的一半（< max_tokens 才合法）。
-    // 不自动推断能力：是否支持由模型/预设决定，未知 effort 字符串原样视为「启用」。
-    if reasoning_effort.is_some_and(|e| !e.trim().is_empty()) {
-        body["thinking"] = json!({ "type": "enabled", "budget_tokens": 2048 });
+    // `none` / `off` 是 Runtime 对简单受控任务下发的明确关闭信号，不能因为字段
+    // 非空反而开启 2048 token 扩展思考。其他非空档位仍按模型预设启用。
+    let thinking_enabled = reasoning_effort.is_some_and(|effort| {
+        !matches!(
+            effort.trim().to_ascii_lowercase().as_str(),
+            "" | "none" | "off"
+        )
+    });
+    if thinking_enabled {
+        let max_tokens = options.max_output_tokens.unwrap_or(4096);
+        // Anthropic 要求 budget_tokens 严格小于 max_tokens；受控短请求可能只有 1024。
+        let budget_tokens = 2_048u64.min(max_tokens.saturating_sub(1)).max(1);
+        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
     }
     body
 }
@@ -363,5 +372,30 @@ mod tests {
             body["messages"][0]["content"][1]["source"]["media_type"],
             "image/png"
         );
+    }
+
+    #[test]
+    fn explicit_none_disables_thinking_and_short_caps_get_a_valid_budget() {
+        let disabled = request_body(
+            "claude-test",
+            &[Message::user("small fix")],
+            Some("none"),
+            &RequestOptions {
+                max_output_tokens: Some(1_024),
+                ..Default::default()
+            },
+        );
+        assert!(disabled.get("thinking").is_none());
+
+        let enabled = request_body(
+            "claude-test",
+            &[Message::user("diagnose")],
+            Some("low"),
+            &RequestOptions {
+                max_output_tokens: Some(1_024),
+                ..Default::default()
+            },
+        );
+        assert_eq!(enabled["thinking"]["budget_tokens"], 1_023);
     }
 }

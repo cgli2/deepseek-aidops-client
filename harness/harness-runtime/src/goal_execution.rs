@@ -247,7 +247,10 @@ impl Default for PhaseBudget {
     fn default() -> Self {
         Self {
             locate: 2,
-            inspect: 2,
+            // 一个小改动经常需要同时查看入口、状态、渲染和测试四个相邻文件。
+            // 旧值 2 会把第三次定向读取误判成空转，直接关闭工具并要求用户确认。
+            // Inspect 仍受目标目录、重复调用守卫和全局硬预算约束，不会放开泛扫。
+            inspect: 4,
             change: 2,
             verify: 2,
         }
@@ -835,11 +838,14 @@ impl GoalExecution {
     /// 占用 == Σ 每面预算，而非 Σ × 并行度。
     pub fn required_budget_parallel(&self) -> SurfaceBudgetDemand {
         let surfaces = self.active_surfaces();
-        let steps: usize = surfaces.iter().map(|item| item.phase_budget.total()).sum();
+        let phase_steps: usize = surfaces.iter().map(|item| item.phase_budget.total()).sum();
+        // 相位预算只计算工具动作；模型还至少需要一次状态校正/阶段切换和一次最终交付。
+        // 不预留这两步时，任务恰好用完相位额度就会在总结前被硬熔断。
+        let steps = phase_steps.saturating_add(2);
         SurfaceBudgetDemand {
             surfaces: surfaces.len(),
             steps,
-            tool_calls: steps.saturating_add(steps / 3),
+            tool_calls: phase_steps.saturating_add(phase_steps / 3),
         }
     }
 
@@ -922,7 +928,7 @@ impl GoalExecution {
     /// 预算求和，供调度器抬升硬预算，让"面数 → 总额"回到线性关系。
     pub fn required_budget(&self) -> SurfaceBudgetDemand {
         let surfaces = self.active_surfaces();
-        let steps: usize = surfaces
+        let phase_steps: usize = surfaces
             .iter()
             .map(|item| item.phase_budget.total())
             .sum::<usize>()
@@ -935,11 +941,14 @@ impl GoalExecution {
                     .map(|item| item.phase_budget.locate as usize / 2)
                     .sum::<usize>(),
             );
+        // 工具相位结束后仍需一次运行时校正/切换和一次不带工具的交付请求。
+        // 这两步属于编排开销，不能挤占业务动作的硬预算。
+        let steps = phase_steps.saturating_add(2);
         SurfaceBudgetDemand {
             surfaces: surfaces.len(),
             steps,
             // 一个相位步可能包含一次工具调用外加一次结果确认，按 4/3 供给。
-            tool_calls: steps.saturating_add(steps / 3),
+            tool_calls: phase_steps.saturating_add(phase_steps / 3),
         }
     }
 
@@ -3008,15 +3017,15 @@ mod tests {
     #[test]
     fn budget_conservation_under_parallel_does_not_multiply() {
         let plan = three_surface_plan();
-        // 每面独立默认预算 8 步（locate2+inspect2+change2+verify2）。
+        // 每面独立默认相位预算 10 步（locate2+inspect4+change2+verify2）。
         let per = PhaseBudget::default().total();
-        assert_eq!(per, 8);
+        assert_eq!(per, 10);
         let serial = plan.required_budget();
         let parallel = plan.required_budget_parallel();
-        // 串行：共享定位按半额摊销 → 24 - 2*(locate/2=1) = 22。
-        assert_eq!(serial.steps, 3 * per - 2, "串行应摊销共享定位");
-        // 并行：满额计入，但绝不乘以并行度 → 恰好等于 Σ 每面预算 = 24。
-        assert_eq!(parallel.steps, 3 * per, "并行不应乘以并行度");
+        // 串行：共享定位按半额摊销，再加 2 步编排/交付开销。
+        assert_eq!(serial.steps, 3 * per - 2 + 2, "串行应摊销共享定位");
+        // 并行：满额计入但不乘并行度，并单独预留 2 步编排/交付开销。
+        assert_eq!(parallel.steps, 3 * per + 2, "并行不应乘以并行度");
         assert!(
             parallel.steps < 3 * per * 2,
             "并发占用上界必须守恒，不得放大"
@@ -3616,7 +3625,7 @@ mod tests {
             zero_prior: false,
         });
 
-        for index in 0..2 {
+        for index in 0..4 {
             let call = ToolCall {
                 id: format!("read-{index}"),
                 name: "fs".into(),
@@ -3639,8 +3648,34 @@ mod tests {
             };
             let action = plan.action_spec(&call, &proposal).expect("read action");
             assert_eq!(action.phase, SolvePhase::Inspect);
+            assert!(
+                plan.allows_tool_call(&call, &proposal).is_ok(),
+                "第 {} 个相邻代码区间仍应允许定向读取",
+                index + 1
+            );
             plan.record_action_result(&action, &proposal, true, "dialog layout source");
         }
+
+        let extra_read = ToolCall {
+            id: "read-5".into(),
+            name: "fs".into(),
+            args: serde_json::json!({
+                "op": "read",
+                "path": "ui/src/gui/settings_view.rs",
+                "start_line": 321,
+                "end_line": 400
+            }),
+        };
+        let extra_proposal = ActionProposal {
+            signature: "fs:{\"end_line\":400,\"op\":\"read\",\"path\":\"ui/src/gui/settings_view.rs\",\"start_line\":321}".into(),
+            question: "inspect unrelated fifth region".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert!(
+            plan.allows_tool_call(&extra_read, &extra_proposal).is_err(),
+            "Inspect 扩容仍须保持有限，不能变成无限读取"
+        );
 
         assert_eq!(plan.items["user-objective"].phase_attempts.change, 0);
         let edit = ToolCall {

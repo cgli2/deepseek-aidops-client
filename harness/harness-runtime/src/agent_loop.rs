@@ -27,6 +27,7 @@ use crate::execution::{
 use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
 use crate::governor::{Decision, TurnGovernor, artifact_text, is_continuation_request};
 use crate::intent::ClarificationKind;
+use crate::response_recovery::{RecoveryDecision, RecoveryPlan, ResponseRecovery};
 use crate::{GoalExecution, TaskLedger, WorkspaceGrounder, WorkspaceIndex};
 
 /// 治理路径选择（spec §5 步骤④：控制器接管后 A/B 默认 On）。
@@ -972,7 +973,7 @@ impl AgentLoop {
         let mut budget_exhausted = false;
         let mut absolute_budget_hit = false;
         // Fix1：断点后进展基线。硬熔断时比较“写入+证据”与基线的增量，有进展才自动续跑。
-        let mut hard_baseline = execution.write_operations + execution.evidence.len();
+        let mut hard_baseline = execution_progress_units(&execution);
         // prompt 安全边界同样是“执行窗口”而不是人工交互边界。窗口内出现可验证进展时，
         // 先压缩为最小断点再自动续期；连续无进展或续期封顶才真正暂停并交回用户。
         // 这避免大上下文任务每 3~4 次模型往返就要求用户手工输入“继续”。
@@ -982,18 +983,14 @@ impl AgentLoop {
         let mut goal_correction_notified = false;
         // 预算续期耗尽后只给一次最终收尾窗口（2 步）；窗口也用尽则强制停止。
         let mut final_window_armed = false;
-        // 上游可能正常结束却没有正文/工具调用（例如网关截断、reasoning-only 帧）。
-        // 这不是完成；允许有限恢复重试，避免把占位文本污染会话上下文。
-        // 首次空响应后改用最小检查点重试一次。没有备用 Provider 可切换时，继续把
-        // 同一目标请求第三遍只会制造截图中的“连续 3 次空响应”伪熔断。
-        const MAX_EMPTY_RESPONSE_RETRIES: usize = 1;
-
         /// Fix1：硬熔断自动续跑硬上限，超过则强制交回用户，防止失控。
         const MAX_HARD_AUTORENEWS: u32 = 8;
         /// 单个用户请求内的 prompt 窗口续期上限；每次续期仍受 300k 窗口边界约束。
         const MAX_PROMPT_AUTORENEWS: u32 = 4;
-        let mut empty_response_retries = 0usize;
-        let mut empty_recovery_pending = false;
+        // 模型请求失败不能直接改写任务状态。独立恢复状态机负责区分普通协议空包和
+        // reasoning 吃满输出额度，并在有效正文/工具调用后自动复位。
+        let mut response_recovery = ResponseRecovery::default();
+        let mut pending_recovery: Option<RecoveryPlan> = None;
         let controlled_delivery_turn = goal_executor_enabled()
             && execution.solve_mode != crate::execution::SolveMode::OpenEnded;
         while debt > 0 {
@@ -1002,7 +999,7 @@ impl AgentLoop {
             // 放在 steps 自增与 StepStart 之前，避免留下"开了步却没请求"的空步骤。
             if let Some(gov) = governor.as_ref() {
                 if gov.should_stop_before_request(turn_prompt_tokens, last_prompt_tokens) {
-                    let progress_now = execution.write_operations + execution.evidence.len();
+                    let progress_now = execution_progress_units(&execution);
                     let progress_since_window = progress_now.saturating_sub(prompt_baseline);
                     if prompt_autorenews < MAX_PROMPT_AUTORENEWS
                         && (progress_since_window > 0
@@ -1039,26 +1036,19 @@ impl AgentLoop {
                     break;
                 }
             }
-            steps += 1;
-            execution.steps = steps;
-            debt -= 1;
             if BudgetManager::hard_exhausted(&execution, &budget) {
                 // Fix1：硬熔断不再一律打断等用户。若本窗口产生了可验证进展
                 // （写入或新证据），自动发放新探索窗口继续推进，避免把任务切碎成
                 // 十几次人工“继续”。连续无进展或达到自动续跑上限才交回用户。
-                let progress_since_window = (execution.write_operations + execution.evidence.len())
-                    .saturating_sub(hard_baseline);
-                let deterministic_retry = progress_since_window == 0
-                    && budget.hard_autorenews == 0
-                    && controlled_delivery_turn
-                    && goal_execution.can_auto_advance();
+                let progress_now = execution_progress_units(&execution);
+                let progress_since_window = progress_now.saturating_sub(hard_baseline);
                 if !cancelled
                     && budget.hard_autorenews < MAX_HARD_AUTORENEWS
-                    && (progress_since_window > 0 || deterministic_retry)
+                    && progress_since_window > 0
                 {
                     BudgetManager::arm_hard_continuation(&mut budget);
                     budget.hard_autorenews += 1;
-                    hard_baseline = execution.write_operations + execution.evidence.len();
+                    hard_baseline = progress_now;
                     messages.push(Message::user(&format!(
                         "[自动续跑·第{}次] 本窗口新增 {} 项可验证进展；下一步仍可直接执行，已自动发放新窗口，无需人工“继续”。围绕未满足的验收条件继续推进。",
                         budget.hard_autorenews, progress_since_window
@@ -1086,6 +1076,11 @@ impl AgentLoop {
                 });
                 break;
             }
+            // `hard_max_steps = N` 必须真的允许执行第 N 步。旧顺序先把 steps 加到 N、
+            // 再用 `>= N` 判顶，导致最后一个业务/交付步骤永远拿不到执行机会。
+            steps += 1;
+            execution.steps = steps;
+            debt -= 1;
             log.append(SessionEvent::StepStart {
                 id: log.gen_id(),
                 step: steps,
@@ -1120,32 +1115,23 @@ impl AgentLoop {
 
             // 每一步都执行上下文预算，而非仅在回合开始时裁剪；工具循环越长，
             // 节省的重复 prompt token 越明显。
-            // 原子任务以低推理、短输出请求模型：工具门禁只能减少后续回合，只有这里
-            // 能抑制首个 tool call 前的隐藏长思考与 `omitted` token 消耗。非原子任务
-            // 完全保留用户的模型设置和默认输出预算。
+            // 受控交付按求解规模限制单次推理和输出。过去只有 AtomicDelivery 会覆盖，
+            // 大量用户眼中的“小修复”实际落在 ScopedDelivery，仍沿用 high/xhigh 与大输出，
+            // 几轮就触发 prompt 总预算。OpenEnded 才保留用户的完整探索配置。
             let controlled_delivery = controlled_delivery_turn;
             let runtime_allowed_tools = if controlled_delivery {
                 goal_execution.allowed_tools()
             } else {
                 execution.allowed_tools()
             };
-            let request_options = if execution.solve_mode
-                == crate::execution::SolveMode::AtomicDelivery
-                || empty_recovery_pending
-            {
-                RequestOptions {
-                    max_output_tokens: Some(if empty_recovery_pending { 1_024 } else { 1_536 }),
-                    // DeepSeek/OpenAI 兼容端使用 `none` 表示关闭；`off` 是旧目录
-                    // 的内部别名，直接透传会被网关以 HTTP 400 拒绝并中断整个回合。
-                    reasoning_effort: Some("none".into()),
-                    allowed_tools: Some(runtime_allowed_tools.clone()),
-                }
-            } else {
-                RequestOptions {
-                    allowed_tools: Some(runtime_allowed_tools.clone()),
-                    ..Default::default()
-                }
-            };
+            let request_options = request_options_for_solve_mode(
+                execution.solve_mode,
+                runtime_allowed_tools.clone(),
+                pending_recovery,
+            );
+            let request_output_cap = request_options
+                .max_output_tokens
+                .unwrap_or_else(configured_max_output_tokens);
             // S5/G2 并发执行器（Phase 1，成本优先）：存在多个无写冲突的就绪面时，
             // 对每个写冲突组并发开一轮作用域化模型往返，融合成单一流交给现有门禁 /
             // dispatch 主体（字节不变）；单写冲突组（最常见）仍走原单一流路径，零回归。
@@ -1745,7 +1731,10 @@ impl AgentLoop {
                 });
             }
             if !should_recover_empty {
-                empty_recovery_pending = false;
+                pending_recovery = None;
+                if !assistant_text.trim().is_empty() || !assistant_tools.is_empty() {
+                    response_recovery.reset_after_actionable_response();
+                }
                 insert_assistant_at_step_boundary(
                     &mut messages,
                     assistant_history_index,
@@ -1765,34 +1754,46 @@ impl AgentLoop {
             // tool_call 缺对应 tool 消息，续跑必 400。
             if should_recover_empty && !hard_stop {
                 let reason = empty_response_reason.as_deref().unwrap_or("unknown");
-                // 任意 finish_reason 的空响应都不能原样重试。`stop` 同样可能来自网关
-                // 截断或上下文污染；继续携带完整历史只会稳定复现同一个空结果。
-                let retry_limit = MAX_EMPTY_RESPONSE_RETRIES;
-                if empty_response_retries < retry_limit {
-                    empty_response_retries += 1;
-                    debt += 1;
-                    messages = compact_for_empty_recovery(
-                        messages,
-                        &execution.compact_checkpoint(),
-                        &goal_execution.render_for_model(),
-                        reason,
-                        empty_response_retries,
-                        retry_limit,
-                    );
-                    empty_recovery_pending = true;
-                } else {
-                    log.append(SessionEvent::Assistant {
-                        id: log.gen_id(),
-                        chunk: Chunk {
-                            text: Some(format!(
-                                "[error] 模型连续 {} 次返回空响应（最后 finish_reason={reason}）。请求未被视为完成；请检查模型/网关日志、输出 token 限制或切换模型后重试。",
-                                retry_limit + 1
-                            )),
-                            ..Default::default()
-                        },
-                    });
-                    debt = 0;
-                    hard_stop = true;
+                match response_recovery.on_empty(reason, request_output_cap) {
+                    RecoveryDecision::Retry(plan) => {
+                        debt += 1;
+                        messages = compact_for_empty_recovery(
+                            messages,
+                            &execution.compact_checkpoint(),
+                            &goal_execution.render_for_model(),
+                            reason,
+                            plan.attempt,
+                            plan.max_attempts,
+                            plan.max_output_tokens,
+                        );
+                        pending_recovery = Some(plan);
+                        log.append(SessionEvent::Thinking {
+                            id: log.gen_id(),
+                            text: format!(
+                                "模型输出被截断，已保存任务断点并自动恢复 {}/{}（下次输出预算 {} tokens）…",
+                                plan.attempt, plan.max_attempts, plan.max_output_tokens
+                            ),
+                        });
+                    }
+                    RecoveryDecision::Exhausted {
+                        class,
+                        attempts,
+                        last_output_cap,
+                    } => {
+                        // 恢复耗尽属于 Provider 健康故障，不是模型答复，更不是任务完成。
+                        // 仅写内部诊断，统一由出口生成简洁的可续跑状态。
+                        provider_error_seen = true;
+                        provider_error_summary = format!(
+                            "response recovery exhausted: class={class:?}, finish_reason={reason}, retries={attempts}, last_output_cap={last_output_cap}"
+                        );
+                        log.append(SessionEvent::Thinking {
+                            id: log.gen_id(),
+                            text: "模型在自适应恢复后仍未返回正文或工具调用；任务断点已保留。"
+                                .into(),
+                        });
+                        debt = 0;
+                        hard_stop = true;
+                    }
                 }
             } else if (step_had_tools || claim_recovery_requested) && !hard_stop {
                 debt += 1;
@@ -2731,6 +2732,7 @@ fn compact_for_empty_recovery(
     reason: &str,
     attempt: usize,
     max_attempts: usize,
+    next_output_cap: u64,
 ) -> Vec<Message> {
     let mut seen = HashSet::new();
     let mut compacted = messages
@@ -2740,12 +2742,13 @@ fn compact_for_empty_recovery(
                 && !message.content.starts_with("[较早会话已按上下文预算压缩")
                 && !message.content.starts_with("[预算窗口续期")
                 && !message.content.starts_with("[空响应恢复")
+                && !message.content.starts_with("[响应恢复")
                 && !message.content.starts_with("[V4 唯一目标求解图")
         })
         .filter(|message| seen.insert(message.content.clone()))
         .collect::<Vec<_>>();
     compacted.push(Message::system(format!(
-        "[空响应恢复 {attempt}/{max_attempts}·最小快照]\nfinish_reason={reason}\n{checkpoint}\n{goal_state}\n旧对话与工具原文已移除，运行时记录的证据和阶段仍有效。禁止重新规划、重复搜索或扩大范围。"
+        "[响应恢复 {attempt}/{max_attempts}·最小快照]\nfinish_reason={reason}; next_output_cap={next_output_cap}\n{checkpoint}\n{goal_state}\n旧对话与工具原文已移除，运行时记录的证据和阶段仍有效。禁止重新规划、重复搜索或扩大范围。"
     )));
     compacted.push(Message::user(
         "继续当前唯一下一动作：需要执行时只返回一个当前阶段允许的工具调用；证据已经充分时给出简短、可验证的最终答复。不得只输出思考过程。",
@@ -2828,6 +2831,12 @@ fn unsupported_runtime_claim_correction(
 /// 结构化系统提示词：语言跟随、工具契约、长周期工作流、安全边界。
 const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding agent.\n\
 \n\
+## 核心工作原则\n\
+1. 先想清楚再动手：不明确时主动询问，不猜测。存在歧义时，列出多种可能。发现更简单方案时，主动提出建议。遇到逻辑矛盾或信息缺失时，及时停止。\n\
+2. 能简单就别复杂：用最简方式完成任务，不刻意增加复杂度。不为“后续可能使用”叠加多余功能。内容啰嗦冗余时，及时精简优化。\n\
+3. 只改该改的内容：仅处理与当前任务直接相关的部分。不擅自改动周边无关内容、原有格式与备注。发现其他问题可文字提醒，不要直接修改。\n\
+4. 定好目标再执行：提前明确任务完成标准，界定“做完”的范围。将“修复Bug”转化为编写用例复现问题，再调试至通过。将“新增功能”转化为编写测试用例并保证通过。多步骤复杂任务，先输出执行计划并标注验证方式。\n\
+\n\
 ## 语言与格式\n\
 - 始终用与用户最新消息相同的语言回复（中文提问用中文答）。\n\
 - 结论先行；需要时用简洁的 markdown 列表展开步骤，不写冗长铺垫。\n\
@@ -2859,6 +2868,64 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 ## 安全\n\
 - 仅当用户明确要求检查/修改/构建/测试/操作工作区时才使用文件系统或 shell 工具。\n\
 - 永不搜索或泄露 API key、凭据、token 等秘密。";
+
+/// 硬预算续跑只接受运行时可核验的进展。失败结果虽然会作为负证据记录，
+/// 但不能靠不断制造失败签名换取新窗口。
+fn execution_progress_units(execution: &ExecutionState) -> usize {
+    execution
+        .successful_tool_results
+        .saturating_add(execution.write_operations)
+        .saturating_add(execution.satisfied_criteria.len())
+}
+
+/// 按求解规模给单次模型请求设成本上限。它只收紧当前请求，不改变用户的全局配置；
+/// 开放探索仍使用用户选择的完整推理档位。
+fn request_options_for_solve_mode(
+    mode: crate::execution::SolveMode,
+    allowed_tools: Vec<String>,
+    recovery: Option<RecoveryPlan>,
+) -> RequestOptions {
+    let profile = match mode {
+        crate::execution::SolveMode::AtomicDelivery => Some((1_536, "none")),
+        crate::execution::SolveMode::GuidedInvestigation
+        | crate::execution::SolveMode::FastDiagnosis => Some((2_048, "low")),
+        crate::execution::SolveMode::ScopedDelivery => Some((3_072, "low")),
+        crate::execution::SolveMode::StagedDelivery => Some((4_096, "low")),
+        crate::execution::SolveMode::OpenEnded => None,
+    };
+    let configured_cap = configured_max_output_tokens();
+    let mut options = if let Some((profile_cap, reasoning_effort)) = profile {
+        RequestOptions {
+            max_output_tokens: Some(configured_cap.min(profile_cap).max(1)),
+            reasoning_effort: Some(reasoning_effort.into()),
+            allowed_tools: Some(allowed_tools),
+        }
+    } else {
+        RequestOptions {
+            allowed_tools: Some(allowed_tools),
+            ..Default::default()
+        }
+    };
+    if let Some(recovery) = recovery {
+        // 恢复额度是一次请求级健康预算，不受普通任务 profile 的低上限反向截断。
+        options.max_output_tokens = Some(recovery.max_output_tokens);
+        if recovery.disable_reasoning {
+            options.reasoning_effort = Some("none".into());
+        }
+    }
+    options
+}
+
+fn configured_max_output_tokens() -> u64 {
+    harness_core::tuning::max_output_tokens()
+        .or_else(|| {
+            std::env::var("HARNESS_MAX_TOKENS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(8_192)
+        .clamp(256, 32_768)
+}
 
 /// 进展检查间隔（沿用 env `HARNESS_MAX_STEPS` 保持兼容，默认 128）。
 /// 这不是完成期限；到点后诊断调用价值并自动续期。失控由循环守卫、取消与 turn timeout 兜底。
@@ -3340,6 +3407,7 @@ mod tests {
             "stop",
             1,
             1,
+            4_096,
         );
         assert!(compacted.iter().all(|message| message.role != Role::Tool));
         assert!(
@@ -3354,9 +3422,10 @@ mod tests {
         );
         let snapshot = compacted
             .iter()
-            .find(|message| message.content.contains("[空响应恢复 1/1·最小快照]"))
+            .find(|message| message.content.contains("[响应恢复 1/1·最小快照]"))
             .expect("应生成一次最小恢复快照");
         assert!(snapshot.content.contains("finish_reason=stop"));
+        assert!(snapshot.content.contains("next_output_cap=4096"));
         assert!(snapshot.content.contains("读取 composer.rs"));
         assert!(snapshot.content.contains("新状态"));
     }

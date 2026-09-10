@@ -151,7 +151,10 @@ fn scripted_call(id: &str, name: &str, args: serde_json::Value) -> Option<ToolCa
 struct EmptyThenTextLlm {
     calls: AtomicUsize,
     requests: Mutex<Vec<Vec<Message>>>,
+    options: Mutex<Vec<RequestOptions>>,
     finish_reason: &'static str,
+    empty_responses: usize,
+    tool_after_empty: bool,
 }
 
 struct ToolCallsWithoutPayloadLlm {
@@ -334,10 +337,19 @@ impl LlmProvider for EmptyThenTextLlm {
     fn stream(&self, messages: Vec<Message>) -> ChunkStream {
         self.requests.lock().unwrap().push(messages);
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let chunk = if call == 0 {
+        let chunk = if call < self.empty_responses {
             Chunk {
                 empty_response: true,
                 finish_reason: Some(self.finish_reason.into()),
+                ..Default::default()
+            }
+        } else if self.tool_after_empty && call == self.empty_responses {
+            Chunk {
+                tool_calls: vec![ToolCall {
+                    id: "recovered-call".into(),
+                    name: "echo".into(),
+                    args: serde_json::json!({"text":"recovered evidence"}),
+                }],
                 ..Default::default()
             }
         } else {
@@ -347,6 +359,11 @@ impl LlmProvider for EmptyThenTextLlm {
             }
         };
         Box::pin(futures::stream::iter(vec![Ok(chunk)]))
+    }
+
+    fn stream_with_options(&self, messages: Vec<Message>, options: RequestOptions) -> ChunkStream {
+        self.options.lock().unwrap().push(options);
+        self.stream(messages)
     }
 }
 
@@ -404,9 +421,12 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
     let llm = Arc::new(EmptyThenTextLlm {
         calls: AtomicUsize::new(0),
         requests: Mutex::new(vec![]),
+        options: Mutex::new(vec![]),
         // 截图中的真实故障是 finish_reason=stop。它也必须换成紧凑检查点，
         // 不能只有 length 才压缩后重试。
         finish_reason: "stop",
+        empty_responses: 1,
+        tool_after_empty: false,
     });
     let hook: Arc<dyn Hook> = Arc::new(AllowHook);
     let mut registrations = vec![];
@@ -432,7 +452,7 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
     assert!(
         requests[1]
             .iter()
-            .any(|message| message.content.contains("[空响应恢复 1/1·最小快照]"))
+            .any(|message| message.content.contains("[响应恢复 1/1·最小快照]"))
     );
     assert!(
         requests[1]
@@ -442,6 +462,68 @@ async fn empty_provider_response_is_retried_without_polluting_session_history() 
     let events = log.replay();
     assert!(events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("恢复后的完整答复"))));
     assert!(!events.iter().any(|event| matches!(event, SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref().is_some_and(|text| text.contains("返回了空内容")))));
+}
+
+#[tokio::test]
+async fn repeated_length_starvation_escalates_budget_and_recovers_in_the_same_turn() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(EmptyThenTextLlm {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(vec![]),
+        options: Mutex::new(vec![]),
+        finish_reason: "length",
+        // 精确回放实机故障：正常请求和第一次恢复请求都只产生 reasoning。
+        empty_responses: 2,
+        tool_after_empty: true,
+    });
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "执行 echo 工具并返回结果".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 4);
+    let options = llm.options.lock().unwrap();
+    assert!(
+        options[1].max_output_tokens.unwrap_or_default() >= 8_192,
+        "首次 length 恢复必须扩容，不能降到 1024"
+    );
+    assert_eq!(
+        options[2].max_output_tokens,
+        options[1]
+            .max_output_tokens
+            .map(|cap| cap.saturating_mul(2).min(32_768))
+    );
+    assert_eq!(options[1].reasoning_effort.as_deref(), Some("none"));
+    assert_eq!(options[2].reasoning_effort.as_deref(), Some("none"));
+    assert!(
+        options[3].max_output_tokens < options[2].max_output_tokens,
+        "拿到有效工具调用后必须退出恢复 profile，避免永久使用高预算"
+    );
+    let events = log.replay();
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref() == Some("恢复后的完整答复")
+    )));
+    assert!(!events.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("模型连续"))
+    )));
 }
 
 #[tokio::test]
@@ -854,6 +936,8 @@ async fn grounded_candidate_replay_skips_redundant_search() {
         options[0].allowed_tools.as_deref(),
         Some(["fs".into(), "search".into()].as_slice())
     );
+    assert_eq!(options[0].max_output_tokens, Some(3_072));
+    assert_eq!(options[0].reasoning_effort.as_deref(), Some("low"));
     let _ = std::fs::remove_dir_all(root);
 }
 

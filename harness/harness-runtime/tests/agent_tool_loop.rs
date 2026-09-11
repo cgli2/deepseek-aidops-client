@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_capability::hook::{Hook, HookDecision, HookPayload};
-use harness_core::AppContext;
 use harness_core::error::Result;
 use harness_core::types::UserInput;
+use harness_core::{AppContext, Workspace};
 use harness_llm::{
     Chunk, ChunkStream, LlmProvider, Message, RequestOptions, ToolCall, ToolResult, Usage,
 };
 use harness_runtime::AgentLoop;
-use harness_session::{SessionEvent, SessionLog};
+use harness_session::{DeliveryOutcome, SessionEvent, SessionLog};
 use harness_tool::{DynTool, ToolRegistry};
 
 struct AllowHook;
@@ -155,6 +155,14 @@ struct EmptyThenTextLlm {
     finish_reason: &'static str,
     empty_responses: usize,
     tool_after_empty: bool,
+}
+
+/// 模拟真实故障：模型先输出一句工作说明，随后 `fs.arguments` 在字符串中间截断。
+/// Provider 已把残缺调用转换成 empty_response；Runtime 仍应忽略前言并自动恢复。
+struct PreambleThenIncompleteToolLlm {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<Vec<Message>>>,
+    options: Mutex<Vec<RequestOptions>>,
 }
 
 struct ToolCallsWithoutPayloadLlm {
@@ -367,6 +375,56 @@ impl LlmProvider for EmptyThenTextLlm {
     }
 }
 
+#[async_trait]
+impl LlmProvider for PreambleThenIncompleteToolLlm {
+    fn name(&self) -> &'static str {
+        "preamble-incomplete-tool-test"
+    }
+
+    fn tools(&self) -> Vec<harness_llm::ToolSchema> {
+        vec![]
+    }
+
+    fn stream(&self, messages: Vec<Message>) -> ChunkStream {
+        self.requests.lock().unwrap().push(messages);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = match call {
+            0 => vec![
+                Ok(Chunk {
+                    text: Some("我来写入这个文件。".into()),
+                    ..Default::default()
+                }),
+                Ok(Chunk {
+                    empty_response: true,
+                    finish_reason: Some(
+                        "incomplete_tool_arguments: EOF while parsing a string at line 1 column 16108"
+                            .into(),
+                    ),
+                    ..Default::default()
+                }),
+            ],
+            1 => vec![Ok(Chunk {
+                tool_calls: vec![ToolCall {
+                    id: "recovered-call".into(),
+                    name: "echo".into(),
+                    args: serde_json::json!({"text":"recovered evidence"}),
+                }],
+                ..Default::default()
+            })],
+            _ => vec![Ok(Chunk {
+                text: Some("恢复后的完整答复".into()),
+                ..Default::default()
+            })],
+        };
+        Box::pin(futures::stream::iter(chunks))
+    }
+
+    fn stream_with_options(&self, messages: Vec<Message>, options: RequestOptions) -> ChunkStream {
+        self.options.lock().unwrap().push(options);
+        self.stream(messages)
+    }
+}
+
 #[tokio::test]
 async fn tool_result_is_sent_back_and_turn_finishes() {
     let ctx = AppContext::new();
@@ -527,6 +585,62 @@ async fn repeated_length_starvation_escalates_budget_and_recovers_in_the_same_tu
 }
 
 #[tokio::test]
+async fn truncated_tool_arguments_recover_even_after_a_text_preamble() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(PreambleThenIncompleteToolLlm {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(vec![]),
+        options: Mutex::new(vec![]),
+    });
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "执行 echo 工具并返回结果".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 3);
+    let options = llm.options.lock().unwrap();
+    assert!(options[1].max_output_tokens.unwrap_or_default() >= 8_192);
+    assert_eq!(options[1].reasoning_effort.as_deref(), Some("none"));
+
+    let requests = llm.requests.lock().unwrap();
+    assert!(requests[1].iter().any(|message| {
+        message.content.contains("不得重发整文件 fs write")
+            && message.content.contains("残缺调用已丢弃且从未执行")
+    }));
+    assert!(
+        requests[1]
+            .iter()
+            .all(|message| message.content != "我来写入这个文件。")
+    );
+
+    let events = log.replay();
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref() == Some("恢复后的完整答复")
+    )));
+    assert!(!events.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("llm provider error"))
+    )));
+}
+
+#[tokio::test]
 async fn prompt_cap_auto_continues_when_the_next_step_is_clear() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
@@ -655,7 +769,7 @@ async fn missing_tool_payload_stops_once_instead_of_three_empty_retries() {
 }
 
 #[tokio::test]
-async fn unverified_text_only_step_keeps_advancing_without_user_follow_up() {
+async fn unverified_text_only_step_stops_after_one_state_correction() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
     let llm = Arc::new(TextThenTextLlm {
@@ -681,18 +795,24 @@ async fn unverified_text_only_step_keeps_advancing_without_user_follow_up() {
         .unwrap();
 
     let requests = llm.requests.lock().unwrap();
-    assert!(requests.len() > 2, "未验证的正文不能结束明确任务");
-    assert!(requests.len() <= 20, "持续无进展时仍必须由硬预算终止");
+    assert_eq!(
+        requests.len(),
+        2,
+        "同一受控状态下的纯文本空转只允许一次校正，第二次必须终止"
+    );
     assert!(
         requests[1]
             .iter()
             .any(|message| message.content.contains("[V4 目标状态校正]"))
     );
-    assert!(requests.iter().skip(2).any(|request| {
-        request
-            .iter()
-            .any(|message| message.content.contains("[自动推进]"))
-    }));
+    assert!(log.replay().iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("已停止空转"))
+    )));
+    assert!(log.replay().iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. }
+            if report.outcome == DeliveryOutcome::PartialDelivery
+    )));
     assert!(!log.replay().iter().any(|event| matches!(event,
         SessionEvent::Assistant { chunk, .. }
             if chunk.text.as_deref().is_some_and(|text| text.contains("下一条“继续”") || text.contains("是否按以下理解继续"))
@@ -741,7 +861,7 @@ async fn ambiguous_delivery_is_clarified_before_model_or_tool_calls() {
 }
 
 #[tokio::test]
-async fn exhausted_location_emits_one_clean_choice_and_preserves_needs_input() {
+async fn exhausted_location_does_not_ask_the_user_to_locate_code() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
     let llm = Arc::new(ScriptedLlm {
@@ -787,10 +907,14 @@ async fn exhausted_location_emits_one_clean_choice_and_preserves_needs_input() {
             )
         })
         .count();
-    assert_eq!(prompts, 1, "同一澄清不能在循环内外重复输出");
-    assert!(events.iter().any(|event| matches!(event,
+    assert_eq!(prompts, 0, "技术定位失败不得转嫁给用户");
+    assert!(!events.iter().any(|event| matches!(event,
         SessionEvent::Delivery { report, .. }
             if report.outcome == harness_session::DeliveryOutcome::NeedsUserInput
+    )));
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. }
+            if report.outcome == harness_session::DeliveryOutcome::PartialDelivery
     )));
     assert!(!events.iter().any(|event| matches!(event,
         SessionEvent::Assistant { chunk, .. }
@@ -1084,6 +1208,100 @@ async fn v4_already_satisfied_replay_verifies_without_editing() {
         SessionEvent::Telemetry { telemetry, .. }
             if telemetry.detail.contains("AlreadySatisfied")
     )));
+}
+
+#[tokio::test]
+async fn document_implementation_cannot_finish_when_edit_tool_changes_nothing() {
+    let root = std::env::temp_dir().join(format!(
+        "harness-document-noop-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn existing() {}\n").unwrap();
+    std::fs::write(root.join("docs/DESIGN.md"), "# New subsystem\n").unwrap();
+
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(ScriptedLlm {
+        calls: AtomicUsize::new(0),
+        initial_text_steps: 0,
+        script: vec![
+            scripted_call(
+                "doc-search",
+                "search",
+                serde_json::json!({"pattern": "document-noop-implementation"}),
+            ),
+            scripted_call(
+                "doc-read",
+                "fs",
+                serde_json::json!({"op": "read", "path": "src/lib.rs"}),
+            ),
+            scripted_call(
+                "doc-edit",
+                "edit",
+                serde_json::json!({
+                    "path": "src/lib.rs",
+                    "old_text": "pub fn existing() {}",
+                    "new_text": "pub fn implemented() {}"
+                }),
+            ),
+            None,
+        ],
+        options: Mutex::new(vec![]),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(Arc::new(StaticTool {
+        name: "search",
+        output: "共 1 条命中（格式：相对路径:行号: 内容）：\nsrc/lib.rs:1: pub fn existing() {}",
+    }));
+    tools.register(Arc::new(StaticTool {
+        name: "fs",
+        output: "pub fn existing() {}",
+    }));
+    // 故意谎报 updated、但不触碰磁盘，复现截图中的“零改动假完成”。
+    tools.register(Arc::new(StaticTool {
+        name: "edit",
+        output: "updated src/lib.rs",
+    }));
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm;
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+    let _e = ctx.provide(Workspace::new(root.clone()));
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "按 docs/DESIGN.md 实施开发".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolResult { result, .. }
+            if result.content.contains("[workspace-change gate]")
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Delivery { report, .. }
+            if report.outcome == harness_session::DeliveryOutcome::Verified
+    )));
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        "pub fn existing() {}\n"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// 流内直接吐 Err 的 Provider：复现「4xx 报错被当成最终回答」的假绿场景。

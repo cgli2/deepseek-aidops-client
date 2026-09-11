@@ -89,8 +89,15 @@ impl ResponseRecovery {
 }
 
 fn classify(reason: &str) -> EmptyResponseClass {
-    match reason.trim().to_ascii_lowercase().as_str() {
-        "length" | "max_tokens" | "reasoning_only" => EmptyResponseClass::OutputStarvation,
+    let normalized = reason
+        .trim()
+        .split_once(':')
+        .map_or_else(|| reason.trim(), |(kind, _)| kind)
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "length" | "max_tokens" | "reasoning_only" | "incomplete_tool_arguments" => {
+            EmptyResponseClass::OutputStarvation
+        }
         _ => EmptyResponseClass::ProtocolEmpty,
     }
 }
@@ -130,5 +137,19 @@ mod tests {
             panic!("a later independent empty response gets its own recovery window");
         };
         assert_eq!(plan.attempt, 1);
+    }
+
+    #[test]
+    fn incomplete_tool_arguments_use_bounded_output_starvation_recovery() {
+        let mut recovery = ResponseRecovery::default();
+        let RecoveryDecision::Retry(plan) = recovery.on_empty(
+            "incomplete_tool_arguments: EOF while parsing a string at line 1 column 16108",
+            4_096,
+        ) else {
+            panic!("truncated tool arguments should be recoverable");
+        };
+        assert_eq!(plan.max_attempts, 3);
+        assert_eq!(plan.max_output_tokens, 8_192);
+        assert!(plan.disable_reasoning);
     }
 }

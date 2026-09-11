@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -151,6 +152,76 @@ fn is_search_like(name: &str) -> bool {
 /// 搜索缓存键：工具名 + 归一化参数（Debug 表示即可，足以区分不同查询）。
 fn search_cache_key(name: &str, args: &impl std::fmt::Debug) -> String {
     format!("{}::{:?}", name, args)
+}
+
+/// 写工具的目标产物。只接受工作区内的普通相对路径，拒绝 `..`、盘符跳转和工作区外
+/// 绝对路径，避免为了验收读取用户未授权的文件。
+fn write_target<'a>(call: &'a ToolCall) -> Option<&'a str> {
+    let is_write = call.name == "edit"
+        || (call.name == "fs"
+            && call
+                .args
+                .get("op")
+                .and_then(|value| value.as_str())
+                .is_some_and(|op| op == "write"));
+    is_write.then(|| call.args.get("path")?.as_str()).flatten()
+}
+
+fn artifact_path(workspace: &Path, target: &str) -> Option<std::path::PathBuf> {
+    let target_path = Path::new(target);
+    Some(if target_path.is_absolute() {
+        if !target_path.starts_with(workspace) {
+            return None;
+        }
+        target_path.to_path_buf()
+    } else {
+        if target_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return None;
+        }
+        workspace.join(target_path)
+    })
+}
+
+fn artifact_key(workspace: &Path, target: &str) -> Option<String> {
+    let key = artifact_path(workspace, target)?
+        .strip_prefix(workspace)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))?;
+    #[cfg(windows)]
+    let key = key.to_ascii_lowercase();
+    Some(key)
+}
+
+/// 获取目标文件的内容指纹。不存在也是可观察状态（用于识别新建文件）；无法安全解析
+/// 或读取时返回 None，让上层按未获得变更证据处理，而不是信任工具自述。
+fn artifact_fingerprint(workspace: &Path, target: &str) -> Option<String> {
+    let path = artifact_path(workspace, target)?;
+    if !path.exists() {
+        return Some("missing".into());
+    }
+    if !path.is_file() {
+        return None;
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn observed_write_change(
+    workspace: Option<&Path>,
+    call: &ToolCall,
+    before: Option<&String>,
+) -> Option<bool> {
+    let root = workspace?;
+    let target = write_target(call)?;
+    let before = before?;
+    let after = artifact_fingerprint(root, target)?;
+    Some(before != &after)
 }
 
 /// 控制器模式下澄清提问是否被允许（spec §4.2 三重前置）；Legacy 一律允许，
@@ -983,6 +1054,13 @@ impl AgentLoop {
         let mut goal_correction_notified = false;
         // 预算续期耗尽后只给一次最终收尾窗口（2 步）；窗口也用尽则强制停止。
         let mut final_window_armed = false;
+        // 连续纯文本回复若没有推动任何受控状态，最多只校正一次。第二次仍停在
+        // 同一状态就结束为可恢复的部分交付，避免模型用不同措辞复读同一结论直到
+        // 硬预算耗尽。这里比较 Runtime 状态而不是文本字节，因此能识别同义改写。
+        let mut text_only_state: Option<String> = None;
+        let mut text_only_no_progress_streak = 0u8;
+        let mut stalled_without_action = false;
+        let mut baseline_verification_observed = false;
         /// Fix1：硬熔断自动续跑硬上限，超过则强制交回用户，防止失控。
         const MAX_HARD_AUTORENEWS: u32 = 8;
         /// 单个用户请求内的 prompt 窗口续期上限；每次续期仍受 300k 窗口边界约束。
@@ -991,6 +1069,9 @@ impl AgentLoop {
         // reasoning 吃满输出额度，并在有效正文/工具调用后自动复位。
         let mut response_recovery = ResponseRecovery::default();
         let mut pending_recovery: Option<RecoveryPlan> = None;
+        // 每个写目标只保存首次写入前的内容指纹。最终交付前再读一次，阻止“先改、
+        // 后回滚到原样”仍靠中间态写入计数获得 Verified。
+        let mut artifact_baselines: HashMap<String, String> = HashMap::new();
         let controlled_delivery_turn = goal_executor_enabled()
             && execution.solve_mode != crate::execution::SolveMode::OpenEnded;
         while debt > 0 {
@@ -1506,6 +1587,30 @@ impl AgentLoop {
                 // 并行执行阶段：只有纯 I/O 的 dispatch 并行；结果顺序与 tool_calls
                 // 声明顺序一致，保证 tool 消息与 assistant 宣告一一配对。
                 if !pending.is_empty() {
+                    // 写入前捕获目标产物内容。工具返回的 “updated” 只是自述，只有调用
+                    // 前后指纹真的不同，Runtime 才承认 ChangeApplied。
+                    let artifact_fingerprints = pending
+                        .iter()
+                        .map(|(tc, _, _, _)| {
+                            workspace_root.as_deref().and_then(|root| {
+                                write_target(tc)
+                                    .and_then(|target| artifact_fingerprint(root, target))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    for ((tc, _, _, _), fingerprint) in pending.iter().zip(&artifact_fingerprints) {
+                        if let (Some(root), Some(target), Some(fingerprint)) = (
+                            workspace_root.as_deref(),
+                            write_target(tc),
+                            fingerprint.as_ref(),
+                        ) {
+                            if let Some(key) = artifact_key(root, target) {
+                                artifact_baselines
+                                    .entry(key)
+                                    .or_insert_with(|| fingerprint.clone());
+                            }
+                        }
+                    }
                     let futs = pending.iter().map(|(tc, _sig, _proposal, _action)| {
                         let tools = Arc::clone(&tools);
                         async move {
@@ -1542,7 +1647,31 @@ impl AgentLoop {
                     };
                     match joined {
                         Some(results) => {
-                            for ((tc, sig, proposal, action), res) in pending.iter().zip(results) {
+                            for (index, ((tc, sig, proposal, action), mut res)) in
+                                pending.iter().zip(results).enumerate()
+                            {
+                                let workspace_changed = observed_write_change(
+                                    workspace_root.as_deref(),
+                                    tc,
+                                    artifact_fingerprints[index].as_ref(),
+                                );
+                                let write_observation_failed = res.ok
+                                    && write_target(tc).is_some()
+                                    && workspace_root.is_some()
+                                    && workspace_changed != Some(true);
+                                if write_observation_failed {
+                                    let target = write_target(tc).unwrap_or("目标产物");
+                                    res.ok = false;
+                                    res.content = if workspace_changed == Some(false) {
+                                        format!(
+                                            "[workspace-change gate] 工具返回成功，但 {target} 的调用前后内容指纹完全相同；本次不计为写入，任务仍未完成"
+                                        )
+                                    } else {
+                                        format!(
+                                            "[workspace-change gate] 工具返回成功，但无法在当前工作区安全核验 {target} 的调用前后内容；本次不计为写入，任务仍未完成"
+                                        )
+                                    };
+                                }
                                 sandbox_denial_observed |= res.content.contains("[sandbox denied]");
                                 access_denial_observed |=
                                     res.content.contains("[access-policy denied]");
@@ -1563,17 +1692,34 @@ impl AgentLoop {
                                     let key = search_cache_key(&tc.name, &tc.args);
                                     search_memo().lock().unwrap().insert(key, res.clone());
                                 }
-                                execution.record_tool_result(proposal, res.ok, &res.content);
+                                execution.record_tool_result_observed(
+                                    proposal,
+                                    res.ok,
+                                    &res.content,
+                                    write_observation_failed
+                                        .then_some(false)
+                                        .or(workspace_changed),
+                                );
                                 let evidence_kind = if let Some(action) = action {
-                                    goal_execution.record_action_result(
+                                    goal_execution.record_action_result_observed(
                                         action,
                                         proposal,
                                         res.ok,
                                         &res.content,
+                                        write_observation_failed
+                                            .then_some(false)
+                                            .or(workspace_changed),
+                                        execution.allows_already_satisfied(),
                                     )
                                 } else {
                                     EvidenceKind::NoInformation
                                 };
+                                if evidence_kind == EvidenceKind::VerificationPassed
+                                    && execution.requires_workspace_change()
+                                    && execution.write_operations == 0
+                                {
+                                    baseline_verification_observed = true;
+                                }
                                 if evidence_kind != EvidenceKind::NoInformation {
                                     goal_correction_notified = false;
                                 }
@@ -1689,7 +1835,7 @@ impl AgentLoop {
             let completion_ready = execution.can_complete() && goal_execution.can_conclude();
             if let Some(correction) = unsupported_runtime_claim_correction(
                 &assistant_text,
-                controlled_delivery || execution.write_attempts > 0,
+                execution.requires_workspace_change() || execution.write_attempts > 0,
                 execution.write_operations,
                 completion_ready,
                 sandbox_denial_observed,
@@ -1712,9 +1858,13 @@ impl AgentLoop {
                     "[运行时事实校正] {correction} 不得重复无证据结论；继续调用当前阶段允许的工具，成功写盘并验证后才能声称已落实。"
                 ));
             }
-            let should_recover_empty = empty_response_reason.is_some()
-                && assistant_text.trim().is_empty()
-                && assistant_tools.is_empty();
+            // 截断可能发生在模型先输出一句说明、再生成工具参数之后。只要 Provider
+            // 明确标记本次响应不完整且没有可执行工具，就必须丢弃这次 assistant
+            // 草稿并恢复；不能因那句前言而把半截响应误当成有效结果。
+            let should_recover_empty =
+                empty_response_reason.is_some() && assistant_tools.is_empty();
+            let assistant_returned_text_without_tools =
+                assistant_tools.is_empty() && !assistant_text.trim().is_empty();
             if !assistant_text.trim().is_empty() {
                 last_assistant = assistant_text.clone();
             }
@@ -1803,7 +1953,46 @@ impl AgentLoop {
                 step: steps,
             });
 
-            if should_recover_empty {
+            let text_only_without_progress = controlled_delivery
+                && !hard_stop
+                && !should_recover_empty
+                && !step_had_tools
+                && assistant_returned_text_without_tools
+                && !completion_ready;
+            if text_only_without_progress {
+                let state = controlled_progress_key(&execution, &goal_execution);
+                if text_only_state.as_deref() == Some(state.as_str()) {
+                    text_only_no_progress_streak = text_only_no_progress_streak.saturating_add(1);
+                } else {
+                    text_only_state = Some(state);
+                    text_only_no_progress_streak = 1;
+                }
+                // 已完成零写入基线验证后，下一次正文就是模型的收尾机会，不再额外
+                // 纠正一轮。没有任何工具证据时仍保留一次纠错机会，容忍模型先说明
+                // 再行动的常见模式。
+                let stop_after = if baseline_verification_observed { 1 } else { 2 };
+                if text_only_no_progress_streak >= stop_after {
+                    stalled_without_action = true;
+                    hard_stop = true;
+                    debt = 0;
+                    log.append(SessionEvent::Thinking {
+                        id: log.gen_id(),
+                        text: if baseline_verification_observed {
+                            "基线验证后模型以正文收尾但没有产生代码修改；已停止继续空转。".into()
+                        } else {
+                            "连续两次纯文本回复未推动任务状态；已停止自动复读并保留现有证据。"
+                                .into()
+                        },
+                    });
+                }
+            } else if step_had_tools || completion_ready {
+                text_only_state = None;
+                text_only_no_progress_streak = 0;
+            }
+
+            if stalled_without_action {
+                // 上面的活性守卫已经形成确定终态；不得再由事实校正或目标校正复活。
+            } else if should_recover_empty {
                 // 恢复重试已经重新记账，不能再被“本步没有工具”误判为完成。
             } else if claim_recovery_requested {
                 // 事实校正已经发放一次续跑；本步正文不能作为完成结论继续裁决。
@@ -1916,19 +2105,9 @@ impl AgentLoop {
                     Decision::Degrade => messages.push(Message::user(
                         "[降至栈底] 请交付可验证的子目标：停止扩大探索，把已确认的部分整理为结构化交付（已完成、证据锚点、未完成原因、下一步）。",
                     )),
-                    Decision::Terminate(_)
-                        if controlled_delivery
-                            && !hard_stop
-                            && goal_execution.can_auto_advance() =>
-                    {
-                        if debt == 0 {
-                            messages.push(Message::user(format!(
-                                "[自动推进] 下一步无需用户决策：{} 直接执行并完成验证，不要等待用户回复。",
-                                goal_execution.next_action_hint()
-                            )));
-                            debt += 1;
-                        }
-                    }
+                    // TurnGovernor 是回合唯一终止权威。到达策略栈底且整个窗口零增益
+                    // 后，不能再因为“仍有工具在白名单”把 Terminate 改写成 Continue；
+                    // 工具可用只代表动作合法，不代表继续动作仍有信息价值。
                     Decision::Terminate(_) => break,
                     Decision::Continue => {}
                 }
@@ -1958,6 +2137,15 @@ impl AgentLoop {
             }
         }
 
+        if execution.requires_workspace_change() && !artifact_baselines.is_empty() {
+            let has_net_workspace_change = workspace_root.as_deref().is_some_and(|root| {
+                artifact_baselines.iter().any(|(target, baseline)| {
+                    artifact_fingerprint(root, target).is_some_and(|current| current != *baseline)
+                })
+            });
+            execution.reject_reverted_workspace_delivery(has_net_workspace_change);
+        }
+
         let terminal_reason = goal_execution.actionable_terminal_reason();
         let (raw_outcome, raw_reason) = if provider_error_seen {
             // provider 流错误优先级最高：错误文本非模型回答，绝不可 Verified；
@@ -1980,6 +2168,15 @@ impl AgentLoop {
             (
                 harness_session::DeliveryOutcome::NeedsUserInput,
                 terminal_reason,
+            )
+        } else if stalled_without_action {
+            (
+                harness_session::DeliveryOutcome::PartialDelivery,
+                Some(if baseline_verification_observed {
+                    "baseline_verified_without_change: 验证命令通过，但本轮没有产生代码修改".into()
+                } else {
+                    "stalled_without_action: 模型连续两次只返回文本，任务状态与证据均未推进".into()
+                }),
             )
         } else if !execution.changed_criteria.is_empty() {
             (
@@ -2151,10 +2348,18 @@ fn concise_incomplete_status(
     phase: crate::goal_execution::SolvePhase,
 ) -> String {
     if *outcome == DeliveryOutcome::NeedsUserInput {
-        return workspace_scope_prompt();
+        return "未完成：执行证据不足，无法安全修改。\n下一步：保留现有证据，继续由 Agent 检查相邻调用链或切换定位策略。".into();
     }
     if reason.is_some_and(|text| text.contains("llm provider error")) {
         return "未完成：模型服务在执行过程中返回错误。\n下一步：恢复模型服务后重试本次任务。"
+            .into();
+    }
+    if reason.is_some_and(|text| text.contains("stalled_without_action")) {
+        return "已停止空转：模型连续两次没有执行任何允许动作，任务状态和证据没有变化。\n结论：本轮未形成可验证交付；已保留现有分析与证据，可从当前断点继续。"
+            .into();
+    }
+    if reason.is_some_and(|text| text.contains("baseline_verified_without_change")) {
+        return "已完成基线核验：验证命令通过，但本轮没有产生代码修改。\n结论：现有证据只能证明当前基线可构建或通过测试，不能证明用户要求的变更已交付；已停止继续空转。"
             .into();
     }
     if successful_writes > 0 {
@@ -2747,12 +2952,26 @@ fn compact_for_empty_recovery(
         })
         .filter(|message| seen.insert(message.content.clone()))
         .collect::<Vec<_>>();
+    let truncated_tool_hint = if reason
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("incomplete_tool_arguments")
+    {
+        "上一次工具参数在传输完成前被截断，残缺调用已丢弃且从未执行。不得重发整文件 fs write；修改已有文件时优先用 edit 做最小精确替换。确需创建大型新文件时，先写入最小骨架，再用 edit 分段扩展。"
+    } else {
+        ""
+    };
     compacted.push(Message::system(format!(
-        "[响应恢复 {attempt}/{max_attempts}·最小快照]\nfinish_reason={reason}; next_output_cap={next_output_cap}\n{checkpoint}\n{goal_state}\n旧对话与工具原文已移除，运行时记录的证据和阶段仍有效。禁止重新规划、重复搜索或扩大范围。"
+        "[响应恢复 {attempt}/{max_attempts}·最小快照]\nfinish_reason={reason}; next_output_cap={next_output_cap}\n{checkpoint}\n{goal_state}\n旧对话与工具原文已移除，运行时记录的证据和阶段仍有效。禁止重新规划、重复搜索或扩大范围。{truncated_tool_hint}"
     )));
-    compacted.push(Message::user(
-        "继续当前唯一下一动作：需要执行时只返回一个当前阶段允许的工具调用；证据已经充分时给出简短、可验证的最终答复。不得只输出思考过程。",
-    ));
+    compacted.push(Message::user(format!(
+        "继续当前唯一下一动作：需要执行时只返回一个当前阶段允许的工具调用；证据已经充分时给出简短、可验证的最终答复。不得只输出思考过程。{}",
+        if truncated_tool_hint.is_empty() {
+            ""
+        } else {
+            " 本次必须缩小工具参数，禁止再次发送整文件内容。"
+        }
+    )));
     compacted
 }
 
@@ -2845,6 +3064,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 只允许使用提供给你的工具：fs / edit / shell / search / plan / delegate。\n\
 - 定位代码/文本位置一律优先用 search（一次调用返回文件:行号:内容）；严禁用 shell findstr/dir/grep 全仓扫描或编写临时扫描脚本来找代码。\n\
 - 严禁在正文里输出任何形式的工具调用标记（DSML、XML invoke、tool_calls 文本等）；调用工具必须走 function calling 通道。\n\
+- 修改已有文件时优先使用 edit 做最小精确替换，禁止用 fs write 重发整个大型文件；确需创建大型新文件时先写最小骨架，再用 edit 分段扩展，确保单次工具参数完整。\n\
 - 问候、提问、普通对话直接回答，不使用工具。\n\
 - 不得虚构沙箱、权限、网络或工具失败原因；只有对应 ToolResult 明确返回时才能引用。execution gate、old_text 失配和 sandbox denied 是不同故障，必须按原始标签准确陈述。\n\
 - 变更任务只有成功执行写工具并获得验证后才能说“已落实/已修改/已写入”；只给方案、代码块或修改建议不等于落盘。\n\
@@ -2861,6 +3081,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 纯界面/配置类任务：search 定位到少数目标文件后集中批量编辑，全部改完再做一次构建验证，不要每改一处就编译一次。\n\
 - 已读过的文件不要重复读取；成功的同一命令/同一参数不得原样重试，失败调用只允许一次带明确原因的定向重试。search 有命中后，下一次读取必须使用命中的路径和最小行区间；下一次搜索必须缩小目录或验证不同假设。\n\
 - 探索（读取/搜索/列目录）应尽快收敛到写操作与验证；交付目标达成后立即停止，不做重复确认与打磨。\n\
+- 技术定位是 Agent 的责任：一旦已经搜索或读取项目文件，不得再要求用户选择项目、分支或代码入口；必须沿现有锚点检查相邻调用链、切换有限假设，或在硬预算耗尽后准确报告尚缺的技术证据。只有会改变产品语义、兼容性或数据边界的决策才询问用户。\n\
 - 步数预算有限且续期次数封顶：收到检查点/收尾提示时必须服从，基于现有证据交付总结，不要继续扩张探索。\n\
 - shell 命令已在工作区根目录执行：不要重复 cd 到工作区，直接用相对路径。\n\
 - 编译验证按 [项目事实] 给出的命令模板一次到位；命令失败后先读全量错误文本再换路一次，禁止用试错方式探索环境（manifest 位置、工具链、目录结构）。\n\
@@ -2876,6 +3097,24 @@ fn execution_progress_units(execution: &ExecutionState) -> usize {
         .successful_tool_results
         .saturating_add(execution.write_operations)
         .saturating_add(execution.satisfied_criteria.len())
+}
+
+/// 纯文本活性守卫使用的受控状态键。它只包含 Runtime 可验证的进展，不包含模型
+/// 措辞；相同结论即使换一种说法，只要状态、工具面和证据都没变，仍会被识别为空转。
+fn controlled_progress_key(execution: &ExecutionState, goal_execution: &GoalExecution) -> String {
+    let active = goal_execution
+        .active_item()
+        .map(|item| format!("{}:{:?}:{}", item.id, item.state, item.read_evidence))
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        goal_execution.phase_name(),
+        active,
+        goal_execution.allowed_tools().join(","),
+        execution_progress_units(execution),
+        execution.write_attempts,
+        execution.failed_tool_results,
+    )
 }
 
 /// 按求解规模给单次模型请求设成本上限。它只收紧当前请求，不改变用户的全局配置；
@@ -3310,7 +3549,7 @@ mod tests {
     }
 
     #[test]
-    fn clarification_is_a_short_choice_and_hides_internal_diagnostics() {
+    fn terminal_needs_input_does_not_ask_the_user_to_locate_code() {
         let status = concise_incomplete_status(
             &DeliveryOutcome::NeedsUserInput,
             Some("完成用户目标（门禁校正：读取 model_catalog.rs 不在候选文件中）"),
@@ -3318,12 +3557,19 @@ mod tests {
             0,
             crate::goal_execution::SolvePhase::Locate,
         );
-        assert_eq!(status, workspace_scope_prompt());
-        assert!(status.contains("1. "));
-        assert!(status.contains("2. "));
-        assert!(status.contains("3. "));
-        for internal in ["门禁", "候选文件", "model_catalog.rs", "完成用户目标"] {
-            assert!(!status.contains(internal));
+        assert!(status.contains("继续由 Agent"));
+        for forbidden in [
+            "请选择一种方式回复",
+            "请告诉我名称",
+            "1. ",
+            "2. ",
+            "3. ",
+            "门禁",
+            "候选文件",
+            "model_catalog.rs",
+            "完成用户目标",
+        ] {
+            assert!(!status.contains(forbidden), "{status}");
         }
     }
 
@@ -3492,6 +3738,32 @@ mod tests {
         )
         .expect("只有部分写入、验收未闭环时不得宣布完成");
         assert!(correction.contains("全部验收项尚未完成"), "{correction}");
+    }
+
+    #[test]
+    fn artifact_fingerprint_detects_real_change_and_rejects_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "harness-artifact-fingerprint-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/lib.rs");
+        std::fs::write(&file, "pub fn before() {}\n").unwrap();
+        let before = artifact_fingerprint(&root, "src/lib.rs").unwrap();
+
+        std::fs::write(&file, "pub fn after() {}\n").unwrap();
+        let after = artifact_fingerprint(&root, "src/lib.rs").unwrap();
+
+        assert_ne!(before, after);
+        assert_eq!(
+            artifact_key(&root, "src/lib.rs"),
+            artifact_key(&root, "src\\lib.rs")
+        );
+        assert!(artifact_fingerprint(&root, "../outside.rs").is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

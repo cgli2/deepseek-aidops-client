@@ -201,6 +201,12 @@ impl GlobalBudgetController {
         self.total_tokens_remaining
     }
 
+    /// Start a new task wave with a fresh global token allowance while keeping
+    /// the provider buckets (including any active 429 backoff) intact.
+    pub fn reset_total_tokens(&mut self, total_tokens: u64) {
+        self.total_tokens_remaining = total_tokens;
+    }
+
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), RateLimitError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -273,6 +279,18 @@ mod tests {
             Admission::GracefulExhaustion
         );
         assert_eq!(value.total_tokens_remaining(), 10);
+    }
+
+    #[test]
+    fn total_budget_can_start_a_new_task_wave_without_resetting_provider_state() {
+        let mut value = controller(10);
+        assert_eq!(value.acquire("primary", 10, 0).unwrap(), Admission::Granted);
+        assert_eq!(value.total_tokens_remaining(), 0);
+
+        value.reset_total_tokens(25);
+
+        assert_eq!(value.total_tokens_remaining(), 25);
+        assert_eq!(value.acquire("primary", 1, 0).unwrap(), Admission::Granted);
     }
 
     #[test]

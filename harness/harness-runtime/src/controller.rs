@@ -14,6 +14,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use crate::council::COUNCIL_PREFIX;
+use crate::long_horizon::configured_turn_timeout;
 use crate::{run_durable_agent_turn, run_durable_council_turn};
 
 #[derive(Clone)]
@@ -228,10 +229,7 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
                 queue.cancellation = Some(cancellation.clone());
             }
         }
-        let timeout_secs = std::env::var("HARNESS_TURN_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1800);
+        let turn_timeout = configured_turn_timeout();
         let is_council = input.text.starts_with(COUNCIL_PREFIX);
         let clean_text = input
             .text
@@ -246,12 +244,13 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
             format!("{clean_text}{note}")
         };
         let outcome = std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            let runner_cancellation = cancellation.clone();
+            let turn = async {
                 if is_council {
                     run_durable_council_turn(
                         &ctx,
                         format!("{clean_text}{}", attachment_note(&attachments)),
-                        cancellation,
+                        runner_cancellation,
                     )
                     .await
                 } else {
@@ -261,17 +260,24 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
                             text: run_text,
                             attachments,
                         },
-                        cancellation,
+                        runner_cancellation,
                     )
                     .await
                 }
-            })
-            .await
-            .map_err(|_| {
-                harness_core::error::Error::Runtime(format!(
-                    "回合超过 {timeout_secs} 秒未完成，已强制中止以避免无限等待"
-                ))
-            })?
+            };
+            match turn_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, turn).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        cancellation.cancel();
+                        Err(harness_core::error::Error::Runtime(format!(
+                            "回合超过显式配置的 {} 秒截止时间，已中止",
+                            timeout.as_secs()
+                        )))
+                    }
+                },
+                None => turn.await,
+            }
         })
         .catch_unwind()
         .await;

@@ -536,6 +536,21 @@ impl ExecutionState {
     }
 
     pub fn record_tool_result(&mut self, proposal: &ActionProposal, ok: bool, summary: &str) {
+        self.record_tool_result_observed(proposal, ok, summary, None);
+    }
+
+    /// 记录工具结果，并在运行时能够观察目标文件时以真实的前后内容差异覆盖工具自述。
+    ///
+    /// `workspace_changed = Some(false)` 表示工具虽然返回成功，但目标产物的内容指纹
+    /// 没有变化。它不能增加写入计数，也不能让后续绿色构建验证旧基线。`None` 仅用于
+    /// 没有 Workspace 的兼容调用与单元测试，保留原有工具协议语义。
+    pub fn record_tool_result_observed(
+        &mut self,
+        proposal: &ActionProposal,
+        ok: bool,
+        summary: &str,
+        workspace_changed: Option<bool>,
+    ) {
         // 搜索服务把“无命中”作为成功返回（工具本身正常执行），但它对目标定位
         // 是明确的负证据。若把它当作成功，状态机会错误进入 Inspect，随后模型便会
         // 用不同关键词反复搜索直至预算耗尽。
@@ -553,7 +568,7 @@ impl ExecutionState {
         if effective_ok {
             self.successful_tool_results += 1;
             // 归一化签名里 edit 工具以 "edit:" 开头；fs 写入的 JSON 参数含 "op":"write"。
-            if is_write && substantive_write {
+            if is_write && substantive_write && workspace_changed.unwrap_or(true) {
                 self.write_operations += 1;
                 self.changed_criteria
                     .extend(proposal.supports.iter().cloned());
@@ -604,6 +619,9 @@ impl ExecutionState {
             self.verification_evidence
                 .insert(criterion.id.clone(), evidence);
             self.satisfied_criteria.insert(criterion.id.clone());
+            // 已由上一执行窗口的 Runtime 验证过，续跑时可作为真实交付检查点恢复；
+            // 否则新增的“必须有变更”门禁会要求已经完成的面再次制造无意义改动。
+            self.changed_criteria.insert(criterion.id.clone());
         }
     }
 
@@ -617,6 +635,14 @@ impl ExecutionState {
             .acceptance_criteria
             .iter()
             .any(|criterion| criterion.id == criterion_id)
+        {
+            return;
+        }
+        // “实施/开发/修复”类任务必须先有实际文件变化。仅从现有文件读到几个目标词，
+        // 不能把一份设计文档要求的完整实现盖章为已交付。
+        if self.requires_workspace_change()
+            && self.write_operations == 0
+            && self.changed_criteria.is_empty()
         {
             return;
         }
@@ -741,12 +767,46 @@ impl ExecutionState {
             || self.write_attempts > 0
     }
 
+    /// 用户明确要求实现、开发或修改时，成功必须包含 Runtime 观察到的工作区变化。
+    /// 精确的幂等变换（例如“把版本号改为 0.2.2”且已经是该值）仍允许走
+    /// `AlreadySatisfied`，因为它有机器可比较的唯一终态；开放式实现要求没有这条捷径。
+    pub fn requires_workspace_change(&self) -> bool {
+        matches!(
+            self.strategy,
+            StrategyKind::Transformative | StrategyKind::Generative
+        ) && !self.allows_already_satisfied()
+    }
+
+    pub fn allows_already_satisfied(&self) -> bool {
+        IntentProfile::compile(&self.contract.objective).has_transformation_contract
+    }
+
+    /// 最终交付前用首次写入基线复核净变化。若所有目标文件都被改回原样，之前的
+    /// 写入和验证只能证明一个已撤销的中间态，必须从完成证据中全部剔除。
+    pub fn reject_reverted_workspace_delivery(&mut self, has_net_workspace_change: bool) {
+        if self.requires_workspace_change()
+            && self.write_operations > 0
+            && !has_net_workspace_change
+        {
+            self.write_operations = 0;
+            self.changed_criteria.clear();
+            self.satisfied_criteria.clear();
+            self.verification_evidence.clear();
+        }
+    }
+
     pub fn can_complete(&self) -> bool {
         if matches!(
             self.strategy,
             StrategyKind::Investigative | StrategyKind::Comparative
         ) {
             return !self.evidence.is_empty();
+        }
+        if self.requires_workspace_change()
+            && self.write_operations == 0
+            && self.changed_criteria.is_empty()
+        {
+            return false;
         }
         !self.requires_verification()
             || (!self.verification_evidence.is_empty()
@@ -1425,6 +1485,26 @@ impl DomainPolicy for GeneralDomainPolicy {
     fn select_strategy(&self, contract: &TaskContract) -> StrategyKind {
         let text = contract.objective.as_str();
         let intent = IntentProfile::compile(text);
+        // 变更请求优先于同一句中的“测试/验证”。“按文档开发并测试”首先是开发任务，
+        // 不能因为包含测试二字退化成允许零改动的纯 Verification。
+        let requests_change = matches!(
+            intent.kind,
+            IntentKind::AtomicRegression | IntentKind::ScopedChange
+        ) || [
+            "修改", "修复", "重构", "更新", "改进", "实现", "实施", "开发", "落地", "编码", "改造",
+            "调整", "拆分", "迁移", "新增", "添加", "增加", "展示", "显示", "隐藏", "移除", "替换",
+            "去掉", "加上",
+        ]
+        .iter()
+        .any(|word| text.contains(word));
+        let explicit_verification_only = ["运行测试", "执行测试", "运行编译", "执行编译"]
+            .iter()
+            .any(|prefix| text.trim_start().starts_with(prefix))
+            && ![
+                "修复", "实现", "实施", "开发", "落地", "编码", "改造", "新增", "添加", "增加",
+            ]
+            .iter()
+            .any(|word| text.contains(word));
         if intent.kind == IntentKind::Investigation {
             StrategyKind::Investigative
         } else if ["比较", "选型", "对比"]
@@ -1432,6 +1512,10 @@ impl DomainPolicy for GeneralDomainPolicy {
             .any(|word| text.contains(word))
         {
             StrategyKind::Comparative
+        } else if explicit_verification_only {
+            StrategyKind::Verification
+        } else if requests_change {
+            StrategyKind::Transformative
         // “检查 / 审查 / 确认”常是普通提问或代码探索的对象，不能仅凭一个
         // 词就收窄成只能运行 shell 的验证阶段。只有明确的验证动作才进入
         // Verification；其余请求保留完整的探索工具面。
@@ -1440,17 +1524,6 @@ impl DomainPolicy for GeneralDomainPolicy {
             .any(|word| text.contains(word))
         {
             StrategyKind::Verification
-        } else if matches!(
-            intent.kind,
-            IntentKind::AtomicRegression | IntentKind::ScopedChange
-        ) || [
-            "修改", "修复", "重构", "更新", "改进", "实现", "改造", "调整", "拆分", "迁移", "新增",
-            "添加", "增加", "展示", "显示", "隐藏", "移除", "替换", "去掉", "加上",
-        ]
-        .iter()
-        .any(|word| text.contains(word))
-        {
-            StrategyKind::Transformative
         } else if ["创建", "生成", "编写", "设计"]
             .iter()
             .any(|word| text.contains(word))
@@ -1502,6 +1575,107 @@ mod tests {
             SolvePlan::for_contract(&contract, strategy).mode,
             SolveMode::ScopedDelivery
         );
+    }
+
+    #[test]
+    fn document_implementation_is_a_change_task_even_when_it_also_mentions_tests() {
+        let contract = TaskContract::from_input(
+            "按 docs/LOCAL_KNOWLEDGE_BASE_DESIGN.md 实施开发，补齐实现并增加测试",
+        );
+        let strategy = GeneralDomainPolicy.select_strategy(&contract);
+        assert_eq!(strategy, StrategyKind::Transformative);
+
+        let state = ExecutionState::new(contract, strategy);
+        assert!(state.requires_workspace_change());
+        assert!(!state.allows_already_satisfied());
+        assert!(!state.can_complete());
+    }
+
+    #[test]
+    fn successful_noop_write_cannot_unlock_implementation_delivery() {
+        let contract = TaskContract::from_input("按 docs/DESIGN.md 实施开发");
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: concat!(
+                "edit:{\"path\":\"src/lib.rs\",",
+                "\"old_text\":\"fn old() {}\",",
+                "\"new_text\":\"fn new() {}\"}"
+            )
+            .into(),
+            question: "按设计实现".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let verify = ActionProposal {
+            signature: "shell:{\"command\":\"cargo test\"}".into(),
+            question: "运行测试".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        state.record_tool_result_observed(&edit, true, "updated src/lib.rs", Some(false));
+        state.record_static_verification("user-objective", "src/lib.rs 已含设计中的名词");
+        state.record_tool_result(&verify, true, "test result: ok");
+
+        assert_eq!(state.write_attempts, 1);
+        assert_eq!(state.write_operations, 0);
+        assert!(state.verification_evidence.is_empty());
+        assert!(!state.can_complete());
+        let report = state.delivery_report(DeliveryOutcome::Verified, None);
+        assert_eq!(report.outcome, DeliveryOutcome::PartialDelivery);
+        assert!(!report.criteria[0].satisfied);
+    }
+
+    #[test]
+    fn observed_file_delta_unlocks_implementation_after_verification() {
+        let contract = TaskContract::from_input("按 docs/DESIGN.md 实施开发");
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"src/lib.rs\"}".into(),
+            question: "按设计实现".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let verify = ActionProposal {
+            signature: "shell:{\"command\":\"cargo test\"}".into(),
+            question: "运行测试".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        state.record_tool_result_observed(&edit, true, "updated src/lib.rs", Some(true));
+        state.record_tool_result(&verify, true, "test result: ok");
+
+        assert_eq!(state.write_operations, 1);
+        assert!(state.can_complete());
+    }
+
+    #[test]
+    fn reverted_workspace_delta_revokes_completion_evidence() {
+        let contract = TaskContract::from_input("按 docs/DESIGN.md 实施开发");
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"src/lib.rs\"}".into(),
+            question: "按设计实现".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let verify = ActionProposal {
+            signature: "shell:{\"command\":\"cargo test\"}".into(),
+            question: "运行测试".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result_observed(&edit, true, "updated", Some(true));
+        state.record_tool_result(&verify, true, "ok");
+        assert!(state.can_complete());
+
+        state.reject_reverted_workspace_delivery(false);
+
+        assert_eq!(state.write_operations, 0);
+        assert!(state.changed_criteria.is_empty());
+        assert!(state.verification_evidence.is_empty());
+        assert!(!state.can_complete());
     }
 
     #[test]

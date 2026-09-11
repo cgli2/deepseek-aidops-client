@@ -284,6 +284,27 @@ fn inner_stream_chat(
         let tool_calls = match finish_stream_tool_calls(tools) {
             Ok(calls) => calls,
             Err(error) => {
+                if let Some(reason) = recoverable_tool_argument_reason(
+                    finish_reason.as_deref(),
+                    &error,
+                ) {
+                    // 工具参数可能在任意字符串/转义符中间被输出上限截断。残片绝不能
+                    // 作为 ToolCall 下发；把它转换成运行时可识别的空响应，由有界恢复
+                    // 提高输出预算并生成更小的编辑调用。即使兼容网关误报
+                    // finish_reason=tool_calls，serde 的 EOF 仍是可恢复的截断证据。
+                    if let Some(usage) = last_usage {
+                        yield Ok(Chunk {
+                            usage: Some(usage),
+                            ..Default::default()
+                        });
+                    }
+                    yield Ok(Chunk {
+                        empty_response: true,
+                        finish_reason: Some(reason),
+                        ..Default::default()
+                    });
+                    return;
+                }
                 yield Err(Error::Llm(format!("{provider_label} 工具调用协议错误: {error}")));
                 return;
             }
@@ -403,19 +424,70 @@ fn json_fragment(value: &Value) -> Option<String> {
     }
 }
 
-fn finish_stream_tool_calls(tools: StreamTools) -> std::result::Result<Vec<ToolCall>, String> {
+#[derive(Debug)]
+struct StreamToolCallError {
+    message: String,
+    is_eof: bool,
+}
+
+impl std::fmt::Display for StreamToolCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl StreamToolCallError {
+    fn protocol(message: String) -> Self {
+        Self {
+            message,
+            is_eof: false,
+        }
+    }
+
+    fn invalid_arguments(name: &str, error: serde_json::Error) -> Self {
+        Self {
+            message: format!("工具 {name} 的 arguments 不是完整 JSON：{error}"),
+            is_eof: error.is_eof(),
+        }
+    }
+}
+
+/// 只有输出额度耗尽或 JSON 在输入末尾尚未闭合才允许自动恢复。其它语法错误继续
+/// fail-closed，避免把真正损坏或不兼容的调用反复重试，更不能执行部分参数。
+fn recoverable_tool_argument_reason(
+    finish_reason: Option<&str>,
+    error: &StreamToolCallError,
+) -> Option<String> {
+    if matches!(finish_reason, Some("length" | "max_tokens")) {
+        Some("length".into())
+    } else if error.is_eof {
+        Some(format!("incomplete_tool_arguments: {}", error.message))
+    } else {
+        None
+    }
+}
+
+fn parse_tool_arguments(name: &str, arguments: &str) -> Result<Value, StreamToolCallError> {
+    if arguments.trim().is_empty() {
+        Ok(json!({}))
+    } else {
+        serde_json::from_str(arguments)
+            .map_err(|error| StreamToolCallError::invalid_arguments(name, error))
+    }
+}
+
+fn finish_stream_tool_calls(
+    tools: StreamTools,
+) -> std::result::Result<Vec<ToolCall>, StreamToolCallError> {
     tools
         .into_values()
         .map(|(id, name, arguments)| {
             if name.trim().is_empty() {
-                return Err(format!("工具 {id} 缺少 function.name"));
+                return Err(StreamToolCallError::protocol(format!(
+                    "工具 {id} 缺少 function.name"
+                )));
             }
-            let args = if arguments.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&arguments)
-                    .map_err(|error| format!("工具 {name} 的 arguments 不是完整 JSON：{error}"))?
-            };
+            let args = parse_tool_arguments(&name, &arguments)?;
             Ok(ToolCall { id, name, args })
         })
         .collect()
@@ -459,21 +531,38 @@ fn complete_response_chunks(response: &Value) -> std::result::Result<Vec<Chunk>,
             });
         }
     }
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|call| {
-            let name = call.pointer("/function/name").and_then(Value::as_str)?;
+    let mut tool_calls = Vec::new();
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let Some(name) = call.pointer("/function/name").and_then(Value::as_str) else {
+                continue;
+            };
             if name.is_empty() {
-                return None;
+                continue;
             }
             let raw_args = call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            Some(ToolCall {
+            let args = match parse_tool_arguments(name, raw_args) {
+                Ok(args) => args,
+                Err(error) => {
+                    if let Some(reason) =
+                        recoverable_tool_argument_reason(finish_reason.as_deref(), &error)
+                    {
+                        // 丢弃整组调用，防止同一响应中的半成品或无参数调用被执行。
+                        tool_calls.clear();
+                        chunks.push(Chunk {
+                            empty_response: true,
+                            finish_reason: Some(reason),
+                            ..Default::default()
+                        });
+                        break;
+                    }
+                    return Err(error.to_string());
+                }
+            };
+            tool_calls.push(ToolCall {
                 id: call
                     .get("id")
                     .and_then(Value::as_str)
@@ -481,10 +570,10 @@ fn complete_response_chunks(response: &Value) -> std::result::Result<Vec<Chunk>,
                     .unwrap_or("call")
                     .to_string(),
                 name: name.to_string(),
-                args: serde_json::from_str(raw_args).unwrap_or_else(|_| json!({})),
-            })
-        })
-        .collect::<Vec<_>>();
+                args,
+            });
+        }
+    }
     if !tool_calls.is_empty() {
         chunks.push(Chunk {
             tool_calls,
@@ -898,7 +987,70 @@ mod tests {
         assert!(
             finish_stream_tool_calls(tools)
                 .unwrap_err()
+                .to_string()
                 .contains("不是完整 JSON")
         );
+    }
+
+    #[test]
+    fn eof_in_stream_tool_arguments_is_recoverable_but_never_executable() {
+        let mut tools = StreamTools::new();
+        collect_stream_tool_fragments(
+            &json!({"choices":[{"delta":{"tool_calls":[{
+                "index": 0,
+                "function":{
+                    "name":"fs",
+                    "arguments":"{\"op\":\"write\",\"content\":\"unterminated"
+                }
+            }]}}]}),
+            &mut tools,
+        );
+
+        let error = finish_stream_tool_calls(tools).unwrap_err();
+        assert!(error.is_eof);
+        assert_eq!(
+            recoverable_tool_argument_reason(Some("tool_calls"), &error)
+                .as_deref()
+                .map(|reason| reason.split(':').next().unwrap_or(reason)),
+            Some("incomplete_tool_arguments")
+        );
+    }
+
+    #[test]
+    fn length_finish_recovers_even_when_gateway_reports_a_non_eof_parse_error() {
+        let error = StreamToolCallError::protocol("broken arguments".into());
+        assert_eq!(
+            recoverable_tool_argument_reason(Some("length"), &error).as_deref(),
+            Some("length")
+        );
+        assert!(recoverable_tool_argument_reason(Some("tool_calls"), &error).is_none());
+    }
+
+    #[test]
+    fn complete_response_never_replaces_malformed_tool_arguments_with_empty_object() {
+        let response = json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "准备写入",
+                    "tool_calls": [{
+                        "id": "call-fs",
+                        "function": {
+                            "name": "fs",
+                            "arguments": "{\"op\":\"write\",\"content\":\"unterminated"
+                        }
+                    }]
+                }
+            }]
+        });
+        let chunks = complete_response_chunks(&response).unwrap();
+        assert!(chunks.iter().all(|chunk| chunk.tool_calls.is_empty()));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.empty_response
+                && chunk
+                    .finish_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("incomplete_tool_arguments:"))
+        }));
     }
 }

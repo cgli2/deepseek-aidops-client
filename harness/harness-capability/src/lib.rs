@@ -12,14 +12,19 @@
 
 pub mod assets;
 pub mod compaction;
+/// 会话蒸馏器（Phase 2）：SessionEvent 流 → L1 会话摘要 / 候选事实队列 / 每日开发日志。
+pub mod distill;
 pub mod editor;
 pub mod fs;
+pub mod frontmatter;
 pub mod git;
 pub mod hook;
 /// 资产索引器：把工作区静态资产（SKILL.md / *.md / 源码）自动沉淀进四类资产服务。
 pub mod index;
 pub mod lsp;
 pub mod memory;
+/// 审核晋升（Phase 3）：review/ 候选事实经质量门禁（来源/可独立理解/置信度/去重）晋升为 facts/ 的 L2 正式事实。
+pub mod promotion;
 pub mod search;
 pub mod shell;
 pub mod subagent;

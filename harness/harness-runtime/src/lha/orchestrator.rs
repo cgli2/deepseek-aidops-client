@@ -10,12 +10,12 @@ use harness_session::{DeliveryOutcome, DeliveryReport};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Admission, ArtifactRef, ArtifactVault, ArtifactVersion, Blackboard, BlackboardError,
-    BlackboardEvent, CheckpointKind, CheckpointState, ContractDiff, ContractError, ContractLock,
-    DagError, DecisionCheckpoint, DecisionLog, DurableDag, EffectJournal, EffectJournalError,
-    EffectProposal, FactMatrix, GlobalBudgetController, HitlConfirmation, HitlError, LeaseWatchdog,
-    MergeDecision, PrepareOutcome, ProviderLimit, QualityGate, RateLimitError, TaskRecord,
-    TaskSpec, TaskStatus, VaultError, WatchdogEvent,
+    Admission, ArtifactVault, ArtifactVersion, Blackboard, BlackboardError, BlackboardEvent,
+    CheckpointKind, CheckpointState, ContractDiff, ContractError, ContractLock, DagError,
+    DecisionCheckpoint, DecisionLog, DurableDag, EffectJournal, EffectJournalError, EffectProposal,
+    FactMatrix, GlobalBudgetController, HitlConfirmation, HitlError, LeaseWatchdog, MergeDecision,
+    PrepareOutcome, ProviderLimit, QualityGate, RateLimitError, TaskRecord, TaskSpec, TaskStatus,
+    VaultError, WatchdogEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +98,7 @@ pub struct LongHorizonRuntime {
     dag: Arc<Mutex<DurableDag>>,
     vault: ArtifactVault,
     budget: Mutex<GlobalBudgetController>,
+    total_token_budget: u64,
     decisions: Mutex<DecisionLog>,
     effects: Mutex<EffectJournal>,
     blackboard: Mutex<Blackboard>,
@@ -122,6 +123,7 @@ impl LongHorizonRuntime {
             )?)),
             vault: ArtifactVault::open(control_root.join("vault"))?,
             budget: Mutex::new(budget),
+            total_token_budget,
             decisions: Mutex::new(DecisionLog::open(control_root.join("decisions.jsonl"))?),
             effects: Mutex::new(EffectJournal::open(control_root.join("effects.jsonl"))?),
             blackboard: Mutex::new(Blackboard::open(control_root.join("blackboard.jsonl"))?),
@@ -150,6 +152,28 @@ impl LongHorizonRuntime {
             .dag
             .lock()
             .map_err(|_| OrchestratorError::Poisoned("dag"))?;
+        // The persisted total is a safety budget for one wave of concurrently
+        // active work, not a lifetime quota for the workspace. Once the prior
+        // wave is fully settled, replenish it before admitting the next task.
+        // Keeping the DAG lock across the reset and create makes two concurrent
+        // submissions join the same wave instead of both resetting the budget.
+        let starts_new_wave = dag.tasks().values().all(|record| {
+            matches!(
+                record.status,
+                TaskStatus::Succeeded { .. }
+                    | TaskStatus::Failed { .. }
+                    | TaskStatus::Cancelled { .. }
+                    | TaskStatus::BudgetExhausted { .. }
+            )
+        });
+        if starts_new_wave {
+            let mut budget = self
+                .budget
+                .lock()
+                .map_err(|_| OrchestratorError::Poisoned("budget"))?;
+            budget.reset_total_tokens(self.total_token_budget);
+            budget.save(self.control_root.join("budget.json"))?;
+        }
         dag.create_task(spec)?;
         dag.refresh_ready()?;
         drop(dag);
@@ -261,10 +285,22 @@ impl LongHorizonRuntime {
         worker_id: &str,
         now_ms: u64,
     ) -> Result<(), OrchestratorError> {
-        self.dag
+        let mut dag = self
+            .dag
             .lock()
-            .map_err(|_| OrchestratorError::Poisoned("dag"))?
-            .fail(task_id, reason)?;
+            .map_err(|_| OrchestratorError::Poisoned("dag"))?;
+        // Budget admission already persists the partial report and transitions
+        // the task to its terminal state. Generic provider-error cleanup runs
+        // afterwards, so treating that cleanup as an idempotent no-op preserves
+        // the authoritative terminal state and avoids an invalid DAG transition.
+        if dag
+            .task(task_id)
+            .is_some_and(|record| matches!(record.status, TaskStatus::BudgetExhausted { .. }))
+        {
+            return Ok(());
+        }
+        dag.fail(task_id, reason)?;
+        drop(dag);
         self.publish_event(task_id, "TaskFailed", None, reason, worker_id, now_ms)
     }
 
@@ -670,21 +706,25 @@ impl LongHorizonRuntime {
         task_id: &str,
         reason: &str,
         now_ms: u64,
-    ) -> Result<ArtifactRef, OrchestratorError> {
-        let report = {
-            let dag = self
-                .dag
-                .lock()
-                .map_err(|_| OrchestratorError::Poisoned("dag"))?;
-            let task = dag
-                .task(task_id)
-                .ok_or_else(|| DagError::UnknownTask(task_id.into()))?;
-            PartialDeliveryReport {
-                task_id: task_id.into(),
-                reason: reason.into(),
-                checkpoint_id: task.checkpoint_id.clone(),
-                progress_pct: task.progress_pct.clamp(0.0, 100.0) as u8,
-            }
+    ) -> Result<(), OrchestratorError> {
+        // Keep the DAG lock through publication and transition so concurrent
+        // LLM requests cannot produce duplicate reports or race to terminalize
+        // the same task twice.
+        let mut dag = self
+            .dag
+            .lock()
+            .map_err(|_| OrchestratorError::Poisoned("dag"))?;
+        let task = dag
+            .task(task_id)
+            .ok_or_else(|| DagError::UnknownTask(task_id.into()))?;
+        if matches!(task.status, TaskStatus::BudgetExhausted { .. }) {
+            return Ok(());
+        };
+        let report = PartialDeliveryReport {
+            task_id: task_id.into(),
+            reason: reason.into(),
+            checkpoint_id: task.checkpoint_id.clone(),
+            progress_pct: task.progress_pct.clamp(0.0, 100.0) as u8,
         };
         let artifact = self.vault.put_bytes(&serde_json::to_vec_pretty(&report)?)?;
         let key = format!("reports/{task_id}");
@@ -702,10 +742,8 @@ impl LongHorizonRuntime {
             BTreeMap::new(),
             now_ms,
         )?;
-        self.dag
-            .lock()
-            .map_err(|_| OrchestratorError::Poisoned("dag"))?
-            .exhaust_budget(task_id, &format!("vault://blake3/{}", artifact.blake3))?;
+        dag.exhaust_budget(task_id, &format!("vault://blake3/{}", artifact.blake3))?;
+        drop(dag);
         self.publish_event(
             task_id,
             "TaskBudgetExhausted",
@@ -714,7 +752,7 @@ impl LongHorizonRuntime {
             "budget-controller",
             now_ms,
         )?;
-        Ok(artifact)
+        Ok(())
     }
 
     fn publish_event(

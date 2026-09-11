@@ -33,7 +33,7 @@ pub struct LongHorizonManager {
     total_token_budget: u64,
     output_token_reserve: u64,
     lease_ttl: Duration,
-    task_timeout: Duration,
+    task_timeout: Option<Duration>,
     max_retries: u32,
     provider_limit: ProviderLimit,
     runtimes: Mutex<BTreeMap<PathBuf, Arc<ManagedRuntime>>>,
@@ -51,7 +51,7 @@ impl LongHorizonManager {
             total_token_budget: env_u64("HARNESS_LHA_TOTAL_TOKENS", 10_000_000),
             output_token_reserve: env_u64("HARNESS_LHA_TURN_TOKENS", 4_096),
             lease_ttl: Duration::from_secs(env_u64("HARNESS_LHA_LEASE_SECS", 180).max(3)),
-            task_timeout: Duration::from_secs(env_u64("HARNESS_TURN_TIMEOUT_SECS", 1_800).max(1)),
+            task_timeout: configured_turn_timeout(),
             max_retries: env_u64("HARNESS_LHA_MAX_RETRIES", 2).min(u64::from(u32::MAX)) as u32,
             provider_limit: ProviderLimit {
                 requests_per_minute: env_u64("HARNESS_LHA_RPM", 60).max(1),
@@ -273,7 +273,10 @@ async fn run_durable_turn(
             }),
             invariants: vec!["delivery.verified".into()],
             expected_output_schema: json!({"type": "DeliveryReport"}),
-            timeout_seconds: manager.task_timeout.as_secs(),
+            // Zero is the durable-schema representation for "no deadline".
+            // The interactive controller only enforces explicitly configured
+            // positive timeouts; lease heartbeats still detect dead workers.
+            timeout_seconds: manager.task_timeout.map_or(0, |timeout| timeout.as_secs()),
             max_retries: manager.max_retries,
         })
         .map_err(runtime_error)?;
@@ -463,6 +466,17 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+pub(crate) fn configured_turn_timeout() -> Option<Duration> {
+    let raw = std::env::var("HARNESS_TURN_TIMEOUT_SECS").ok();
+    parse_turn_timeout(raw.as_deref())
+}
+
+fn parse_turn_timeout(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +491,16 @@ mod tests {
         let second = manager.runtime_for(&root).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn turn_timeout_is_opt_in_and_zero_disables_it() {
+        assert_eq!(parse_turn_timeout(None), None);
+        assert_eq!(parse_turn_timeout(Some("0")), None);
+        assert_eq!(parse_turn_timeout(Some("invalid")), None);
+        assert_eq!(
+            parse_turn_timeout(Some("10800")),
+            Some(Duration::from_secs(10_800))
+        );
     }
 }

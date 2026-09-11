@@ -1265,7 +1265,8 @@ impl GoalExecution {
     pub fn link_proposal(&mut self, proposal: &mut ActionProposal) {
         let is_verify = is_verification(&proposal.signature);
         proposal.supports = if is_verify {
-            self.items
+            let changed = self
+                .items
                 .values()
                 .filter(|item| {
                     matches!(
@@ -1274,7 +1275,20 @@ impl GoalExecution {
                     )
                 })
                 .map(|item| item.id.clone())
-                .collect()
+                .collect::<Vec<_>>();
+            if changed.is_empty() {
+                // 已经读过并确认修改位置、但模型判断当前实现可能已经满足目标时，
+                // 允许一次基线验证。它只产生诊断证据，不会在零写入时把变更任务
+                // 标记为 Verified；这样既不会强迫模型制造无意义 diff，也不会假绿。
+                self.active_item()
+                    .filter(|item| {
+                        item.state == WorkItemState::ReadyToChange && item.read_evidence > 0
+                    })
+                    .map(|item| vec![item.id.clone()])
+                    .unwrap_or_default()
+            } else {
+                changed
+            }
         } else {
             self.next_admitted_surface()
                 .map(|id| vec![id])
@@ -1294,15 +1308,15 @@ impl GoalExecution {
             return None;
         }
         if is_verify
-            && self.items.values().any(|work_item| {
-                matches!(
-                    work_item.state,
-                    WorkItemState::Pending
-                        | WorkItemState::Locating
-                        | WorkItemState::Inspecting
-                        | WorkItemState::ReadyToChange
-                )
-            })
+            && (proposal.supports.is_empty()
+                || self.items.values().any(|work_item| {
+                    matches!(
+                        work_item.state,
+                        WorkItemState::Pending
+                            | WorkItemState::Locating
+                            | WorkItemState::Inspecting
+                    )
+                }))
         {
             return None;
         }
@@ -1392,6 +1406,16 @@ impl GoalExecution {
             Some(WorkItemState::ReadyToChange) if self.confirmed_target_files.is_empty() => {
                 &["fs", "search"]
             }
+            // 读取过已确认实现后开放一次最小基线验证。零写入的绿色构建不会满足
+            // ExecutionState 的变更交付门禁，只用于让模型验证“无需修改”的判断并
+            // 形成诚实的未变更结论，避免 edit/fs 与 shell 之间的相位死锁。
+            Some(WorkItemState::ReadyToChange)
+                if self
+                    .active_item()
+                    .is_some_and(|item| item.read_evidence > 0) =>
+            {
+                &["edit", "fs", "shell"]
+            }
             Some(WorkItemState::ReadyToChange) => &["edit", "fs"],
             Some(WorkItemState::Satisfied | WorkItemState::Changed) if statically_provable => {
                 &["fs", "shell"]
@@ -1454,7 +1478,7 @@ impl GoalExecution {
             WorkItemState::ReadyToChange if self.confirmed_target_files.is_empty() =>
                 "当前文件仅为弱匹配候选；执行一次带目录约束的高信号 search，确认具体实现文件后再编辑。".into(),
             WorkItemState::ReadyToChange =>
-                "对已确认文件执行一次最小编辑；若内容已满足目标，先读取确认后进入验证。".into(),
+                "对已确认文件执行一次最小编辑；若检查后确认无需修改，运行一次最小构建或测试固化基线证据，然后如实报告零变更，禁止制造无意义编辑。".into(),
             WorkItemState::Satisfied => {
                 "当前内容已经满足期望值；禁止重复编辑，运行最小验证。".into()
             }
@@ -1679,6 +1703,20 @@ impl GoalExecution {
         ok: bool,
         summary: &str,
     ) -> EvidenceKind {
+        self.record_action_result_observed(action, proposal, ok, summary, None, true)
+    }
+
+    /// 与 `record_action_result` 相同，但允许 AgentLoop 注入运行时观察到的真实写入结果，
+    /// 并决定本任务是否允许“目标本来就存在”的幂等捷径。
+    pub fn record_action_result_observed(
+        &mut self,
+        action: &ActionContract,
+        proposal: &ActionProposal,
+        ok: bool,
+        summary: &str,
+        workspace_changed: Option<bool>,
+        allow_already_satisfied: bool,
+    ) -> EvidenceKind {
         let is_search = action.tool == "search";
         let is_read = action.tool == "fs" && !proposal.signature.contains("\"op\":\"write\"");
         let is_write = action.tool == "edit" || proposal.signature.contains("\"op\":\"write\"");
@@ -1696,6 +1734,7 @@ impl GoalExecution {
             .iter()
             .any(|marker| self.goal.objective.to_lowercase().contains(marker));
         let effective_ok = ok && !proposal.is_search_miss(summary) && substantive_write;
+        let write_changed = !is_write || workspace_changed.unwrap_or(true);
         let previous_target_count = self.target_files.len();
         let previous_confirmed_target_count = self.confirmed_target_files.len();
         if effective_ok && is_search {
@@ -1703,10 +1742,14 @@ impl GoalExecution {
         }
         if let Some(path) = &action.target_path {
             if effective_ok && matches!(action.tool.as_str(), "fs" | "edit") {
+                // 读到弱候选只能证明文件存在，不能单凭读取成功就授权写入。
+                // 只有编辑成功才在这里提升为已确认目标；搜索命中的强锚点由
+                // record_targets_from_search 单独负责。
                 self.add_target_file(path, action.tool == "edit");
             }
         }
-        let already_satisfied = is_read
+        let already_satisfied = allow_already_satisfied
+            && is_read
             && effective_ok
             && !self.goal.expected_values.is_empty()
             && self
@@ -1729,7 +1772,7 @@ impl GoalExecution {
             EvidenceKind::VerificationPassed
         } else if is_verify {
             EvidenceKind::VerificationFailed
-        } else if is_write && effective_ok {
+        } else if is_write && effective_ok && write_changed {
             EvidenceKind::ChangeApplied
         } else if is_read && effective_ok {
             EvidenceKind::DataFlowConfirmed
@@ -1783,9 +1826,17 @@ impl GoalExecution {
             if is_read {
                 item.read_evidence = item.read_evidence.saturating_add(1);
             }
-            item.state = if is_verify {
+            item.state = if is_verify
+                && matches!(
+                    item.state,
+                    WorkItemState::Changed | WorkItemState::Satisfied
+                ) {
                 WorkItemState::Verified
-            } else if is_write {
+            } else if is_verify {
+                // ReadyToChange 阶段的 shell 是基线探针。成功只能证明当前代码可通过
+                // 该命令，不能证明用户要求的改动已经在本回合完成。
+                item.state
+            } else if is_write && write_changed {
                 WorkItemState::Changed
             } else if already_satisfied {
                 WorkItemState::Satisfied
@@ -1797,6 +1848,10 @@ impl GoalExecution {
                 }
             } else if is_search {
                 WorkItemState::Inspecting
+            } else if is_write {
+                // 工具成功但产物指纹没变：保留可修改状态，让下一步修正编辑，不能
+                // 把 no-op 当成 Changed 后直接进入验证。
+                WorkItemState::ReadyToChange
             } else {
                 item.state
             };
@@ -2064,9 +2119,23 @@ impl GoalExecution {
     /// 用户提示由 Agent Loop 统一渲染；这里仅暴露结构化状态，避免把内部证据、
     /// 门禁原因和整段目标拼接进面向用户的澄清文字。
     pub fn needs_user_input(&self) -> bool {
-        self.items
-            .values()
-            .any(|item| item.state == WorkItemState::NeedsUserInput)
+        !self.has_execution_evidence()
+            && self
+                .items
+                .values()
+                .any(|item| item.state == WorkItemState::NeedsUserInput)
+    }
+
+    /// 一旦运行时已经定位或读取过项目资产，“实现在哪”就是 Agent 的技术定位问题，
+    /// 不能再伪装成只有用户才能回答的产品决策。
+    pub fn has_execution_evidence(&self) -> bool {
+        !self.anchor_dirs.is_empty()
+            || !self.target_files.is_empty()
+            || !self.confirmed_target_files.is_empty()
+            || self
+                .items
+                .values()
+                .any(|item| item.read_evidence > 0 || !item.candidate_targets.is_empty())
     }
 
     pub fn actionable_terminal_reason(&self) -> Option<String> {
@@ -2121,7 +2190,27 @@ fn advance_hypothesis(item: &mut WorkItem, phase: SolvePhase) {
         item.no_information_streak = 0;
         item.phase_attempts.reset(phase);
     } else {
-        item.state = WorkItemState::NeedsUserInput;
+        // 技术假设耗尽不等于缺少用户决策。保留已有定位前沿，重开一个有界策略窗口：
+        // - 已读到代码就收敛到修改；
+        // - 有候选就继续最短调用链；
+        // - 零先验则交给 TurnGovernor 切换 broad/runtime 策略。
+        // 总步骤/工具硬预算仍会终止真正的无解任务，因此这里不会无限空转。
+        item.state = if item.read_evidence > 0 {
+            WorkItemState::ReadyToChange
+        } else if !item.candidate_targets.is_empty() {
+            WorkItemState::Located
+        } else {
+            WorkItemState::Locating
+        };
+        item.active_hypothesis = 0;
+        for hypothesis in &mut item.hypotheses {
+            hypothesis.state = HypothesisState::Rejected;
+        }
+        if let Some(first) = item.hypotheses.first_mut() {
+            first.state = HypothesisState::Active;
+        }
+        item.no_information_streak = 0;
+        item.phase_attempts.reset(phase);
     }
 }
 
@@ -2436,7 +2525,7 @@ mod tests {
     }
 
     #[test]
-    fn two_failed_locates_request_user_input() {
+    fn failed_locates_remain_agent_owned_and_auto_advance() {
         let contract = TaskContract::from_input("修复登录按钮无反应");
         let mut plan = GoalExecution::from_contract(&contract);
         assert!(plan.can_auto_advance());
@@ -2448,14 +2537,13 @@ mod tests {
         };
         plan.record_result(&proposal, false, "no match");
         plan.record_result(&proposal, false, "no match");
-        assert!(plan.needs_user_input());
-        let reason = plan.actionable_terminal_reason().unwrap();
-        assert!(!reason.contains("门禁校正"));
-        assert!(!reason.contains("修复登录按钮"));
+        assert!(!plan.needs_user_input());
         assert!(
-            !plan.can_auto_advance(),
-            "真正需要用户补充信息时必须停止自动推进"
+            plan.can_auto_advance(),
+            "技术定位失败后应由 Agent 自动换假设，不应询问用户代为定位"
         );
+        assert_eq!(plan.active_item().unwrap().state, WorkItemState::Locating);
+        assert!(plan.actionable_terminal_reason().is_none());
     }
 
     #[test]
@@ -3494,8 +3582,9 @@ mod tests {
         plan.record_result(&locate, true, "未找到匹配（pattern=\"appCode\"）。");
         assert_eq!(plan.active_item().unwrap().state, WorkItemState::Pending);
         plan.record_result(&locate, true, "未找到匹配（pattern=\"appCode\"）。");
-        assert!(plan.active_item().is_none());
-        assert!(plan.needs_user_input());
+        assert_eq!(plan.active_item().unwrap().state, WorkItemState::Locating);
+        assert!(!plan.needs_user_input());
+        assert!(plan.can_auto_advance());
     }
 
     #[test]
@@ -3778,7 +3867,7 @@ mod tests {
     }
 
     #[test]
-    fn no_information_actions_rotate_a_finite_hypothesis_queue() {
+    fn exhausted_hypotheses_preserve_evidence_and_reopen_a_bounded_strategy() {
         let contract = TaskContract::from_input("修复登录按钮无反应");
         let mut plan = GoalExecution::from_contract(&contract);
         let proposal = ActionProposal {
@@ -3806,8 +3895,48 @@ mod tests {
         );
         plan.record_result(&proposal, true, hit);
         plan.record_result(&proposal, true, hit);
-        assert!(plan.active_item().is_none(), "有限假设耗尽后必须停止");
-        assert!(plan.needs_user_input());
+        let item = plan.active_item().expect("技术定位仍由 Agent 负责");
+        assert_eq!(item.state, WorkItemState::Located);
+        assert_eq!(item.active_hypothesis, 0);
+        assert_eq!(item.candidate_targets, vec!["web/src/login.tsx"]);
+        assert!(!plan.needs_user_input());
+        assert!(plan.can_auto_advance());
+    }
+
+    #[test]
+    fn reading_code_then_exhausting_hypotheses_never_requests_project_location() {
+        let contract = TaskContract::from_input("按设计文档实施本地记忆 Provider");
+        let mut plan = GoalExecution::from_contract(&contract);
+        let locate = ActionProposal {
+            signature: "search:{\"pattern\":\"MemoryProvider\"}".into(),
+            question: "locate provider".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        plan.record_result(
+            &locate,
+            true,
+            "共 1 条命中（格式：相对路径:行号: 内容）：\nharness/src/memory.rs:10: struct MemoryProvider",
+        );
+        let inspect = ActionProposal {
+            signature: "fs:{\"op\":\"read\",\"path\":\"harness/src/memory.rs\"}".into(),
+            question: "inspect provider".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert_eq!(
+            plan.record_result(&inspect, true, "struct MemoryProvider;"),
+            EvidenceKind::DataFlowConfirmed
+        );
+        for _ in 0..4 {
+            plan.record_result(&inspect, true, "struct MemoryProvider;");
+        }
+
+        let item = plan.active_item().expect("读过代码后仍应自动推进");
+        assert_eq!(item.state, WorkItemState::ReadyToChange);
+        assert!(item.read_evidence > 0);
+        assert!(!plan.needs_user_input());
+        assert!(plan.actionable_terminal_reason().is_none());
     }
 
     #[test]
@@ -3900,6 +4029,50 @@ mod tests {
         // S4：版本号是可逐字复核的产物断言（0.2.2 @ Cargo.toml），因此验证阶段除 shell
         // 之外还放开 fs —— 读一眼产物就能收敛，不必去跑一条它证明不了的命令。
         assert_eq!(plan.allowed_tools(), vec!["fs", "shell"]);
+    }
+
+    #[test]
+    fn inspected_change_target_can_run_baseline_verification_without_false_completion() {
+        let contract = TaskContract::from_input("修复 agent loop 的重复空转");
+        let mut plan = GoalExecution::from_contract(&contract);
+        let id = plan.items.keys().next().unwrap().clone();
+        plan.confirmed_target_files.push("src/agent_loop.rs".into());
+        {
+            let item = plan.items.get_mut(&id).unwrap();
+            item.state = WorkItemState::ReadyToChange;
+            item.read_evidence = 1;
+            item.candidate_targets = vec!["src/agent_loop.rs".into()];
+        }
+
+        assert_eq!(plan.allowed_tools(), vec!["edit", "fs", "shell"]);
+
+        let call = ToolCall {
+            id: "verify-baseline".into(),
+            name: "shell".into(),
+            args: serde_json::json!({"command": "cargo check"}),
+        };
+        let mut proposal = ActionProposal::from_tool_call(
+            &call,
+            &crate::execution::ExecutionState::new(
+                contract,
+                crate::execution::StrategyKind::Transformative,
+            ),
+        );
+        plan.link_proposal(&mut proposal);
+        let action = plan
+            .action_spec(&call, &proposal)
+            .expect("读取后的基线验证应通过目标门禁");
+        assert!(plan.allows_tool_call(&call, &proposal).is_ok());
+        assert_eq!(
+            plan.record_action_result(&action, &proposal, true, "cargo check passed"),
+            EvidenceKind::VerificationPassed
+        );
+        assert_eq!(
+            plan.items[&id].state,
+            WorkItemState::ReadyToChange,
+            "零写入的绿色基线不能把变更任务标成已验证"
+        );
+        assert!(!plan.can_conclude());
     }
 
     #[test]

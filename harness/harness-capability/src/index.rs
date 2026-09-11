@@ -1094,3 +1094,448 @@ mod tests {
         let _ = std::fs::remove_dir_all(&packs_root);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 1：知识根索引 + checkpoint 增量（坑 5：checkpoint 增量索引）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 知识根目录名（与 `.harness-memory/` 对齐）。
+pub const KNOWLEDGE_ROOT: &str = ".harness-memory";
+
+/// checkpoint 文件名（存放于知识根内，记录每个文件的 mtime+size）。
+pub const CHECKPOINT_FILE: &str = ".index-checkpoint.json";
+
+/// 单文件 checkpoint 条目：用 mtime+size 判断内容是否变更。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct FileCheckpoint {
+    /// 相对知识根的路径（统一用 `/` 分隔）。
+    pub rel: String,
+    /// 上次索引时的修改时间（秒，自 epoch）。
+    pub mtime_secs: u64,
+    /// 上次索引时的文件大小（字节）。
+    pub size: u64,
+}
+
+/// checkpoint 文件整体结构。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeCheckpoint {
+    pub files: Vec<FileCheckpoint>,
+}
+
+impl KnowledgeCheckpoint {
+    /// 从知识根读取 checkpoint；不存在或损坏时返回空 checkpoint（坑 4：显式降级）。
+    pub fn load(knowledge_root: &Path) -> Self {
+        let path = knowledge_root.join(CHECKPOINT_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// 把当前 checkpoint 写回知识根。
+    pub fn save(&self, knowledge_root: &Path) -> Result<()> {
+        let path = knowledge_root.join(CHECKPOINT_FILE);
+        let text = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, text)?;
+        Ok(())
+    }
+
+    /// 判断文件是否需要重新索引（新文件或 mtime/size 变更）。
+    pub fn needs_reindex(&self, rel: &str, mtime_secs: u64, size: u64) -> bool {
+        match self.files.iter().find(|f| f.rel == rel) {
+            None => true, // 新文件
+            Some(f) => f.mtime_secs != mtime_secs || f.size != size,
+        }
+    }
+
+    /// 更新单个文件的 checkpoint 条目。
+    pub fn update(&mut self, rel: String, mtime_secs: u64, size: u64) {
+        match self.files.iter_mut().find(|f| f.rel == rel) {
+            Some(f) => {
+                f.mtime_secs = mtime_secs;
+                f.size = size;
+            }
+            None => self.files.push(FileCheckpoint {
+                rel,
+                mtime_secs,
+                size,
+            }),
+        }
+    }
+}
+
+/// 知识根索引统计。
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeIndexStats {
+    /// 本次新索引或更新的页面数。
+    pub upserted: usize,
+    /// 因 checkpoint 命中而跳过的文件数。
+    pub skipped: usize,
+    /// 扫描到的总 Markdown 文件数。
+    pub total: usize,
+    /// 非致命警告（如 front matter 解析失败，坑 4：显式回显）。
+    pub warnings: Vec<String>,
+}
+
+/// 扫描 `<workspace>/.harness-memory/**/*.md`，把带 front matter 的知识条目
+/// 投影到 `WikiStore`。支持 checkpoint 增量：仅处理新文件或 mtime/size 变更的文件。
+///
+/// 与 `bootstrap_assets` 的关系：
+/// - `bootstrap_assets` 扫描整个工作区，**跳过** `.harness-memory`（SKIP_DIRS）；
+/// - 本函数专门扫描知识根，与 `bootstrap_assets` 互补，不重复投影。
+///
+/// 幂等：同一文件重复索引按 id 覆盖，不产生重复页面。
+pub async fn index_knowledge_base(
+    wiki: &Arc<dyn WikiStore>,
+    workspace: &Path,
+) -> Result<KnowledgeIndexStats> {
+    let knowledge_root = workspace.join(KNOWLEDGE_ROOT);
+    let mut stats = KnowledgeIndexStats::default();
+
+    if !knowledge_root.is_dir() {
+        return Ok(stats); // 知识根不存在，零成本退出
+    }
+
+    let mut checkpoint = KnowledgeCheckpoint::load(&knowledge_root);
+
+    // 收集所有 Markdown 文件（递归，不受 MAX_FILES 限制，知识根本身体积可控）。
+    let mut md_files: Vec<(PathBuf, String)> = Vec::new();
+    collect_md_files(&knowledge_root, &knowledge_root, &mut md_files);
+    stats.total = md_files.len();
+
+    for (abs_path, rel) in &md_files {
+        let meta = match std::fs::metadata(abs_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime_secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let size = meta.len();
+
+        if !checkpoint.needs_reindex(rel, mtime_secs, size) {
+            stats.skipped += 1;
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(abs_path) {
+            Ok(c) => c,
+            Err(e) => {
+                stats
+                    .warnings
+                    .push(format!("读取失败 {rel}: {e}"));
+                continue;
+            }
+        };
+
+        // 用 Phase 0 的 frontmatter 模块解析（坑 4：warnings 显式回显）。
+        let parsed = crate::frontmatter::parse_markdown(&content);
+        for w in &parsed.warnings {
+            stats.warnings.push(format!("{rel}: {w}"));
+        }
+
+        // 构造 WikiPage：id 用相对路径规整，title 优先取 front matter，
+        // 其次取正文第一个 `# ` 标题，最后退化为文件名。
+        let page = knowledge_page_from(rel, &parsed);
+        wiki.upsert_page(page).await?;
+
+        checkpoint.update(rel.clone(), mtime_secs, size);
+        stats.upserted += 1;
+    }
+
+    checkpoint.save(&knowledge_root)?;
+    Ok(stats)
+}
+
+/// 递归收集知识根下所有 `.md` 文件，返回 (绝对路径, 相对知识根路径)。
+/// 排除知识根顶层 `review/`（Phase 2：未审核候选事实不进入默认上下文）。
+fn collect_md_files(dir: &Path, root: &Path, out: &mut Vec<(PathBuf, String)>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            // Phase 2 验收：review/ 存未审核候选事实，不进入默认上下文（跳过投影；
+            // 由审核链路晋升到正式目录后才被索引）。仅排除知识根顶层 review。
+            let is_top_review = dir == root
+                && path.file_name().and_then(|n| n.to_str()) == Some("review");
+            if !is_top_review {
+                collect_md_files(&path, root, out);
+            }
+        } else if ft.is_file() {
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((path.clone(), rel));
+            }
+        }
+    }
+}
+
+/// 从解析结果构造 WikiPage（知识根投影规则）。
+fn knowledge_page_from(rel: &str, parsed: &crate::frontmatter::ParsedMarkdown) -> WikiPage {
+    let id = sanitize(rel.trim_end_matches(".md"));
+    let title = parsed
+        .front_matter
+        .as_ref()
+        .and_then(|fm| {
+            if fm.id.is_empty() {
+                None
+            } else {
+                Some(fm.id.clone())
+            }
+        })
+        .or_else(|| {
+            parsed
+                .body
+                .lines()
+                .find_map(|l| l.trim_start().strip_prefix("# "))
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| id.clone());
+
+    // 正文按空行分段为 blocks；链接抽取与普通 Wiki 一致。
+    let mut blocks: Vec<String> = Vec::new();
+    let mut links: Vec<WikiLink> = Vec::new();
+    let mut para = String::new();
+    for line in parsed.body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !para.is_empty() {
+                blocks.push(para.trim().to_string());
+                para.clear();
+            }
+            continue;
+        }
+        for (label, target) in extract_md_links(line) {
+            let tgt_id = sanitize_target(&target);
+            if !tgt_id.is_empty() && tgt_id != id {
+                links.push(WikiLink {
+                    target: tgt_id,
+                    label,
+                });
+            }
+        }
+        let clean = t
+            .trim_start_matches('#')
+            .trim_start()
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim_start_matches("> ");
+        if !clean.is_empty() {
+            para.push_str(clean);
+            para.push(' ');
+        }
+    }
+    if !para.is_empty() {
+        blocks.push(para.trim().to_string());
+    }
+
+    WikiPage {
+        id,
+        title,
+        blocks,
+        links,
+    }
+}
+
+#[cfg(test)]
+mod knowledge_tests {
+    use super::*;
+    use crate::assets::{WikiPage, WikiStore};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// 内存 WikiStore，仅用于测试。
+    struct MemWiki {
+        pages: Mutex<HashMap<String, WikiPage>>,
+    }
+
+    impl MemWiki {
+        fn new() -> Self {
+            Self {
+                pages: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WikiStore for MemWiki {
+        async fn upsert_page(&self, page: WikiPage) -> Result<()> {
+            self.pages.lock().unwrap().insert(page.id.clone(), page);
+            Ok(())
+        }
+        async fn get_page(&self, id: &str) -> Result<Option<WikiPage>> {
+            Ok(self.pages.lock().unwrap().get(id).cloned())
+        }
+        async fn list_pages(&self) -> Result<Vec<WikiPage>> {
+            Ok(self.pages.lock().unwrap().values().cloned().collect())
+        }
+        async fn link(&self, _from: &str, _to: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn query_pages(&self, query: &str) -> Result<Vec<WikiPage>> {
+            let q = query.to_lowercase();
+            Ok(self
+                .pages
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|p| {
+                    p.title.to_lowercase().contains(&q)
+                        || p.blocks.iter().any(|b| b.to_lowercase().contains(&q))
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn make_workspace() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "harness_kb_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".harness-memory")).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn first_index_upserts_all() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        std::fs::write(
+            kb.join("rust-tips.md"),
+            "---\nid: rust-tips\nkind: wiki\n---\n# Rust Tips\n\nOwnership rules.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            kb.join("async-notes.md"),
+            "# Async Notes\n\nTokio runtime.\n",
+        )
+        .unwrap();
+
+        let wiki: Arc<dyn WikiStore> = Arc::new(MemWiki::new());
+        let stats = index_knowledge_base(&wiki, &ws).await.unwrap();
+
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.upserted, 2);
+        assert_eq!(stats.skipped, 0);
+        assert!(stats.warnings.is_empty());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn second_index_skips_unchanged() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        let file = kb.join("stable.md");
+        std::fs::write(&file, "# Stable\n\nNo change.\n").unwrap();
+
+        let wiki: Arc<dyn WikiStore> = Arc::new(MemWiki::new());
+
+        // 第一次：全新索引
+        let s1 = index_knowledge_base(&wiki, &ws).await.unwrap();
+        assert_eq!(s1.upserted, 1);
+        assert_eq!(s1.skipped, 0);
+
+        // 第二次：无变更，应全部跳过
+        let s2 = index_knowledge_base(&wiki, &ws).await.unwrap();
+        assert_eq!(s2.upserted, 0);
+        assert_eq!(s2.skipped, 1);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn changed_file_is_reindexed() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        let file = kb.join("evolving.md");
+        std::fs::write(&file, "# V1\n\nFirst version.\n").unwrap();
+
+        let wiki: Arc<dyn WikiStore> = Arc::new(MemWiki::new());
+        let s1 = index_knowledge_base(&wiki, &ws).await.unwrap();
+        assert_eq!(s1.upserted, 1);
+
+        // 修改文件（size 变化，保证 checkpoint 检测到）
+        std::fs::write(&file, "# V2\n\nSecond version with more content.\n").unwrap();
+        let s2 = index_knowledge_base(&wiki, &ws).await.unwrap();
+        assert_eq!(s2.upserted, 1);
+        assert_eq!(s2.skipped, 0);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn missing_knowledge_root_is_noop() {
+        let ws = std::env::temp_dir().join("harness_kb_noop_test");
+        let wiki: Arc<dyn WikiStore> = Arc::new(MemWiki::new());
+        let stats = index_knowledge_base(&wiki, &ws).await.unwrap();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.upserted, 0);
+    }
+
+    #[tokio::test]
+    async fn broken_frontmatter_produces_warning_not_error() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        std::fs::write(
+            kb.join("broken.md"),
+            "---\ninvalid: [unclosed\n---\n# Broken\n\nBody.\n",
+        )
+        .unwrap();
+
+        let wiki: Arc<dyn WikiStore> = Arc::new(MemWiki::new());
+        let stats = index_knowledge_base(&wiki, &ws).await.unwrap();
+
+        // 坑 4：降级不致命，warning 显式回显
+        assert_eq!(stats.upserted, 1);
+        assert!(!stats.warnings.is_empty());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn review_candidates_not_projected() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        std::fs::create_dir_all(kb.join("review")).unwrap();
+        std::fs::write(kb.join("wiki-note.md"), "# Wiki Note\n\nBody.\n").unwrap();
+        std::fs::write(
+            kb.join("review").join("fact-1.md"),
+            "---\nid: fact-1\nkind: fact\nstatus: candidate\n---\n# Candidate\n\nUnreviewed content.\n",
+        )
+        .unwrap();
+
+        let wiki: Arc<dyn WikiStore> = Arc::new(MemWiki::new());
+        let stats = index_knowledge_base(&wiki, &ws).await.unwrap();
+
+        // Phase 2 验收：未审核候选（review/）不进入默认上下文
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.upserted, 1);
+        let pages = wiki.list_pages().await.unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(!pages[0]
+            .blocks
+            .iter()
+            .any(|b| b.contains("Unreviewed content")));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}

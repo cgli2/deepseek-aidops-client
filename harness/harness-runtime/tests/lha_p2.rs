@@ -284,6 +284,21 @@ fn exhausted_global_budget_persists_partial_delivery_terminal() {
         runtime.task("budgeted").unwrap().unwrap().status,
         TaskStatus::BudgetExhausted { .. }
     ));
+    // Concurrent/late admissions observe the same terminal result instead of
+    // trying to publish a second report and failing the state transition.
+    assert_eq!(
+        runtime.admit_llm("budgeted", "primary", 6, 2).unwrap(),
+        Admission::GracefulExhaustion
+    );
+    // Generic provider-error cleanup happens after budget admission. It must
+    // not try to transition the already-terminal task to Failed.
+    runtime
+        .fail_task("budgeted", "provider stream stopped", "worker", 3)
+        .unwrap();
+    assert!(matches!(
+        runtime.task("budgeted").unwrap().unwrap().status,
+        TaskStatus::BudgetExhausted { .. }
+    ));
     drop(runtime);
     assert!(matches!(
         LongHorizonRuntime::open(&root, 1_000)
@@ -294,5 +309,53 @@ fn exhausted_global_budget_persists_partial_delivery_terminal() {
             .status,
         TaskStatus::BudgetExhausted { .. }
     ));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn settled_task_wave_replenishes_the_global_budget() {
+    let root = std::env::temp_dir().join(format!("lha_p2_budget_wave_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let runtime = LongHorizonRuntime::open(&root, 5).unwrap();
+    runtime
+        .register_provider(
+            "primary",
+            ProviderLimit {
+                requests_per_minute: 60,
+                tokens_per_minute: 600,
+                request_burst: 2,
+                token_burst: 100,
+            },
+            0,
+        )
+        .unwrap();
+
+    let task = |task_id: &str| TaskSpec {
+        task_id: task_id.into(),
+        parent_id: None,
+        dependencies: vec![],
+        inputs: json!({}),
+        invariants: vec![],
+        expected_output_schema: json!({}),
+        timeout_seconds: 60,
+        max_retries: 1,
+    };
+
+    runtime.submit(task("first")).unwrap();
+    runtime.claim_task("first", "worker", 0, 1_000).unwrap();
+    assert_eq!(
+        runtime.admit_llm("first", "primary", 6, 1).unwrap(),
+        Admission::GracefulExhaustion
+    );
+
+    // Starting a later, independent wave must not inherit a permanently empty
+    // workspace budget from the completed wave.
+    runtime.submit(task("second")).unwrap();
+    runtime.claim_task("second", "worker", 2, 1_000).unwrap();
+    assert_eq!(
+        runtime.admit_llm("second", "primary", 5, 3).unwrap(),
+        Admission::Granted
+    );
+
     fs::remove_dir_all(root).ok();
 }

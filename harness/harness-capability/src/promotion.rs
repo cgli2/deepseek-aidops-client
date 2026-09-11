@@ -22,6 +22,36 @@ pub const REVIEW_DIR: &str = "review";
 /// 晋升后的正式事实目录。
 pub const FACTS_DIR: &str = "facts";
 
+/// 由 Unix 天数计算公历 `(年, 月, 日)`（UTC；Hinnant `civil_from_days` 算法，零依赖）。
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// 由 Unix 秒（UTC）得到 `YYYY-MM-DD`；与 front matter 的 `updated_at` 同格式。
+pub fn date_from_secs(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 今天的日期（UTC，`YYYY-MM-DD`），供 runtime 组合根驱动晋升管线。
+pub fn today() -> String {
+    date_from_secs(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    )
+}
+
 /// 单条候选的晋升结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotionOutcome {
@@ -375,5 +405,26 @@ mod tests {
         let report = promote_review_dir(&root, "2026-02-14").unwrap();
         assert_eq!(report.promoted_count(), 1);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn date_helpers_match_utc_calendar() {
+        // 纪元与闰日锚点（UTC）
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(date_from_secs(0), "1970-01-01");
+        assert_eq!(date_from_secs(951_782_400), "2000-02-29");
+        assert_eq!(date_from_secs(1_771_027_200), "2026-02-14");
+        // 日内任意时刻归属同一天，跨日进位
+        assert_eq!(date_from_secs(86_399), "1970-01-01");
+        assert_eq!(date_from_secs(86_400), "1970-01-02");
+        // 纪元前（负 Unix 秒）也要给出正确公历日期，保证 `today()` 不依赖时钟方向
+        assert_eq!(date_from_secs(-86_400), "1969-12-31");
+        // today() 形状固定：YYYY-MM-DD 且年份可解析
+        let t = today();
+        assert_eq!(t.len(), 10);
+        assert_eq!(t.as_bytes()[4], b'-');
+        assert_eq!(t.as_bytes()[7], b'-');
+        let year: i64 = t[..4].parse().expect("today() 前四位应为年份");
+        assert!((1970..=9999).contains(&year));
     }
 }

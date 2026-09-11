@@ -16,7 +16,12 @@ use harness_capability::assets::{
     ChatTurn, CodeGraph, CodeSymbol, ConversationMemory, FactKind, LifecycleLayer, MemoryFact,
     Skill, SkillLibrary, WikiLink, WikiPage, WikiStore,
 };
+use harness_capability::inverted::InvertedIndex;
 use harness_core::error::{Error, Result};
+
+/// 候选集规模护栏（Phase 6 / 坑 3）：精排只处理前 N 个候选，
+/// 避免极端查询（命中大量 term）把候选集放大回全量。
+const CANDIDATE_CAP: usize = 512;
 
 /// 把查询拆成小写词（按空白与常见标点）。
 fn tokenize(s: &str) -> Vec<String> {
@@ -132,10 +137,21 @@ fn asset_root(cwd: &Path) -> PathBuf {
 // ConversationMemory（Chat Memory，L0~L3）原生实现
 // ---------------------------------------------------------------------------
 
+/// 召回加速结构（Phase 6 / 坑 3：规模性能）：倒排索引 + id→事实映射。
+///
+/// 惰性构建（首次召回时由全量事实建一次），之后由写路径增量维护；
+/// 二者同生命周期，保证「候选集精排」能 O(1) 取到条目而不扫全量。
+struct RecallIndex {
+    inverted: InvertedIndex,
+    by_id: HashMap<String, MemoryFact>,
+}
+
 pub struct NativeConversationMemory {
     root: PathBuf,
     /// 内存缓存事实列表，避免每次 recall 都读盘（与 FileMemory 的 index 思路一致）。
     facts: Mutex<Option<Vec<MemoryFact>>>,
+    /// 倒排索引 + id 映射（Phase 6 / 坑 3）：召回先取候选集再精排，写时增量更新。
+    recall_index: Mutex<Option<RecallIndex>>,
 }
 
 impl NativeConversationMemory {
@@ -145,6 +161,7 @@ impl NativeConversationMemory {
         Arc::new(Self {
             root,
             facts: Mutex::new(None),
+            recall_index: Mutex::new(None),
         })
     }
 
@@ -176,6 +193,50 @@ impl NativeConversationMemory {
         std::fs::write(self.facts_path(), body).map_err(Error::Io)?;
         *self.facts.lock().unwrap() = Some(facts.to_vec());
         Ok(())
+    }
+
+    /// 事实的可检索文本：倒排建索引与词法精排共用同一份文本，
+    /// 保证「候选集」与「打分」口径一致（此前精排用 `{:?}`，这里沿用同一来源）。
+    fn fact_text(fact: &MemoryFact) -> String {
+        format!("{fact:?}")
+    }
+
+    /// 候选集（Phase 6 / 坑 3）：首次调用由全量事实构建倒排索引，之后只走倒排取候选。
+    ///
+    /// 未命中任何 term 时返回空——按设计**不做全量兜底扫描**（否则规模性能优化失效）。
+    fn candidate_facts(&self, query: &str) -> Vec<MemoryFact> {
+        let mut guard = self.recall_index.lock().unwrap();
+        if guard.is_none() {
+            let mut idx = RecallIndex {
+                inverted: InvertedIndex::new(),
+                by_id: HashMap::new(),
+            };
+            for f in self.load_facts() {
+                idx.inverted.insert(&f.id, &Self::fact_text(&f));
+                idx.by_id.insert(f.id.clone(), f);
+            }
+            *guard = Some(idx);
+        }
+        let Some(idx) = guard.as_ref() else {
+            return Vec::new();
+        };
+        idx.inverted
+            .candidates(query)
+            .into_iter()
+            .take(CANDIDATE_CAP)
+            .filter_map(|id| idx.by_id.get(&id).cloned())
+            .collect()
+    }
+
+    /// 写路径增量维护（坑 3 验收 2）：单条写入只调整该 id 涉及的 term 集合与映射项，
+    /// 不重建全索引；同 id 覆盖写时旧文本独有的 term 由 `insert` 自动清理。
+    ///
+    /// 索引尚未构建（None）时不做任何事——首次召回会由全量事实一次性建好。
+    fn index_upsert(&self, fact: &MemoryFact) {
+        if let Some(idx) = self.recall_index.lock().unwrap().as_mut() {
+            idx.inverted.insert(&fact.id, &Self::fact_text(fact));
+            idx.by_id.insert(fact.id.clone(), fact.clone());
+        }
     }
 }
 
@@ -251,16 +312,25 @@ impl ConversationMemory for NativeConversationMemory {
             produced.push(fact);
         }
         self.save_facts(&facts)?;
+        // 写路径增量维护倒排索引：只对本次产出的事实调整 term 集合，不重建全索引。
+        for f in &produced {
+            self.index_upsert(f);
+        }
         Ok(produced)
     }
 
     async fn recall(&self, query: &str, min_layer: LifecycleLayer) -> Result<Vec<MemoryFact>> {
         let (q, base) = query_tokens(query);
+        // Phase 6 / 坑 3：先走倒排索引取**候选集**，再只对候选集做词法精排，
+        // 扫描范围从「全量事实」降到「候选集」（不再对每条事实做 Debug 格式化 + 打分）。
         let mut scored: Vec<(f32, MemoryFact)> = self
-            .load_facts()
+            .candidate_facts(query)
             .into_iter()
             .filter(|f| f.layer.at_least(min_layer))
-            .map(|f| (lex_score_with(&q, base, &format!("{:?}", f)), f))
+            .map(|f| {
+                let s = lex_score_with(&q, base, &Self::fact_text(&f));
+                (s, f)
+            })
             .filter(|(s, _)| *s > 0.0)
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -270,8 +340,10 @@ impl ConversationMemory for NativeConversationMemory {
     async fn remember(&self, fact: MemoryFact) -> Result<()> {
         let mut facts = self.load_facts();
         facts.retain(|f| f.id != fact.id);
-        facts.push(fact);
-        self.save_facts(&facts)
+        facts.push(fact.clone());
+        self.save_facts(&facts)?;
+        self.index_upsert(&fact);
+        Ok(())
     }
 
     async fn list_facts(&self) -> Result<Vec<MemoryFact>> {
@@ -706,6 +778,76 @@ fn sanitize(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 6 / 坑 3：召回改为「倒排候选集 → 候选集精排」两段式。
+    /// 验收：① 未命中 term 时不做全量兜底扫描（返回空）；② 写路径增量维护后
+    /// 新事实立即可召回且只新增自身 term（doc_count 200→201，不重建全索引）。
+    #[tokio::test]
+    async fn recall_uses_inverted_candidates_with_incremental_write_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-recall-idx-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conv = NativeConversationMemory::new(&dir);
+
+        // 批量写入无关事实，制造「全量很大、候选集很小」的规模差。
+        for i in 0..200 {
+            conv.remember(MemoryFact {
+                id: format!("fact:noise:{i:03}"),
+                kind: FactKind::Fact,
+                content: format!("common token payload {i}"),
+                layer: LifecycleLayer::L2,
+                confidence: 0.5,
+                source: "test".into(),
+            })
+            .await
+            .unwrap();
+        }
+
+        // 首次候选集查询触发索引构建：doc_count 等于全量事实数。
+        assert!(conv.candidate_facts("zebra migration").is_empty());
+        assert_eq!(
+            conv.recall_index
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|i| i.inverted.doc_count()),
+            Some(200)
+        );
+        // 未命中任何 term → 空结果，不退化为全量扫描。
+        assert!(conv.recall("zebra migration", LifecycleLayer::L2).await.unwrap().is_empty());
+
+        // 写路径增量维护：新增 1 条 → 201，无需重建。
+        let target = MemoryFact {
+            id: "fact:zebra".into(),
+            kind: FactKind::Fact,
+            content: "zebra migration note 关于索引迁移的记录".into(),
+            layer: LifecycleLayer::L2,
+            confidence: 0.9,
+            source: "test".into(),
+        };
+        conv.remember(target.clone()).await.unwrap();
+        assert_eq!(
+            conv.recall_index
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|i| i.inverted.doc_count()),
+            Some(201)
+        );
+        // 候选集只包含命中项（远小于全量），精排后命中目标事实。
+        let cand = conv.candidate_facts("zebra migration");
+        assert_eq!(cand.len(), 1);
+        assert!(cand.len() * 100 < 201);
+        let hits = conv.recall("zebra migration", LifecycleLayer::L2).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "fact:zebra");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 对话记忆闭环：record_turn 落盘 → consolidate 产出事实 → list_facts 可见；
     /// recent_turns 按不带扩展名的会话 id 可读到轮次（守卫面板曾恒空的回归）。

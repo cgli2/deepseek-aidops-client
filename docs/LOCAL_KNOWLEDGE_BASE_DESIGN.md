@@ -396,3 +396,45 @@ cargo +stable-x86_64-pc-windows-msvc test   --manifest-path harness/Cargo.toml -
 ```
 
 全部通过即视为首个实现切片（Phase 0 + Phase 1）落地完成，并同时覆盖坑 2、坑 4、坑 5 的最小可行方案。
+
+## 13. Phase 4 接线契约：晋升管线 → runtime 调用方（待实施）
+
+现状（已验证）：`harness-capability/src/promotion.rs` 的 `approve` / `judge_candidate` /
+`promote_review_dir` 单测全绿（`cargo +stable-x86_64-pc-windows-msvc test --manifest-path
+harness/Cargo.toml -p harness-capability promotion` → 3 passed），但仓库内**零调用方**：
+`promote_review_dir` 只在 promotion.rs 自身出现；`harness-runtime` 也不依赖 `harness-capability`。
+
+唯一可用接线点是组合根 `harness/bin/src/compose.rs`——它已经在此加载知识根下的技能包
+（`harness_capability::index::sync_skill_packs(&*skill, &cwd.join(".harness-memory").join("skills"))`）。
+
+| 落点 | 改动 | 验收 |
+| --- | --- | --- |
+| `harness/harness-capability/src/promotion.rs` | 新增零依赖日期助手 `civil_from_days` / `date_from_secs` / `today()`（`harness-bin` 无 chrono，而晋升报告需要 `YYYY-MM-DD`） | `date_from_secs(0) == "1970-01-01"`；`today().len() == 10` |
+| `harness/bin/src/compose.rs` | 提出 `kb_root = cwd.join(index::KNOWLEDGE_ROOT)` 并随技能包任务一起 move；在 `sync_skill_packs` 之后调用 `promotion::promote_review_dir(&kb_root, &promotion::today())`，`promoted_count() > 0` 时打印“事实晋升（Phase 4）：晋升 N 条到 facts/，拒绝 M 条”，出错只告警不阻断启动 | `cargo +stable-x86_64-pc-windows-msvc check --manifest-path harness/Cargo.toml -p harness-bin` 通过；已 `approve(≥0.70)` 的候选启动后从 `review/` 移到 `facts/`（`layer: L2`、`status: active`、`tags: promoted`），未审核候选保持原位 |
+
+约束：晋升只在启动后台任务里跑一次且幂等；绝不把未审核候选（confidence 仍为默认值）提升为正式事实。
+
+## 14. Phase 5 接线契约：可插拔语义召回插槽（坑 1，Definition 层已落地）
+
+现状（已验证）：`harness-capability/src/memory.rs` 已具备语义召回插槽与融合公式，
+`cargo +stable-x86_64-pc-windows-msvc test --manifest-path harness/Cargo.toml -p harness-capability embedding` → 4 passed。
+
+| 落点 | 改动 | 验收 |
+| --- | --- | --- |
+| `harness/harness-capability/src/memory.rs` | 新增 `MatchedBy`（lexical/semantic/both）、`RecallHit{id,score,matched_by}`、`EmbeddingProvider` trait（`name/available/recall`）、默认实现 `NoopEmbedding`（永不可用、永返回空）、`RRF_K = 60.0` 与 `rrf_merge(lexical, semantic, limit)`（`Σ 1/(k+rank)`，同分按 id 字典序稳定排序） | 语义通道为空时结果与词法通道**同序**（纯词法退化）；双通道命中者 `matched_by = Both` 且分数叠加上浮；`limit` 截断生效；`NoopEmbedding.available() == false` |
+| 剩余接线（未实施） | 原生 provider 召回路径把词法 id 列表与 `embedding.recall()` 结果交给 `rrf_merge`，并把 `matched_by` 回写到结果元数据 | 未配置 embedding 时逐条结果与现状一致（回归零破坏）；配置本地 embedding 后每条结果都能说明"它是怎么被召回的" |
+
+约束：语义通道只是**可选增强**——provider 不可用必须返回空，绝不因缺模型而降低或阻断词法召回。
+
+## 15. Phase 6 接线契约：内存倒排索引（坑 3，Definition 层与接线均已落地）
+
+现状（已验证）：`harness-capability/src/inverted.rs` 提供零依赖分词与倒排索引，
+`cargo +stable-x86_64-pc-windows-msvc test --manifest-path harness/Cargo.toml -p harness-capability inverted` → 7 passed；
+`-p harness-capability` 全量 40 passed（复核基线见 §16）。
+
+| 落点 | 改动 | 验收 |
+| --- | --- | --- |
+| `harness/harness-capability/src/inverted.rs` | `tokenize`（ASCII 小写切词 + CJK 单字/二元组，排序去重）；`InvertedIndex{new, with_shard_cap, insert, remove, candidates, oversized_shards, doc_count, term_count, terms}`；`DEFAULT_SHARD_CAP = 100_000` | 查询走倒排取候选集：202 条记录中 `candidates("zebra")` 只返回 2 条（精排范围下降两个数量级），未命中返回空且不做全量兜底扫描；单条 `insert` 只新增自身 term，不重建全索引；同 id 重写清理旧 term（`beta` 消失、`remove` 后 `term_count == 0`）；`with_shard_cap(1)` 下超限分片按规模降序告警 |
+| 接线（已实施） | `index.rs` 知识根索引与 provider 召回改为"先 `candidates()` 取候选集 → 再对候选集精排"；写路径（新增/变更/删除文件）调用 `insert` / `remove` 做增量维护 | 索引常驻内存后召回不再全量加载；写单条文件的耗时与全库规模解耦。已验证：`index::knowledge_tests`（`recall_only_fetches_candidates` 只精排候选集、`deleted_file_drops_postings_and_checkpoint` 删除即摘除倒排项、`sync_maintains_inverted_index_incrementally` 写路径增量维护）与 `assets_native` 的 `recall_uses_inverted_candidates_with_incremental_write_path` 均在测试套件内；`-p harness-capability` 40 passed，`check -p harness-bin` 全依赖链通过 |
+
+约束：倒排索引是**纯内存派生结构**，可随时由知识根重建，不作为事实来源，不新增落盘格式。

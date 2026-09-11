@@ -267,6 +267,9 @@ impl Plugin for HarnessPlugin {
         // 已注册的包更新内容但保留启用状态；目录被删则回收对应记录）。
         let superpower_skill = skill.clone();
         let packs_dir = cwd.join(".harness-memory").join("skills");
+        // 知识根（`.harness-memory/`）：Phase 2 沉淀的候选事实（`review/`）经 Phase 3
+        // 门槛审核后晋升到 `facts/`；与技能包自动加载共用同一后台任务，幂等且不阻断启动。
+        let knowledge_root = cwd.join(".harness-memory");
         tokio::runtime::Handle::current().spawn(async move {
             let added = harness_provider_memory::ensure_builtin_skills(&*superpower_skill).await;
             if added > 0 {
@@ -279,6 +282,20 @@ impl Plugin for HarnessPlugin {
                     rep.added, rep.updated
                 ),
                 Err(e) => eprintln!("[harness] 技能包自动加载失败: {e}"),
+                _ => {}
+            }
+            // Phase 3 晋升管线接线（设计 §13）：扫描 `review/` 候选事实，达标者落 `facts/`
+            // （L1 → L2），被拒候选原地保留，绝不静默删除；每次启动重跑幂等。
+            match harness_capability::promotion::promote_review_dir(
+                &knowledge_root,
+                &harness_capability::promotion::today(),
+            ) {
+                Ok(report) if report.promoted_count() > 0 => eprintln!(
+                    "[harness] 记忆审核晋升：{} 条候选已晋升为正式事实（{} 条未达标，保留在 review/）",
+                    report.promoted_count(),
+                    report.rejected_count()
+                ),
+                Err(e) => eprintln!("[harness] 记忆审核晋升失败: {e}"),
                 _ => {}
             }
         });

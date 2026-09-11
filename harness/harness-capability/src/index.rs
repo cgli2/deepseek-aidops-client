@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::assets::{CodeGraph, CodeSymbol, Skill, SkillLibrary, WikiLink, WikiPage, WikiStore};
+use crate::inverted::InvertedIndex;
 use harness_core::error::{Error, Result};
 
 /// 一次索引的统计结果（用于面板反馈）。
@@ -1173,6 +1174,8 @@ pub struct KnowledgeIndexStats {
     pub skipped: usize,
     /// 扫描到的总 Markdown 文件数。
     pub total: usize,
+    /// 因源文件消失而从 checkpoint 回收的条目数（Phase 6：删除走 `remove(id)`）。
+    pub removed: usize,
     /// 非致命警告（如 front matter 解析失败，坑 4：显式回显）。
     pub warnings: Vec<String>,
 }
@@ -1189,6 +1192,27 @@ pub async fn index_knowledge_base(
     wiki: &Arc<dyn WikiStore>,
     workspace: &Path,
 ) -> Result<KnowledgeIndexStats> {
+    walk_knowledge_root(wiki, workspace, |_| Ok(())).await
+}
+
+/// 知识根索引事件（Phase 6：写入路径增量维护内存倒排索引的钩子）。
+pub enum IndexEvent<'a> {
+    /// 一个知识条目被投影（新增或更新）；`text` 为可分词的检索文本。
+    Upsert { page: &'a WikiPage, text: String },
+    /// 源文件已消失，其投影条目需要被移除。
+    Remove { id: String },
+}
+
+/// [`index_knowledge_base`] 的实现体：扫描知识根、投影 `WikiStore`、维护 checkpoint，
+/// 并把每条变更以 [`IndexEvent`] 回调给 `sink`（默认实现忽略；倒排索引接线时消费）。
+async fn walk_knowledge_root<F>(
+    wiki: &Arc<dyn WikiStore>,
+    workspace: &Path,
+    mut sink: F,
+) -> Result<KnowledgeIndexStats>
+where
+    F: FnMut(IndexEvent<'_>) -> Result<()>,
+{
     let knowledge_root = workspace.join(KNOWLEDGE_ROOT);
     let mut stats = KnowledgeIndexStats::default();
 
@@ -1240,14 +1264,127 @@ pub async fn index_knowledge_base(
         // 构造 WikiPage：id 用相对路径规整，title 优先取 front matter，
         // 其次取正文第一个 `# ` 标题，最后退化为文件名。
         let page = knowledge_page_from(rel, &parsed);
-        wiki.upsert_page(page).await?;
+        let text = page_text(&page);
+        wiki.upsert_page(page.clone()).await?;
+        sink(IndexEvent::Upsert { page: &page, text })?;
 
         checkpoint.update(rel.clone(), mtime_secs, size);
         stats.upserted += 1;
     }
 
+    // Phase 6：源文件消失 ⇒ 回收 checkpoint 条目，并通知 sink 移除对应倒排项
+    // （倒排索引本身不落盘，这里只保证内存派生结构与知识根一致）。
+    let seen: std::collections::HashSet<&str> =
+        md_files.iter().map(|(_, rel)| rel.as_str()).collect();
+    let stale: Vec<String> = checkpoint
+        .files
+        .iter()
+        .filter(|f| !seen.contains(f.rel.as_str()))
+        .map(|f| page_id_from_rel(&f.rel))
+        .collect();
+    checkpoint.files.retain(|f| seen.contains(f.rel.as_str()));
+    stats.removed = stale.len();
+    for id in stale {
+        sink(IndexEvent::Remove { id })?;
+    }
+
     checkpoint.save(&knowledge_root)?;
     Ok(stats)
+}
+
+/// 知识根常驻索引：`WikiStore`（事实来源）+ 内存倒排索引（派生结构）。
+///
+/// 坑 3 的接线点：召回先用倒排索引取候选 id，再**只对候选集** `get_page` 精排，
+/// 不再 `list_pages` 全量加载。倒排索引不落盘、不作为事实来源，进程重启或
+/// 索引失效时重新 [`sync`](Self::sync) 即可由知识根完整重建。
+pub struct KnowledgeIndex {
+    wiki: Arc<dyn WikiStore>,
+    inverted: InvertedIndex,
+}
+
+/// 单次召回最多精排的候选数（护栏：候选集异常膨胀时只精排头部）。
+pub const RECALL_CANDIDATE_CAP: usize = 64;
+
+impl KnowledgeIndex {
+    /// 用默认倒排容量护栏构造常驻索引。
+    pub fn new(wiki: Arc<dyn WikiStore>) -> Self {
+        Self {
+            wiki,
+            inverted: InvertedIndex::new(),
+        }
+    }
+
+    /// 指定倒排分片容量护栏（大规模知识根调参 / 审计用）。
+    pub fn with_shard_cap(wiki: Arc<dyn WikiStore>, shard_cap: usize) -> Self {
+        Self {
+            wiki,
+            inverted: InvertedIndex::with_shard_cap(shard_cap),
+        }
+    }
+
+    /// 事实来源（面板浏览 / 链接图谱仍走 `WikiStore`）。
+    pub fn wiki(&self) -> &Arc<dyn WikiStore> {
+        &self.wiki
+    }
+
+    /// 内存倒排索引（只读视图，供统计与审计）。
+    pub fn inverted(&self) -> &InvertedIndex {
+        &self.inverted
+    }
+
+    /// 增量同步知识根：投影 `WikiStore` 的同时维护倒排索引。
+    ///
+    /// 写入路径：新增/更新条目 → `insert(id, text)`；源文件消失 → `remove(id)`。
+    /// 幂等：同一文件重复同步按 id 覆盖，不产生重复倒排项。
+    pub async fn sync(&mut self, workspace: &Path) -> Result<KnowledgeIndexStats> {
+        let wiki = Arc::clone(&self.wiki);
+        let inverted = &mut self.inverted;
+        walk_knowledge_root(&wiki, workspace, |event| {
+            match event {
+                IndexEvent::Upsert { page, text } => inverted.insert(&page.id, &text),
+                IndexEvent::Remove { id } => inverted.remove(&id),
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// 候选 id 集（已按命中 term 数降序，最多 [`RECALL_CANDIDATE_CAP`] 条）。
+    pub fn candidate_ids(&self, query: &str) -> Vec<String> {
+        self.inverted()
+            .candidates(query)
+            .into_iter()
+            .take(RECALL_CANDIDATE_CAP)
+            .collect()
+    }
+
+    /// 召回：倒排索引取候选集 → 仅对候选集精排（不触发全量加载）。
+    ///
+    /// 空查询或无命中返回空集；返回顺序即候选命中度顺序。
+    pub async fn recall(&self, query: &str, limit: usize) -> Result<Vec<WikiPage>> {
+        let mut out: Vec<WikiPage> = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        for id in self.candidate_ids(query) {
+            if let Some(page) = self.wiki.get_page(&id).await? {
+                out.push(page);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 倒排索引规模统计：(已索引条目数, term 数, 超容量护栏的分片数)。
+    pub fn inverted_stats(&self) -> (usize, usize, usize) {
+        (
+            self.inverted.doc_count(),
+            self.inverted.term_count(),
+            self.inverted.oversized_shards().len(),
+        )
+    }
 }
 
 /// 递归收集知识根下所有 `.md` 文件，返回 (绝对路径, 相对知识根路径)。
@@ -1284,9 +1421,28 @@ fn collect_md_files(dir: &Path, root: &Path, out: &mut Vec<(PathBuf, String)>) {
     }
 }
 
+/// 由知识根相对路径推导页面 id（投影与删除回收必须用同一规则）。
+fn page_id_from_rel(rel: &str) -> String {
+    sanitize(rel.trim_end_matches(".md"))
+}
+
+/// 知识页面的可检索文本（标题 + 正文块 + 链接标签），供倒排索引分词。
+fn page_text(page: &WikiPage) -> String {
+    let mut text = page.title.clone();
+    for block in &page.blocks {
+        text.push(' ');
+        text.push_str(block);
+    }
+    for link in &page.links {
+        text.push(' ');
+        text.push_str(&link.label);
+    }
+    text
+}
+
 /// 从解析结果构造 WikiPage（知识根投影规则）。
 fn knowledge_page_from(rel: &str, parsed: &crate::frontmatter::ParsedMarkdown) -> WikiPage {
-    let id = sanitize(rel.trim_end_matches(".md"));
+    let id = page_id_from_rel(rel);
     let title = parsed
         .front_matter
         .as_ref()
@@ -1535,6 +1691,148 @@ mod knowledge_tests {
             .blocks
             .iter()
             .any(|b| b.contains("Unreviewed content")));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ── Phase 6：内存倒排索引接线（坑 3：召回不再全量加载） ──────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 统计 `get_page` / `list_pages` 调用次数的 WikiStore，
+    /// 用于验证召回只精排候选集、从不全量加载。
+    struct CountingWiki {
+        pages: Mutex<HashMap<String, WikiPage>>,
+        gets: AtomicUsize,
+        lists: AtomicUsize,
+    }
+
+    impl CountingWiki {
+        fn new() -> Self {
+            Self {
+                pages: Mutex::new(HashMap::new()),
+                gets: AtomicUsize::new(0),
+                lists: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WikiStore for CountingWiki {
+        async fn upsert_page(&self, page: WikiPage) -> Result<()> {
+            self.pages.lock().unwrap().insert(page.id.clone(), page);
+            Ok(())
+        }
+        async fn get_page(&self, id: &str) -> Result<Option<WikiPage>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(self.pages.lock().unwrap().get(id).cloned())
+        }
+        async fn list_pages(&self) -> Result<Vec<WikiPage>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            Ok(self.pages.lock().unwrap().values().cloned().collect())
+        }
+        async fn link(&self, _from: &str, _to: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn query_pages(&self, _query: &str) -> Result<Vec<WikiPage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_maintains_inverted_index_incrementally() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        std::fs::write(
+            kb.join("tokio-notes.md"),
+            "# Tokio Notes\n\nAsync runtime tuning.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            kb.join("sql-notes.md"),
+            "# Sql Notes\n\nQuery planner hints.\n",
+        )
+        .unwrap();
+
+        let wiki = Arc::new(CountingWiki::new());
+        let mut index = KnowledgeIndex::new(wiki.clone());
+
+        let s1 = index.sync(&ws).await.unwrap();
+        assert_eq!(s1.upserted, 2);
+        assert_eq!(s1.removed, 0);
+        let (docs, terms, oversized) = index.inverted_stats();
+        assert_eq!(docs, 2);
+        assert!(terms > 0);
+        assert_eq!(oversized, 0);
+        assert_eq!(index.candidate_ids("tokio"), vec!["tokio-notes".to_string()]);
+
+        // 新增一个文件：只索引新文件，倒排索引增量长到 3 条
+        std::fs::write(
+            kb.join("grpc-notes.md"),
+            "# Grpc Notes\n\nStreaming backpressure.\n",
+        )
+        .unwrap();
+        let s2 = index.sync(&ws).await.unwrap();
+        assert_eq!(s2.upserted, 1);
+        assert_eq!(s2.skipped, 2);
+        assert_eq!(index.inverted_stats().0, 3);
+        assert_eq!(index.candidate_ids("grpc"), vec!["grpc-notes".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn deleted_file_drops_postings_and_checkpoint() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        let file = kb.join("runtime-notes.md");
+        std::fs::write(&file, "# Runtime Notes\n\nScheduler internals.\n").unwrap();
+
+        let wiki = Arc::new(CountingWiki::new());
+        let mut index = KnowledgeIndex::new(wiki.clone());
+        index.sync(&ws).await.unwrap();
+        assert_eq!(index.inverted_stats().0, 1);
+        assert_eq!(
+            index.candidate_ids("scheduler"),
+            vec!["runtime-notes".to_string()]
+        );
+
+        std::fs::remove_file(&file).unwrap();
+        let stats = index.sync(&ws).await.unwrap();
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.upserted, 0);
+        // 倒排项被摘除：召回不再命中已删除条目
+        assert_eq!(index.inverted_stats().0, 0);
+        assert!(index.candidate_ids("scheduler").is_empty());
+        assert!(index.recall("scheduler", 5).await.unwrap().is_empty());
+        // checkpoint 同步回收，不会无限增长
+        assert!(KnowledgeCheckpoint::load(&kb).files.is_empty());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn recall_only_fetches_candidates() {
+        let ws = make_workspace();
+        let kb = ws.join(".harness-memory");
+        std::fs::write(kb.join("a.md"), "# A\n\nTokio runtime tuning.\n").unwrap();
+        std::fs::write(kb.join("b.md"), "# B\n\nQuery planner hints.\n").unwrap();
+        std::fs::write(kb.join("c.md"), "# C\n\nUnrelated gardening notes.\n").unwrap();
+
+        let wiki = Arc::new(CountingWiki::new());
+        let mut index = KnowledgeIndex::new(wiki.clone());
+        index.sync(&ws).await.unwrap();
+
+        let pages = index.recall("planner", 10).await.unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].id, "b");
+        // 坑 3 验收：只精排候选集（1 次 get_page），从不全量加载（0 次 list_pages）
+        assert_eq!(wiki.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(wiki.lists.load(Ordering::SeqCst), 0);
+
+        // 空查询零成本：不产生任何 get_page
+        assert!(index.recall("", 10).await.unwrap().is_empty());
+        assert_eq!(wiki.gets.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(&ws);
     }

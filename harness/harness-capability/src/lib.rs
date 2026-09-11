@@ -21,7 +21,10 @@ pub mod git;
 pub mod hook;
 /// 资产索引器：把工作区静态资产（SKILL.md / *.md / 源码）自动沉淀进四类资产服务。
 pub mod index;
+/// 内存倒排索引（Phase 6 / 坑 3）：term → id 集合，查询先取候选集再精排，写时增量更新。
+pub mod inverted;
 pub mod lsp;
+/// 跨会话记忆机制；Phase 5 / 坑 1 在此追加可插拔语义召回插槽（`EmbeddingProvider` + RRF 融合）。
 pub mod memory;
 /// 审核晋升（Phase 3）：review/ 候选事实经质量门禁（来源/可独立理解/置信度/去重）晋升为 facts/ 的 L2 正式事实。
 pub mod promotion;

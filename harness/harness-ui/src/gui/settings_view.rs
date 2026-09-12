@@ -493,16 +493,35 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     }
                                     "新建项目" => {
                                         ui.label(
-                                            egui::RichText::new("选择项目目录后立即切换到该项目，并保存到侧栏项目列表。")
+                                            egui::RichText::new("选择项目目录后点击“确定”，切换到该项目并保存到侧栏项目列表。")
                                                 .size(12.5)
                                                 .color(pal.text),
                                         );
                                         ui.add_space(12.0);
+                                        let pending_id = egui::Id::new("new_project_pending_dir");
+                                        let mut pending: Option<String> =
+                                            ui.ctx().data_mut(|d| d.get_temp(pending_id));
                                         if accent_button(ui, &pal, "选择项目目录") {
                                             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                                 let s = path.display().to_string();
+                                                pending = Some(s.clone());
+                                                ui.ctx().data_mut(|d| d.insert_temp(pending_id, pending.clone()));
+                                            }
+                                        }
+                                        if let Some(dir) = pending {
+                                            ui.add_space(8.0);
+                                            ui.label(
+                                                egui::RichText::new(format!("待创建项目目录: {dir}"))
+                                                    .size(12.0)
+                                                    .color(pal.text),
+                                            );
+                                            ui.add_space(8.0);
+                                            if accent_button(ui, &pal, "确定") {
+                                                let path = std::path::PathBuf::from(dir.clone());
                                                 let _ = state.host.settings.add_project(&path);
-                                                state.switch_project(&s);
+                                                state.switch_project(&dir);
+                                                state.settings_open = false;
+                                                ui.ctx().data_mut(|d| d.insert_temp::<Option<String>>(pending_id, None));
                                             }
                                         }
                                         ui.add_space(8.0);

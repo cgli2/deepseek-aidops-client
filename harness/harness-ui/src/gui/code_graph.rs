@@ -134,10 +134,14 @@ pub(super) fn render(
             ui.make_persistent_id(("code_group", file)),
             egui::Sense::click(),
         );
-        if header_resp.double_clicked() || toggle {
+        // 整行单击即折叠/展开（修复：原先仅小三角可点，热区过小导致点半天不触发）。
+        if header_resp.clicked() || header_resp.double_clicked() || toggle {
             if !expanded.insert(file.clone()) {
                 expanded.remove(file);
             }
+        }
+        if header_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         ui.add_space(3.0);
         if !is_open {
@@ -223,7 +227,7 @@ fn empty_hint(ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(
-            "还没有代码符号。点击「重新索引资产」扫描工作区源码，自动建立代码图谱；之后即可按文件浏览符号、查看调用关系。",
+            "还没有代码符号。点击「重新索引资产」扫描工作区源码，自动建立代码图谱。\n\n这个代码库用在哪？\n· Agent 执行编码任务时，用它快速定位相关文件与函数，避免全仓扫描；\n· 跨项目协作时，可按文件浏览符号、查看调用关系，作为检索入口；\n· 索引按当前工作区建立，切换工作区后重新索引即可。",
         )
         .size(12.0)
         .color(pal.dim),

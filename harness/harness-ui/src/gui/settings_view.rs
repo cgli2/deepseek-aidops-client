@@ -907,6 +907,17 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         } else {
                                             state.mem_items.len()
                                         };
+                                        // item-2：明示索引归属——代码索引按工作区（项目）独立建立，
+                                        // 让用户一眼看清"这是哪个项目的代码库"；跨项目检索时按此路径过滤。
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "当前项目索引库：{}（切换工作区即切换代码索引库）",
+                                                state.host.workspace_root
+                                            ))
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(4.0);
                                         ui.label(
                                             egui::RichText::new(format!(
                                                 "共 {mem_count} 条 · 本地原生记忆（若已连接 aidops 后端，以远端为准）"

@@ -14,8 +14,9 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use crate::council::COUNCIL_PREFIX;
+use crate::execution::{TaskContract, TaskScale, TaskShape};
 use crate::long_horizon::configured_turn_timeout;
-use crate::{run_durable_agent_turn, run_durable_council_turn};
+use crate::{AgentLoop, run_durable_agent_turn, run_durable_council_turn};
 
 #[derive(Clone)]
 pub struct SessionController {
@@ -254,15 +255,33 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
                     )
                     .await
                 } else {
-                    run_durable_agent_turn(
-                        &ctx,
-                        UserInput {
-                            text: run_text,
-                            attachments,
-                        },
-                        runner_cancellation,
-                    )
-                    .await
+                    // 前置任务规模判断：Atomic 小任务走轻量路径，跳过持久化开销。
+                    let contract = TaskContract::from_input(&clean_text);
+                    let shape = TaskShape::for_contract(&contract);
+                    let is_atomic = shape.scale == TaskScale::Atomic;
+                    if is_atomic {
+                        AgentLoop::new()
+                            .run_turn_cancellable(
+                                &ctx,
+                                UserInput {
+                                    text: run_text,
+                                    attachments,
+                                },
+                                runner_cancellation,
+                                None,
+                            )
+                            .await
+                    } else {
+                        run_durable_agent_turn(
+                            &ctx,
+                            UserInput {
+                                text: run_text,
+                                attachments,
+                            },
+                            runner_cancellation,
+                        )
+                        .await
+                    }
                 }
             };
             match turn_timeout {

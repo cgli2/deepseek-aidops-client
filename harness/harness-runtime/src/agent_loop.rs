@@ -1124,9 +1124,13 @@ impl AgentLoop {
                 // 十几次人工“继续”。连续无进展或达到自动续跑上限才交回用户。
                 let progress_now = execution_progress_units(&execution);
                 let progress_since_window = progress_now.saturating_sub(hard_baseline);
+                // 根因修复：即使本窗口有“可验证进展”，只要已无任何仍可自主推进的
+                // 交付面（全部 Verified / Failed / NeedsUserInput，即已有结论），
+                // 就不再自动续跑，避免“已经得出答案却仍被反复驱动继续”。
                 if !cancelled
                     && budget.hard_autorenews < MAX_HARD_AUTORENEWS
                     && progress_since_window > 0
+                    && !goal_execution.active_surfaces().is_empty()
                 {
                     BudgetManager::arm_hard_continuation(&mut budget);
                     budget.hard_autorenews += 1;

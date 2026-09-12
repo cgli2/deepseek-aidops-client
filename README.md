@@ -24,9 +24,11 @@ auditable work in development, DevOps, AIOps, and resource-constrained environme
   Git capabilities guarded by policies and workspace boundaries.
 - **Durable long-horizon work** — append-only task DAGs, lease recovery, rate/token budgets,
   immutable artifacts, quality gates, and checkpoints for irreversible operations.
-  - **LHA P2 (2025)** — 新增 `lha` 控制面模块：MVCC 工件投递与崩溃恢复、HITL 不可逆副作用精确绑定、
-    契约锁（放行 body / 阻断公共签名漂移 / 防路径逃逸）、全局预算耗尽终态持久化（`BudgetExhausted`）、
-    新任务波次预算回补。见 `harness-runtime/tests/lha_p2.rs`（7 个用例）与 `docs/lha-gap-analysis.md`。
+  - **LHA P2 (2025)** — adds `lha` control-plane modules: MVCC artifact delivery and crash recovery,
+    precise binding of HITL irreversible side effects, contract lock (allow body / block public-signature
+    drift / prevent path escape), persistent global budget-exhaustion terminal state (`BudgetExhausted`),
+    and budget replenishment for new task waves. See `harness-runtime/tests/lha_p2.rs` (7 cases) and
+    `docs/lha-gap-analysis.md`.
 - **Composable architecture** — independently combine GUI, TUI, headless, ACP, sandbox, and WASM
   capabilities through Definition / Provider / Consumer seams.
 

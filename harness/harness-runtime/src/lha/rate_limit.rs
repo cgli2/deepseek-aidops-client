@@ -148,7 +148,28 @@ impl GlobalBudgetController {
         estimated_tokens: u64,
         now_ms: u64,
     ) -> Result<Admission, RateLimitError> {
-        if estimated_tokens > self.total_tokens_remaining {
+        self.acquire_inner(provider, estimated_tokens, now_ms, true)
+    }
+
+    /// Apply provider limits without enforcing a cumulative task allowance.
+    /// Persisted exhausted allowances do not prevent uncapped work from running.
+    pub fn acquire_rate_limited(
+        &mut self,
+        provider: &str,
+        estimated_tokens: u64,
+        now_ms: u64,
+    ) -> Result<Admission, RateLimitError> {
+        self.acquire_inner(provider, estimated_tokens, now_ms, false)
+    }
+
+    fn acquire_inner(
+        &mut self,
+        provider: &str,
+        estimated_tokens: u64,
+        now_ms: u64,
+        enforce_total: bool,
+    ) -> Result<Admission, RateLimitError> {
+        if enforce_total && estimated_tokens > self.total_tokens_remaining {
             return Ok(Admission::GracefulExhaustion);
         }
         let bucket = self
@@ -177,7 +198,9 @@ impl GlobalBudgetController {
         bucket.request_units -= request_cost;
         bucket.token_units -= token_cost;
         bucket.consecutive_429 = 0;
-        self.total_tokens_remaining -= estimated_tokens;
+        if enforce_total {
+            self.total_tokens_remaining -= estimated_tokens;
+        }
         Ok(Admission::Granted)
     }
 

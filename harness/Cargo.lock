@@ -1826,6 +1826,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-observer"
+version = "0.3.0"
+dependencies = [
+ "harness-runtime",
+]
+
+[[package]]
 name = "harness-provider-aidops"
 version = "0.3.0"
 dependencies = [

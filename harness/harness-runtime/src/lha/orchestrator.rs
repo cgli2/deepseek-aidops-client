@@ -105,6 +105,8 @@ pub struct LongHorizonRuntime {
 }
 
 impl LongHorizonRuntime {
+    /// A zero total_token_budget disables the cumulative cap, including when
+    /// reopening an older workspace with an exhausted persisted allowance.
     pub fn open(
         control_root: impl AsRef<Path>,
         total_token_budget: u64,
@@ -330,7 +332,11 @@ impl LongHorizonRuntime {
                 .budget
                 .lock()
                 .map_err(|_| OrchestratorError::Poisoned("budget"))?;
-            let admission = budget.acquire(provider, estimated_tokens, now_ms)?;
+            let admission = if self.total_token_budget == 0 {
+                budget.acquire_rate_limited(provider, estimated_tokens, now_ms)?
+            } else {
+                budget.acquire(provider, estimated_tokens, now_ms)?
+            };
             budget.save(self.control_root.join("budget.json"))?;
             admission
         };

@@ -414,7 +414,7 @@ harness/Cargo.toml -p harness-capability promotion` → 3 passed），但仓库�
 
 约束：晋升只在启动后台任务里跑一次且幂等；绝不把未审核候选（confidence 仍为默认值）提升为正式事实。
 
-## 14. Phase 5 接线契约：可插拔语义召回插槽（坑 1，Definition 层已落地）
+## 14. Phase 5 接线契约：可插拔语义召回插槽（坑 1，Definition 层与接线均已落地）
 
 现状（已验证）：`harness-capability/src/memory.rs` 已具备语义召回插槽与融合公式，
 `cargo +stable-x86_64-pc-windows-msvc test --manifest-path harness/Cargo.toml -p harness-capability embedding` → 4 passed。
@@ -422,7 +422,7 @@ harness/Cargo.toml -p harness-capability promotion` → 3 passed），但仓库�
 | 落点 | 改动 | 验收 |
 | --- | --- | --- |
 | `harness/harness-capability/src/memory.rs` | 新增 `MatchedBy`（lexical/semantic/both）、`RecallHit{id,score,matched_by}`、`EmbeddingProvider` trait（`name/available/recall`）、默认实现 `NoopEmbedding`（永不可用、永返回空）、`RRF_K = 60.0` 与 `rrf_merge(lexical, semantic, limit)`（`Σ 1/(k+rank)`，同分按 id 字典序稳定排序） | 语义通道为空时结果与词法通道**同序**（纯词法退化）；双通道命中者 `matched_by = Both` 且分数叠加上浮；`limit` 截断生效；`NoopEmbedding.available() == false` |
-| 剩余接线（未实施） | 原生 provider 召回路径把词法 id 列表与 `embedding.recall()` 结果交给 `rrf_merge`，并把 `matched_by` 回写到结果元数据 | 未配置 embedding 时逐条结果与现状一致（回归零破坏）；配置本地 embedding 后每条结果都能说明"它是怎么被召回的" |
+| 接线（已实施，`assets_native.rs`） | 原生 provider 召回路径把词法 id 列表与 `embedding.recall()` 结果交给 `rrf_merge`，并把 `matched_by` 回写到结果元数据 | 未配置 embedding 时逐条结果与现状一致（回归零破坏）；配置本地 embedding 后每条结果都能说明"它是怎么被召回的"。已验证：`recall_without_embedding_degrades_to_pure_lexical`、`recall_with_embedding_merges_channels_and_labels_matched_by` 均通过（`-p harness-provider-memory` 8 passed） |
 
 约束：语义通道只是**可选增强**——provider 不可用必须返回空，绝不因缺模型而降低或阻断词法召回。
 
@@ -438,3 +438,31 @@ harness/Cargo.toml -p harness-capability promotion` → 3 passed），但仓库�
 | 接线（已实施） | `index.rs` 知识根索引与 provider 召回改为"先 `candidates()` 取候选集 → 再对候选集精排"；写路径（新增/变更/删除文件）调用 `insert` / `remove` 做增量维护 | 索引常驻内存后召回不再全量加载；写单条文件的耗时与全库规模解耦。已验证：`index::knowledge_tests`（`recall_only_fetches_candidates` 只精排候选集、`deleted_file_drops_postings_and_checkpoint` 删除即摘除倒排项、`sync_maintains_inverted_index_incrementally` 写路径增量维护）与 `assets_native` 的 `recall_uses_inverted_candidates_with_incremental_write_path` 均在测试套件内；`-p harness-capability` 40 passed，`check -p harness-bin` 全依赖链通过 |
 
 约束：倒排索引是**纯内存派生结构**，可随时由知识根重建，不作为事实来源，不新增落盘格式。
+
+## 16. 复核基线（回归门槛）
+
+| 命令 | 基线 |
+| --- | --- |
+| `cargo +stable-x86_64-pc-windows-msvc test --manifest-path harness/Cargo.toml -p harness-capability` | 40 passed |
+| `cargo +stable-x86_64-pc-windows-msvc test --manifest-path harness/Cargo.toml -p harness-provider-memory` | 8 passed |
+| `cargo +stable-x86_64-pc-windows-msvc check --manifest-path harness/Cargo.toml -p harness-bin` | 通过（全依赖链） |
+
+后续任何 Phase 落地后，以上命令必须保持同等或更好的结果；行为变化需在本文件追加说明。
+
+## 17. Phase 7 / Phase 8 接线契约：CodeGraph 分级置信（坑 6，待实施）
+
+现状（已核实）：`CodeGraph` 已提供代码符号、调用关系与影响路径，但关系边不区分
+证据强度——`parse_code` 抽取的显式调用与启发式推断（同名符号、类型近似）混在同一
+调用集合中，`impact_path` 无法说明每一跳是"看见的"还是"推断的"。
+
+| 落点 | 改动 | 验收 |
+| --- | --- | --- |
+| `harness/harness-capability/src/assets.rs` | 调用边新增 `confidence`（`Declared` 显式调用 / `Inferred` 经导入或类型解析可证 / `Heuristic` 同名或位置启发）与 `source_line`；缺省解析为 `Heuristic`，旧数据向后兼容 | `impact_path` 每一跳回带该边的置信与来源行号；`Declared` 边行号与源码调用点可对齐 |
+| `harness/harness-provider-memory/src/assets_native.rs` | `parse_code` 抽取边时标注置信：语法可见的直接调用 → `Declared(line)`；经导入 / trait 解析 → `Inferred`；其余 → `Heuristic` | 单测：静态调用样例产出 `Declared` 边且行号正确；动态分发、同名歧义标 `Heuristic`，不虚报 |
+| `harness/harness-ui/src/gui/code_graph.rs` | 面板渲染按置信区分样式（如 `Heuristic` 边虚线 / 降饱和），悬停显示来源行号 | 置信可视化落地，不改变现有布局 |
+
+Phase 8 收尾：调用方工具描述声明能力边界（影响路径含推断边，仅 `Declared` 可对齐
+源码行号）；实施完成后在本文件追加验证记录并复核 §16 基线。
+
+约束：置信是**只增不改**的元数据扩展——不改变现有调用边的集合语义��启发式边绝不
+阻断查询；`Declared` 判定必须保守，宁可降级为 `Inferred` 也不虚报证据强度。

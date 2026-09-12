@@ -17,6 +17,7 @@ use harness_capability::assets::{
     Skill, SkillLibrary, WikiLink, WikiPage, WikiStore,
 };
 use harness_capability::inverted::InvertedIndex;
+use harness_capability::memory::{EmbeddingProvider, MatchedBy, NoopEmbedding, rrf_merge};
 use harness_core::error::{Error, Result};
 
 /// 候选集规模护栏（Phase 6 / 坑 3）：精排只处理前 N 个候选，
@@ -152,17 +153,44 @@ pub struct NativeConversationMemory {
     facts: Mutex<Option<Vec<MemoryFact>>>,
     /// 倒排索引 + id 映射（Phase 6 / 坑 3）：召回先取候选集再精排，写时增量更新。
     recall_index: Mutex<Option<RecallIndex>>,
+    /// Phase 5 / 坑 1：可插拔语义召回插槽；默认 `NoopEmbedding`（不可用 → 纯词法）。
+    embedding: Arc<dyn EmbeddingProvider>,
+    /// 最近一次 recall 的结果元数据：id → 召回来源（词法 / 语义 / 双通道）。
+    last_matched_by: Mutex<HashMap<String, MatchedBy>>,
 }
 
 impl NativeConversationMemory {
     pub fn new(cwd: impl AsRef<Path>) -> Arc<Self> {
+        Self::with_embedding(cwd, Arc::new(NoopEmbedding))
+    }
+
+    /// Phase 5 / 坑 1：注入语义召回 provider（本地模型 / aidops 后端）。
+    /// 语义通道只是可选增强：provider 不可用时 `recall` 返回空列表，
+    /// 融合自然退化为纯词法同序，词法召回零破坏。
+    pub fn with_embedding(
+        cwd: impl AsRef<Path>,
+        embedding: Arc<dyn EmbeddingProvider>,
+    ) -> Arc<Self> {
         let root = asset_root(cwd.as_ref());
         let _ = ensure_dir(&root);
         Arc::new(Self {
             root,
             facts: Mutex::new(None),
             recall_index: Mutex::new(None),
+            embedding,
+            last_matched_by: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// 当前语义召回 provider 标识（配置回显 / 结果溯源）。
+    pub fn embedding_name(&self) -> &'static str {
+        self.embedding.name()
+    }
+
+    /// 最近一次 recall 的结果元数据（Phase 5 / 坑 1）：id → 召回来源。
+    /// 每条结果都能据此说明“它是怎么被召回的”。
+    pub fn last_matched_by(&self) -> HashMap<String, MatchedBy> {
+        self.last_matched_by.lock().unwrap().clone()
     }
 
     fn conv_path(&self, session_id: &str) -> PathBuf {
@@ -201,22 +229,34 @@ impl NativeConversationMemory {
         format!("{fact:?}")
     }
 
+    /// 由全量事实构建一次倒排索引（首次召回时触发，之后由写路径增量维护）。
+    fn build_index(facts: Vec<MemoryFact>) -> RecallIndex {
+        let mut idx = RecallIndex {
+            inverted: InvertedIndex::new(),
+            by_id: HashMap::new(),
+        };
+        for f in facts {
+            idx.inverted.insert(&f.id, &Self::fact_text(&f));
+            idx.by_id.insert(f.id.clone(), f);
+        }
+        idx
+    }
+
+    /// 惰性构建并锁定倒排索引（候选集查询与语义通道按 id 取条目共用）。
+    fn ensure_index(&self) -> std::sync::MutexGuard<'_, Option<RecallIndex>> {
+        let mut guard = self.recall_index.lock().unwrap();
+        if guard.is_none() {
+            let idx = Self::build_index(self.load_facts());
+            *guard = Some(idx);
+        }
+        guard
+    }
+
     /// 候选集（Phase 6 / 坑 3）：首次调用由全量事实构建倒排索引，之后只走倒排取候选。
     ///
     /// 未命中任何 term 时返回空——按设计**不做全量兜底扫描**（否则规模性能优化失效）。
     fn candidate_facts(&self, query: &str) -> Vec<MemoryFact> {
-        let mut guard = self.recall_index.lock().unwrap();
-        if guard.is_none() {
-            let mut idx = RecallIndex {
-                inverted: InvertedIndex::new(),
-                by_id: HashMap::new(),
-            };
-            for f in self.load_facts() {
-                idx.inverted.insert(&f.id, &Self::fact_text(&f));
-                idx.by_id.insert(f.id.clone(), f);
-            }
-            *guard = Some(idx);
-        }
+        let guard = self.ensure_index();
         let Some(idx) = guard.as_ref() else {
             return Vec::new();
         };
@@ -226,6 +266,16 @@ impl NativeConversationMemory {
             .take(CANDIDATE_CAP)
             .filter_map(|id| idx.by_id.get(&id).cloned())
             .collect()
+    }
+
+    /// 按 id 取事实（Phase 5 / 坑 1）：语义通道命中但词法候选集未覆盖的条目从这里补齐，
+    /// 仍只做 O(1) 映射查找，不扫全量。
+    fn facts_by_ids(&self, ids: &[String]) -> Vec<MemoryFact> {
+        let guard = self.ensure_index();
+        let Some(idx) = guard.as_ref() else {
+            return Vec::new();
+        };
+        ids.iter().filter_map(|id| idx.by_id.get(id).cloned()).collect()
     }
 
     /// 写路径增量维护（坑 3 验收 2）：单条写入只调整该 id 涉及的 term 集合与映射项，
@@ -321,7 +371,7 @@ impl ConversationMemory for NativeConversationMemory {
 
     async fn recall(&self, query: &str, min_layer: LifecycleLayer) -> Result<Vec<MemoryFact>> {
         let (q, base) = query_tokens(query);
-        // Phase 6 / 坑 3：先走倒排索引取**候选集**，再只对候选集做词法精排，
+        // Phase 6 / 坑 3：词法通道先走倒排索引取**候选集**，再只对候选集做词法精排，
         // 扫描范围从「全量事实」降到「候选集」（不再对每条事实做 Debug 格式化 + 打分）。
         let mut scored: Vec<(f32, MemoryFact)> = self
             .candidate_facts(query)
@@ -334,7 +384,37 @@ impl ConversationMemory for NativeConversationMemory {
             .filter(|(s, _)| *s > 0.0)
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(scored.into_iter().map(|(_, f)| f).take(20).collect())
+        let lexical: Vec<MemoryFact> = scored.into_iter().map(|(_, f)| f).collect();
+        let lexical_ids: Vec<String> = lexical.iter().map(|f| f.id.clone()).collect();
+
+        // Phase 5 / 坑 1：语义通道是可选增强——provider 不可用时返回空，
+        // rrf_merge 退化为纯词法同序（未配置 embedding 时逐条结果与现状一致）。
+        let semantic_ids: Vec<String> = if self.embedding.available() {
+            self.embedding.recall(query, 20)
+        } else {
+            Vec::new()
+        };
+        // 语义命中但词法候选集未覆盖的条目按 id 补齐（仍不做全量扫描），并遵守 layer 过滤。
+        let mut by_id: HashMap<String, MemoryFact> =
+            lexical.into_iter().map(|f| (f.id.clone(), f)).collect();
+        for f in self.facts_by_ids(&semantic_ids) {
+            if !by_id.contains_key(&f.id) && f.layer.at_least(min_layer) {
+                by_id.insert(f.id.clone(), f);
+            }
+        }
+
+        let hits = rrf_merge(&lexical_ids, &semantic_ids, 20);
+        let mut trace: HashMap<String, MatchedBy> = HashMap::with_capacity(hits.len());
+        let mut out: Vec<MemoryFact> = Vec::with_capacity(hits.len());
+        for h in &hits {
+            if let Some(f) = by_id.get(&h.id) {
+                out.push(f.clone());
+                // 结果元数据：每条结果都能说明“它是怎么被召回的”。
+                trace.insert(h.id.clone(), h.matched_by);
+            }
+        }
+        *self.last_matched_by.lock().unwrap() = trace;
+        Ok(out)
     }
 
     async fn remember(&self, fact: MemoryFact) -> Result<()> {
@@ -845,6 +925,104 @@ mod tests {
         let hits = conv.recall("zebra migration", LifecycleLayer::L2).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "fact:zebra");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 5 / 坑 1：语义召回插槽测试替身——恒可用，返回预设 id 列表。
+    struct FakeEmbedding {
+        ids: Vec<String>,
+    }
+
+    impl EmbeddingProvider for FakeEmbedding {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn recall(&self, _query: &str, _limit: usize) -> Vec<String> {
+            self.ids.clone()
+        }
+    }
+
+    /// Phase 5 / 坑 1：未配置 embedding（默认 NoopEmbedding）时，
+    /// 语义通道为空 → 召回结果与纯词法通道完全一致，逐条标注 `lexical`（回归零破坏）。
+    #[tokio::test]
+    async fn recall_without_embedding_degrades_to_pure_lexical() {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-recall-noop-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conv = NativeConversationMemory::new(&dir);
+        assert_eq!(conv.embedding_name(), "noop");
+        conv.remember(MemoryFact {
+            id: "fact:alpha".into(),
+            kind: FactKind::Fact,
+            content: "zebra migration note 关于索引迁移的记录".into(),
+            layer: LifecycleLayer::L2,
+            confidence: 0.9,
+            source: "test".into(),
+        })
+        .await
+        .unwrap();
+
+        let hits = conv.recall("zebra migration", LifecycleLayer::L2).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "fact:alpha");
+        // 未配置 embedding：每条结果都标注为纯词法召回。
+        let trace = conv.last_matched_by();
+        assert_eq!(trace.get("fact:alpha"), Some(&MatchedBy::Lexical));
+        assert_eq!(trace.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 5 / 坑 1：配置 embedding 后，词法 id 列表与 `embedding.recall()` 结果
+    /// 交给 `rrf_merge` 融合：双通道命中者分数叠加上浮排第一，
+    /// 词法未命中但语义命中的条目仍被召回，`matched_by` 逐条可解释。
+    #[tokio::test]
+    async fn recall_with_embedding_merges_channels_and_labels_matched_by() {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-recall-emb-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // fact:lexical 词法命中；fact:semantic-only 词法不命中，只能靠语义通道召回。
+        let conv = NativeConversationMemory::with_embedding(
+            &dir,
+            Arc::new(FakeEmbedding {
+                ids: vec!["fact:semantic-only".into(), "fact:lexical".into()],
+            }),
+        );
+        for (id, content) in [
+            ("fact:lexical", "zebra migration note 关于索引迁移的记录"),
+            ("fact:semantic-only", "完全不同的主题，词法无法命中"),
+        ] {
+            conv.remember(MemoryFact {
+                id: id.into(),
+                kind: FactKind::Fact,
+                content: content.into(),
+                layer: LifecycleLayer::L2,
+                confidence: 0.8,
+                source: "test".into(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let hits = conv.recall("zebra migration", LifecycleLayer::L2).await.unwrap();
+        // 双通道命中的 fact:lexical 分数叠加，排第一；semantic-only 仍被召回。
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "fact:lexical");
+        let trace = conv.last_matched_by();
+        assert_eq!(trace.get("fact:lexical"), Some(&MatchedBy::Both));
+        assert_eq!(trace.get("fact:semantic-only"), Some(&MatchedBy::Semantic));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

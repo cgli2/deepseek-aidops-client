@@ -48,7 +48,9 @@ impl Default for LongHorizonManager {
 impl LongHorizonManager {
     pub fn from_env() -> Self {
         Self {
-            total_token_budget: env_u64("HARNESS_LHA_TOTAL_TOKENS", 10_000_000),
+            // Cumulative spend must be explicitly capped; long-running turns
+            // otherwise stop before they can satisfy the delivery gate.
+            total_token_budget: env_u64("HARNESS_LHA_TOTAL_TOKENS", 0),
             output_token_reserve: env_u64("HARNESS_LHA_TURN_TOKENS", 4_096),
             lease_ttl: Duration::from_secs(env_u64("HARNESS_LHA_LEASE_SECS", 180).max(3)),
             task_timeout: configured_turn_timeout(),

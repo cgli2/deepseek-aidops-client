@@ -6,6 +6,7 @@
 
 mod log;
 pub use log::{
+    Observation,
     CouncilEvent, CouncilGateResult, CouncilTaskSpec, CouncilTaskState, DeliveryCriterion,
     DeliveryOutcome, DeliveryReport, EventId, ExecutionTelemetry, PlanItem, SessionEvent,
     SessionId, SessionLog, SessionMeta, WorkItemTelemetry, delete_session, list_sessions,

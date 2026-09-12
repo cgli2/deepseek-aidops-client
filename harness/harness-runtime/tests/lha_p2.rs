@@ -8,6 +8,91 @@ use harness_runtime::{
 use serde_json::json;
 
 #[test]
+fn uncapped_runtime_reopens_spent_budget_and_delivers_after_many_requests() {
+    let root = std::env::temp_dir().join(format!("lha_uncapped_{}", uuid::Uuid::new_v4()));
+    let runtime = LongHorizonRuntime::open(&root, 100).unwrap();
+    runtime
+        .register_provider(
+            "primary",
+            ProviderLimit {
+                requests_per_minute: 60,
+                tokens_per_minute: 6_000,
+                request_burst: 1,
+                token_burst: 100,
+            },
+            0,
+        )
+        .unwrap();
+    runtime
+        .submit(TaskSpec {
+            task_id: "long-task".into(),
+            parent_id: None,
+            dependencies: vec![],
+            inputs: json!({}),
+            invariants: vec![],
+            expected_output_schema: json!({}),
+            timeout_seconds: 0,
+            max_retries: 1,
+        })
+        .unwrap();
+    runtime
+        .claim_task("long-task", "worker", 0, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        runtime.admit_llm("long-task", "primary", 100, 0).unwrap(),
+        Admission::Granted
+    );
+    drop(runtime);
+
+    // No new wave: an active task and a zero remaining balance are restored.
+    let runtime = LongHorizonRuntime::open(&root, 0).unwrap();
+    assert!(matches!(
+        runtime.admit_llm("long-task", "primary", 100, 0).unwrap(),
+        Admission::Backpressure { .. }
+    ));
+    for tick in 1..=200 {
+        assert_eq!(
+            runtime
+                .admit_llm("long-task", "primary", 100, tick * 1_000)
+                .unwrap(),
+            Admission::Granted
+        );
+    }
+    let delay = runtime.record_429("primary", 200_000).unwrap();
+    assert!(
+        matches!(runtime.admit_llm("long-task", "primary", 1, 200_000).unwrap(), Admission::Backpressure { retry_after_ms } if retry_after_ms == delay)
+    );
+    let report = harness_session::DeliveryReport {
+        outcome: harness_session::DeliveryOutcome::Verified,
+        criteria: vec![harness_session::DeliveryCriterion {
+            id: "delivery".into(),
+            description: "complete long task".into(),
+            satisfied: true,
+            evidence: vec!["completed 200 requests".into()],
+        }],
+        verification: vec!["request sequence verified".into()],
+        reason: None,
+    };
+    // Use the real delivery gate; uncapped admission must not terminalize work.
+    runtime
+        .finalize_delivery(
+            "long-task",
+            "deliveries/long-task",
+            b"done",
+            &report,
+            "worker",
+            300_000,
+        )
+        .unwrap();
+    assert!(matches!(
+        runtime.task("long-task").unwrap().unwrap().status,
+        TaskStatus::Succeeded { .. }
+    ));
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn p1_p2_control_plane_delivers_and_recovers_authoritative_mvcc_artifact() {
     let root = std::env::temp_dir().join(format!("lha_p2_e2e_{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

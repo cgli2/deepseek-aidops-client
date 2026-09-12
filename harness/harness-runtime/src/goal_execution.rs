@@ -1112,6 +1112,22 @@ impl GoalExecution {
             .iter()
             .chain(self.goal.code_entities.iter())
             .cloned()
+            // G4 修复：概念注册只跟踪代码符号/路径。L0 标识符信号会把用户目标里的
+            // 中文 n-gram 碎片（如“中文”“中文词碎”）误当候选符号，导致跨面漏改预警
+            // 把自然语言切词当成“待改实体”、面数虚高（“506 面”幻觉）。这里在注册
+            // 入口直接丢弃含 CJK 字符的碎片，让漏改清单只反映真实的跨文件一致性缺口。
+            .filter(|symbol| {
+                !symbol.chars().any(|c| {
+                    matches!(
+                        c,
+                        '\u{3000}'..='\u{303F}' // CJK 标点
+                            | '\u{3400}'..='\u{4DBF}' // CJK 扩展 A
+                            | '\u{4E00}'..='\u{9FFF}' // CJK 统一表意
+                            | '\u{F900}'..='\u{FAFF}' // CJK 兼容表意
+                            | '\u{FF00}'..='\u{FFEF}' // 全角形式
+                    )
+                })
+            })
             .collect();
         symbols.sort();
         symbols.dedup();

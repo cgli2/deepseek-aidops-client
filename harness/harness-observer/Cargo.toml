@@ -1,0 +1,8 @@
+[package]
+name = "harness-observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-runtime = { path = "../harness-runtime" }

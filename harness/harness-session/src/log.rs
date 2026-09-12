@@ -310,6 +310,7 @@ struct SessionState {
 /// 回合必须先调用 [`SessionLog::pin`]，得到固定到当时状态的句柄，因而不会把
 /// 流式输出串写进用户后来打开的新会话。
 pub struct SessionLog {
+    observers: Arc<RwLock<Vec<(Uuid, Arc<dyn Fn(&SessionEvent) + Send + Sync>)>>>,
     state: RwLock<Arc<SessionState>>,
     /// 已被后台回合 pin 住的会话状态。UI 从历史切回该文件时复用同一状态，
     /// 既能继续看到流式输出，也能保持控制器的会话队列身份不变。
@@ -320,6 +321,7 @@ impl SessionLog {
     fn from_state(state: SessionState) -> Arc<Self> {
         let state = Arc::new(state);
         let log = Arc::new(Self {
+            observers: Arc::new(RwLock::new(Vec::new())),
             state: RwLock::new(state.clone()),
             state_cache: Arc::new(Mutex::new(HashMap::new())),
         });
@@ -340,6 +342,7 @@ impl SessionLog {
     /// 固定当前会话状态，供后台执行持有。随后 UI 切换/新建会话不会影响它。
     pub fn pin(&self) -> Arc<Self> {
         Arc::new(Self {
+            observers: Arc::new(RwLock::new(Vec::new())),
             state: RwLock::new(self.state()),
             state_cache: self.state_cache.clone(),
         })
@@ -481,6 +484,12 @@ impl SessionLog {
     /// 条批量落盘），回合/工具结果等边界事件即时 flush——此前每个 token 分片一次
     /// 「open+write+flush」，一次中等回复数百次同步 syscall，是流式热路径的主要开销。
     pub fn append(&self, ev: SessionEvent) {
+        // Bounded taps only. Observation never owns persistence or delivery truth.
+        if let Ok(observers) = self.observers.try_read() {
+            for (_, observer) in observers.iter() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(&ev)));
+            }
+        }
         let state = self.state();
         let mut g = state.inner.lock().unwrap();
         let deferred = is_stream_chunk(&ev);
@@ -519,6 +528,12 @@ impl SessionLog {
         if force_flush {
             g.pending_flush = 0;
         }
+    }
+
+    pub fn observe(&self, callback: Arc<dyn Fn(&SessionEvent) + Send + Sync>) -> Observation {
+        let id = Uuid::new_v4();
+        self.observers.write().unwrap().push((id, callback));
+        Observation { id, observers: self.observers.clone() }
     }
 
     /// 重放全部事件（模型可见状态只能从此重建，完成文档 §8 不变量 1）。
@@ -1162,5 +1177,18 @@ mod tests {
             SessionEvent::Assistant { chunk, .. } if chunk.text.as_deref() == Some("A 的实时输出")
         )));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Scoped registration for a nonblocking event tap.
+pub struct Observation {
+    id: Uuid,
+    observers: Arc<RwLock<Vec<(Uuid, Arc<dyn Fn(&SessionEvent) + Send + Sync>)>>>,
+}
+impl Drop for Observation {
+    fn drop(&mut self) {
+        if let Ok(mut observers) = self.observers.write() {
+            observers.retain(|(id, _)| *id != self.id);
+        }
     }
 }

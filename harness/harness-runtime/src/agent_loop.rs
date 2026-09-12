@@ -563,6 +563,7 @@ impl AgentLoop {
         injected_goal: Option<GoalExecution>,
     ) -> Result<()> {
         let log = ctx.get::<SessionLog>();
+        let mut monitor = crate::monitoring::monitor_adapter::MonitorTurn::start(ctx, &log);
         let llm = ctx.get::<dyn LlmProvider>();
         let tools = ctx.get::<ToolRegistry>();
         let hook = ctx.get::<dyn Hook>();
@@ -1865,6 +1866,7 @@ impl AgentLoop {
                 empty_response_reason.is_some() && assistant_tools.is_empty();
             let assistant_returned_text_without_tools =
                 assistant_tools.is_empty() && !assistant_text.trim().is_empty();
+            let monitor_stop = monitor.observe(&assistant_text, execution.evidence.len());
             if !assistant_text.trim().is_empty() {
                 last_assistant = assistant_text.clone();
             }
@@ -1959,6 +1961,11 @@ impl AgentLoop {
                 && !step_had_tools
                 && assistant_returned_text_without_tools
                 && !completion_ready;
+            if monitor_stop && !completion_ready {
+                stalled_without_action = true;
+                hard_stop = true;
+                debt = 0;
+            }
             if text_only_without_progress {
                 let state = controlled_progress_key(&execution, &goal_execution);
                 if text_only_state.as_deref() == Some(state.as_str()) {
@@ -2146,6 +2153,7 @@ impl AgentLoop {
             execution.reject_reverted_workspace_delivery(has_net_workspace_change);
         }
 
+        execution.record_direct_answer(&last_assistant);
         let terminal_reason = goal_execution.actionable_terminal_reason();
         let (raw_outcome, raw_reason) = if provider_error_seen {
             // provider 流错误优先级最高：错误文本非模型回答，绝不可 Verified；
@@ -2286,9 +2294,11 @@ impl AgentLoop {
         } else {
             (raw_outcome, raw_reason)
         };
+        let report = execution.delivery_report(outcome, reason);
+        let outcome = report.outcome.clone();
         log.append(SessionEvent::Delivery {
             id: log.gen_id(),
-            report: execution.delivery_report(outcome.clone(), reason),
+            report,
         });
         // 只在 Runtime 验证通过后沉淀经验卡；模型文本或 TurnEnd 绝不触发写入，
         // 这样下一次检索到的是可复核的解决路径而不是自报完成。

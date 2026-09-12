@@ -9,6 +9,8 @@ use crate::Result;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub self_monitor: SelfMonitorConfig,
+    #[serde(default)]
     pub llm: LlmConfig,
     #[serde(default = "default_sandbox")]
     pub sandbox_mode: crate::types::SandboxMode,
@@ -28,6 +30,20 @@ pub struct Config {
     /// Trellis 插件（spec 驱动开发）配置（见 `[trellis]` 表）。默认关闭。
     #[serde(default)]
     pub trellis: TrellisConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelfMonitorConfig {
+    pub enabled: bool,
+    pub mode: String,
+    pub sidecar: bool,
+    pub repeat_stop: u32,
+}
+impl Default for SelfMonitorConfig {
+    fn default() -> Self {
+        Self { enabled: true, mode: "protect".into(), sidecar: true, repeat_stop: 3 }
+    }
 }
 
 /// 可选后端（智程平台 aidops）连接配置（见 `[aidops]` 表）。
@@ -186,6 +202,7 @@ impl Default for Config {
                 project_id: None,
             },
             trellis: TrellisConfig::default(),
+            self_monitor: SelfMonitorConfig::default(),
         }
     }
 }

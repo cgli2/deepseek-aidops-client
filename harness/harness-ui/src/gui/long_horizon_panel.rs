@@ -41,6 +41,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
         .min_width(560.0)
         .resizable(true)
         .show(ctx, |ui| {
+            super::self_monitor_panel::show(ui, &state.active_project);
             ui.label(
                 egui::RichText::new("持久化执行、恢复状态与人工决策")
                     .size(12.0)

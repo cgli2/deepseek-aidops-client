@@ -69,6 +69,7 @@ impl Plugin for HarnessPlugin {
 
     fn register(self: Arc<Self>, ctx: &AppContext) -> Vec<Registration> {
         let mut regs = Vec::new();
+        regs.push(ctx.provide(Arc::new(self.config.clone())));
 
         // 扩展点登记表（审计用，不参与调度）。
         let ext = Arc::new(ExtensionRegistry::new());

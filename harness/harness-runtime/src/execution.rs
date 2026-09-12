@@ -799,7 +799,7 @@ impl ExecutionState {
         if matches!(
             self.strategy,
             StrategyKind::Investigative | StrategyKind::Comparative
-        ) {
+        ) && !self.requires_verification() {
             return !self.evidence.is_empty();
         }
         if self.requires_workspace_change()
@@ -875,12 +875,43 @@ impl ExecutionState {
                     }),
             })
             .collect();
-        DeliveryReport {
+        let mut report = DeliveryReport {
             outcome,
             criteria,
             verification,
             reason,
+        };
+        if report.outcome == DeliveryOutcome::Verified
+            && (report.criteria.is_empty()
+                || report.criteria.iter().any(|criterion| {
+                    !criterion.satisfied
+                        || criterion.evidence.iter().all(|item| item.trim().is_empty())
+                })
+                || report.verification.iter().all(|item| item.trim().is_empty()))
+        {
+            report.outcome = DeliveryOutcome::PartialDelivery;
+            report.reason = Some("交付报告缺少验收项或非空验证证据；任务仍未完成".into());
         }
+        report
+    }
+
+    /// A direct answer is itself the deliverable. Preserve its actual text as
+    /// evidence, but never use model prose to verify tool-based work or writes.
+    pub fn record_direct_answer(&mut self, answer: &str) {
+        if self.strategy != StrategyKind::Direct
+            || self.requires_verification()
+            || answer.trim().is_empty()
+        {
+            return;
+        }
+        self.evidence.insert(
+            "assistant:final".into(),
+            Evidence {
+                question: self.contract.objective.clone(),
+                tool_signature: "assistant:final".into(),
+                summary: answer.trim().chars().take(600).collect(),
+            },
+        );
     }
 
     /// 上游因输出/上下文长度而未返回可用内容时，Runtime 仅携带此紧凑检查点重试，
@@ -1703,6 +1734,50 @@ mod tests {
         let state = ExecutionState::new(contract, strategy);
         assert_eq!(state.allowed_tools(), vec!["search"]);
         assert!(!state.can_complete(), "无证据诊断不得被标记为完成");
+    }
+
+    #[test]
+    fn verified_delivery_without_evidence_is_partial() {
+        let state = ExecutionState::new(TaskContract::from_input("你好"), StrategyKind::Direct);
+        assert!(state.can_complete());
+        let report = state.delivery_report(DeliveryOutcome::Verified, None);
+        assert_eq!(report.outcome, DeliveryOutcome::PartialDelivery);
+        assert!(report.reason.is_some());
+    }
+
+    #[test]
+    fn direct_answer_retains_actual_delivery_evidence() {
+        let mut state = ExecutionState::new(TaskContract::from_input("你好"), StrategyKind::Direct);
+        state.record_direct_answer("你好，有什么需要帮助的？");
+        let report = state.delivery_report(DeliveryOutcome::Verified, None);
+        assert_eq!(report.outcome, DeliveryOutcome::Verified);
+        assert_eq!(report.verification, vec!["你好，有什么需要帮助的？"]);
+        assert!(report.criteria.iter().all(|criterion| criterion.satisfied
+            && criterion.evidence == report.verification));
+    }
+
+    #[test]
+    fn investigation_write_cannot_bypass_verification() {
+        let mut state = ExecutionState::new(
+            TaskContract::from_input("诊断登录按钮无反应的根因"),
+            StrategyKind::Investigative,
+        );
+        state.record_tool_result(
+            &ActionProposal {
+                signature: "edit:{}".into(),
+                question: "fix login".into(),
+                supports: vec!["user-objective".into()],
+                estimated_cost: 1,
+            },
+            true,
+            "changed login handler",
+        );
+        state.record_direct_answer("修复完成");
+        assert!(!state.can_complete());
+        assert_eq!(
+            state.delivery_report(DeliveryOutcome::Verified, None).outcome,
+            DeliveryOutcome::PartialDelivery,
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod governor;
 pub mod intent;
 pub mod lha;
 pub mod long_horizon;
+pub mod monitoring;
 mod response_recovery;
 pub mod scheduler;
 pub mod solve_sketch;

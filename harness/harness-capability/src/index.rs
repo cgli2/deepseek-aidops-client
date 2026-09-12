@@ -687,6 +687,7 @@ fn parse_code(rel: &str, content: &str) -> Vec<CodeSymbol> {
                 signature: String::new(),
                 summary: String::new(),
                 calls: vec![],
+                call_edges: vec![],
             });
             calls_map.push((id.clone(), std::collections::HashSet::new()));
             current_fn = Some((id, name.to_string()));

@@ -174,6 +174,80 @@ pub struct CodeSymbol {
     /// 该符号直接调用的其它符号 id。
     #[serde(default)]
     pub calls: Vec<String>,
+    /// 调用边证据元数据（Phase 7 / 坑 6）：与 `calls` 平行的只增扩展。
+    /// 缺省为空 = 未标注的边一律按 `Heuristic` 处理，旧数据向后兼容。
+    #[serde(default)]
+    pub call_edges: Vec<CallEdge>,
+}
+
+/// 调用边证据强度（CodeGraph 分级置信，Phase 7 / 坑 6）。
+///
+/// `Declared`：语法可见的显式调用，来源行号可与源码对齐；
+/// `Inferred`：经导入 / trait 解析可证的调用；
+/// `Heuristic`：同名或位置启发推断，仅作提示不作结论。
+/// 判定必须保守：宁可降级为 `Inferred` / `Heuristic`，也不虚报证据强度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CallEdgeConfidence {
+    Declared,
+    Inferred,
+    #[default]
+    Heuristic,
+}
+
+impl CallEdgeConfidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CallEdgeConfidence::Declared => "declared",
+            CallEdgeConfidence::Inferred => "inferred",
+            CallEdgeConfidence::Heuristic => "heuristic",
+        }
+    }
+
+    /// 解析 "declared"/"inferred"/"heuristic"；非法值保守回落 `Heuristic`。
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "declared" => CallEdgeConfidence::Declared,
+            "inferred" => CallEdgeConfidence::Inferred,
+            _ => CallEdgeConfidence::Heuristic,
+        }
+    }
+}
+
+/// 一条带证据元数据的调用边：`CodeSymbol::calls` 的平行扩展。
+///
+/// 不改变 `calls: Vec<String>` 的集合语义；`call_edges` 缺省为空时
+/// 全部按 `Heuristic` 处理（启发式边绝不阻断查询）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallEdge {
+    /// 被调用符号 id（与 `calls` 中元素对应）。
+    pub target: String,
+    /// 证据强度。
+    #[serde(default)]
+    pub confidence: CallEdgeConfidence,
+    /// 调用点源码行号（1-based；`Declared` 边应与源码调用点对齐，未知为 0）。
+    #[serde(default)]
+    pub source_line: u32,
+}
+
+impl CodeSymbol {
+    /// 查询指向 `target` 的调用边置信；无标注时保守回落 `Heuristic`。
+    pub fn edge_confidence(&self, target: &str) -> CallEdgeConfidence {
+        self.call_edges
+            .iter()
+            .find(|e| e.target == target)
+            .map(|e| e.confidence)
+            .unwrap_or(CallEdgeConfidence::Heuristic)
+    }
+
+    /// 查询指向 `target` 的调用边来源行号；无标注或 0 时返回 `None`。
+    pub fn edge_source_line(&self, target: &str) -> Option<u32> {
+        self.call_edges
+            .iter()
+            .find(|e| e.target == target)
+            .map(|e| e.source_line)
+            .filter(|l| *l > 0)
+    }
 }
 
 /// 对话记忆能力（Chat Memory，L0~L3）。

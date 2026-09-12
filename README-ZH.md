@@ -19,6 +19,9 @@ AIOps、CI 冒烟和资源受限的开发环境。
 - **工作区感知工具**：文件系统、精确编辑、Shell、搜索、计划、记忆和 Git 能力均受策略与边界约束。
 - **可恢复长任务**：持久化 DAG、WAL 恢复、租约看门狗、Token/RPM/TPM 预算、质量门、不可变工件库
   以及不可逆操作的人工检查点。
+  - **LHA P2（2025）**：新增 `lha` 控制面模块——MVCC 工件投递与崩溃恢复、HITL 不可逆副作用精确绑定、
+    契约锁（放行 body / 阻断公共签名漂移 / 防路径逃逸）、全局预算耗尽终态持久化（`BudgetExhausted`）、
+    新任务波次预算回补。见 `harness-runtime/tests/lha_p2.rs`（7 个用例）与 `docs/lha-gap-analysis.md`。
 - **微内核插件架构**：通过 Definition / Provider / Consumer 能力接缝组合 GUI、TUI、Headless、ACP、
   沙箱和 WASM 能力。
 

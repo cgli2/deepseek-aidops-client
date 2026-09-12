@@ -25,6 +25,7 @@ mod composer;
 mod fonts;
 mod icons;
 mod long_horizon_panel;
+mod self_monitor_panel;
 mod memory_panel;
 mod model;
 mod preview_panel;

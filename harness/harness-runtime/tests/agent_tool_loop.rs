@@ -1467,3 +1467,100 @@ async fn search_memo_hit_keeps_tool_results_pairing_one_to_one() {
         "同一 tool_call 记录了多条响应，说明缓存把旧 call_id 带进了新步骤: {duplicated:?}"
     );
 }
+
+/// 记录真实派发次数的工具：准入降级后，被"建议"的动作必须仍然到达工具层。
+struct CountingTool {
+    name: &'static str,
+    hits: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl DynTool for CountingTool {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    async fn call(&self, call: &ToolCall) -> Result<ToolResult> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult {
+            call_id: call.id.clone(),
+            ok: true,
+            content: "命中 1 行：src/demo.py:1".into(),
+            continuation_debt: 0,
+        })
+    }
+}
+
+/// 红线：任何一次工具调用都不得因「计数/阶段/关联」类判断被替换成错误工具结果。
+#[tokio::test]
+async fn advisory_gates_never_replace_a_dispatched_tool_result() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    // 同一文件重复读、与验收项无关联的搜索、重复 search：全是旧门禁最爱拦的形态。
+    let llm = Arc::new(ScriptedLlm {
+        calls: AtomicUsize::new(0),
+        initial_text_steps: 0,
+        script: vec![
+            scripted_call("a1", "search", serde_json::json!({"pattern": "save_draft"})),
+            scripted_call("a2", "fs", serde_json::json!({"op": "read", "path": "server/routers/strategy.py"})),
+            scripted_call("a3", "fs", serde_json::json!({"op": "read", "path": "server/routers/strategy.py"})),
+            scripted_call("a4", "search", serde_json::json!({"pattern": "save_draft"})),
+            scripted_call("a5", "fs", serde_json::json!({"op": "read", "path": "server/routers/strategy.py"})),
+            scripted_call("a6", "search", serde_json::json!({"pattern": "publish_version"})),
+            None,
+        ],
+        options: Mutex::new(vec![]),
+    });
+    let search_hits = Arc::new(CountingTool {
+        name: "search",
+        hits: AtomicUsize::new(0),
+    });
+    let fs_hits = Arc::new(CountingTool {
+        name: "fs",
+        hits: AtomicUsize::new(0),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(search_hits.clone());
+    tools.register(fs_hits.clone());
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm;
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "策略页保存报错，定位并修复".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    let denied: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { result, .. } => {
+                let hit = ["gate]", "guard]"]
+                    .iter()
+                    .any(|marker| result.content.contains(marker));
+                hit.then(|| result.content.chars().take(160).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(denied.is_empty(), "计数/阶段类判断仍在吞动作: {denied:#?}");
+    assert_eq!(
+        search_hits.hits.load(Ordering::SeqCst),
+        3,
+        "三次 search 必须全部到达工具层"
+    );
+    assert_eq!(
+        fs_hits.hits.load(Ordering::SeqCst),
+        3,
+        "三次读取必须全部到达工具层"
+    );
+}

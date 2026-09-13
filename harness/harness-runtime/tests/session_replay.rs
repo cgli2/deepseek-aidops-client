@@ -244,6 +244,31 @@ async fn replay_session(fixture: &str) -> Arc<SessionLog> {
     replay_session_with(fixture, GovernorMode::On).await
 }
 
+/// 真实历史会话回放后，不得再出现任何被门禁替换的工具结果。
+#[tokio::test]
+async fn replayed_sessions_emit_no_denied_tool_results() {
+    for fixture in [
+        "7ba3370f_full.jsonl",
+        "7ba3370f_t03_14_symptom.jsonl",
+        "7ba3370f_t15_18_clarification.jsonl",
+        "7ba3370f_t19_22_gitfix.jsonl",
+        "success_677bd6e0.jsonl",
+    ] {
+        let events = replay_session(fixture).await.replay();
+        let denied: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolResult { result, .. } => ["gate]", "guard]"]
+                    .iter()
+                    .any(|marker| result.content.contains(marker))
+                    .then(|| result.call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(denied.is_empty(), "{fixture} 仍产生拦停结果: {denied:?}");
+    }
+}
+
 #[tokio::test]
 async fn clarification_loop_replay_emits_delivery_per_turn() {
     let log =

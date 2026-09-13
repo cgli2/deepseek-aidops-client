@@ -1372,7 +1372,11 @@ fn evidence_digest(state: &ExecutionState) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
     Allow,
+    /// 真实外部约束：动作不得执行（访问策略、沙箱、写冲突、用户审批、IO 错误）。
     Deny(String),
+    /// 证据不足、疑似空转或计数用尽：动作照常执行，原因作为提示注入下一步请求。
+    /// 它不得产生工具结果——见 spec R1/R3。
+    Advise(String),
 }
 
 pub struct ActionGate;
@@ -1408,18 +1412,20 @@ impl ActionGate {
         if state.solve_mode != SolveMode::OpenEnded
             && !allowed_tools.iter().any(|allowed| allowed == tool)
         {
-            return GateDecision::Deny(format!(
-                "当前 {} 阶段的动态工具白名单不包含 {tool}；允许：{}",
+            return GateDecision::Advise(format!(
+                "当前 {} 阶段的动态工具白名单不包含 {tool}；说明它要验证哪个假设。当前允许：{}",
                 state.tool_phase().as_str(),
                 allowed_tools.join(", ")
             ));
         }
         if proposal.supports.is_empty() {
-            return GateDecision::Deny("该调用未关联任何验收标准".into());
+            return GateDecision::Advise(
+                "该调用未关联具体验收项：说明它要回答什么问题，避免无关探索".into(),
+            );
         }
         if state.tool_calls >= budget.hard_max_tool_calls {
-            return GateDecision::Deny(format!(
-                "已达到任务绝对工具调用上限 {}；禁止继续探索，应基于现有证据交付或报告阻塞",
+            return GateDecision::Advise(format!(
+                "已达到任务绝对工具调用上限 {}；继续调用必须说明它新增了什么证据，否则基于现有证据交付或报告精确阻塞",
                 budget.hard_max_tool_calls
             ));
         }
@@ -1436,8 +1442,8 @@ impl ActionGate {
                 .count()
                 >= 3
         {
-            return GateDecision::Deny(
-                "渐进探索最多允许三条独立搜索证据；请停止换关键词，基于现有结果收敛为具体目标，或提出一个会改变实现方向的决策问题"
+            return GateDecision::Advise(
+                "渐进探索最多允许三条独立搜索证据；再换关键词不再增加定位覆盖，请基于现有结果收敛为具体目标，或提出一个会改变实现方向的决策问题"
                     .into(),
             );
         }
@@ -1959,7 +1965,7 @@ mod tests {
         };
         assert!(matches!(
             ActionGate::authorize(&fourth, &state, &budget),
-            GateDecision::Deny(reason) if reason.contains("最多允许三条")
+            GateDecision::Advise(reason) if reason.contains("最多允许三条")
         ));
     }
 
@@ -2462,9 +2468,11 @@ mod tests {
             supports: vec!["user-objective".into()],
             estimated_cost: 1,
         };
+        // 未写入前的 shell 验证由动态工具白名单判断标记；该判断属阶段/计数类，
+        // 现为提示而非拦停（动作照常派发）。匹配原因文本以锁定它仍在生效。
         assert!(matches!(
             ActionGate::authorize(&verify, &state, &budget),
-            GateDecision::Deny(_)
+            GateDecision::Advise(reason) if reason.contains("不包含 shell")
         ));
         let edit = ActionProposal {
             signature: "edit:{\"path\":\"harness-ui/src/gui/composer.rs\"}".into(),

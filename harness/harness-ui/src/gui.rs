@@ -57,7 +57,8 @@ use widgets::{
 };
 
 // 窗口 / 任务栏图标 RGBA（自动生成，见 scripts/make_icon.py）。eframe 不会自动读 exe 资源，
-// 必须在此显式喂给 NativeOptions.icon_data，否则标题栏与任务栏仍是系统默认图标。
+// 必须显式喂给 ViewportBuilder::with_icon（egui 0.30 起 NativeOptions.icon_data 已移除），
+// 否则标题栏与任务栏仍是系统默认图标。
 include!("icon_data.rs");
 
 const READY: &str =

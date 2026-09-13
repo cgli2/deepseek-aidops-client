@@ -82,10 +82,19 @@ struct ToolRepeatGuard {
     /// 同一调用（名称+参数）的累计执行次数：即使每次输出略有差异（扫描类命令
     /// 常见），超过阈值也判定为低价值重复。取证：同回合扫描脚本被跑 13 次。
     cumulative: HashMap<String, u8>,
+    /// 连续「定位/探测类」调用计数：换关键词、换路径会让签名各不相同，同参守卫
+    /// 拦不住这种空转；只在纯试探链条上累积，任何非定位动作都会清零。
+    consecutive_locate: u8,
 }
 
 /// 同回合内同一失败调用（名称+参数完全相同）最多执行两次（首次 + 一次定向重试）。
 const MAX_SAME_CALLS_PER_TURN: u8 = 2;
+
+/// 同回合内连续「定位/探测类」调用（搜索、读文件、列目录）的软上限。模型已经
+/// 定位到目标却仍不停换关键词试探时，每次签名都不同，唯一的同参守卫无法拦截；
+/// 这里对「只搜不写」的连续链条设限：一旦发生写入或任何非定位动作即清零。
+/// 取证：同回合换关键词试探十余次仍未收敛。
+const MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN: u8 = 10;
 
 /// 用户的“继续”不是一个新的、只有一句话的 Direct 任务。它必须接回最近一个
 /// 未验证结束的根任务，否则复杂迁移会被重新分类为 Direct，并误用 36/48 这类
@@ -147,6 +156,18 @@ fn is_search_like(name: &str) -> bool {
         || n == "rg"
         || n.contains("locate")
         || n.contains("ack")
+}
+
+/// 判定调用签名是否属于「只看不改」的定位探针：搜索类工具，或 fs 的读/列目录。
+/// 写入与编辑改变工作区（是进展而非试探），因此不计入连续定位链条。
+fn is_locate_signature(signature: &str) -> bool {
+    let name = signature.split(':').next().unwrap_or_default();
+    if is_search_like(name) {
+        return true;
+    }
+    name == "fs"
+        && !signature.contains("\"op\":\"write\"")
+        && !signature.contains("\"op\":\"edit\"")
 }
 
 /// 搜索缓存键：工具名 + 归一化参数（Debug 表示即可，足以区分不同查询）。
@@ -460,7 +481,11 @@ impl ToolRepeatGuard {
             .cumulative
             .get(signature)
             .is_some_and(|count| *count >= MAX_SAME_CALLS_PER_TURN);
-        repeated_success || failed_retries_exhausted
+        // 只搜不写链路过长：即使每次换关键词/换路径，也必须在预算内停止试探，
+        // 转为写入或收尾。
+        let locate_probes_exhausted = is_locate_signature(signature)
+            && self.consecutive_locate >= MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN;
+        repeated_success || failed_retries_exhausted || locate_probes_exhausted
     }
 
     fn record_result(&mut self, signature: &str, result: &ToolResult) {
@@ -489,6 +514,13 @@ impl ToolRepeatGuard {
             self.recovery_attempts.clear();
         }
         self.previous = Some((signature.to_string(), fingerprint, result.ok));
+        // 连续定位计数：任何非定位动作（写入、shell、plan 等）都会打断「只搜
+        // 不写」的链条，只在纯试探序列上累积。
+        if is_locate_signature(signature) {
+            self.consecutive_locate = self.consecutive_locate.saturating_add(1);
+        } else {
+            self.consecutive_locate = 0;
+        }
         // 累计计数：与「连续相同结果」互补，拦截输出有微小差异的空转重复。
         *self.cumulative.entry(signature.to_string()).or_default() = self
             .cumulative

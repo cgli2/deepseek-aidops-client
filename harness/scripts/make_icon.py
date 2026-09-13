@@ -10,7 +10,7 @@
     python scripts/make_icon.py
 产物：
     harness/bin/assets/icon.ico
-    harness/bin/assets/icon_1024.png
+    harness/bin/assets/icon_1024.png（同时输出 harness/bin/assets/AppIcon.icns 与 harness/harness-ui/src/icon_data.rs）
 横向品牌字标源文件位于 bin/assets/aidops-logo.svg。
 """
 import io

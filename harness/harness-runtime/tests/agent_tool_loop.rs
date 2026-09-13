@@ -1562,57 +1562,91 @@ async fn advisory_gates_never_replace_a_dispatched_tool_result() {
         "三次读取必须全部到达工具层"
     );
 }
-
-/// 每次请求都固定吐一个重复 search，制造「零增益」提示场景。
-struct RepeatSearchLlm {
+/// 带出站请求捕获的脚本模型：每轮固定发一个工具调用，同时留下发给模型的历史，
+/// 用于断言提示是否随下一步请求注入。
+struct CapturingScriptedLlm {
     calls: AtomicUsize,
     requests: Mutex<Vec<Vec<Message>>>,
+    script: Vec<Option<ToolCall>>,
 }
 
 #[async_trait]
-impl LlmProvider for RepeatSearchLlm {
+impl LlmProvider for CapturingScriptedLlm {
     fn name(&self) -> &'static str {
-        "repeat-search-test"
+        "capturing-scripted-test"
     }
     fn tools(&self) -> Vec<harness_llm::ToolSchema> {
         vec![]
     }
     fn stream(&self, messages: Vec<Message>) -> ChunkStream {
         self.requests.lock().unwrap().push(messages);
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let chunk = if call < 4 {
-            Chunk {
-                tool_calls: vec![ToolCall {
-                    id: format!("rep-{call}"),
-                    name: "search".into(),
-                    args: serde_json::json!({"pattern": "同一个关键词"}),
-                }],
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunk = match self.script.get(index).cloned().flatten() {
+            Some(call) => Chunk {
+                tool_calls: vec![call],
                 ..Default::default()
-            }
-        } else {
-            Chunk {
+            },
+            None => Chunk {
                 text: Some("已基于现有证据收尾".into()),
                 ..Default::default()
-            }
+            },
         };
         Box::pin(futures::stream::iter(vec![Ok(chunk)]))
     }
 }
 
+fn denied_contents(events: &[SessionEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { result, .. } => ["gate]", "guard]"]
+                .iter()
+                .any(|marker| result.content.contains(marker))
+                .then(|| result.content.chars().take(160).collect()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn hinted(requests: &[Vec<Message>], skip_first: bool) -> bool {
+    requests
+        .iter()
+        .skip(if skip_first { 1 } else { 0 })
+        .any(|request| {
+            request.iter().any(|message| {
+                message.role == harness_llm::Role::User
+                    && message.content.contains("未新增信息")
+            })
+        })
+}
+
+/// Task 3 契约：ActionGate 的 Advise 必须「动作照常派发 + 提示注入下一步请求」，
+/// 且原因文本永不出现在任何工具结果或 tool 消息里（红线本体）。
+///
+/// 载体必须是非记忆化工具：shell 验证调用不属 is_search_like（不走 SEARCH_MEMO
+/// 复用，故派发次数可断言）、每条命令签名不同（不触发 ToolRepeatGuard 的紧邻
+/// 同签名与累计上限），且零写入时 link_proposal 会把验证调用的 supports 置空，
+/// 恰好命中 supports.is_empty() 的 Advise 分支。
 #[tokio::test]
 async fn zero_gain_advice_is_injected_without_swallowing_the_action() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
-    let llm = Arc::new(RepeatSearchLlm {
+    let llm = Arc::new(CapturingScriptedLlm {
         calls: AtomicUsize::new(0),
         requests: Mutex::new(vec![]),
+        script: vec![
+            scripted_call("v1", "shell", serde_json::json!({"command": "cargo test -p alpha"})),
+            scripted_call("v2", "shell", serde_json::json!({"command": "cargo test -p beta"})),
+            scripted_call("v3", "shell", serde_json::json!({"command": "cargo test -p gamma"})),
+            None,
+        ],
     });
-    let hits = Arc::new(CountingTool {
-        name: "search",
+    let shell_hits = Arc::new(CountingTool {
+        name: "shell",
         hits: AtomicUsize::new(0),
     });
     let tools = ToolRegistry::new();
-    tools.register(hits.clone());
+    tools.register(shell_hits.clone());
     let _a = ctx.provide(log.clone());
     let provider: Arc<dyn LlmProvider> = llm.clone();
     let _b = ctx.provide(provider);
@@ -1624,7 +1658,7 @@ async fn zero_gain_advice_is_injected_without_swallowing_the_action() {
         .run_turn(
             &ctx,
             UserInput {
-                text: "反复用同一关键词定位后修复".into(),
+                text: "策略页保存报错，修复后验证".into(),
                 attachments: vec![],
             },
         )
@@ -1632,18 +1666,110 @@ async fn zero_gain_advice_is_injected_without_swallowing_the_action() {
         .unwrap();
 
     let events = log.replay();
-    assert!(
-        !events.iter().any(|event| matches!(event,
-            SessionEvent::ToolResult { result, .. }
-                if result.content.contains("gate]") || result.content.contains("guard]"))),
-        "零增益只提示，不得拦停"
+    let denied = denied_contents(&events);
+    assert!(denied.is_empty(), "Advise 不得替换成工具结果: {denied:#?}");
+    assert_eq!(
+        shell_hits.hits.load(Ordering::SeqCst),
+        3,
+        "三次未关联验收项的验证调用必须全部到达工具层"
     );
-    assert_eq!(hits.hits.load(Ordering::SeqCst), 4, "四次重复 search 必须全部派发");
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { result, .. } => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 3, "每个 tool_call 恰有一条结果");
+    assert!(results.iter().all(|result| result.ok), "放行的动作必须成功返回");
     let requests = llm.requests.lock().unwrap();
-    let advised = requests.iter().skip(1).any(|request| {
+    assert!(
+        hinted(&requests, true),
+        "提示须以 user 消息随下一步请求注入"
+    );
+    let leaked = requests.iter().any(|request| {
         request.iter().any(|message| {
-            message.role == harness_llm::Role::User && message.content.contains("未新增信息")
+            message.role == harness_llm::Role::Tool && message.content.contains("未新增信息")
         })
     });
-    assert!(advised, "提示须随下一步请求注入: {:?}", requests.last().map(|r| r.len()));
+    assert!(!leaked, "Advise 原因文本不得进入任何 tool 消息");
+}
+
+/// 修正 3 契约：同签名 search 命中 SEARCH_MEMO 时合法地复用而不进工具层，它不是
+/// 拦停。这里锁定复用的三项不变量——仍然给出成功结果、配对完整、只追加提示——
+/// 防止将来把复用改回用 [tool-loop guard] 吞动作。
+///
+/// 复用只在守卫放行后才可达：ToolRepeatGuard 的累计上限是 2，故同签名至多出现
+/// 两次，中间必须夹一个不同签名的动作以避开「紧邻同签名且成功」的拦截。
+#[tokio::test]
+async fn repeated_search_replays_from_memo_without_denial() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(CapturingScriptedLlm {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(vec![]),
+        script: vec![
+            scripted_call("s1", "search", serde_json::json!({"pattern": "save_draft"})),
+            scripted_call("f1", "fs", serde_json::json!({"op": "read", "path": "a.py"})),
+            scripted_call("s2", "search", serde_json::json!({"pattern": "save_draft"})),
+            scripted_call("f2", "fs", serde_json::json!({"op": "read", "path": "b.py"})),
+            None,
+        ],
+    });
+    let search_hits = Arc::new(CountingTool {
+        name: "search",
+        hits: AtomicUsize::new(0),
+    });
+    let fs_hits = Arc::new(CountingTool {
+        name: "fs",
+        hits: AtomicUsize::new(0),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(search_hits.clone());
+    tools.register(fs_hits.clone());
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "策略页保存报错，定位后修复".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    let denied = denied_contents(&events);
+    assert!(denied.is_empty(), "缓存复用不是拦停: {denied:#?}");
+    assert_eq!(
+        search_hits.hits.load(Ordering::SeqCst),
+        1,
+        "同签名 search 只应真实派发一次，其余走复用"
+    );
+    let search_results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { result, .. } if result.call_id.starts_with('s') => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(search_results.len(), 2, "两次 search 宣告都必须有响应");
+    assert!(
+        search_results.iter().all(|result| result.ok),
+        "复用必须返回成功结果，不得退化为错误结果"
+    );
+    assert_eq!(fs_hits.hits.load(Ordering::SeqCst), 2, "不同文件的读取都要真实派发");
+    assert!(
+        hinted(&llm.requests.lock().unwrap(), true),
+        "复用只追加一条提示"
+    );
 }

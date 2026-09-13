@@ -1650,6 +1650,11 @@ impl AgentLoop {
                                 result: replayed.clone(),
                             });
                             repeat_guard.record_result(&sig, &replayed);
+                            // 修正 3：复用只追加提示，不产生拦停。
+                            crate::delivery_workflow::note_advice(
+                                &mut advisories,
+                                "同一查询本会话已执行过，本次直接复用上次结果而未重跑工具；请基于已有输出继续。",
+                            );
                             messages.push(Message::tool(tc.id.clone(), replayed.content));
                             step_had_tools = true;
                             continue;

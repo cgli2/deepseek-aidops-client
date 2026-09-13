@@ -37,13 +37,7 @@ impl LocalBash {
 #[async_trait]
 impl Shell for LocalBash {
     async fn run(&self, req: ShellRequest) -> Result<ShellOutput> {
-        let (shell, flag) = if cfg!(windows) {
-            ("cmd", "/c")
-        } else {
-            ("sh", "-c")
-        };
-        let mut cmd = Command::new(shell);
-        cmd.arg(flag).arg(&req.cmd);
+        let mut cmd = shell_command(&req.cmd);
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：GUI 调用命令时不弹 CMD 窗口。
         let ws_root = self.ws.root();
@@ -115,6 +109,23 @@ impl Shell for LocalBash {
     }
 }
 
+fn shell_command(script: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd");
+        // cmd parses a command line, not C-runtime argv escaping. Preserve inner quotes.
+        cmd.arg("/D").arg("/S").arg("/C");
+        cmd.raw_arg(format!("\"{script}\""));
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    }
+}
+
 /// 控制台输出解码：中文 Windows 的 cmd 子进程按 GBK 码页（CP936）输出，
 /// 直接 `from_utf8_lossy` 会把中文变成替换符乱码。策略：合法 UTF-8 直接用；
 /// 否则回退 GB18030（GBK 超集）；仍失败才兜底 lossy。
@@ -132,6 +143,15 @@ fn decode_console(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::decode_console;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn quoted_python_command_preserves_code_and_output() {
+        let output = super::shell_command("python -c \"import sys; print('quote test'); print(42)\"")
+            .output().await.unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).replace('\r', ""), "quote test\n42\n");
+    }
 
     #[test]
     fn utf8_passes_through() {

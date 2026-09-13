@@ -137,11 +137,22 @@ const CLARIFICATION_REASON_PREFIX: &str = "需要补充执行信息：";
 /// 缓存结果、不重跑真实工具，消除单窗口重复扫描（取证：同回合扫描被跑 13 次）
 /// 与续跑重扫。进程内长驻（同一 harness 会话跨多次“继续”共享），进程退出后失效；
 /// 只读搜索命中不重复记证据/写入，避免污染 Fix1 的进展度量与预算计数。
+///
+/// 值刻意只存可复用的输出载荷，不含 `call_id`：调用身份属于本次 tool_call，
+/// 缓存它会让后续命中把上一次调用的 id 写进本步日志，assistant 的 tool_call
+/// 因此永远等不到响应，历史重建后 Provider 直接回 HTTP 400。
+#[derive(Debug, Clone)]
+struct CachedSearchOutput {
+    ok: bool,
+    content: String,
+}
+
 static SEARCH_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, ToolResult>>,
+    std::sync::Mutex<std::collections::HashMap<String, CachedSearchOutput>>,
 > = std::sync::OnceLock::new();
 
-fn search_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, ToolResult>> {
+fn search_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedSearchOutput>>
+{
     SEARCH_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -158,16 +169,14 @@ fn is_search_like(name: &str) -> bool {
         || n.contains("ack")
 }
 
-/// 判定调用签名是否属于「只看不改」的定位探针：搜索类工具，或 fs 的读/列目录。
-/// 写入与编辑改变工作区（是进展而非试探），因此不计入连续定位链条。
+/// 搜索和目录枚举属于定位探针；读取具体文件进入检查阶段。
+/// 重复读取仍由相同签名守卫处理，不能因读取了多个不同文件而全部拒绝。
 fn is_locate_signature(signature: &str) -> bool {
     let name = signature.split(':').next().unwrap_or_default();
     if is_search_like(name) {
         return true;
     }
-    name == "fs"
-        && !signature.contains("\"op\":\"write\"")
-        && !signature.contains("\"op\":\"edit\"")
+    name == "fs" && signature.contains("\"op\":\"list\"")
 }
 
 /// 搜索缓存键：工具名 + 归一化参数（Debug 表示即可，足以区分不同查询）。
@@ -651,6 +660,7 @@ impl AgentLoop {
             solve_plan.hard_max_tool_calls,
         );
         let mut execution = ExecutionState::new(contract, strategy);
+        let implementation_workflow = crate::delivery_workflow::owns(&execution);
         if let Some(state) = &resume {
             execution.restore_verified_criteria(&state.report);
         }
@@ -757,7 +767,7 @@ impl AgentLoop {
                 && last_assistant_text(&history).as_deref() == Some(user_prompt.as_str());
             let permitted =
                 ask_user_permitted(governor.as_ref(), &case_file, &input_text, &question);
-            if !repeated && permitted {
+            if !repeated && permitted && !implementation_workflow {
                 // 澄清不是失败后的补救，而是执行前门禁：不请求模型、不暴露工具、不开始
                 // 目录搜索。问题被补全后，下一条用户消息会与本轮根请求合并再编译。
                 log.append(SessionEvent::TurnStart {
@@ -1003,9 +1013,18 @@ impl AgentLoop {
                     .render_for_model(execution.strategy, &budget),
             ),
         );
-        messages.insert(1, Message::system(solve_plan.instructions.clone()));
+        messages.insert(1, Message::system(if implementation_workflow {
+            crate::delivery_workflow::instructions(&execution)
+        } else {
+            solve_plan.instructions.clone()
+        }));
         // 捕获目标提示文本作为后续并发执行器作用域替换的锚点（内容匹配，与插入位置无关）。
-        let goal_prompt = goal_execution.render_for_model();
+        let goal_prompt = if implementation_workflow {
+            format!("目标及验收项：\n{}", execution.contract.acceptance_criteria.iter()
+                .map(|item| format!("{}: {}", item.id, item.description)).collect::<Vec<_>>().join("\n"))
+        } else {
+            goal_execution.render_for_model()
+        };
         messages.insert(1, Message::system(goal_prompt.clone()));
         if let Some(grounding) = &workspace_grounding {
             messages.insert(1, Message::system(grounding.render_for_model()));
@@ -1105,8 +1124,8 @@ impl AgentLoop {
         // 每个写目标只保存首次写入前的内容指纹。最终交付前再读一次，阻止“先改、
         // 后回滚到原样”仍靠中间态写入计数获得 Verified。
         let mut artifact_baselines: HashMap<String, String> = HashMap::new();
-        let controlled_delivery_turn = goal_executor_enabled()
-            && execution.solve_mode != crate::execution::SolveMode::OpenEnded;
+        let controlled_delivery_turn = implementation_workflow || (goal_executor_enabled()
+            && execution.solve_mode != crate::execution::SolveMode::OpenEnded);
         while debt > 0 {
             // R3 前置：本执行回合到顶后暂停，不再向模型发请求。下一条用户消息会新建
             // 回合预算，并通过 resume 断点继续；历史成本只做审计，不会把会话永久锁死。
@@ -1116,8 +1135,7 @@ impl AgentLoop {
                     let progress_now = execution_progress_units(&execution);
                     let progress_since_window = progress_now.saturating_sub(prompt_baseline);
                     if prompt_autorenews < MAX_PROMPT_AUTORENEWS
-                        && (progress_since_window > 0
-                            || (controlled_delivery_turn && goal_execution.can_auto_advance()))
+                        && progress_since_window > 0
                     {
                         prompt_autorenews += 1;
                         prompt_baseline = progress_now;
@@ -1237,7 +1255,9 @@ impl AgentLoop {
             // 大量用户眼中的“小修复”实际落在 ScopedDelivery，仍沿用 high/xhigh 与大输出，
             // 几轮就触发 prompt 总预算。OpenEnded 才保留用户的完整探索配置。
             let controlled_delivery = controlled_delivery_turn;
-            let runtime_allowed_tools = if controlled_delivery {
+            let runtime_allowed_tools = if implementation_workflow {
+                crate::delivery_workflow::tools(&execution)
+            } else if controlled_delivery {
                 goal_execution.allowed_tools()
             } else {
                 execution.allowed_tools()
@@ -1282,16 +1302,16 @@ impl AgentLoop {
                             scoped_msgs[pos] = Message::system(scoped_prompt);
                         }
                         streams.push(llm.stream_with_options(
-                            apply_context_budget(scoped_msgs),
+                            prepare_request_messages(scoped_msgs),
                             request_options.clone(),
                         ));
                     }
                     Box::pin(futures::stream::select_all(streams))
                 } else {
-                    llm.stream_with_options(apply_context_budget(pre_input), request_options)
+                    llm.stream_with_options(prepare_request_messages(pre_input), request_options)
                 }
             } else {
-                llm.stream_with_options(apply_context_budget(pre_input), request_options)
+                llm.stream_with_options(prepare_request_messages(pre_input), request_options)
             };
             let mut assistant_text = String::new();
             let mut assistant_tools = Vec::new();
@@ -1439,7 +1459,7 @@ impl AgentLoop {
                         continue;
                     }
 
-                    if controlled_delivery && action_spec.is_none() {
+                    if controlled_delivery && !implementation_workflow && action_spec.is_none() {
                         let blocked = ToolResult {
                             call_id: tc.id.clone(),
                             ok: false,
@@ -1454,7 +1474,7 @@ impl AgentLoop {
                         step_had_tools = true;
                         continue;
                     }
-                    if controlled_delivery {
+                    if controlled_delivery && !implementation_workflow {
                         if let Err(reason) = goal_execution.allows_tool_call(tc, &proposal) {
                             if let Some(action) = &action_spec {
                                 goal_execution.record_gate_rejection(action, &reason);
@@ -1608,12 +1628,20 @@ impl AgentLoop {
                     if is_search_like(&tc.name) {
                         let key = search_cache_key(&tc.name, &tc.args);
                         if let Some(cached) = search_memo().lock().unwrap().get(&key).cloned() {
+                            // 复用输出，身份必须换成本次调用：否则本步 assistant 的
+                            // tool_call 没有响应，而日志多出一条上一条 assistant 的孤儿结果。
+                            let replayed = ToolResult {
+                                call_id: tc.id.clone(),
+                                ok: cached.ok,
+                                content: cached.content,
+                                continuation_debt: 0,
+                            };
                             log.append(SessionEvent::ToolResult {
                                 id: log.gen_id(),
-                                result: cached.clone(),
+                                result: replayed.clone(),
                             });
-                            repeat_guard.record_result(&sig, &cached);
-                            messages.push(Message::tool(tc.id.clone(), cached.content.clone()));
+                            repeat_guard.record_result(&sig, &replayed);
+                            messages.push(Message::tool(tc.id.clone(), replayed.content));
                             step_had_tools = true;
                             continue;
                         }
@@ -1727,7 +1755,13 @@ impl AgentLoop {
                                 // Fix2：把搜索类调用结果写入会话级记忆化缓存，供后续同查询直接复用。
                                 if is_search_like(&tc.name) {
                                     let key = search_cache_key(&tc.name, &tc.args);
-                                    search_memo().lock().unwrap().insert(key, res.clone());
+                                    search_memo().lock().unwrap().insert(
+                                        key,
+                                        CachedSearchOutput {
+                                            ok: res.ok,
+                                            content: res.content.clone(),
+                                        },
+                                    );
                                 }
                                 execution.record_tool_result_observed(
                                     proposal,
@@ -1751,6 +1785,18 @@ impl AgentLoop {
                                 } else {
                                     EvidenceKind::NoInformation
                                 };
+                                // Exact already-satisfied transformations are a
+                                // proof-based exception to writing, not an authority
+                                // for the goal graph to finish an unverified repair.
+                                if evidence_kind == EvidenceKind::VerificationPassed
+                                    && execution.allows_already_satisfied()
+                                    && execution.write_attempts == 0
+                                    && goal_execution.can_conclude()
+                                {
+                                    for id in &proposal.supports {
+                                        execution.record_static_verification(id, &res.content);
+                                    }
+                                }
                                 if evidence_kind == EvidenceKind::VerificationPassed
                                     && execution.requires_workspace_change()
                                     && execution.write_operations == 0
@@ -1869,7 +1915,8 @@ impl AgentLoop {
                 }
             }
             let mut claim_recovery_requested = false;
-            let completion_ready = execution.can_complete() && goal_execution.can_conclude();
+            let completion_ready = execution.can_complete()
+                && (implementation_workflow || goal_execution.can_conclude());
             if let Some(correction) = unsupported_runtime_claim_correction(
                 &assistant_text,
                 execution.requires_workspace_change() || execution.write_attempts > 0,
@@ -2013,7 +2060,7 @@ impl AgentLoop {
                 // 已完成零写入基线验证后，下一次正文就是模型的收尾机会，不再额外
                 // 纠正一轮。没有任何工具证据时仍保留一次纠错机会，容忍模型先说明
                 // 再行动的常见模式。
-                let stop_after = if baseline_verification_observed { 1 } else { 2 };
+                let stop_after = if baseline_verification_observed && !implementation_workflow { 1 } else { 2 };
                 if text_only_no_progress_streak >= stop_after {
                     stalled_without_action = true;
                     hard_stop = true;
@@ -2039,6 +2086,16 @@ impl AgentLoop {
                 // 恢复重试已经重新记账，不能再被“本步没有工具”误判为完成。
             } else if claim_recovery_requested {
                 // 事实校正已经发放一次续跑；本步正文不能作为完成结论继续裁决。
+            } else if implementation_workflow && !hard_stop {
+                // One completion authority for implementation: observed writes and
+                // verification, not the advisory phase or the model's closing prose.
+                if completion_ready && !step_had_tools {
+                    delivery_verified = true;
+                    debt = 0;
+                } else if !step_had_tools {
+                    messages.push(Message::user(crate::delivery_workflow::next_action(&execution)));
+                    debt += 1;
+                }
             } else if controlled_delivery {
                 match goal_execution.evaluate_completion(step_had_tools) {
                     GoalCompletion::Complete => {
@@ -2391,7 +2448,7 @@ fn concise_incomplete_status(
     reason: Option<&str>,
     successful_writes: usize,
     write_attempts: usize,
-    phase: crate::goal_execution::SolvePhase,
+    _phase: crate::goal_execution::SolvePhase,
 ) -> String {
     if *outcome == DeliveryOutcome::NeedsUserInput {
         return "未完成：执行证据不足，无法安全修改。\n下一步：保留现有证据，继续由 Agent 检查相邻调用链或切换定位策略。".into();
@@ -2409,29 +2466,19 @@ fn concise_incomplete_status(
             .into();
     }
     if successful_writes > 0 {
-        return "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。".into();
+        return "本轮未完成交付：已有文件改动，但尚未通过完整验证。Agent 应继续修复或验证，不能声明完成。".into();
     }
     if write_attempts > 0 {
-        return "未完成：缺少“写入修改”步骤，之前的编辑没有成功落盘。\n下一步：修正编辑内容并确认目标文件确实发生变化。".into();
+        return "本轮修复失败：Agent 尝试了编辑，但没有产生有效文件改动。原请求已包含修改授权，无需再次确认写入。".into();
     }
-    match phase {
-        crate::goal_execution::SolvePhase::Locate => {
-            "未完成：缺少“定位实现文件”步骤。\n下一步：用目标中的明确文字或符号做一次限定范围搜索。"
-                .into()
-        }
-        crate::goal_execution::SolvePhase::Inspect => {
-            "未完成：缺少“确认修改位置”步骤。\n下一步：读取已命中文件的相关代码区间。".into()
-        }
-        crate::goal_execution::SolvePhase::Change => {
-            "未完成：缺少“写入修改”步骤。\n下一步：对已确认文件执行最小编辑。".into()
-        }
-        crate::goal_execution::SolvePhase::Verify => {
-            "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。".into()
-        }
-        crate::goal_execution::SolvePhase::Conclude => {
-            "未完成：验收证据不完整。\n下一步：补充尚未通过的验收项证据。".into()
-        }
-    }
+    let cause = if reason.is_some_and(|text| text.contains("预算") || text.contains("窗口")) {
+        "执行预算已耗尽"
+    } else if *outcome == DeliveryOutcome::Interrupted {
+        "执行流程被中断"
+    } else {
+        "执行器未获得有效修复结果"
+    };
+    format!("本轮修复失败：{cause}，没有产生文件改动。原请求已包含修改授权，无需补充“修改写入”；这是 Agent 未完成工作。")
 }
 
 fn append_telemetry(
@@ -2448,7 +2495,9 @@ fn append_telemetry(
     log.append(SessionEvent::Telemetry {
         id: log.gen_id(),
         telemetry: ExecutionTelemetry {
-            executor: if goal_executor_enabled()
+            executor: if crate::delivery_workflow::owns(execution) {
+                "delivery-workflow".into()
+            } else if goal_executor_enabled()
                 && execution.solve_mode != crate::execution::SolveMode::OpenEnded
             {
                 "v4".into()
@@ -2460,13 +2509,15 @@ fn append_telemetry(
                 "{:?}",
                 crate::IntentProfile::compile(&execution.contract.objective).kind
             ),
-            phase: if execution.solve_mode == crate::execution::SolveMode::OpenEnded {
+            phase: if crate::delivery_workflow::owns(execution) || execution.solve_mode == crate::execution::SolveMode::OpenEnded {
                 execution.tool_phase().as_str()
             } else {
                 goal_execution.phase_name()
             }
             .into(),
-            allowed_tools: if execution.solve_mode == crate::execution::SolveMode::OpenEnded {
+            allowed_tools: if crate::delivery_workflow::owns(execution) {
+                crate::delivery_workflow::tools(execution)
+            } else if execution.solve_mode == crate::execution::SolveMode::OpenEnded {
                 execution.allowed_tools()
             } else {
                 goal_execution.allowed_tools()
@@ -2633,34 +2684,11 @@ fn messages_from_events(events: &[SessionEvent]) -> Vec<Message> {
             m.content = harness_llm::dsml::strip_dsml(&m.content);
         }
     }
-    // 协议净化：DeepSeek/OpenAI 要求 assistant 消息的每个 tool_call 后面必须紧跟
-    // 同 call_id 的 tool 消息。取消/流错误/循环守卫等异常终止会在日志里留下
-    // 「已宣告未执行」的 tool_call，直接发送即 HTTP 400；剔除无响应的 tool_call
-    // 与孤儿 tool 消息，保证任何日志重建出的上下文都协议合法。
-    let responded: std::collections::HashSet<String> = messages
-        .iter()
-        .filter(|m| m.role == Role::Tool)
-        .filter_map(|m| m.tool_call_id.clone())
-        .collect();
-    let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for m in messages.iter_mut() {
-        if m.role == Role::Assistant {
-            m.tool_calls.retain(|tc| responded.contains(&tc.id));
-            for tc in &m.tool_calls {
-                announced.insert(tc.id.clone());
-            }
-        }
-    }
-    messages.retain(|m| match m.role {
-        Role::Tool => m
-            .tool_call_id
-            .as_deref()
-            .is_some_and(|id| announced.contains(id)),
-        // 剥离 tool_calls 后内容为空的 assistant 消息无信息量，且部分服务端拒收。
-        Role::Assistant => !(m.content.is_empty() && m.tool_calls.is_empty()),
-        _ => true,
-    });
-    apply_context_budget(compress_stale_tool_results(messages))
+    // 协议净化：DeepSeek/OpenAI 要求 assistant 的每个 tool_call 紧跟同 call_id 的 tool
+    // 消息。取消/流错误/循环守卫等异常终止会在日志里留下「已宣告未执行」的 tool_call，
+    // 记忆化缓存缺陷也会把结果记到别的 call_id 上；prepare_request_messages 按邻接
+    // 顺序剔掉这些非法配对，保证任何日志重建出的上下文都能被 Provider 接受。
+    prepare_request_messages(compress_stale_tool_results(messages))
 }
 
 /// 把本步 assistant 放在该步产生的 Tool 结果和控制器 follow-up 之前。
@@ -2674,6 +2702,74 @@ fn insert_assistant_at_step_boundary(
     assistant: Message,
 ) {
     messages.insert(step_boundary.min(messages.len()), assistant);
+}
+
+/// 构造发往 Provider 的请求历史。协议校验必须排在预算裁剪之后作为最后一道关口：
+/// 任何上游缺陷（取消留下的残缺宣告、门禁跳过执行、日志回放）都只能在这里收敛为
+/// 合法请求，而不是变成之后每一步都复用的 400。
+fn prepare_request_messages(messages: Vec<Message>) -> Vec<Message> {
+    enforce_tool_call_protocol(apply_context_budget(messages))
+}
+
+/// assistant 宣告的每个 tool_call 必须由紧随其后的 tool 消息逐一应答，且同一
+/// `call_id` 只能应答一次。
+///
+/// 判定必须基于邻接顺序而不是全局 id 集合：错位或重复的工具消息在全局集合里看似
+/// 「已有响应」，Provider 却只检查紧邻的上一条 assistant，于是 DeepSeek 回
+/// `must be followed by tool messages responding to each tool_call_id`、
+/// OpenAI 兼容端回 `does not match any tool_call.id in the preceding assistant
+/// message`。此类请求在同一上下文上必然持续失败，换模型无效。
+fn enforce_tool_call_protocol(messages: Vec<Message>) -> Vec<Message> {
+    let mut guarded: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut stream = messages.into_iter().peekable();
+    while let Some(mut message) = stream.next() {
+        if message.role == Role::Tool {
+            // 无宣告方紧邻其上的工具消息：上游 assistant 已被剔除或从未存在。
+            continue;
+        }
+        if message.role != Role::Assistant || message.tool_calls.is_empty() {
+            guarded.push(message);
+            continue;
+        }
+        // 声明顺序去重：同一 assistant 内重复的 call_id 同样非法。
+        let mut declared: Vec<String> = Vec::with_capacity(message.tool_calls.len());
+        let mut calls: HashMap<String, ToolCall> = HashMap::new();
+        for call in std::mem::take(&mut message.tool_calls) {
+            if !call.id.is_empty() && !calls.contains_key(&call.id) {
+                declared.push(call.id.clone());
+                calls.insert(call.id.clone(), call);
+            }
+        }
+        let mut answers: HashMap<String, Message> = HashMap::new();
+        while stream.peek().is_some_and(|next| next.role == Role::Tool) {
+            // 未认领的应答（错位、重复、无宣告）在这一跳被消费并丢弃。
+            let answer = match stream.next() {
+                Some(answer) => answer,
+                None => break,
+            };
+            if let Some(id) = answer.tool_call_id.as_deref()
+                && calls.contains_key(id)
+                && !answers.contains_key(id)
+            {
+                answers.insert(id.to_string(), answer);
+            }
+        }
+        let mut results: Vec<Message> = Vec::with_capacity(declared.len());
+        for id in &declared {
+            if let (Some(call), Some(answer)) = (calls.remove(id), answers.remove(id)) {
+                message.tool_calls.push(call);
+                results.push(answer);
+            }
+        }
+        if !message.tool_calls.is_empty() {
+            guarded.push(message);
+            guarded.extend(results);
+        } else if !message.content.trim().is_empty() {
+            // 宣告全部落空：只剩正文的 assistant 仍可安全发送，空调用列表必须剥离。
+            guarded.push(message);
+        }
+    }
+    guarded
 }
 
 /// 陈旧工具结果渐进压缩：仅最近 `RECENT_FULL` 条工具输出保留完整（已被
@@ -3139,9 +3235,12 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 /// 硬预算续跑只接受运行时可核验的进展。失败结果虽然会作为负证据记录，
 /// 但不能靠不断制造失败签名换取新窗口。
 fn execution_progress_units(execution: &ExecutionState) -> usize {
+    if !execution.requires_workspace_change() {
+        return execution.successful_tool_results
+            .saturating_add(execution.satisfied_criteria.len());
+    }
     execution
-        .successful_tool_results
-        .saturating_add(execution.write_operations)
+        .write_operations
         .saturating_add(execution.satisfied_criteria.len())
 }
 
@@ -3572,7 +3671,7 @@ mod tests {
         );
         assert_eq!(
             status,
-            "未完成：缺少“验证”步骤。\n下一步：运行与本次修改相关的最小构建或测试。"
+            "本轮未完成交付：已有文件改动，但尚未通过完整验证。Agent 应继续修复或验证，不能声明完成。"
         );
         for internal_label in ["【资产】", "锚点：", "假设：", "补丁建议：", "问项："]
         {
@@ -3649,6 +3748,156 @@ mod tests {
         );
         assert!(compacted.iter().any(|m| m.content == "LATEST-QUESTION"));
         assert!(compacted.iter().map(message_chars).sum::<usize>() < 105_000);
+    }
+
+    fn assistant_with_calls(calls: &[&str]) -> Message {
+        Message::assistant_with_tools_and_reasoning(
+            String::new(),
+            calls
+                .iter()
+                .map(|id| harness_llm::ToolCall {
+                    id: (*id).to_string(),
+                    name: "search".to_string(),
+                    args: serde_json::json!({"pattern": id}),
+                })
+                .collect(),
+            None,
+        )
+    }
+
+    /// 把请求历史压成一行可比对的协议骨架：角色 + tool_call id + tool 消息归属。
+    fn transcript_shape(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .map(|message| match message.role {
+                Role::Tool => format!("tool<-{}", message.tool_call_id.as_deref().unwrap_or("?")),
+                Role::Assistant if message.tool_calls.is_empty() => {
+                    format!("assistant:{}", message.content)
+                }
+                Role::Assistant => format!(
+                    "assistant[{}]",
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                role => format!("{role:?}:{}", message.content),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Provider 的邻接契约：每个 tool 消息必须紧跟宣告它的 assistant 并逐一对齐 id。
+    /// 只按全局集合配对会留下错位的 tool 消息，OpenAI 兼容端据此回
+    /// “does not match any tool_call.id in the preceding assistant message”。
+    #[test]
+    fn protocol_guard_leaves_a_valid_transcript_untouched() {
+        let messages = vec![
+            Message::system("contract"),
+            Message::user("问题"),
+            assistant_with_calls(&["a", "b"]),
+            Message::tool("a", "结果 A"),
+            Message::tool("b", "结果 B"),
+            Message::assistant("结论"),
+        ];
+        let expected = transcript_shape(&messages);
+        assert_eq!(
+            transcript_shape(&enforce_tool_call_protocol(messages)),
+            expected
+        );
+    }
+
+    #[test]
+    fn protocol_guard_removes_results_that_do_not_belong_to_their_assistant() {
+        // 回放实机日志形状：搜索缓存把更早 assistant 的 call_id 带进了本步结果序列，
+        // 于是本步多出一条无人宣告的工具消息，同时自己的调用等不到响应。
+        let messages = vec![
+            Message::system("contract"),
+            Message::user("问题"),
+            assistant_with_calls(&["first"]),
+            Message::tool("first", "首次结果"),
+            Message::user("控制器提醒"),
+            assistant_with_calls(&["unanswered", "answered"]),
+            Message::tool("first", "缓存泄漏的重复结果"),
+            Message::tool("answered", "有效结果"),
+            Message::user("后续输入"),
+        ];
+        assert_eq!(
+            transcript_shape(&enforce_tool_call_protocol(messages)),
+            "System:contract | User:问题 | assistant[first] | tool<-first | User:控制器提醒 \
+             | assistant[answered] | tool<-answered | User:后续输入"
+        );
+    }
+
+    #[test]
+    fn protocol_guard_drops_assistant_that_announced_only_unanswered_calls() {
+        let messages = vec![
+            Message::system("contract"),
+            Message::user("问题"),
+            assistant_with_calls(&["never-ran"]),
+            Message::user("控制器提醒"),
+        ];
+        assert_eq!(
+            transcript_shape(&enforce_tool_call_protocol(messages)),
+            "System:contract | User:问题 | User:控制器提醒"
+        );
+    }
+
+    /// 已被旧缓存写坏的会话必须仍能续跑：从日志重建时按邻接契约剔除错位结果与无响应
+    /// 宣告，而不是把 HTTP 400 永久留在上下文里导致换模型也修不好。
+    #[test]
+    fn replaying_a_log_with_a_leaked_call_id_rebuilds_a_legal_history() {
+        let announced = |ids: &[&str]| Chunk {
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCall {
+                    id: (*id).to_string(),
+                    name: "search".into(),
+                    args: serde_json::json!({"pattern": "target-anchor gate"}),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let result = |id: &str| ToolResult {
+            call_id: id.to_string(),
+            ok: true,
+            content: "命中 2 行".into(),
+            continuation_debt: 0,
+        };
+        let events = vec![
+            SessionEvent::TurnStart {
+                id: 0,
+                input: "问题".into(),
+            },
+            SessionEvent::Assistant {
+                id: 1,
+                chunk: announced(&["first"]),
+            },
+            SessionEvent::ToolResult {
+                id: 2,
+                result: result("first"),
+            },
+            SessionEvent::Assistant {
+                id: 3,
+                chunk: announced(&["unanswered", "answered"]),
+            },
+            // 缓存命中把上一步的 call_id 记进了本步结果序列。
+            SessionEvent::ToolResult {
+                id: 4,
+                result: result("first"),
+            },
+            SessionEvent::ToolResult {
+                id: 5,
+                result: result("answered"),
+            },
+        ];
+        let shape = transcript_shape(&messages_from_events(&events));
+        assert!(
+            shape.ends_with("assistant[answered] | tool<-answered"),
+            "重建历史应回到合法配对，实际 {shape}"
+        );
     }
 
     #[test]
@@ -3810,6 +4059,25 @@ mod tests {
         );
         assert!(artifact_fingerprint(&root, "../outside.rs").is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distinct_file_reads_remain_available_after_search_limit() {
+        let mut guard = ToolRepeatGuard::default();
+        let result = ToolResult {
+            call_id: "test".into(), ok: true, content: "new evidence".into(),
+            continuation_debt: 0,
+        };
+        for i in 0..MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN {
+            guard.record_result(&format!("search:{{\"pattern\":\"{i}\"}}"), &result);
+        }
+        assert!(guard.should_block("search:{}"));
+        for i in 0..20 {
+            let signature = format!("fs:{{\"op\":\"read\",\"path\":\"src/{i}.rs\"}}");
+            assert!(!guard.should_block(&signature));
+            guard.record_result(&signature, &result);
+            assert!(guard.should_block(&signature));
+        }
     }
 
     #[test]

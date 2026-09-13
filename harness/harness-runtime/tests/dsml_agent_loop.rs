@@ -20,6 +20,7 @@ use harness_tool::{DynTool, ToolRegistry};
 /// 脚本化 Provider：第一次调用发跨帧 DSML 工具调用 + reasoning；第二次发收尾文本。
 struct ScriptedLlm {
     requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    pasted_variant: bool,
 }
 
 #[async_trait]
@@ -63,7 +64,21 @@ impl LlmProvider for ScriptedLlm {
                 ..Default::default()
             }]
         };
-        dsml::filter_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        let chunks = chunks
+            .into_iter()
+            .map(|mut chunk| {
+                if self.pasted_variant {
+                    chunk.text = chunk.text.map(|text| {
+                        text.replace("<｜DSML｜tool_cal", "<｜｜DSML｜｜ cal")
+                            .replace("</｜DSML｜tool_calls>", "</｜｜DSML｜｜ calls>")
+                            .replace("</｜DSML｜", "</｜｜DSML｜｜ ")
+                            .replace("<｜DSML｜", "<｜｜DSML｜｜ ")
+                    });
+                }
+                Ok(chunk)
+            })
+            .collect::<Vec<_>>();
+        dsml::filter_stream(Box::pin(futures::stream::iter(chunks)))
     }
 }
 
@@ -95,12 +110,22 @@ impl DynTool for RecShell {
 
 #[tokio::test]
 async fn dsml_text_becomes_executed_tool_and_context_stays_clean() {
+    assert_tool_execution(false).await;
+}
+
+#[tokio::test]
+async fn pasted_dsml_variant_becomes_executed_tool_and_context_stays_clean() {
+    assert_tool_execution(true).await;
+}
+
+async fn assert_tool_execution(pasted_variant: bool) {
     let ctx = AppContext::new();
     let log = SessionLog::new();
     let _a = ctx.provide(log.clone());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm {
         requests: requests.clone(),
+        pasted_variant,
     });
     let _b = ctx.provide(llm);
     let tools = ToolRegistry::new();

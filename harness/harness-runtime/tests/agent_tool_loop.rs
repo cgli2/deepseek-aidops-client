@@ -641,7 +641,7 @@ async fn truncated_tool_arguments_recover_even_after_a_text_preamble() {
 }
 
 #[tokio::test]
-async fn prompt_cap_auto_continues_when_the_next_step_is_clear() {
+async fn prompt_cap_does_not_renew_a_repair_without_actual_progress() {
     let ctx = AppContext::new();
     let log = SessionLog::new();
     let llm = Arc::new(CapThenResumeLlm {
@@ -667,14 +667,13 @@ async fn prompt_cap_auto_continues_when_the_next_step_is_clear() {
         .unwrap();
 
     let calls = llm.calls.load(Ordering::SeqCst);
-    assert!(calls > 1, "下一步明确时应在同一用户请求内自动续跑");
-    assert!(calls <= 20, "无进展自动续跑仍必须受硬预算约束");
+    assert_eq!(calls, 1, "仅有下一步描述不能给零修改修复任务续期");
     let events = log.replay();
     assert!(!events.iter().any(|event| matches!(event,
         SessionEvent::Assistant { chunk, .. }
             if chunk.text.as_deref().is_some_and(|text| text.contains("下一条“继续”") || text.contains("是否按以下理解继续"))
     )));
-    assert!(llm.requests.lock().unwrap().iter().skip(1).any(|request| {
+    assert!(!llm.requests.lock().unwrap().iter().skip(1).any(|request| {
         request
             .iter()
             .any(|message| message.content.contains("[预算窗口续期 1/4·最小断点]"))
@@ -803,7 +802,7 @@ async fn unverified_text_only_step_stops_after_one_state_correction() {
     assert!(
         requests[1]
             .iter()
-            .any(|message| message.content.contains("[V4 目标状态校正]"))
+            .any(|message| message.content.contains("用户已授权修复"))
     );
     assert!(log.replay().iter().any(|event| matches!(event,
         SessionEvent::Assistant { chunk, .. }
@@ -953,7 +952,7 @@ async fn concrete_problem_replay_starts_with_locate_not_shell_verification() {
     assert!(!options.is_empty());
     assert_eq!(
         options[0].allowed_tools.as_deref(),
-        Some(["search".into()].as_slice())
+        Some(["search".into(), "fs".into(), "edit".into(), "shell".into()].as_slice())
     );
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("none"));
     let events = log.replay();
@@ -961,7 +960,7 @@ async fn concrete_problem_replay_starts_with_locate_not_shell_verification() {
         SessionEvent::Telemetry { telemetry, .. }
             if telemetry.intent == "AtomicRegression"
                 && telemetry.phase == "locate"
-                && telemetry.allowed_tools == vec!["search"]
+                && telemetry.allowed_tools == vec!["search", "fs"]
     )));
 }
 
@@ -1007,7 +1006,7 @@ async fn quoted_menu_shortening_starts_from_the_grounded_file_not_repository_sea
     assert!(!options.is_empty());
     assert_eq!(
         options[0].allowed_tools.as_deref(),
-        Some(["fs".into(), "search".into()].as_slice()),
+        Some(["search".into(), "fs".into(), "edit".into(), "shell".into()].as_slice()),
         "运行时已从旧文案直接落到 composer.rs，首步应读取候选而非从仓库根搜索"
     );
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("none"));
@@ -1058,7 +1057,7 @@ async fn grounded_candidate_replay_skips_redundant_search() {
     assert!(!options.is_empty());
     assert_eq!(
         options[0].allowed_tools.as_deref(),
-        Some(["fs".into(), "search".into()].as_slice())
+        Some(["search".into(), "fs".into(), "edit".into(), "shell".into()].as_slice())
     );
     assert_eq!(options[0].max_output_tokens, Some(3_072));
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("low"));
@@ -1369,5 +1368,102 @@ async fn provider_error_never_delivers_verified() {
     assert!(
         texts.iter().any(|t| t.contains("[error]")),
         "错误须对用户可见: {texts:?}"
+    );
+}
+
+/// 会话日志必须满足 Provider 的硬协议：assistant 宣告的每个 tool_call 都要有且只有一条
+/// 同 `call_id` 的 ToolResult。搜索记忆化缓存曾把首次调用的整条 `ToolResult`（含
+/// `call_id`）原样写入日志，使后续同参数调用既留下无响应的 tool_call（DeepSeek 400），
+/// 又留下一条紧邻 assistant 并不持有的 tool 消息（OpenAI 兼容端 400）。
+#[tokio::test]
+async fn search_memo_hit_keeps_tool_results_pairing_one_to_one() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(ScriptedLlm {
+        calls: AtomicUsize::new(0),
+        initial_text_steps: 0,
+        script: vec![
+            scripted_call(
+                "memo-call-1",
+                "search",
+                serde_json::json!({"pattern": "target-anchor gate"}),
+            ),
+            scripted_call(
+                "memo-call-2",
+                "search",
+                serde_json::json!({"pattern": "另一关键词"}),
+            ),
+            // 与第一条参数完全相同：命中缓存，但必须记在本条 call_id 下。
+            scripted_call(
+                "memo-call-3",
+                "search",
+                serde_json::json!({"pattern": "target-anchor gate"}),
+            ),
+            None,
+        ],
+        options: Mutex::new(vec![]),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(Arc::new(StaticTool {
+        name: "search",
+        output: "命中 2 行",
+    }));
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm;
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "反复检索同一关键词后汇总结论".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    let announced: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Assistant { chunk, .. } => Some(
+                chunk
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let mut responded: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for event in &events {
+        if let SessionEvent::ToolResult { result, .. } = event {
+            *responded.entry(result.call_id.as_str()).or_default() += 1;
+        }
+    }
+
+    assert!(announced.len() >= 3, "脚本未产生预期的工具调用: {announced:?}");
+    let missing: Vec<&String> = announced
+        .iter()
+        .filter(|id| responded.get(id.as_str()).copied().unwrap_or(0) == 0)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "assistant 宣告的 tool_call 缺少同 id 响应，Provider 会拒绝整个历史: {missing:?}"
+    );
+    let duplicated: Vec<&&str> = responded
+        .iter()
+        .filter(|(id, count)| announced.iter().any(|a| a == *id) && **count > 1)
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        duplicated.is_empty(),
+        "同一 tool_call 记录了多条响应，说明缓存把旧 call_id 带进了新步骤: {duplicated:?}"
     );
 }

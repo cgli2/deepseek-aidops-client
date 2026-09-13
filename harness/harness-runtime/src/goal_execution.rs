@@ -1223,7 +1223,9 @@ impl GoalExecution {
         leaks.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         let mut lines: Vec<String> = Vec::new();
         lines.push(
-            "[跨面一致性·漏改预警] 以下概念在多个交付面出现，但部分面尚未改动，必须同步：".into(),
+            "[跨面一致性·漏改预警]（harness 内部提示，请勿在给用户的结论中复述）“交付面”指待修改的文件；\
+以下名词出现在多个待改文件里，但还有部分文件没同步修改，需要一起改完："
+                .into(),
         );
         for (symbol, surfaces) in leaks.iter().take(MAX_LEAK_CONCEPTS) {
             let shown: Vec<&str> = surfaces
@@ -1396,12 +1398,8 @@ impl GoalExecution {
     /// 受控任务的工具阶段只由活动工作项决定。这是 V4 的唯一阶段源；旧
     /// ExecutionState 的全局阶段仍保留给开放式兼容路径和遥测。
     pub fn allowed_tools(&self) -> Vec<String> {
-        let phase = self.phase();
-        if let Some(item) = self.active_item() {
-            if item.phase_attempts.get(phase) >= item.phase_budget.get(phase) {
-                return Vec::new();
-            }
-        }
+        // Per-action budgets are checked in allows_tool_call. Exhausting reads must
+        // not hide editing or reproduction tools from the model.
         // S4：静态可证的交付面在验证阶段额外放开 `fs`。此前只给 `shell`，等于强迫
         // 界面/字段/签名这类面去跑一次它证明不了的命令——本该读一眼产物就能收敛。
         let statically_provable = self
@@ -1414,11 +1412,11 @@ impl GoalExecution {
             })
             .unwrap_or(false);
         let names: &[&str] = match self.active_item().map(|item| item.state) {
-            Some(WorkItemState::Pending | WorkItemState::Locating) => &["search"],
+            Some(WorkItemState::Pending | WorkItemState::Locating) => &["search", "fs"],
             Some(WorkItemState::Located | WorkItemState::Inspecting) => &["fs", "search"],
             Some(WorkItemState::ReadyToChange) if self.read_only => &["fs", "search"],
-            // 弱实体命中只能提示“先读哪里”，不能直接授权写入。读完仍没有定向搜索
-            // 证据时回到 search/fs，避免为满足写计数而随便改一个软候选。
+            // 弱候选尚未读取时只开放定位与检查；读取成功即可确认目标，
+            // 无需额外搜索同一文件来取得编辑资格。
             Some(WorkItemState::ReadyToChange) if self.confirmed_target_files.is_empty() => {
                 &["fs", "search"]
             }
@@ -1430,9 +1428,9 @@ impl GoalExecution {
                     .active_item()
                     .is_some_and(|item| item.read_evidence > 0) =>
             {
-                &["edit", "fs", "shell"]
+                &["edit", "fs", "shell", "search"]
             }
-            Some(WorkItemState::ReadyToChange) => &["edit", "fs"],
+            Some(WorkItemState::ReadyToChange) => &["edit", "fs", "search"],
             Some(WorkItemState::Satisfied | WorkItemState::Changed) if statically_provable => {
                 &["fs", "shell"]
             }
@@ -1492,7 +1490,7 @@ impl GoalExecution {
                 "基于已确认的最短调用链形成证据结论；如仍有一个关键缺口，只读取对应候选。".into()
             }
             WorkItemState::ReadyToChange if self.confirmed_target_files.is_empty() =>
-                "当前文件仅为弱匹配候选；执行一次带目录约束的高信号 search，确认具体实现文件后再编辑。".into(),
+                "读取具体候选文件确认实现后直接编辑；尚无具体文件时执行一次带目录约束的 search。".into(),
             WorkItemState::ReadyToChange =>
                 "对已确认文件执行一次最小编辑；若检查后确认无需修改，运行一次最小构建或测试固化基线证据，然后如实报告零变更，禁止制造无意义编辑。".into(),
             WorkItemState::Satisfied => {
@@ -1581,19 +1579,50 @@ impl GoalExecution {
         call: &ToolCall,
         proposal: &ActionProposal,
     ) -> Result<(), String> {
+        let is_write = call.name == "edit"
+            || (call.name == "fs" && call.args.get("op").and_then(|v| v.as_str()) == Some("write"));
+        if is_write && (self.read_only || !self.allowed_tools().iter().any(|tool| tool == "edit")) {
+            return Err("当前阶段不允许写入；先读取具体目标文件确认实现。".into());
+        }
         let allowed = self.allowed_tools();
         let phase = self
             .active_item()
             .map(|item| action_phase(call, item.state, &proposal.signature))
             .unwrap_or_else(|| self.phase());
         if let Some(item) = self.active_item() {
-            if item.phase_attempts.get(phase) >= item.phase_budget.get(phase) {
+            let concrete_read = call.name == "fs"
+                && call.args.get("op").and_then(|v| v.as_str()) == Some("read")
+                && call.args.get("path").and_then(|v| v.as_str()).is_some();
+            let limit = if phase == SolvePhase::Inspect && concrete_read {
+                item.phase_budget.get(phase).max(16)
+            } else {
+                item.phase_budget.get(phase)
+            };
+            if item.phase_attempts.get(phase) >= limit {
                 return Err(format!(
                     "当前 {} 阶段预算已耗尽；必须切换假设或报告精确阻塞，禁止继续同类动作。",
                     phase.as_str()
                 ));
             }
         }
+        // A concrete read is how the model confirms a candidate, including a sibling
+        // component referenced by a router. Directory anchors are navigation hints,
+        // not filesystem permissions (those are enforced by the tool access policy).
+        let concrete_read = call.name == "fs"
+            && call.args.get("op").and_then(|v| v.as_str()) == Some("read")
+            && call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .is_some_and(|path| {
+                    let path = path.replace('\\', "/");
+                    !path.is_empty()
+                        && path
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|name| name.contains('.'))
+                })
+            && self.active_item().is_some();
         if !allowed.iter().any(|tool| tool == &call.name) {
             return Err(format!(
                 "当前工作项状态只允许 [{}]；{}",
@@ -1624,6 +1653,9 @@ impl GoalExecution {
             ));
         };
         let normalized = path.replace('\\', "/").trim_start_matches("./").to_owned();
+        if concrete_read {
+            return Ok(());
+        }
         // 已有锚点时仍允许在另一个明确子目录中执行定向搜索，以便从错误锚点恢复；
         // 但禁止重新回到工作区根泛搜。旧实现把正确的 UI 子项目搜索也一并拒绝，
         // 导致错误定位后永久锁死。
@@ -1648,12 +1680,14 @@ impl GoalExecution {
             .confirmed_target_files
             .iter()
             .any(|target| normalize_path(target) == normalized);
-        if call.name == "edit" {
+        if call.name == "edit"
+            || (call.name == "fs" && call.args.get("op").and_then(|v| v.as_str()) == Some("write"))
+        {
             return if exact_confirmed_target {
                 Ok(())
             } else {
                 Err(format!(
-                    "编辑目标 {path} 尚未被定向搜索或明确字面量确认；只能修改已确认文件 [{}]。请先用一次有目录约束的 search 建立目标相关性证据。",
+                    "编辑目标 {path} 尚未确认；已确认文件 [{}]。请先 fs.read 读取该文件，或用有目录约束的 search 定位。",
                     self.confirmed_target_files.join("、")
                 ))
             };
@@ -1758,10 +1792,9 @@ impl GoalExecution {
         }
         if let Some(path) = &action.target_path {
             if effective_ok && matches!(action.tool.as_str(), "fs" | "edit") {
-                // 读到弱候选只能证明文件存在，不能单凭读取成功就授权写入。
-                // 只有编辑成功才在这里提升为已确认目标；搜索命中的强锚点由
-                // record_targets_from_search 单独负责。
-                self.add_target_file(path, action.tool == "edit");
+                // Successful inspection supplies the exact source needed by edit.
+                // Requiring an additional search here deadlocks ReadyToChange.
+                self.add_target_file(path, is_read || is_write);
             }
         }
         let already_satisfied = allow_already_satisfied
@@ -1900,9 +1933,8 @@ impl GoalExecution {
                 reason.chars().take(180).collect::<String>()
             ));
             item.no_information_streak = item.no_information_streak.saturating_add(1);
-            if item.no_information_streak >= 2 {
-                advance_hypothesis(item, action.phase);
-            }
+            // A rejected call is not evidence against a code hypothesis. In
+            // particular it must not reset the exhausted budget and replay H1/H2.
         }
     }
 
@@ -1937,8 +1969,7 @@ impl GoalExecution {
     fn record_targets_from_search(&mut self, summary: &str) {
         // Local Search 的标准格式为“相对路径:行号: 内容”。只采纳代码文件的
         // 父目录；结果中的普通文本、绝对临时路径或冒号后的源码均不会成为锚点。
-        let mut captured = 0usize;
-        for line in summary.lines().skip(1).take(12) {
+        for line in summary.lines() {
             let Some((candidate, rest)) = line.split_once(':') else {
                 continue;
             };
@@ -1949,18 +1980,11 @@ impl GoalExecution {
             match candidate.rsplit_once('/') {
                 Some((dir, file)) if file.contains('.') && !dir.is_empty() => {
                     self.add_target_file(&candidate, true);
-                    captured = captured.saturating_add(1);
                 }
                 None if candidate.contains('.') => {
                     self.add_target_file(&candidate, true);
-                    captured = captured.saturating_add(1);
                 }
                 _ => {}
-            }
-            // Grounder 可能已塞入较多软候选；搜索结果必须仍能把命中文件提升为
-            // 强证据，不能因为 target_files 预先达到上限而被整体丢弃。
-            if captured >= 8 {
-                break;
             }
         }
     }
@@ -2243,6 +2267,7 @@ fn is_verification(signature: &str) -> bool {
 /// 绝不能消耗 change 预算，否则若干次读取后第一次真正的 edit 就会被拒绝。
 fn action_phase(call: &ToolCall, state: WorkItemState, signature: &str) -> SolvePhase {
     match call.name.as_str() {
+        "fs" if call.args.get("op").and_then(|v| v.as_str()) == Some("write") => SolvePhase::Change,
         "search" if matches!(state, WorkItemState::Pending | WorkItemState::Locating) => {
             SolvePhase::Locate
         }
@@ -2258,7 +2283,9 @@ fn action_phase(call: &ToolCall, state: WorkItemState, signature: &str) -> Solve
 }
 
 fn phase_for_signature(signature: &str) -> SolvePhase {
-    if is_verification(signature) {
+    if signature.starts_with("fs:") && signature.contains("\"op\":\"write\"") {
+        SolvePhase::Change
+    } else if is_verification(signature) {
         SolvePhase::Verify
     } else if signature.starts_with("search:") {
         SolvePhase::Locate
@@ -3555,7 +3582,7 @@ mod tests {
     }
 
     #[test]
-    fn search_hit_locks_follow_up_actions_to_the_hit_directory() {
+    fn search_hit_keeps_navigation_anchors_without_locking_concrete_reads() {
         let contract = TaskContract::from_input("列表、新增、编辑展示 appCode");
         let mut plan = GoalExecution::from_contract(&contract);
         let locate = ActionProposal {
@@ -3576,7 +3603,7 @@ mod tests {
             name: "fs".into(),
             args: serde_json::json!({"op": "read", "path": "server/main.rs"}),
         };
-        assert!(plan.allows_tool_call(&outside, &locate).is_err());
+        assert!(plan.allows_tool_call(&outside, &locate).is_ok());
         let inside = ToolCall {
             id: "read-inside".into(),
             name: "fs".into(),
@@ -3635,7 +3662,7 @@ mod tests {
     }
 
     #[test]
-    fn weak_grounding_cannot_authorize_an_unrelated_edit() {
+    fn inspected_candidate_can_be_edited_but_unread_files_cannot() {
         let contract = TaskContract::from_input("文件树右键可以把选定文件添加到对话框附件");
         let mut plan = GoalExecution::from_contract(&contract);
         plan.apply_grounding(&WorkspaceGrounding {
@@ -3657,9 +3684,9 @@ mod tests {
             estimated_cost: 1,
         };
         plan.record_result(&read_proposal, true, "theme palette source");
-        assert_eq!(plan.allowed_tools(), vec!["fs", "search"]);
+        assert_eq!(plan.allowed_tools(), vec!["edit", "fs", "shell", "search"]);
 
-        let edit = ToolCall {
+        let mut edit = ToolCall {
             id: "bad-edit".into(),
             name: "edit".into(),
             args: serde_json::json!({
@@ -3674,6 +3701,8 @@ mod tests {
             supports: vec!["user-objective".into()],
             estimated_cost: 1,
         };
+        assert!(plan.allows_tool_call(&edit, &edit_proposal).is_ok());
+        edit.args["path"] = serde_json::json!("harness/harness-ui/src/gui/unread.rs");
         assert!(plan.allows_tool_call(&edit, &edit_proposal).is_err());
     }
 
@@ -3777,6 +3806,8 @@ mod tests {
             supports: vec!["user-objective".into()],
             estimated_cost: 1,
         };
+        assert!(plan.allows_tool_call(&extra_read, &extra_proposal).is_ok());
+        plan.items.get_mut("user-objective").unwrap().phase_attempts.inspect = 16;
         assert!(
             plan.allows_tool_call(&extra_read, &extra_proposal).is_err(),
             "Inspect 扩容仍须保持有限，不能变成无限读取"
@@ -3874,6 +3905,182 @@ mod tests {
             args: serde_json::json!({"dir": ".", "pattern": "menu"}),
         };
         assert!(plan.allows_tool_call(&broad, &locate).is_err());
+    }
+
+    #[test]
+    fn copy_button_log_replay_can_read_edit_and_verify_without_gate_recovery() {
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复气泡复制按钮"));
+        let mut run = |name: &str, args: serde_json::Value, result: &str| {
+            let call = ToolCall {
+                id: "replay".into(),
+                name: name.into(),
+                args,
+            };
+            let proposal = ActionProposal {
+                signature: format!("{}:{}", name, call.args),
+                question: "fix copy button".into(),
+                supports: vec!["user-objective".into()],
+                estimated_cost: 1,
+            };
+            let action = plan.action_spec(&call, &proposal).unwrap();
+            assert!(
+                plan.allows_tool_call(&call, &proposal).is_ok(),
+                "{name}: {:?}",
+                plan.allows_tool_call(&call, &proposal)
+            );
+            plan.record_action_result(&action, &proposal, true, result);
+        };
+        run(
+            "search",
+            serde_json::json!({"dir":"harness","pattern":"copy"}),
+            "共 60 条命中\nharness/Cargo.lock:80: zerocopy\nharness/scripts/build.bat:36: copy",
+        );
+        run(
+            "fs",
+            serde_json::json!({"op":"read","path":"harness/harness-ui/src/gui/workspace.rs"}),
+            "let size = 10.0;",
+        );
+        run(
+            "edit",
+            serde_json::json!({"path":"harness/harness-ui/src/gui/workspace.rs","old_text":"let size = 10.0;","new_text":"let size = 24.0;"}),
+            "updated",
+        );
+        run(
+            "shell",
+            serde_json::json!({"command":"cargo check -p harness-ui"}),
+            "Finished",
+        );
+        assert!(plan.can_conclude());
+    }
+
+    #[test]
+    fn strategy_save_replay_reads_call_chain_then_edits_without_budget_restarts() {
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input("策略页编辑运行实例保存报错，修复"));
+        let paths = ["webui/src/views/StrategyView.vue", "server/routers/strategy.py",
+            "server/schemas.py", "webui/src/components/ParameterForm.vue",
+            "webui/src/components/ParameterValue.vue", "qmt_trade/core/parameter_schema.py",
+            "webui/src/api.ts", "qmt_trade/core/config.py"];
+        for path in paths {
+            let call = ToolCall { id: "read".into(), name: "fs".into(),
+                args: serde_json::json!({"op":"read","path":path}) };
+            let proposal = ActionProposal { signature: format!("fs:{}", call.args),
+                question: "inspect save flow".into(), supports: vec!["user-objective".into()], estimated_cost: 1 };
+            assert!(plan.allowed_tools().contains(&"fs".into()));
+            assert!(plan.allows_tool_call(&call, &proposal).is_ok());
+            let action = plan.action_spec(&call, &proposal).unwrap();
+            plan.record_action_result(&action, &proposal, true, "source code");
+        }
+        let call = ToolCall { id: "blocked".into(), name: "fs".into(),
+            args: serde_json::json!({"op":"read","path":paths[0]}) };
+        let proposal = ActionProposal { signature: format!("fs:{}", call.args),
+            question: "inspect".into(), supports: vec!["user-objective".into()], estimated_cost: 1 };
+        plan.items.get_mut("user-objective").unwrap().phase_attempts.inspect = 16;
+        let action = plan.action_spec(&call, &proposal).unwrap();
+        for _ in 0..6 {
+            let reason = plan.allows_tool_call(&call, &proposal).unwrap_err();
+            plan.record_gate_rejection(&action, &reason);
+        }
+        assert_eq!(plan.items["user-objective"].phase_attempts.inspect, 16);
+        let edit = ToolCall { id: "edit".into(), name: "edit".into(),
+            args: serde_json::json!({"path":paths[0],"old_text":"save(old)","new_text":"save(fixed)"}) };
+        let proposal = ActionProposal { signature: format!("edit:{}", edit.args), ..proposal };
+        assert!(plan.allowed_tools().contains(&"edit".into()));
+        assert!(plan.allows_tool_call(&edit, &proposal).is_ok());
+        let action = plan.action_spec(&edit, &proposal).unwrap();
+        assert_eq!(plan.record_action_result(&action, &proposal, true, "updated"), EvidenceKind::ChangeApplied);
+    }
+
+    #[test]
+    fn search_records_hits_after_noise_and_without_a_header() {
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复复制按钮"));
+        let mut output = String::new();
+        for line in 1..=60 {
+            output.push_str(&format!("harness/Cargo.lock:{line}: zerocopy\n"));
+        }
+        output.push_str("harness/harness-ui/src/gui\\workspace.rs:284: copy-icon");
+        plan.record_targets_from_search(&output);
+        assert!(
+            plan.confirmed_target_files
+                .contains(&"harness/harness-ui/src/gui/workspace.rs".into())
+        );
+        assert!(
+            plan.confirmed_target_files
+                .contains(&"harness/Cargo.lock".into())
+        );
+    }
+
+    #[test]
+    fn failed_read_does_not_confirm_target_and_recovery_remains_bounded() {
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复复制按钮"));
+        plan.record_targets_from_search("src/router.rs:1: route");
+        plan.items.get_mut("user-objective").unwrap().state = WorkItemState::ReadyToChange;
+        let read = ActionProposal {
+            signature: "fs:{\"op\":\"read\",\"path\":\"src/missing.rs\"}".into(),
+            question: "inspect".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        plan.record_result(&read, false, "file not found");
+        assert!(
+            !plan
+                .confirmed_target_files
+                .contains(&"src/missing.rs".into())
+        );
+        assert!(plan.allowed_tools().contains(&"search".into()));
+        let search = ToolCall {
+            id: "recover".into(),
+            name: "search".into(),
+            args: serde_json::json!({"dir":"src/ui","pattern":"copy"}),
+        };
+        assert!(plan.allows_tool_call(&search, &read).is_ok());
+        let item = plan.items.get_mut("user-objective").unwrap();
+        item.phase_attempts.inspect = item.phase_budget.inspect;
+        assert!(plan.allows_tool_call(&search, &read).is_err());
+        let write = ToolCall {
+            id: "write".into(),
+            name: "fs".into(),
+            args: serde_json::json!({"op":"write","path":"src/router.rs","content":"changed"}),
+        };
+        plan.read_only = true;
+        assert!(plan.allows_tool_call(&write, &read).is_err());
+    }
+
+    #[test]
+    fn router_inspection_allows_sibling_component_and_write_uses_change_budget() {
+        let mut plan =
+            GoalExecution::from_contract(&TaskContract::from_input("缩小行情与事件按钮"));
+        plan.record_targets_from_search(
+            "webui/src/router/index.ts:7: import('@/views/MarketHubView.vue')",
+        );
+        plan.items.get_mut("user-objective").unwrap().state = WorkItemState::ReadyToChange;
+        for (op, expected) in [("write", false), ("read", true), ("write", true)] {
+            let call = ToolCall {
+                id: "component".into(),
+                name: "fs".into(),
+                args: serde_json::json!({"op":op,"path":"webui/src/views/MarketHubView.vue","content":"<template>small tabs</template>"}),
+            };
+            let proposal = ActionProposal {
+                signature: format!("fs:{}", call.args),
+                question: "component".into(),
+                supports: vec!["user-objective".into()],
+                estimated_cost: 1,
+            };
+            let action = plan.action_spec(&call, &proposal).unwrap();
+            assert_eq!(plan.allows_tool_call(&call, &proposal).is_ok(), expected);
+            assert_eq!(
+                action.phase,
+                if op == "write" {
+                    SolvePhase::Change
+                } else {
+                    SolvePhase::Inspect
+                }
+            );
+            if expected {
+                plan.record_action_result(&action, &proposal, true, "<template>tabs</template>");
+            }
+        }
+        assert_eq!(plan.items["user-objective"].state, WorkItemState::Changed);
+        assert!(!plan.can_conclude());
     }
 
     #[test]
@@ -4060,7 +4267,7 @@ mod tests {
             item.candidate_targets = vec!["src/agent_loop.rs".into()];
         }
 
-        assert_eq!(plan.allowed_tools(), vec!["edit", "fs", "shell"]);
+        assert_eq!(plan.allowed_tools(), vec!["edit", "fs", "shell", "search"]);
 
         let call = ToolCall {
             id: "verify-baseline".into(),

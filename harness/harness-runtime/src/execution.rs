@@ -246,7 +246,7 @@ impl SolvePlan {
         }
         if matches!(
             strategy,
-            StrategyKind::Transformative | StrategyKind::Verification
+            StrategyKind::Transformative | StrategyKind::Verification | StrategyKind::Generative
         ) {
             let initial_steps = 10 + extra_surfaces;
             let initial_tool_calls = 12 + extra_surfaces * 2;
@@ -570,10 +570,14 @@ impl ExecutionState {
             // 归一化签名里 edit 工具以 "edit:" 开头；fs 写入的 JSON 参数含 "op":"write"。
             if is_write && substantive_write && workspace_changed.unwrap_or(true) {
                 self.write_operations += 1;
+                // Verification belongs to the previous file revision. Any later
+                // change invalidates it, including integration checks across items.
+                self.verification_evidence.clear();
+                self.satisfied_criteria.clear();
                 self.changed_criteria
                     .extend(proposal.supports.iter().cloned());
             }
-            if self.is_verification(proposal)
+            if self.is_verification(proposal) && effective_ok
                 && (self.write_operations > 0 || self.strategy == StrategyKind::Verification)
             {
                 let evidence = format!(
@@ -744,6 +748,7 @@ impl ExecutionState {
             "yarn test",
             "pytest",
             "python -m pytest",
+            "python -m unittest",
             "py_compile",
             "go test",
             "mvn test",
@@ -1516,6 +1521,11 @@ impl DomainPolicy for GeneralDomainPolicy {
     fn select_strategy(&self, contract: &TaskContract) -> StrategyKind {
         let text = contract.objective.as_str();
         let intent = IntentProfile::compile(text);
+        if ["只分析", "仅分析", "不要修改", "不修改代码", "只读诊断"]
+            .iter().any(|constraint| text.contains(constraint))
+        {
+            return StrategyKind::Investigative;
+        }
         // 变更请求优先于同一句中的“测试/验证”。“按文档开发并测试”首先是开发任务，
         // 不能因为包含测试二字退化成允许零改动的纯 Verification。
         let requests_change = matches!(

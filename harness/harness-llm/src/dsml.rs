@@ -54,11 +54,12 @@ impl DsmlFilter {
     /// 喂入一段文本增量，产出已确定的文本/工具调用序列。
     pub fn push(&mut self, text: &str) -> Vec<DsmlItem> {
         let mut out = Vec::new();
-        let mut pending = normalize(text);
+        let mut pending = text.to_string();
         loop {
             if self.capture.is_some() {
                 let cap = self.capture.as_mut().unwrap();
                 cap.push_str(&pending);
+                *cap = normalize(cap);
                 drain_invokes(cap, &mut self.counter, &mut out);
                 if let Some(pos) = cap.find(CLOSE) {
                     let tail = cap[pos + CLOSE.len()..].to_string();
@@ -71,6 +72,7 @@ impl DsmlFilter {
 
             let mut s = std::mem::take(&mut self.buf);
             s.push_str(&pending);
+            s = normalize(&s);
             if let Some(pos) = s.find(OPEN) {
                 if pos > 0 {
                     out.push(DsmlItem::Text(s[..pos].to_string()));
@@ -79,7 +81,7 @@ impl DsmlFilter {
                 pending = s[pos + OPEN.len()..].to_string();
                 continue;
             }
-            let hold = hold_suffix(&s, OPEN);
+            let hold = hold_open_suffix(&s);
             let emit_len = s.len() - hold;
             if emit_len > 0 {
                 out.push(DsmlItem::Text(s[..emit_len].to_string()));
@@ -173,15 +175,32 @@ pub fn strip_dsml(text: &str) -> String {
         }
         break;
     }
-    let hold = hold_suffix(&s, OPEN);
+    let hold = hold_open_suffix(&s);
     s.truncate(s.len() - hold);
     s
 }
 
 /// ASCII 变体归一化为全宽竖线规范形（开/闭标记都要覆盖，否则混合变体的闭合标签无法匹配）。
 fn normalize(text: &str) -> String {
-    text.replace("</|DSML|", "</｜DSML｜")
+    text.replace("</｜｜DSML｜｜ ", "</｜DSML｜")
+        .replace("<｜｜DSML｜｜ ", "<｜DSML｜")
+        .replace("</|DSML|", "</｜DSML｜")
         .replace("<|DSML|", "<｜DSML｜")
+        .replace("<｜DSML｜calls>", OPEN)
+        .replace("</｜DSML｜calls>", CLOSE)
+}
+
+fn hold_open_suffix(s: &str) -> usize {
+    [
+        OPEN,
+        "<|DSML|tool_calls>",
+        "<｜｜DSML｜｜ calls>",
+        "<｜DSML｜calls>",
+    ]
+    .iter()
+    .map(|marker| hold_suffix(s, marker))
+    .max()
+    .unwrap_or(0)
 }
 
 /// 返回 `s` 尾部「是 marker 真前缀」的最长后缀字节长度（按字符边界枚举，防 UTF-8  panic）。
@@ -403,5 +422,37 @@ mod tests {
         let items = f.push("普通对话，没有工具。");
         assert_eq!(items, vec![DsmlItem::Text("普通对话，没有工具。".into())]);
         assert!(f.finish().is_empty());
+    }
+
+    #[test]
+    fn pasted_log_variant_executes_across_every_frame_boundary() {
+        for (prefix, suffix, wrapper) in [
+            ("<｜｜DSML｜｜ ", "</｜｜DSML｜｜ ", "calls"),
+            ("<|DSML|", "</|DSML|", "tool_calls"),
+        ] {
+            let block = format!(
+                "前文{prefix}{wrapper}>{prefix}invoke name=\"fs\">{prefix}parameter name=\"op\" string=\"true\">read{suffix}parameter>{prefix}parameter name=\"path\" string=\"true\">server/routers/strategy.py{suffix}parameter>{suffix}invoke>{suffix}{wrapper}>后文"
+            );
+            for split in block.char_indices().map(|(i, _)| i) {
+                let mut filter = DsmlFilter::new();
+                let mut items = filter.push(&block[..split]);
+                items.extend(filter.push(&block[split..]));
+                items.extend(filter.finish());
+                let parsed = calls(&items);
+                assert_eq!(parsed.len(), 1, "split {split}");
+                assert_eq!(parsed[0].name, "fs");
+                assert_eq!(parsed[0].args["path"], "server/routers/strategy.py");
+                let visible: String = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        DsmlItem::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(visible, "前文后文", "split {split}");
+                assert!(!strip_dsml(&block[..split]).contains("DSML"));
+            }
+            assert_eq!(strip_dsml(&block), "前文后文");
+        }
     }
 }

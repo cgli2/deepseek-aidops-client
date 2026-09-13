@@ -275,15 +275,13 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         // 保证覆盖在最上层。采用紧凑小尺寸并紧贴右上角，避免遮挡
                                         // 首行长文字尾部内容。
                                         let icon_rect = egui::Rect::from_min_size(
-                                            ui.max_rect().right_top() + egui::vec2(-14.0, 2.0),
+                                            ui.max_rect().right_top() + egui::vec2(-11.0, 2.0),
                                             egui::vec2(10.0, 10.0),
                                         );
-                                        let hit_rect = icon_rect.expand(2.0);
-                                        let copy_resp = ui.interact(
-                                            hit_rect,
-                                            egui::Id::new(("copy-icon", index)),
-                                            egui::Sense::click(),
-                                        );
+                                        // 命中区放大到 16×16，更易点中。实际交互注册在正文
+                                        // 渲染之后（见下方 copy_resp），否则会被可选中的
+                                        // Markdown 正文抢走点击，表现为“按钮经常点不到”。
+                                        let hit_rect = icon_rect.expand(3.0);
                                         // 交付状态只接受 Runtime 的 Delivery 事件；TurnEnd 或模型
                                         // 文本出现“完成”都不能推导为成功，避免未验证任务假完成。
                                         let is_final = !state.busy
@@ -429,6 +427,16 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         // 绘制悬浮在右上角的复制图标（矢量双矩形，不依赖字体字形、
                                         // 不会变豆腐块），并处理 hover 光标与点击复制；图标绘制
                                         // 在正文之后，会覆盖在最上层，且不参与正常布局流。
+                                        // 关键：在正文之后注册本按钮的交互。egui 中后注册的控件
+                                        // 位于更上层，若像旧实现那样先注册，会被可选中的
+                                        // Markdown 正文抢走点击，表现为“按钮经常点不到”。
+                                        let copy_resp = ui.interact(
+                                            hit_rect,
+                                            // id 里加入消息长度，流式追加/删除消息导致 index
+                                            // 漂移时，不会把状态串到别的气泡上。
+                                            egui::Id::new(("copy-icon", index, msg.text.len())),
+                                            egui::Sense::click(),
+                                        );
                                         let icon_color = if copy_resp.hovered() {
                                             ui.ctx()
                                                 .set_cursor_icon(egui::CursorIcon::PointingHand);

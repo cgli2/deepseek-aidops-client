@@ -1562,3 +1562,88 @@ async fn advisory_gates_never_replace_a_dispatched_tool_result() {
         "三次读取必须全部到达工具层"
     );
 }
+
+/// 每次请求都固定吐一个重复 search，制造「零增益」提示场景。
+struct RepeatSearchLlm {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl LlmProvider for RepeatSearchLlm {
+    fn name(&self) -> &'static str {
+        "repeat-search-test"
+    }
+    fn tools(&self) -> Vec<harness_llm::ToolSchema> {
+        vec![]
+    }
+    fn stream(&self, messages: Vec<Message>) -> ChunkStream {
+        self.requests.lock().unwrap().push(messages);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunk = if call < 4 {
+            Chunk {
+                tool_calls: vec![ToolCall {
+                    id: format!("rep-{call}"),
+                    name: "search".into(),
+                    args: serde_json::json!({"pattern": "同一个关键词"}),
+                }],
+                ..Default::default()
+            }
+        } else {
+            Chunk {
+                text: Some("已基于现有证据收尾".into()),
+                ..Default::default()
+            }
+        };
+        Box::pin(futures::stream::iter(vec![Ok(chunk)]))
+    }
+}
+
+#[tokio::test]
+async fn zero_gain_advice_is_injected_without_swallowing_the_action() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(RepeatSearchLlm {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(vec![]),
+    });
+    let hits = Arc::new(CountingTool {
+        name: "search",
+        hits: AtomicUsize::new(0),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(hits.clone());
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "反复用同一关键词定位后修复".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    assert!(
+        !events.iter().any(|event| matches!(event,
+            SessionEvent::ToolResult { result, .. }
+                if result.content.contains("gate]") || result.content.contains("guard]"))),
+        "零增益只提示，不得拦停"
+    );
+    assert_eq!(hits.hits.load(Ordering::SeqCst), 4, "四次重复 search 必须全部派发");
+    let requests = llm.requests.lock().unwrap();
+    let advised = requests.iter().skip(1).any(|request| {
+        request.iter().any(|message| {
+            message.role == harness_llm::Role::User && message.content.contains("未新增信息")
+        })
+    });
+    assert!(advised, "提示须随下一步请求注入: {:?}", requests.last().map(|r| r.len()));
+}

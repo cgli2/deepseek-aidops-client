@@ -32,3 +32,35 @@ pub(crate) fn next_action(state: &ExecutionState) -> &'static str {
         "用户已授权修复。根据已有证据确定根因并执行编辑，随后验证；缺少诊断证据时先运行最小复现，不要重复总结或重新泛搜。"
     }
 }
+
+/// 准入提示的唯一落点：去重、限量，并保证它只成为提示而不是工具结果。
+pub(crate) fn note_advice(advisories: &mut Vec<String>, reason: &str) {
+    let line = format!("未新增信息的可能：{reason}");
+    if !advisories.contains(&line) {
+        advisories.push(line);
+    }
+}
+
+/// 每回合最多注入 1 条提示：多条同类提示只会挤掉真正需要的上下文。
+pub(crate) fn render_advisories(advisories: &[String]) -> Vec<String> {
+    advisories
+        .iter()
+        .take(1)
+        .map(|line| format!("[运行时提示] {line}；如仍需该动作，直接继续。"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advisories_deduplicate_and_are_capped_at_one_per_step() {
+        let mut seen = Vec::new();
+        note_advice(&mut seen, "相同参数的调用不会带来新信息");
+        note_advice(&mut seen, "相同参数的调用不会带来新信息");
+        note_advice(&mut seen, "inspect 阶段已用去 5 次动作");
+        assert_eq!(seen.len(), 2, "同类提示必须去重");
+        assert_eq!(render_advisories(&seen).len(), 1, "每回合最多注入一条提示");
+    }
+}

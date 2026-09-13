@@ -1319,6 +1319,7 @@ impl AgentLoop {
             let mut last_leak_reminder = String::new();
             let mut step_had_tools = false;
             let mut loop_recovery_prompts = Vec::new();
+            let mut advisories: Vec<String> = Vec::new();
             let mut empty_response_reason: Option<String> = None;
             // 本步（单次请求）的 token 用量累计（AIOps 成本计量）。
             let mut step_usage = Usage::default();
@@ -1549,29 +1550,37 @@ impl AgentLoop {
 
                     // 通用行动门禁：每个工具动作必须关联验收目标。调用/时间预算是软检查点，
                     // 只触发进展诊断与续期，不会因为任务耗时较长而拒绝必要动作。
-                    if let GateDecision::Deny(reason) = ActionGate::authorize_with_tools(
+                    match ActionGate::authorize_with_tools(
                         &proposal,
                         &execution,
                         &budget,
                         &runtime_allowed_tools,
                     ) {
-                        if let Some(action) = &action_spec {
-                            goal_execution.record_gate_rejection(action, &reason);
+                        // 真实外部约束：保持原有拒绝行为与文案通道。
+                        GateDecision::Deny(reason) => {
+                            if let Some(action) = &action_spec {
+                                goal_execution.record_gate_rejection(action, &reason);
+                            }
+                            let denied = ToolResult {
+                                call_id: tc.id.clone(),
+                                ok: false,
+                                content: format!("[execution gate] {reason}"),
+                                continuation_debt: 0,
+                            };
+                            log.append(SessionEvent::ToolResult {
+                                id: log.gen_id(),
+                                result: denied.clone(),
+                            });
+                            repeat_guard.record_result(&sig, &denied);
+                            messages.push(Message::tool(tc.id.clone(), denied.content));
+                            step_had_tools = true;
+                            continue;
                         }
-                        let denied = ToolResult {
-                            call_id: tc.id.clone(),
-                            ok: false,
-                            content: format!("[execution gate] {reason}"),
-                            continuation_debt: 0,
-                        };
-                        log.append(SessionEvent::ToolResult {
-                            id: log.gen_id(),
-                            result: denied.clone(),
-                        });
-                        repeat_guard.record_result(&sig, &denied);
-                        messages.push(Message::tool(tc.id.clone(), denied.content));
-                        step_had_tools = true;
-                        continue;
+                        // 计数/关联类：动作照常派发，原因变成提示。
+                        GateDecision::Advise(reason) => {
+                            crate::delivery_workflow::note_advice(&mut advisories, &reason);
+                        }
+                        GateDecision::Allow => {}
                     }
                     execution.tool_calls =
                         execution.tool_calls.saturating_add(proposal.estimated_cost);
@@ -1979,6 +1988,9 @@ impl AgentLoop {
                         (!assistant_reasoning.is_empty()).then_some(assistant_reasoning),
                     ),
                 );
+            }
+            for hint in crate::delivery_workflow::render_advisories(&advisories) {
+                messages.push(Message::user(hint));
             }
             for prompt in loop_recovery_prompts {
                 messages.push(Message::user(prompt));

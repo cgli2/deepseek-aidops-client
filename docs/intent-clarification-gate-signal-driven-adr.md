@@ -200,7 +200,7 @@ Phase 2 观察差异：
 意图分类（封闭信号）：
 - `classifies_generic_intents_by_closed_signals`：提问→`Investigative`、代码符号→`Transformative`、无信号非提问→`Direct`；
 - `concrete_problem_report_uses_transformative_strategy_without_fix_verb`：未说"修复"但给代码符号 `Composer` → `ScopedDelivery`；
-- `atomic_regression_uses_a_short_state_machine_window` / `stale_state_after_mutation_is_atomic_regression` / `atomic_gate_blocks_broad_second_search_and_pre_change_verification` / `dynamic_tool_whitelist_follows_verified_execution_evidence`：变更契约（`改为`/结构动作）→ `AtomicDelivery`，短窗口 + 定位门禁生效；
+- `atomic_regression_uses_a_short_state_machine_window` / `stale_state_after_mutation_is_atomic_regression` / `atomic_gate_advises_broad_second_search_and_pre_change_verification` / `dynamic_tool_whitelist_follows_verified_execution_evidence`：变更契约（`改为`/结构动作）→ `AtomicDelivery`，短窗口 + 定位门禁生效；
 - `review_word_does_not_force_shell_only_verification_mode`：诊断式提问→`Investigative`（不被"审查"收窄成 shell-only），明确验证动作→`Verification`；
 - `read_only_goal_requires_a_real_read_before_conclusion`：提问形态→`Investigation`（只读），必须先读后有证据才能结案；
 - `multi_surface_fields_use_scoped_plan_and_scaled_budget`：交付面数改由 `acceptance_criteria.len()` 推导（`24/30` 熔断），单面回归预算饥饿已修复。

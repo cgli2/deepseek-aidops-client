@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::execution::{ActionProposal, TaskContract, edit_has_substantive_delta};
+use crate::execution::{ActionProposal, GateDecision, TaskContract, edit_has_substantive_delta};
 use crate::intent::{
     Clarification, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior, inspect_diff,
 };
@@ -1574,15 +1574,24 @@ impl GoalExecution {
         }
     }
 
+    /// 准入裁决：计数/阶段/锚点类判断只产 `Advise`（动作照常派发），
+    /// 只有真实外部约束产 `Deny`（见 spec §4.1 与阶段 A 计划的决策边界）。
     pub fn allows_tool_call(
         &self,
         call: &ToolCall,
         proposal: &ActionProposal,
-    ) -> Result<(), String> {
+    ) -> Result<(), GateDecision> {
         let is_write = call.name == "edit"
             || (call.name == "fs" && call.args.get("op").and_then(|v| v.as_str()) == Some("write"));
-        if is_write && (self.read_only || !self.allowed_tools().iter().any(|tool| tool == "edit")) {
-            return Err("当前阶段不允许写入；先读取具体目标文件确认实现。".into());
+        if is_write && self.read_only {
+            return Err(GateDecision::Deny(
+                "当前任务为只读，写入不被允许；请基于已有证据给出定位结论。".into(),
+            ));
+        }
+        if is_write && !self.allowed_tools().iter().any(|tool| tool == "edit") {
+            return Err(GateDecision::Advise(
+                "当前阶段尚未开放写入工具；先读取具体目标文件确认实现。".into(),
+            ));
         }
         let allowed = self.allowed_tools();
         let phase = self
@@ -1599,10 +1608,11 @@ impl GoalExecution {
                 item.phase_budget.get(phase)
             };
             if item.phase_attempts.get(phase) >= limit {
-                return Err(format!(
-                    "当前 {} 阶段预算已耗尽；必须切换假设或报告精确阻塞，禁止继续同类动作。",
-                    phase.as_str()
-                ));
+                return Err(GateDecision::Advise(format!(
+                    "{} 阶段已用去 {} 次动作；说明本次动作将新增什么证据",
+                    phase.as_str(),
+                    item.phase_attempts.get(phase)
+                )));
             }
         }
         // A concrete read is how the model confirms a candidate, including a sibling
@@ -1624,15 +1634,18 @@ impl GoalExecution {
                 })
             && self.active_item().is_some();
         if !allowed.iter().any(|tool| tool == &call.name) {
-            return Err(format!(
+            return Err(GateDecision::Advise(format!(
                 "当前工作项状态只允许 [{}]；{}",
                 allowed.join("、"),
                 self.next_action_hint()
-            ));
+            )));
         }
         if call.name == "fs" && call.args.get("op").and_then(|value| value.as_str()) == Some("list")
         {
-            return Err(format!("受控交付禁止目录枚举；{}", self.next_action_hint()));
+            return Err(GateDecision::Advise(format!(
+                "目录枚举不新增证据；{}",
+                self.next_action_hint()
+            )));
         }
         if !matches!(call.name.as_str(), "search" | "fs" | "edit") {
             return Ok(());
@@ -1646,11 +1659,11 @@ impl GoalExecution {
             if call.name == "search" && self.anchor_dirs.is_empty() {
                 return Ok(());
             }
-            return Err(format!(
-                "已定位共享目录 [{}]；{} 调用必须显式提供该目录内的 path/dir，禁止回到工作区根泛搜。",
+            return Err(GateDecision::Advise(format!(
+                "已定位共享目录 [{}]；{} 调用带该目录内的 path/dir 才能命中，回到工作区根泛搜不新增信息。",
                 self.anchor_dirs.join("、"),
                 call.name
-            ));
+            )));
         };
         let normalized = path.replace('\\', "/").trim_start_matches("./").to_owned();
         if concrete_read {
@@ -1665,10 +1678,10 @@ impl GoalExecution {
                 || normalized == "/"
                 || (normalized.len() == 2 && normalized.ends_with(':'));
             if !self.anchor_dirs.is_empty() && broad_root {
-                return Err(format!(
-                    "已有定位锚点 [{}]，禁止回到工作区根泛搜；请指定新的候选子目录进行定向换路。",
+                return Err(GateDecision::Advise(format!(
+                    "已有定位锚点 [{}]；回到工作区根泛搜不会新增信息，指定新的候选子目录即可定向换路。",
                     self.anchor_dirs.join("、")
-                ));
+                )));
             }
             return Ok(());
         }
@@ -1683,22 +1696,23 @@ impl GoalExecution {
         if call.name == "edit"
             || (call.name == "fs" && call.args.get("op").and_then(|v| v.as_str()) == Some("write"))
         {
+            // 真实外部约束：未读过的文件不得盲写（spec §7「edit 精确锚点」保留项）。
             return if exact_confirmed_target {
                 Ok(())
             } else {
-                Err(format!(
+                Err(GateDecision::Deny(format!(
                     "编辑目标 {path} 尚未确认；已确认文件 [{}]。请先 fs.read 读取该文件，或用有目录约束的 search 定位。",
                     self.confirmed_target_files.join("、")
-                ))
+                )))
             };
         }
         if self.anchor_dirs.is_empty() {
             return if exact_target {
                 Ok(())
             } else {
-                Err(format!(
-                    "读取目标 {path} 不在工作区给出的候选文件中；请先用定向 search 定位实现入口。"
-                ))
+                Err(GateDecision::Advise(format!(
+                    "读取目标 {path} 不在工作区给出的候选文件中；可先用定向 search 定位实现入口。"
+                )))
             };
         }
         if exact_target
@@ -1709,13 +1723,13 @@ impl GoalExecution {
         {
             Ok(())
         } else {
-            Err(format!(
-                "当前工作项 {} 已定位到 [{}]，本次 {} 的路径 {} 不在已确认调用链中。请只读取/修改锚点目录，或基于现有证据说明需要切换哪个子项目。",
+            Err(GateDecision::Advise(format!(
+                "当前工作项 {} 已定位到 [{}]，本次 {} 的路径 {} 不在已确认调用链中；该路径仍可执行，但它新增的证据需要说明。",
                 proposal.supports.first().cloned().unwrap_or_default(),
                 self.anchor_dirs.join("、"),
                 call.name,
                 path
-            ))
+            )))
         }
     }
 
@@ -3977,7 +3991,11 @@ mod tests {
         plan.items.get_mut("user-objective").unwrap().phase_attempts.inspect = 16;
         let action = plan.action_spec(&call, &proposal).unwrap();
         for _ in 0..6 {
-            let reason = plan.allows_tool_call(&call, &proposal).unwrap_err();
+            // 预算耗尽已降级为提示：仍按信号记账，但不得重置或继续消耗预算。
+            let GateDecision::Advise(reason) = plan.allows_tool_call(&call, &proposal).unwrap_err()
+            else {
+                panic!("阶段预算耗尽必须是 Advise，不得再吞动作");
+            };
             plan.record_gate_rejection(&action, &reason);
         }
         assert_eq!(plan.items["user-objective"].phase_attempts.inspect, 16);
@@ -4595,6 +4613,111 @@ mod tests {
         assert!(
             scoped.contains("跨面一致性"),
             "作用域提示仍须含跨面清单（G4 不漏警）"
+        );
+    }
+
+    /// 阶段 A 红线：`allows_tool_call` 的裁决词汇表。
+    /// 计数/阶段/锚点类判断只能产 `Advise`（动作照常派发）；只有真实外部约束保留 `Deny`。
+    #[test]
+    fn anchor_and_counter_rules_advise_while_only_real_constraints_deny() {
+        use crate::execution::GateDecision;
+        // 每个分支逐条判定：断言变体而不是 is_err，否则 Advise 与 Deny 无法区分。
+        let decide = |outcome: Result<(), GateDecision>| match outcome {
+            Ok(()) => "allow".to_string(),
+            Err(GateDecision::Allow) => "allow".to_string(),
+            Err(GateDecision::Deny(_)) => "deny".to_string(),
+            Err(GateDecision::Advise(_)) => "advise".to_string(),
+        };
+
+        let located = |state: WorkItemState| -> GoalExecution {
+            let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复气泡菜单缩短"));
+            plan.record_targets_from_search(
+                "共 1 条命中（格式：相对路径:行号: 内容）：\nharness/harness-ui/src/gui/menu.rs:10: menu",
+            );
+            plan.items.get_mut("user-objective").unwrap().state = state;
+            plan
+        };
+        let proposal = |signature: &str| ActionProposal {
+            signature: signature.into(),
+            question: "取证".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            args,
+        };
+
+        // 1) 阶段预算耗尽：实测回放里最大吞动作者（inspect 18 + change 8）。
+        let mut plan = located(WorkItemState::Located);
+        plan.items.get_mut("user-objective").unwrap().phase_attempts.inspect = 99;
+        let search = call("search", serde_json::json!({"dir": "harness/harness-ui/src/gui/", "pattern": "menu"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&search, &proposal("search:{\"x\":1}"))),
+            "advise",
+            "阶段预算耗尽不得吞掉动作"
+        );
+
+        // 2) 阶段工具白名单（状态只允许部分工具）。
+        let plan = located(WorkItemState::Located);
+        let shell = call("shell", serde_json::json!({"command": "cargo check"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&shell, &proposal("shell:{\"command\":\"cargo check\"}"))),
+            "advise",
+            "白名单是阶段提示，不是外部约束"
+        );
+
+        // 3) 目录枚举（回放实测 12 次拦停）。
+        let plan = located(WorkItemState::Located);
+        let list = call("fs", serde_json::json!({"op": "list", "path": "harness/harness-ui/src"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&list, &proposal("fs:{\"op\":\"list\"}"))),
+            "advise",
+            "目录枚举只提示，不拦停"
+        );
+
+        // 4) 已有锚点但缺 dir → 回根泛搜提示。
+        let plan = located(WorkItemState::Located);
+        let bare = call("search", serde_json::json!({"pattern": "menu"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&bare, &proposal("search:{\"pattern\":\"menu\"}"))),
+            "advise"
+        );
+
+        // 5) 显式回工作区根泛搜。
+        let plan = located(WorkItemState::Located);
+        let root = call("search", serde_json::json!({"dir": ".", "pattern": "menu"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&root, &proposal("search:{\"dir\":\".\"}"))),
+            "advise"
+        );
+
+        // 6) 路径不在已确认调用链（回放实测 8 次拦停）。
+        let plan = located(WorkItemState::Located);
+        let outside = call("fs", serde_json::json!({"op": "read", "path": "other_project/src"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&outside, &proposal("fs:{\"op\":\"read\"}"))),
+            "advise"
+        );
+
+        // 7) read_only 任务的写入：真实外部约束，必须仍是 Deny。
+        let mut plan = located(WorkItemState::Located);
+        plan.read_only = true;
+        let write = call("fs", serde_json::json!({"op": "write", "path": "harness/harness-ui/src/gui/menu.rs", "content": "x"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&write, &proposal("fs:{\"op\":\"write\"}"))),
+            "deny",
+            "read_only 任务的写入是真实约束，不得退化为提示"
+        );
+
+        // 8) 未确认目标的编辑：真实外部约束（spec §7「edit 精确锚点」保留）。
+        let plan = located(WorkItemState::ReadyToChange);
+        let edit = call("edit", serde_json::json!({"path": "harness/harness-ui/src/gui/unread.rs", "old_text": "a", "new_text": "b"}));
+        assert_eq!(
+            decide(plan.allows_tool_call(&edit, &proposal("edit:{\"path\":\"unread\"}"))),
+            "deny",
+            "未读文件不得盲写"
         );
     }
 }

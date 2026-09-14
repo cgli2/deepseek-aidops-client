@@ -1453,13 +1453,13 @@ impl ActionGate {
         if legacy_atomic_rules && state.solve_mode == SolveMode::AtomicDelivery {
             let sig = proposal.signature.as_str();
             if sig.starts_with("plan:") || sig.starts_with("delegate:") {
-                return GateDecision::Deny(
-                    "原子交付任务不允许计划或委派；直接执行当前路径的定位、修改或验证".into(),
+                return GateDecision::Advise(
+                    "原子交付任务通常不需要计划或委派；先执行当前路径的定位、修改或验证".into(),
                 );
             }
             if sig.starts_with("fs:") && sig.contains("\"op\":\"list\"") {
-                return GateDecision::Deny(
-                    "原子交付任务禁止列目录泛扫；先使用一个高信号 search 定位".into(),
+                return GateDecision::Advise(
+                    "列目录泛扫不新增证据；一个高信号 search 通常更能定位到实现".into(),
                 );
             }
             if sig.starts_with("search:") {
@@ -1468,15 +1468,16 @@ impl ActionGate {
                     .keys()
                     .any(|signature| signature.starts_with("search:"));
                 if already_located && !sig.contains("\"dir\":") {
-                    return GateDecision::Deny(
-                        "首次定位已有结果；后续 search 必须限定到命中目录或验证不同的局部假设"
+                    return GateDecision::Advise(
+                        "首次定位已有结果；限定到命中目录或换验证不同的局部假设才新增证据"
                             .into(),
                     );
                 }
             }
             if sig.starts_with("shell:") && state.write_operations == 0 {
-                return GateDecision::Deny(
-                    "原子交付任务的 shell 仅用于修改后的针对性验证；先定位并完成最小修改".into(),
+                return GateDecision::Advise(
+                    "原子交付任务的 shell 通常在修改后做针对性验证；先定位并完成最小修改"
+                        .into(),
                 );
             }
         }
@@ -2429,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_gate_blocks_broad_second_search_and_pre_change_verification() {
+    fn atomic_gate_advises_broad_second_search_and_pre_change_verification() {
         let contract = TaskContract::from_input(
             "输入优化加了 loading 之后结果没有变化，把 loading 状态改为初始值",
         );
@@ -2449,7 +2450,7 @@ mod tests {
         state.record_tool_result(&locate, true, "composer.rs:91");
         assert!(matches!(
             ActionGate::authorize(&locate, &state, &budget),
-            GateDecision::Deny(_)
+            GateDecision::Advise(reason) if reason.contains("限定到命中目录")
         ));
         let scoped_search = ActionProposal {
             signature: "search:{\"dir\":\"harness-ui/src/gui\",\"pattern\":\"poll_optimize\"}"

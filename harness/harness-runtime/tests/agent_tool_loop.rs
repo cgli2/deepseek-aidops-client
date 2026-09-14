@@ -1289,7 +1289,7 @@ async fn document_implementation_cannot_finish_when_edit_tool_changes_nothing() 
     assert!(events.iter().any(|event| matches!(
         event,
         SessionEvent::ToolResult { result, .. }
-            if result.content.contains("[workspace-change gate]")
+            if result.content.contains("[write-not-counted]")
     )));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -1709,9 +1709,11 @@ async fn repeated_search_replays_from_memo_without_denial() {
         calls: AtomicUsize::new(0),
         requests: Mutex::new(vec![]),
         script: vec![
-            scripted_call("s1", "search", serde_json::json!({"pattern": "save_draft"})),
+            // pattern 必须本测试独有：SEARCH_MEMO 是进程级 static 且键只含 (工具名, 参数)，
+            // 与同二进制其它测试共用 pattern 会随并发顺序污染缓存，使首次派发数不确定。
+            scripted_call("s1", "search", serde_json::json!({"pattern": "memo_contract_unique"})),
             scripted_call("f1", "fs", serde_json::json!({"op": "read", "path": "a.py"})),
-            scripted_call("s2", "search", serde_json::json!({"pattern": "save_draft"})),
+            scripted_call("s2", "search", serde_json::json!({"pattern": "memo_contract_unique"})),
             scripted_call("f2", "fs", serde_json::json!({"op": "read", "path": "b.py"})),
             None,
         ],

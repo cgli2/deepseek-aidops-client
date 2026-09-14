@@ -1461,38 +1461,39 @@ impl AgentLoop {
                     }
 
                     if controlled_delivery && !implementation_workflow && action_spec.is_none() {
-                        let blocked = ToolResult {
-                            call_id: tc.id.clone(),
-                            ok: false,
-                            content: "[goal-execution gate] 该调用没有关联当前工作项；请先围绕当前验收项定位、修改或验证。".into(),
-                            continuation_debt: 0,
-                        };
-                        log.append(SessionEvent::ToolResult {
-                            id: log.gen_id(),
-                            result: blocked.clone(),
-                        });
-                        messages.push(Message::tool(tc.id.clone(), blocked.content));
-                        step_had_tools = true;
-                        continue;
+                        // 关联类判断：动作照常派发，只提示它未关联当前工作项。
+                        crate::delivery_workflow::note_advice(
+                            &mut advisories,
+                            "该调用未关联当前工作项；说明它要回答哪个验收问题。",
+                        );
                     }
                     if controlled_delivery && !implementation_workflow {
-                        if let Err(reason) = goal_execution.allows_tool_call(tc, &proposal) {
-                            if let Some(action) = &action_spec {
-                                goal_execution.record_gate_rejection(action, &reason);
+                        match goal_execution.allows_tool_call(tc, &proposal) {
+                            // 真实外部约束：仍然拒绝；标记改用 constraint denied，
+                            // gate]/guard] 此后专指吞动作类判断（红线口径）。
+                            Err(GateDecision::Deny(reason)) => {
+                                if let Some(action) = &action_spec {
+                                    goal_execution.record_gate_rejection(action, &reason);
+                                }
+                                let blocked = ToolResult {
+                                    call_id: tc.id.clone(),
+                                    ok: false,
+                                    content: format!("[constraint denied] {reason}"),
+                                    continuation_debt: 0,
+                                };
+                                log.append(SessionEvent::ToolResult {
+                                    id: log.gen_id(),
+                                    result: blocked.clone(),
+                                });
+                                messages.push(Message::tool(tc.id.clone(), blocked.content));
+                                step_had_tools = true;
+                                continue;
                             }
-                            let blocked = ToolResult {
-                                call_id: tc.id.clone(),
-                                ok: false,
-                                content: format!("[target-anchor gate] {reason}"),
-                                continuation_debt: 0,
-                            };
-                            log.append(SessionEvent::ToolResult {
-                                id: log.gen_id(),
-                                result: blocked.clone(),
-                            });
-                            messages.push(Message::tool(tc.id.clone(), blocked.content));
-                            step_had_tools = true;
-                            continue;
+                            // 计数/阶段/锚点类：动作照常派发，原因变成提示。
+                            Err(GateDecision::Advise(reason)) => {
+                                crate::delivery_workflow::note_advice(&mut advisories, &reason);
+                            }
+                            Ok(()) | Err(GateDecision::Allow) => {}
                         }
                     }
                     if let Some(action_spec) = &action_spec {
@@ -1556,7 +1557,7 @@ impl AgentLoop {
                         &budget,
                         &runtime_allowed_tools,
                     ) {
-                        // 真实外部约束：保持原有拒绝行为与文案通道。
+                        // 真实外部约束：仍然拒绝并走工具结果通道。
                         GateDecision::Deny(reason) => {
                             if let Some(action) = &action_spec {
                                 goal_execution.record_gate_rejection(action, &reason);
@@ -1564,7 +1565,7 @@ impl AgentLoop {
                             let denied = ToolResult {
                                 call_id: tc.id.clone(),
                                 ok: false,
-                                content: format!("[execution gate] {reason}"),
+                                content: format!("[constraint denied] {reason}"),
                                 continuation_debt: 0,
                             };
                             log.append(SessionEvent::ToolResult {
@@ -1743,11 +1744,11 @@ impl AgentLoop {
                                     res.ok = false;
                                     res.content = if workspace_changed == Some(false) {
                                         format!(
-                                            "[workspace-change gate] 工具返回成功，但 {target} 的调用前后内容指纹完全相同；本次不计为写入，任务仍未完成"
+                                            "[write-not-counted] 工具返回成功，但 {target} 的调用前后内容指纹完全相同；本次不计为写入，任务仍未完成"
                                         )
                                     } else {
                                         format!(
-                                            "[workspace-change gate] 工具返回成功，但无法在当前工作区安全核验 {target} 的调用前后内容；本次不计为写入，任务仍未完成"
+                                            "[write-not-counted] 工具返回成功，但无法在当前工作区安全核验 {target} 的调用前后内容；本次不计为写入，任务仍未完成"
                                         )
                                     };
                                 }
@@ -3225,7 +3226,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 严禁在正文里输出任何形式的工具调用标记（DSML、XML invoke、tool_calls 文本等）；调用工具必须走 function calling 通道。\n\
 - 修改已有文件时优先使用 edit 做最小精确替换，禁止用 fs write 重发整个大型文件；确需创建大型新文件时先写最小骨架，再用 edit 分段扩展，确保单次工具参数完整。\n\
 - 问候、提问、普通对话直接回答，不使用工具。\n\
-- 不得虚构沙箱、权限、网络或工具失败原因；只有对应 ToolResult 明确返回时才能引用。execution gate、old_text 失配和 sandbox denied 是不同故障，必须按原始标签准确陈述。\n\
+- 不得虚构沙箱、权限、网络或工具失败原因；只有对应 ToolResult 明确返回时才能引用。constraint denied、old_text 失配和 sandbox denied 是不同故障，必须按原始标签准确陈述。\n\
 - 变更任务只有成功执行写工具并获得验证后才能说“已落实/已修改/已写入”；只给方案、代码块或修改建议不等于落盘。\n\
 \n\
 ## 复杂任务工作流\n\

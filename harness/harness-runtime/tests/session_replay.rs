@@ -2,7 +2,7 @@
 //! 四条红线（spec §3）断言作用于重放产出的新日志。红线测试 #[ignore] 封存，
 //! 新控制器（步骤④）接管后移除标记；旧守卫代码上它们必须跑红（断言有效性证明）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use harness_llm::{Chunk, ToolResult, Usage};
 use harness_session::SessionEvent;
@@ -244,7 +244,16 @@ async fn replay_session(fixture: &str) -> Arc<SessionLog> {
     replay_session_with(fixture, GovernorMode::On).await
 }
 
-/// 真实历史会话回放后，不得再出现任何被门禁替换的工具结果。
+/// 真实历史会话回放后，运行时不得再合成任何被门禁替换的工具结果。
+///
+/// 口径（阶段 A 修正 5）：fixture 里录制的工具结果本身就是旧运行时的拒绝文本，重放时
+/// 它们以「工具输出」的身份原样返回——那是历史数据，不是本次运行时行为，改门禁消不掉。
+/// 因此只判定内容不属于本 fixture 录制值集合的拦停文本。两点口径说明：
+/// - 按录制值**集合**而非 `call_id` 比对：`SEARCH_MEMO` 以 (工具名, 参数) 为键复用，
+///   同参数的第二次调用会拿到别处录制的那份输出，`call_id` 对不上但内容仍是历史数据。
+/// - 尾部空白归一：工具输出在 dispatch 侧会被规范化（补尾部换行），逐字节比较做不到。
+/// 这条红线的牙齿另有一处兜住：`agent_tool_loop::advisory_gates_never_replace_a_dispatched_tool_result`
+/// 用计数工具直接证明「被提示的动作仍到达工具层」，不依赖任何文本口径。
 #[tokio::test]
 async fn replayed_sessions_emit_no_denied_tool_results() {
     for fixture in [
@@ -254,18 +263,32 @@ async fn replayed_sessions_emit_no_denied_tool_results() {
         "7ba3370f_t19_22_gitfix.jsonl",
         "success_677bd6e0.jsonl",
     ] {
+        let recorded: HashSet<String> = load_fixture(fixture)
+            .iter()
+            .flat_map(|turn| turn.tool_results.values())
+            .map(|result| result.content.trim_end().to_owned())
+            .collect();
         let events = replay_session(fixture).await.replay();
         let denied: Vec<String> = events
             .iter()
             .filter_map(|event| match event {
-                SessionEvent::ToolResult { result, .. } => ["gate]", "guard]"]
-                    .iter()
-                    .any(|marker| result.content.contains(marker))
-                    .then(|| result.call_id.clone()),
+                SessionEvent::ToolResult { result, .. } => {
+                    let marker_hit = ["gate]", "guard]"]
+                        .iter()
+                        .any(|marker| result.content.contains(marker));
+                    if !marker_hit || recorded.contains(result.content.trim_end()) {
+                        return None;
+                    }
+                    Some(format!(
+                        "{} :: {}",
+                        result.call_id,
+                        result.content.chars().take(120).collect::<String>()
+                    ))
+                }
                 _ => None,
             })
             .collect();
-        assert!(denied.is_empty(), "{fixture} 仍产生拦停结果: {denied:?}");
+        assert!(denied.is_empty(), "{fixture} 运行时仍合成拦停结果: {denied:#?}");
     }
 }
 

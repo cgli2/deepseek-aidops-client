@@ -165,7 +165,8 @@ const CLARIFICATION_REASON_PREFIX: &str = "需要补充执行信息：";
 
 /// Fix2：搜索/扫描类调用的会话级记忆化缓存。键=工具名+归一化参数；命中即返回
 /// 缓存结果、不重跑真实工具，消除单窗口重复扫描（取证：同回合扫描被跑 13 次）
-/// 与续跑重扫。进程内长驻（同一 harness 会话跨多次“继续”共享），进程退出后失效；
+/// 与续跑重扫。作用域=当前 `SessionLog` 会话：同一会话跨多次“继续”共享，切换会话即清空；
+/// 会话切换时旧条目会被丢弃，因此 A 会话的搜索结果不会被 B 会话复用；
 /// 只读搜索命中不重复记证据/写入，避免污染 Fix1 的进展度量与预算计数。
 ///
 /// 值刻意只存可复用的输出载荷，不含 `call_id`：调用身份属于本次 tool_call，
@@ -178,15 +179,32 @@ struct CachedSearchOutput {
 }
 
 static SEARCH_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, CachedSearchOutput>>,
+    std::sync::Mutex<(String, std::collections::HashMap<String, CachedSearchOutput>)>,
 > = std::sync::OnceLock::new();
 
-fn search_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedSearchOutput>>
+fn with_search_memo<R>(
+    session: &str,
+    f: impl FnOnce(&mut std::collections::HashMap<String, CachedSearchOutput>) -> R,
+) -> R
 {
-    SEARCH_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    let cell = SEARCH_MEMO
+        .get_or_init(|| std::sync::Mutex::new((String::new(), std::collections::HashMap::new())));
+    let mut guard = cell.lock().unwrap();
+    if guard.0 != session {
+        // 会话变了：上一次会话的搜索结果一律作废，既是隔离也是缓存上限。
+        guard.1.clear();
+        guard.0 = session.to_string();
+    }
+    f(&mut guard.1)
 }
 
 /// 识别搜索/扫描/定位类工具（易产生重复空转调用）。
+fn memo_put(session: &str, key: String, value: CachedSearchOutput) {
+    with_search_memo(session, |memo| {
+        memo.insert(key, value);
+    });
+}
+
 fn is_search_like(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.contains("search")
@@ -210,6 +228,8 @@ fn is_locate_signature(signature: &str) -> bool {
 }
 
 /// 搜索缓存键：工具名 + 归一化参数（Debug 表示即可，足以区分不同查询）。
+/// 会话隔离由 `search_memo` 实现：会话切换（`SessionLog` 生命周期变化）时清空缓存表，
+/// 因此键本身无需带会话 id，A 会话的结果不可能被 B 会话命中。
 fn search_cache_key(name: &str, args: &impl std::fmt::Debug) -> String {
     format!("{}::{:?}", name, args)
 }
@@ -1674,7 +1694,7 @@ impl AgentLoop {
                     // 不重跑真实工具，消除重复扫描与续跑重扫。只读搜索不重复记证据/写入。
                     if is_search_like(&tc.name) {
                         let key = search_cache_key(&tc.name, &tc.args);
-                        if let Some(cached) = search_memo().lock().unwrap().get(&key).cloned() {
+                        if let Some(cached) = with_search_memo(&log.id().to_string(), |memo| memo.get(&key).cloned()) {
                             // 复用输出，身份必须换成本次调用：否则本步 assistant 的
                             // tool_call 没有响应，而日志多出一条上一条 assistant 的孤儿结果。
                             let replayed = ToolResult {
@@ -1807,7 +1827,7 @@ impl AgentLoop {
                                 // Fix2：把搜索类调用结果写入会话级记忆化缓存，供后续同查询直接复用。
                                 if is_search_like(&tc.name) {
                                     let key = search_cache_key(&tc.name, &tc.args);
-                                    search_memo().lock().unwrap().insert(
+                                    memo_put(&log.id().to_string(), 
                                         key,
                                         CachedSearchOutput {
                                             ok: res.ok,

@@ -91,8 +91,9 @@ struct ToolRepeatGuard {
 const MAX_SAME_CALLS_PER_TURN: u8 = 2;
 
 /// 同回合内连续「定位/探测类」调用（搜索、读文件、列目录）的软上限。模型已经
-/// 定位到目标却仍不停换关键词试探时，每次签名都不同，唯一的同参守卫无法拦截；
+/// 定位到目标却仍不停换关键词试探时，每次签名都不同，同参判断发现不了这种空转；
 /// 这里对「只搜不写」的连续链条设限：一旦发生写入或任何非定位动作即清零。
+/// 达到上限只生成一条提示，不拦停动作——停止与换路归 `TurnGovernor`。
 /// 取证：同回合换关键词试探十余次仍未收敛。
 const MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN: u8 = 10;
 
@@ -468,20 +469,23 @@ impl LocateStepGate {
         }
     }
 
-    fn allows(&mut self, controlled: bool, signature: &str) -> bool {
+    /// 只产信号：本步的第 N 个定位 search 超出并行度时返回 true。计数始终累加，
+    /// 供 §6 遥测消费；它不再有权替模型决定这个动作做不做。
+    fn exceeds_locate_parallelism(&mut self, controlled: bool, signature: &str) -> bool {
         if !controlled || !signature.starts_with("search:") {
-            return true;
-        }
-        if self.search_queued >= self.max_parallel {
             return false;
         }
         self.search_queued += 1;
-        true
+        self.search_queued > self.max_parallel
     }
 }
 
 impl ToolRepeatGuard {
-    fn should_block(&self, signature: &str) -> bool {
+    /// 只产信号：这次调用与上一次同签名且已有结果，很可能不新增信息。
+    /// 计数（`previous` / `cumulative` / `consecutive_locate`）继续为遥测与
+    /// 控制器供输入；它不再决定动作做不做——「只搜不写」的长链路由控制器换路，
+    /// 不由守卫吞动作。
+    fn flags_repeat(&self, signature: &str) -> bool {
         let repeated_success = self
             .previous
             .as_ref()
@@ -490,8 +494,8 @@ impl ToolRepeatGuard {
             .cumulative
             .get(signature)
             .is_some_and(|count| *count >= MAX_SAME_CALLS_PER_TURN);
-        // 只搜不写链路过长：即使每次换关键词/换路径，也必须在预算内停止试探，
-        // 转为写入或收尾。
+        // 「只搜不写」链路过长仍然值得提醒模型，但它只能出现在提示里：
+        // 停止试探与换路归控制器，不归守卫。
         let locate_probes_exhausted = is_locate_signature(signature)
             && self.consecutive_locate >= MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN;
         repeated_success || failed_retries_exhausted || locate_probes_exhausted
@@ -1434,30 +1438,19 @@ impl AgentLoop {
                         call: tc.clone(),
                     });
 
-                    if repeat_guard.should_block(&sig) {
+                    if repeat_guard.flags_repeat(&sig) {
+                        // 计数类判断：动作照常派发，判断降级为提示（红线：不得吞动作）。
                         let recovery = repeat_guard.note_recovery(&sig);
-                        let blocked = ToolResult {
-                            call_id: tc.id.clone(),
-                            ok: false,
-                            content: format!(
-                                "[tool-loop guard] 工具 {} 的相同参数调用不会带来新信息：成功调用不得原样重试，失败调用最多首次加一次定向重试。本次未执行；请分析已有结果、换用不同参数/工具或直接基于现有证据收尾。",
-                                tc.name
-                            ),
-                            continuation_debt: 0,
-                        };
-                        log.append(SessionEvent::ToolResult {
-                            id: log.gen_id(),
-                            result: blocked.clone(),
-                        });
-                        messages.push(Message::tool(tc.id.clone(), blocked.content));
-                        step_had_tools = true;
+                        crate::delivery_workflow::note_advice(
+                            &mut advisories,
+                            "相同参数的调用不会带来新信息；换参数、换工具或基于现有结果收尾",
+                        );
                         if recovery <= MAX_LOOP_RECOVERY_PROMPTS {
                             loop_recovery_prompts.push(format!(
-                                "[循环恢复] 工具 {} 的相同调用已被拦截（恢复提示 {recovery}/{MAX_LOOP_RECOVERY_PROMPTS}）。任务尚未完成：先解释现有结果，再选择不同参数、不同工具或下一项验证；禁止原样重试。",
+                                "[循环恢复] 工具 {} 的相同调用已重复过（恢复提示 {recovery}/{MAX_LOOP_RECOVERY_PROMPTS}）。任务尚未完成：先解释现有结果，再选择不同参数、不同工具或下一项验证。",
                                 tc.name
                             ));
                         }
-                        continue;
                     }
 
                     if controlled_delivery && !implementation_workflow && action_spec.is_none() {
@@ -1511,31 +1504,24 @@ impl AgentLoop {
                         });
                     }
 
-                    if !locate_step_gate.allows(true, &sig) {
-                        let blocked = ToolResult {
-                                call_id: tc.id.clone(),
-                                ok: false,
-                                content: "[controlled-delivery guard] 当前受控交付阶段只允许一个定位 search；请先使用该结果缩小到具体文件/行号，再决定下一步。".into(),
-                                continuation_debt: 0,
-                            };
-                        log.append(SessionEvent::ToolResult {
-                            id: log.gen_id(),
-                            result: blocked.clone(),
-                        });
-                        messages.push(Message::tool(tc.id.clone(), blocked.content));
-                        step_had_tools = true;
-                        continue;
+                    if locate_step_gate.exceeds_locate_parallelism(true, &sig) {
+                        // 并行度判断属提示类：本步多发的定位 search 照常执行。
+                        crate::delivery_workflow::note_advice(
+                            &mut advisories,
+                            "本步已有一个定位 search；先用它缩小到具体文件/行号，再决定是否继续搜",
+                        );
                     }
 
                     // 同一回复里出现完全相同的并行调用时，执行其中一个不会比执行全部
-                    // 少任何信息，只会放大空跑成本。这里在分发前去重，仍给每个调用补齐
-                    // 协议要求的 tool result。
+                    // 少任何信息，只会放大空跑成本；重复执行写调用更会二次施加副作用。
+                    // 这条属写冲突类真实约束（spec §4.1 的 Deny 范畴），保留跳过，
+                    // 标记改用 [duplicate-call] 让 gate]/guard] 专指吞动作类判断。
                     if !pending_signatures.insert(sig.clone()) {
                         let blocked = ToolResult {
                             call_id: tc.id.clone(),
                             ok: false,
                             content: format!(
-                                "[tool-loop guard] 工具 {} 与本步骤中已排队调用的参数完全相同，已跳过重复执行；请使用第一个结果继续。",
+                                "[duplicate-call] 工具 {} 与本步骤中已排队调用的参数完全相同，已跳过重复执行；请使用第一个结果继续。",
                                 tc.name
                             ),
                             continuation_debt: 0,
@@ -4089,17 +4075,17 @@ mod tests {
         for i in 0..MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN {
             guard.record_result(&format!("search:{{\"pattern\":\"{i}\"}}"), &result);
         }
-        assert!(guard.should_block("search:{}"));
+        assert!(guard.flags_repeat("search:{}"));
         for i in 0..20 {
             let signature = format!("fs:{{\"op\":\"read\",\"path\":\"src/{i}.rs\"}}");
-            assert!(!guard.should_block(&signature));
+            assert!(!guard.flags_repeat(&signature));
             guard.record_result(&signature, &result);
-            assert!(guard.should_block(&signature));
+            assert!(guard.flags_repeat(&signature));
         }
     }
 
     #[test]
-    fn repeat_guard_blocks_success_retries_but_allows_retry_after_a_write() {
+    fn repeat_guard_flags_success_retries_but_not_after_a_write() {
         let mut guard = ToolRepeatGuard::default();
         let sig = "shell:{\"cmd\":\"status\"}";
         let success = ToolResult {
@@ -4108,9 +4094,10 @@ mod tests {
             content: "still running".into(),
             continuation_debt: 0,
         };
-        // 成功读取后，原样调用不会获得新信息，下一次调用必须被拦截。
+        // 成功读取后原样调用不会获得新信息：下一次调用须报「疑似空转」提示，
+        // 但动作照常派发（flags_repeat 只产信号，不再有拦截语义）。
         guard.record_result(sig, &success);
-        assert!(guard.should_block(sig));
+        assert!(guard.flags_repeat(sig));
 
         // 成功写入改变观察对象，允许重新运行同一验证命令。
         let write = ToolResult {
@@ -4120,7 +4107,7 @@ mod tests {
             continuation_debt: 0,
         };
         guard.record_result("edit:{\"path\":\"src/app.rs\"}", &write);
-        assert!(!guard.should_block(sig));
+        assert!(!guard.flags_repeat(sig));
 
         // 失败调用允许一次定向重试；第二次失败后不再重试。
         let failed = ToolResult {
@@ -4130,23 +4117,27 @@ mod tests {
             continuation_debt: 0,
         };
         guard.record_result(sig, &failed);
-        assert!(!guard.should_block(sig));
+        assert!(!guard.flags_repeat(sig));
         guard.record_result(sig, &failed);
-        assert!(guard.should_block(sig));
+        assert!(guard.flags_repeat(sig));
         assert_eq!(guard.note_recovery(sig), 1);
 
         // 不同签名的调用不受影响。
-        assert!(!guard.should_block("shell:{\"cmd\":\"other\"}"));
+        assert!(!guard.flags_repeat("shell:{\"cmd\":\"other\"}"));
     }
 
     #[test]
-    fn controlled_locate_gate_allows_only_one_search_per_model_response() {
+    fn controlled_locate_gate_only_signals_a_second_search_per_model_response() {
         let mut gate = LocateStepGate::default();
-        assert!(gate.allows(true, "search:{\"pattern\":\"optimizing\"}"));
-        assert!(!gate.allows(true, "search:{\"pattern\":\"loading\"}"));
-        // 读取和写入不是定位泛扫；它们由跨步骤 ActionGate 判断是否符合阶段。
-        assert!(gate.allows(true, "fs:{\"op\":\"read\"}"));
-        assert!(gate.allows(false, "search:{\"pattern\":\"anything\"}"));
+        assert!(!gate.exceeds_locate_parallelism(true, "search:{\"pattern\":\"optimizing\"}"));
+        // 第二个定位 search 仍会执行，只是得到一条提示。
+        assert!(gate.exceeds_locate_parallelism(true, "search:{\"pattern\":\"loading\"}"));
+        // 计数不因超出而停摆：§6 的「每步定位次数」遥测要看得见空转。
+        assert!(gate.exceeds_locate_parallelism(true, "search:{\"pattern\":\"again\"}"));
+        assert_eq!(gate.search_queued, 3);
+        // 读取和写入不是定位泛扫；它们由跨步骤准入判断归类。
+        assert!(!gate.exceeds_locate_parallelism(true, "fs:{\"op\":\"read\"}"));
+        assert!(!gate.exceeds_locate_parallelism(false, "search:{\"pattern\":\"anything\"}"));
     }
 
     #[test]

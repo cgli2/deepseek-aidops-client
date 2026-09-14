@@ -1775,3 +1775,100 @@ async fn repeated_search_replays_from_memo_without_denial() {
         "复用只追加一条提示"
     );
 }
+
+/// Task 5 契约：`ToolRepeatGuard` 与 `LocateStepGate` 只产信号。紧邻同签名的重复
+/// 动作必须照常派发到工具层，判断退化为一条提示，且每步至多注入一条提示。
+///
+/// 载体必须是非记忆化工具：`fs` 不属 `is_search_like`（不走 SEARCH_MEMO 复用，
+/// 派发次数才可断言），而同一文件的重复读正是重复守卫的主判形。
+#[tokio::test]
+async fn repeated_identical_calls_run_and_are_hinted_at_most_once_per_step() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let llm = Arc::new(CapturingScriptedLlm {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(vec![]),
+        script: vec![
+            scripted_call(
+                "r1",
+                "fs",
+                serde_json::json!({"op": "read", "path": "repeat_contract.py"}),
+            ),
+            scripted_call(
+                "r2",
+                "fs",
+                serde_json::json!({"op": "read", "path": "repeat_contract.py"}),
+            ),
+            scripted_call(
+                "r3",
+                "fs",
+                serde_json::json!({"op": "read", "path": "repeat_contract.py"}),
+            ),
+            None,
+        ],
+    });
+    let fs_hits = Arc::new(CountingTool {
+        name: "fs",
+        hits: AtomicUsize::new(0),
+    });
+    let tools = ToolRegistry::new();
+    tools.register(fs_hits.clone());
+    let _a = ctx.provide(log.clone());
+    let provider: Arc<dyn LlmProvider> = llm.clone();
+    let _b = ctx.provide(provider);
+    let _c = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let _d = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "重复读取同一文件直到确认结论".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    assert!(
+        denied_contents(&events).is_empty(),
+        "重复守卫只提示，不得吞动作: {:#?}",
+        denied_contents(&events)
+    );
+    assert_eq!(
+        fs_hits.hits.load(Ordering::SeqCst),
+        3,
+        "三次同签名读取必须全部到达工具层"
+    );
+
+    let requests = llm.requests.lock().unwrap();
+    assert!(hinted(&requests, true), "重复须产生一条提示");
+    // 每次请求都带完整历史，提示条数是累积量；「每步至多一条」只能按相邻
+    // 请求的增量判定，否则第三步会把第一步那条一起数进来。
+    let per_request: Vec<usize> = requests
+        .iter()
+        .map(|request| {
+            request
+                .iter()
+                .filter(|message| {
+                    message.role == harness_llm::Role::User
+                        && message.content.contains("[运行时提示]")
+                })
+                .count()
+        })
+        .collect();
+    let grew_by = per_request
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .collect::<Vec<_>>();
+    assert!(
+        grew_by.iter().all(|delta| *delta <= 1),
+        "每步至多注入一条运行时提示: 累计 {per_request:?} 增量 {grew_by:?}"
+    );
+    assert!(
+        per_request.last().is_some_and(|last| *last >= 1),
+        "提示必须真的注入: {per_request:?}"
+    );
+}

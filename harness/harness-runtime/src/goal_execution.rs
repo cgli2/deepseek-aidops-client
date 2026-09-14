@@ -1574,12 +1574,26 @@ impl GoalExecution {
         }
     }
 
-    /// 准入裁决：计数/阶段/锚点类判断只产 `Advise`（动作照常派发），
-    /// 只有真实外部约束产 `Deny`（见 spec §4.1 与阶段 A 计划的决策边界）。
+    /// 准入裁决：计数/阶段/锚点类判断通常只产 `Advise`（动作照常派发）。
+    /// `Deny` 保留给真实外部约束，以及已经由运行时确定的空转循环：后者不会
+    /// 丢掉完成任务所需的动作，只会强制模型从继续搜索切换到编辑、精确读取或验证。
     pub fn allows_tool_call(
         &self,
         call: &ToolCall,
         proposal: &ActionProposal,
+    ) -> Result<(), GateDecision> {
+        self.allows_tool_call_with_new_file(call, proposal, false)
+    }
+
+    /// Same action gate with runtime knowledge that an `fs.write` target does
+    /// not exist yet.  Creating a new, workspace-contained reproduction or
+    /// regression-test artifact must not require an impossible prior read;
+    /// edits and overwrites still require a confirmed source file.
+    pub fn allows_tool_call_with_new_file(
+        &self,
+        call: &ToolCall,
+        proposal: &ActionProposal,
+        creates_new_file: bool,
     ) -> Result<(), GateDecision> {
         let is_write = call.name == "edit"
             || (call.name == "fs" && call.args.get("op").and_then(|v| v.as_str()) == Some("write"));
@@ -1647,6 +1661,26 @@ impl GoalExecution {
                 self.next_action_hint()
             )));
         }
+        // Once two concrete reads have confirmed editable source files, another
+        // search cannot be the shortest path to delivery.  In replayed failures
+        // the model kept searching for display text after it had already read
+        // the view, component, and route, spending dozens of turns without ever
+        // attempting an edit.  This is a mechanical no-progress loop, not a
+        // judgment about the product: exact fs.read calls remain available for
+        // a known dependency, as do edits and runtime probes.
+        if call.name == "search"
+            && self.active_item().is_some_and(|item| {
+                item.state == WorkItemState::ReadyToChange
+                    && item.read_evidence >= 2
+                    && !self.confirmed_target_files.is_empty()
+            })
+        {
+            return Err(GateDecision::Deny(format!(
+                "已读取 {} 个实现片段并确认编辑目标 [{}]；停止额外 search。下一步只能编辑已确认文件、fs.read 一个明确依赖，或运行接口/测试验证。",
+                self.active_item().map(|item| item.read_evidence).unwrap_or_default(),
+                self.confirmed_target_files.join("、"),
+            )));
+        }
         if !matches!(call.name.as_str(), "search" | "fs" | "edit") {
             return Ok(());
         }
@@ -1696,12 +1730,17 @@ impl GoalExecution {
         if call.name == "edit"
             || (call.name == "fs" && call.args.get("op").and_then(|v| v.as_str()) == Some("write"))
         {
-            // 真实外部约束：未读过的文件不得盲写（spec §7「edit 精确锚点」保留项）。
-            return if exact_confirmed_target {
+            // Existing files must still be read before they are edited or
+            // overwritten.  A verified new `fs.write` target is different: a
+            // reproduction/test artifact cannot be read before it exists.
+            let may_create_new_file = call.name == "fs"
+                && call.args.get("op").and_then(|v| v.as_str()) == Some("write")
+                && creates_new_file;
+            return if exact_confirmed_target || may_create_new_file {
                 Ok(())
             } else {
                 Err(GateDecision::Deny(format!(
-                    "编辑目标 {path} 尚未确认；已确认文件 [{}]。请先 fs.read 读取该文件，或用有目录约束的 search 定位。",
+                    "编辑目标 {path} 尚未确认；已确认文件 [{}]。已有文件请先 fs.read，新增复现/测试文件仅可用 fs.write 创建。",
                     self.confirmed_target_files.join("、")
                 )))
             };
@@ -4617,7 +4656,8 @@ mod tests {
     }
 
     /// 阶段 A 红线：`allows_tool_call` 的裁决词汇表。
-    /// 计数/阶段/锚点类判断只能产 `Advise`（动作照常派发）；只有真实外部约束保留 `Deny`。
+    /// 计数/阶段/锚点类判断通常只产 `Advise`（动作照常派发）；外部约束和已证实的
+    /// 搜索空转循环保留 `Deny`。
     #[test]
     fn anchor_and_counter_rules_advise_while_only_real_constraints_deny() {
         use crate::execution::GateDecision;
@@ -4719,5 +4759,84 @@ mod tests {
             "deny",
             "未读文件不得盲写"
         );
+    }
+
+    #[test]
+    fn confirmed_edit_target_stops_search_only_loops_but_keeps_precise_reads_available() {
+        use crate::execution::GateDecision;
+
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复市场列表名称展示"));
+        let item = plan.items.get_mut("user-objective").unwrap();
+        item.state = WorkItemState::ReadyToChange;
+        item.read_evidence = 2;
+        item.candidate_targets = vec!["webui/src/views/MarketView.vue".into()];
+        plan.confirmed_target_files
+            .push("webui/src/views/MarketView.vue".into());
+
+        let search = ToolCall {
+            id: "search-again".into(),
+            name: "search".into(),
+            args: serde_json::json!({"dir": "webui/src", "pattern": "未知"}),
+        };
+        let proposal = ActionProposal {
+            signature: "search:{\"dir\":\"webui/src\",\"pattern\":\"未知\"}".into(),
+            question: "repeat a broad search".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert!(matches!(
+            plan.allows_tool_call(&search, &proposal),
+            Err(GateDecision::Deny(reason)) if reason.contains("停止额外 search")
+        ));
+
+        let direct_dependency = ToolCall {
+            id: "read-api".into(),
+            name: "fs".into(),
+            args: serde_json::json!({"op": "read", "path": "webui/src/api.ts"}),
+        };
+        let dependency_proposal = ActionProposal {
+            signature: "fs:{\"op\":\"read\",\"path\":\"webui/src/api.ts\"}".into(),
+            question: "inspect the known API dependency".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        assert!(plan
+            .allows_tool_call(&direct_dependency, &dependency_proposal)
+            .is_ok());
+    }
+
+    #[test]
+    fn new_workspace_artifact_can_be_created_without_reading_an_impossible_preimage() {
+        use crate::execution::GateDecision;
+
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复保存逻辑"));
+        let item = plan.items.get_mut("user-objective").unwrap();
+        item.state = WorkItemState::ReadyToChange;
+        item.read_evidence = 1;
+        plan.confirmed_target_files.push("src/save.py".into());
+
+        let create = ToolCall {
+            id: "create-repro".into(),
+            name: "fs".into(),
+            args: serde_json::json!({
+                "op": "write",
+                "path": "repro.py",
+                "content": "from save import save\n"
+            }),
+        };
+        let proposal = ActionProposal {
+            signature: "fs:{\"op\":\"write\",\"path\":\"repro.py\"}".into(),
+            question: "create a regression reproduction".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        assert!(matches!(
+            plan.allows_tool_call(&create, &proposal),
+            Err(GateDecision::Deny(_)),
+        ));
+        assert!(plan
+            .allows_tool_call_with_new_file(&create, &proposal, true)
+            .is_ok());
     }
 }

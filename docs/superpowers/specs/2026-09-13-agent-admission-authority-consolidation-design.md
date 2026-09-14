@@ -149,6 +149,9 @@
 
 每片独立可回滚，且都跑同一套重放红线，避免"改好了 A 症状、B 症状悄悄回来"。
 
+阶段 A（S1+S2）计划：`docs/superpowers/plans/2026-09-13-admission-authority-phase-a-zero-denials.md`（收官结果见其「收官补记」）。
+S3–S5 与 §6 的拆分、依赖顺序、逐条锚点与验收判据，以及三项待裁定（`Delivered` 语义、实机采集授权、多 MB fixture 入库方式）：`docs/superpowers/plans/2026-09-14-admission-authority-phase-B-roadmap.md`。
+
 ## 6. 硬验收：端到端重放交付率
 
 沿用 `harness/scripts/governance_ab_run.py` + `governance_redline_check.py`，新增交付率指标。

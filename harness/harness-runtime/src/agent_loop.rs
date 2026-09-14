@@ -10,7 +10,7 @@ use harness_capability::assets::{
 };
 use harness_capability::compaction::Compaction;
 use harness_capability::hook::{Hook, HookDecision, HookEvent, HookPayload};
-use harness_core::{AppContext, error::Result, types::UserInput};
+use harness_core::{AppContext, Workspace, error::Result, types::UserInput};
 use harness_llm::{Chunk, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolResult, Usage};
 use harness_session::{
     DeliveryOutcome, DeliveryReport, ExecutionTelemetry, SessionEvent, SessionLog,
@@ -64,6 +64,31 @@ impl Default for AgentLoop {
 
 fn goal_executor_enabled() -> bool {
     parse_goal_executor_mode(std::env::var("HARNESS_GOAL_EXECUTOR").ok().as_deref())
+}
+
+/// A new file has no readable pre-image.  Keep the precise-edit guard for
+/// existing files, but let a repair create a bounded workspace-local repro or
+/// regression test through `fs.write`.
+fn fs_write_creates_new_workspace_file(ctx: &AppContext, call: &ToolCall) -> bool {
+    if call.name != "fs"
+        || call.args.get("op").and_then(|value| value.as_str()) != Some("write")
+    {
+        return false;
+    }
+    let Some(raw_path) = call.args.get("path").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let path = Path::new(raw_path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return false;
+    }
+    ctx.try_get::<Workspace>()
+        .is_some_and(|workspace| !workspace.root().join(path).exists())
 }
 
 fn parse_goal_executor_mode(value: Option<&str>) -> bool {
@@ -1453,15 +1478,24 @@ impl AgentLoop {
                         }
                     }
 
-                    if controlled_delivery && !implementation_workflow && action_spec.is_none() {
+                    if controlled_delivery && action_spec.is_none() {
                         // 关联类判断：动作照常派发，只提示它未关联当前工作项。
                         crate::delivery_workflow::note_advice(
                             &mut advisories,
                             "该调用未关联当前工作项；说明它要回答哪个验收问题。",
                         );
                     }
-                    if controlled_delivery && !implementation_workflow {
-                        match goal_execution.allows_tool_call(tc, &proposal) {
+                    // The implementation workflow owns its completion evidence,
+                    // but it must not bypass the GoalExecution action gate.  That
+                    // bypass let a repair task keep issuing broad searches after
+                    // it had read and confirmed an editable view/component/route,
+                    // so the convergence guard was never reached in production.
+                    if controlled_delivery {
+                        match goal_execution.allows_tool_call_with_new_file(
+                            tc,
+                            &proposal,
+                            fs_write_creates_new_workspace_file(ctx, tc),
+                        ) {
                             // 真实外部约束：仍然拒绝；标记改用 constraint denied，
                             // gate]/guard] 此后专指吞动作类判断（红线口径）。
                             Err(GateDecision::Deny(reason)) => {

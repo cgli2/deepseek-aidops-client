@@ -120,6 +120,13 @@ impl TaskShape {
         let scale = if clarity == TaskClarity::Exact
             && contract.risk != RiskLevel::High
             && contract.acceptance_criteria.len() == 1
+            // An exact `from -> to` fragment can coexist with another requested
+            // outcome.  Treating the whole request as atomic in that case gives
+            // a cross-layer change the one-search/one-verify budget intended for
+            // a single control or literal.  Sentence boundaries are structural
+            // evidence from the request itself; this deliberately does not rely
+            // on a product- or domain-specific action-word list.
+            && has_single_delivery_statement(&contract.objective)
             && contract.objective.chars().count() <= 500
         {
             TaskScale::Atomic
@@ -130,6 +137,22 @@ impl TaskShape {
         };
         Self { clarity, scale }
     }
+}
+
+/// Atomic delivery is safe only when the user stated one outcome.  A second
+/// non-empty sentence is an independently observable requirement even if the
+/// first sentence contains an exact transformation such as `改为`.
+///
+/// We intentionally do not split on `.` because it is common in URLs, version
+/// numbers, and identifiers.  Newlines and sentence terminators are stable
+/// prose structure across domains and languages.
+fn has_single_delivery_statement(objective: &str) -> bool {
+    objective
+        .split(['\n', '。', '！', '？', ';', '；'])
+        .filter(|statement| !statement.trim().is_empty())
+        .take(2)
+        .count()
+        == 1
 }
 
 /// 工具调用的运行时阶段。它是实际执行状态的投影，不接受模型的计划文本推动。
@@ -1851,6 +1874,24 @@ mod tests {
         assert_eq!(plan.initial_steps, 6);
         assert_eq!(plan.initial_tool_calls, 8);
         assert!(plan.instructions.contains("不要创建计划"));
+    }
+
+    #[test]
+    fn additional_outcome_keeps_an_exact_change_out_of_atomic_delivery() {
+        // A real request can contain a precise mutation plus an independent
+        // UI/data-integrity outcome.  The latter must retain enough budget for
+        // the repository, route, client, and verification path instead of
+        // inheriting the eight-step atomic window from the first clause.
+        let contract = TaskContract::from_input(
+            "把策略列表的状态标记改为禁用。增加删除入口，并在启用时拒绝重复运行实例。",
+        );
+        let shape = TaskShape::for_contract(&contract);
+        let plan = SolvePlan::for_contract(&contract, StrategyKind::Transformative);
+
+        assert_eq!(shape.clarity, TaskClarity::Exact);
+        assert_eq!(shape.scale, TaskScale::Scoped);
+        assert_eq!(plan.mode, SolveMode::ScopedDelivery);
+        assert_eq!((plan.hard_max_steps, plan.hard_max_tool_calls), (20, 24));
     }
 
     #[test]

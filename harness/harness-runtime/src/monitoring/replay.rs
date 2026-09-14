@@ -164,12 +164,14 @@ mod tests {
     #[test]
     fn test_replay_spec_from_incident_and_deterministic_run() {
         let incident = Incident {
+            incident_id: "sess-test-p3#10".to_string(),
             session_id: "sess-test-p3".to_string(),
             terminated_seq: 10,
             anomaly_count: 2,
             max_repeat: 3,
             reason: "stagnation detected".to_string(),
             ts_ms: 1000,
+            state: IncidentState::Mitigated,
         };
 
         let events = vec![

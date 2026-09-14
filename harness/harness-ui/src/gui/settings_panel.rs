@@ -277,6 +277,21 @@ impl AppState {
         harness_core::tuning::set_context_budget_chars(self.f_context_budget.trim().parse().ok());
         harness_core::tuning::set_max_steps(self.f_max_steps.trim().parse().ok());
         harness_core::tuning::set_max_output_tokens(self.f_max_tokens.trim().parse().ok());
+        // 门禁开关：同样持久化 + 即时写入进程级开关（每个 turn 读取）。
+        let _ = settings.set(
+            "runtime.self_monitor_enabled",
+            if self.f_self_monitor { "true" } else { "false" },
+        );
+        harness_core::tuning::set_self_monitor_enabled(Some(self.f_self_monitor));
+        // 监控模式：同样持久化 + 即时写入进程级开关（每个 turn 读取）。
+        let _ = settings.set("runtime.self_monitor_mode", self.f_self_monitor_mode.trim());
+        harness_core::tuning::set_self_monitor_mode(Some(self.f_self_monitor_mode.clone()));
+        // 目标执行框架开关：同样持久化 + 即时写入进程级开关（每个 turn 读取）。
+        let _ = settings.set(
+            "runtime.goal_executor_enabled",
+            if self.f_goal_executor { "true" } else { "false" },
+        );
+        harness_core::tuning::set_goal_executor_enabled(Some(self.f_goal_executor));
         self.host.sink.set_permission(self.permission.clone());
         self.note = "偏好与运行时参数已保存并生效".into();
         // 不自动关闭：note 在弹窗内可见，给用户明确的保存反馈。

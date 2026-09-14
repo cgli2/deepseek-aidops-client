@@ -104,12 +104,14 @@ mod tests {
     #[test]
     fn test_proposal_generation_and_validation() {
         let incident = Incident {
+            incident_id: "sess-prop#42".to_string(),
             session_id: "sess-prop".to_string(),
             terminated_seq: 42,
             anomaly_count: 3,
             max_repeat: 3,
             reason: "repeated same conclusion".to_string(),
             ts_ms: 1000,
+            state: IncidentState::Mitigated,
         };
 
         let mut proposal = ImprovementProposal::generate_from_incident(&incident);

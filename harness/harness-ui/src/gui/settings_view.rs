@@ -1245,6 +1245,54 @@ if state.mem_tab == "code" {
                                             .color(pal.dim),
                                         );
                                         ui.add_space(14.0);
+                                        field_label(ui, &pal, "自我监控与门禁");
+                                        let _ = ui.checkbox(
+                                            &mut state.f_self_monitor,
+                                            "启用自我监控（每轮采集运行证据 + 停滞保护）",
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("监控模式")
+                                                    .size(12.0)
+                                                    .color(pal.dim),
+                                            );
+                                            egui::ComboBox::from_id_salt("self-monitor-mode")
+                                                .width(180.0)
+                                                .selected_text(state.f_self_monitor_mode.clone())
+                                                .show_ui(ui, |ui| {
+                                                    for (mode, label) in [
+                                                        ("off", "off · 关闭采集"),
+                                                        ("observe", "observe · 只记录不干预"),
+                                                        ("protect", "protect · 停滞时保护性干预"),
+                                                        ("evolve", "evolve · 预留扩展（当前同 observe）"),
+                                                    ] {
+                                                        ui.selectable_value(
+                                                            &mut state.f_self_monitor_mode,
+                                                            mode.to_string(),
+                                                            label,
+                                                        );
+                                                    }
+                                                });
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "关闭后不再写入 .harness/self-monitor 观测记录，停滞时也不触发保护性干预。点「保存参数配置」即时生效。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        let _ = ui.checkbox(
+                                            &mut state.f_goal_executor,
+                                            "启用目标执行框架（V4 受控任务）",
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "受控任务按目标分解并逐项验证交付；关闭则回退到普通执行流程。点「保存参数配置」即时生效。",
+                                            )
+                                            .size(11.0)
+                                            .color(pal.dim),
+                                        );
+                                        ui.add_space(14.0);
                                         field_label(ui, &pal, "窗口外观");
                                         let stored_titlebar = state
                                             .host

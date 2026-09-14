@@ -234,7 +234,7 @@ mod tests {
     use harness_tool::ToolRegistry;
 
     #[tokio::test]
-    async fn child_uses_isolated_log_and_returns_text() {
+    async fn child_uses_isolated_log_and_returns_runtime_conclusion() {
         let ctx = AppContext::new();
         let parent_log = SessionLog::new();
         let _a = ctx.provide(parent_log.clone());
@@ -252,12 +252,13 @@ mod tests {
         let sub = InProcessSubagent::new(ctx, 2, Duration::from_secs(2));
         // 子代理接收的是一个带代码符号（ModelForm）的具体任务：has_locatable_signal
         // 为真，Phase 1 定位门禁不会触发，由回放 LLM 产出文本。本测试验证的是
-        // "子代理使用隔离日志、按时返回 LLM 文本"——受控交付校正可能对同一回放文本
-        // 重复请求一次，故只校验文本来自 LLM 且父日志保持隔离，不纠结确切拼接次数。
+        // "子代理使用隔离日志、按时返回最终交付结论"。此回放没有工作区或工具证据，
+        // 因而运行时必须拒绝 `child-ok` 这句模型草稿，返回诚实的未完成状态；不能再
+        // 从日志顺序里捞出未经验证的模型文本。
         let output = sub.spawn("修复 ModelForm 的校验规则").await.unwrap();
         assert!(
-            output.contains("child-ok"),
-            "子代理应返回回放 LLM 的文本，实际返回：{output}"
+            output.contains("本轮未形成可验证交付"),
+            "子代理应返回运行时最终结论，实际返回：{output}"
         );
         assert!(
             parent_log.replay().is_empty(),

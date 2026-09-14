@@ -2,7 +2,21 @@
 use std::{path::PathBuf, sync::{Arc, atomic::{AtomicU32, AtomicU64, Ordering}}};
 use harness_core::{AppContext, Config, Workspace};
 use harness_session::{Observation, SessionEvent, SessionLog};
-use super::{event::{AgentEventEnvelope, EventClass, EventKind}, hot_guard::{HotGuard, GuardVerdict}, tap::EventTap};
+use super::{event::{AgentEventEnvelope, EventClass, EventKind}, graduation::{Governor, GovernorConfig}, hot_guard::{HotGuard, GuardVerdict}, tap::EventTap};
+
+/// 演进门禁接线入口：由生效模式 + UI 进程级开关构造 `Governor`。
+///
+/// 只有开关打开时才把门禁提升为 `evolve` 并允许低风险（`repeat_stop` /
+/// `repeat_warning` 阈值类）变更自动晋级；否则保持观察/保护语义，
+/// 任何晋级请求都会被 `Governor::authorize` 拒绝（`ModeNotEvolve`）。
+pub fn governor_for(mode: &str, evolution: bool) -> Governor {
+    let mut config = GovernorConfig { mode: mode.to_string(), ..GovernorConfig::default() };
+    if evolution {
+        config.mode = "evolve".to_string();
+        config.auto_promote_low_risk = true;
+    }
+    Governor::new(config)
+}
 
 pub struct MonitorTurn {
     tap: Option<EventTap>,
@@ -12,6 +26,7 @@ pub struct MonitorTurn {
     turn: String,
     session: String,
     guard: HotGuard,
+    governor: Governor,
     protect: bool,
     evidence: usize,
     sidecar: bool,
@@ -19,11 +34,17 @@ pub struct MonitorTurn {
 impl MonitorTurn {
     pub fn start(ctx: &AppContext, log: &SessionLog) -> Self {
         let config = ctx.try_get::<Config>().map(|c| c.self_monitor.clone()).unwrap_or_default();
+        // 门禁开关：UI「参数配置」页写入的进程级开关优先于配置文件；
+        // 未配置（None）时回退 `[self_monitor].enabled`，保持既有默认。
+        let enabled = harness_core::tuning::self_monitor_enabled().unwrap_or(config.enabled);
+        // 模式开关：UI「参数配置」页写入的进程级模式优先于配置文件 `[self_monitor].mode`。
+        let mode = harness_core::tuning::self_monitor_mode().unwrap_or_else(|| config.mode.clone());
         let mut state = Self { tap: None, registration: None, writer: None, spool: None,
             turn: uuid::Uuid::new_v4().to_string(), session: log.id().to_string(),
             guard: HotGuard::new(config.repeat_stop.clamp(2, 64) - 1),
-            protect: config.enabled && config.mode == "protect", evidence: 0, sidecar: config.sidecar };
-        if !config.enabled || config.mode == "off" { return state; }
+            governor: governor_for(&mode, harness_core::tuning::self_monitor_evolution().unwrap_or(false)),
+            protect: enabled && mode == "protect", evidence: 0, sidecar: config.sidecar };
+        if !enabled || mode == "off" { return state; }
         let Some(workspace) = ctx.try_get::<Workspace>() else { return state; };
         let spool = workspace.root().join(".harness/self-monitor/spool").join(&state.turn);
         let (tap, rx) = EventTap::new(super::tap::DEFAULT_TAP_CAPACITY);

@@ -12,13 +12,27 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::event::{AgentEventEnvelope, EventKind, Severity};
 
+/// 事故生命周期状态（§6.3 状态机）。
+///
+/// `Open`（已观测异常、尚未止血）→ `Mitigated`（GuardTerminated 已止血）
+/// → `Closed`（确认恢复后结案）。迁移单向且不可跳步：未止血不得直接结案，
+/// 防止"跳过止血直接注销事故"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IncidentState {
+    Open,
+    Mitigated,
+    Closed,
+}
+
 /// 一次事故：以 GuardTerminated（止血动作）为锚点，聚合其前的异常信号。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Incident {
+    /// 稳定事故 ID：`{session_id}#{terminated_seq}`，跨重启可复现、可去重。
+    pub incident_id: String,
     pub session_id: String,
     /// 触发止血的事件序号。
     pub terminated_seq: u64,
@@ -28,10 +42,11 @@ pub struct Incident {
     pub max_repeat: u32,
     /// 窗口内异常事件数（RepeatedConclusion 等）。
     pub anomaly_count: u32,
+    pub state: IncidentState,
 }
 
 /// 事故库：按会话聚合的事故集合。
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IncidentBook {
     pub incidents: Vec<Incident>,
 }
@@ -56,12 +71,14 @@ impl IncidentBook {
                 EventKind::GuardTerminated { reason } => {
                     let (window_max_repeat, window_anomalies) = windows.remove(&key).unwrap_or_default();
                     book.incidents.push(Incident {
+                        incident_id: format!("{}#{}", ev.session_id, ev.seq),
                         session_id: ev.session_id.clone(),
                         terminated_seq: ev.seq,
                         ts_ms: ev.ts_ms,
                         reason: reason.clone(),
                         max_repeat: window_max_repeat,
                         anomaly_count: window_anomalies,
+                        state: IncidentState::Mitigated,
                     });
                 }
                 _ => {}

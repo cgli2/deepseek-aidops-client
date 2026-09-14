@@ -63,7 +63,11 @@ impl Default for AgentLoop {
 }
 
 fn goal_executor_enabled() -> bool {
-    parse_goal_executor_mode(std::env::var("HARNESS_GOAL_EXECUTOR").ok().as_deref())
+    // 门禁开关：UI「参数配置」页写入的进程级开关优先于环境变量；
+    // 未配置（None）时回退 `HARNESS_GOAL_EXECUTOR`，再回退默认启用。
+    harness_core::tuning::goal_executor_enabled().unwrap_or_else(|| {
+        parse_goal_executor_mode(std::env::var("HARNESS_GOAL_EXECUTOR").ok().as_deref())
+    })
 }
 
 /// A new file has no readable pre-image.  Keep the precise-edit guard for
@@ -278,6 +282,16 @@ fn observed_write_change(
     let before = before?;
     let after = artifact_fingerprint(root, target)?;
     Some(before != &after)
+}
+
+/// A delivery model's prose is a draft until the runtime has checked the
+/// workspace delta and the required verification.  Streaming that draft to the
+/// user immediately lets an optimistic "fixed" claim be followed by the
+/// controller's failure result, which is two contradictory final answers for
+/// one turn.  Tool calls and reasoning still remain observable; only a
+/// text-only closing response is deferred to the single delivery decision.
+fn defer_plain_delivery_text(controlled_delivery: bool, chunk: &Chunk) -> bool {
+    controlled_delivery && chunk.text.is_some() && chunk.tool_calls.is_empty()
 }
 
 /// 控制器模式下澄清提问是否被允许（spec §4.2 三重前置）；Legacy 一律允许，
@@ -1418,7 +1432,10 @@ impl AgentLoop {
                     empty_response_reason = Some(reason);
                     continue;
                 }
-                if chunk.text.is_some() || !chunk.tool_calls.is_empty() || chunk.reasoning.is_some()
+                if !defer_plain_delivery_text(controlled_delivery, &chunk)
+                    && (chunk.text.is_some()
+                        || !chunk.tool_calls.is_empty()
+                        || chunk.reasoning.is_some())
                 {
                     log.append(SessionEvent::Assistant {
                         id: log.gen_id(),
@@ -2261,20 +2278,6 @@ impl AgentLoop {
             }
         }
 
-        // 记忆自动沉淀（L0）：记录本轮助手最终回复（无后端则落本地文件）。失败容忍。
-        if !last_assistant.trim().is_empty() {
-            if let Some(conv) = ctx.try_get::<dyn ConversationMemory>() {
-                let _ = conv
-                    .record_turn(ChatTurn {
-                        session_id: log.id().to_string(),
-                        role: "assistant".into(),
-                        content: last_assistant.clone(),
-                        ts: String::new(),
-                    })
-                    .await;
-            }
-        }
-
         if execution.requires_workspace_change() && !artifact_baselines.is_empty() {
             let has_net_workspace_change = workspace_root.as_deref().is_some_and(|root| {
                 artifact_baselines.iter().any(|(target, baseline)| {
@@ -2427,10 +2430,51 @@ impl AgentLoop {
         };
         let report = execution.delivery_report(outcome, reason);
         let outcome = report.outcome.clone();
+        let memory_content = (controlled_delivery_turn && outcome != DeliveryOutcome::Verified)
+            .then(|| {
+                report
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "本轮未形成可验证交付。".into())
+            })
+            .unwrap_or_else(|| last_assistant.clone());
+        // A controlled delivery has exactly one user-visible conclusion.  A
+        // verified run may publish the model's summary, while any unverified
+        // run publishes only the runtime-authored status above.  This prevents
+        // a model claim such as "tests passed" from surviving next to a later
+        // runtime failure caused by missing evidence.
+        if controlled_delivery_turn && outcome == DeliveryOutcome::Verified {
+            let text = if last_assistant.trim().is_empty() {
+                "已完成并通过运行时验证。".to_owned()
+            } else {
+                last_assistant.clone()
+            };
+            log.append(SessionEvent::Assistant {
+                id: log.gen_id(),
+                chunk: Chunk {
+                    text: Some(text),
+                    ..Default::default()
+                },
+            });
+        }
         log.append(SessionEvent::Delivery {
             id: log.gen_id(),
             report,
         });
+        // Persist the same conclusion the user was shown.  In particular, do
+        // not turn an unverified model draft into a reusable memory fact.
+        if !last_assistant.trim().is_empty() {
+            if let Some(conv) = ctx.try_get::<dyn ConversationMemory>() {
+                let _ = conv
+                    .record_turn(ChatTurn {
+                        session_id: log.id().to_string(),
+                        role: "assistant".into(),
+                        content: memory_content,
+                        ts: String::new(),
+                    })
+                    .await;
+            }
+        }
         // 只在 Runtime 验证通过后沉淀经验卡；模型文本或 TurnEnd 绝不触发写入，
         // 这样下一次检索到的是可复核的解决路径而不是自报完成。
         if outcome == harness_session::DeliveryOutcome::Verified {
@@ -2507,7 +2551,7 @@ fn concise_incomplete_status(
         return "本轮未完成交付：已有文件改动，但尚未通过完整验证。Agent 应继续修复或验证，不能声明完成。".into();
     }
     if write_attempts > 0 {
-        return "本轮修复失败：Agent 尝试了编辑，但没有产生有效文件改动。原请求已包含修改授权，无需再次确认写入。".into();
+        return "本轮未完成交付：Agent 已尝试编辑，但运行时未确认可关联的文件变更与完整验证；因此不采信任何“已修复”声明。原请求已包含修改授权，无需再次确认写入。".into();
     }
     let cause = if reason.is_some_and(|text| text.contains("预算") || text.contains("窗口")) {
         "执行预算已耗尽"
@@ -4100,6 +4144,27 @@ mod tests {
         );
         assert!(artifact_fingerprint(&root, "../outside.rs").is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controlled_delivery_defers_plain_model_claims_until_runtime_decides() {
+        let closing = Chunk {
+            text: Some("修复完成，测试通过".into()),
+            ..Default::default()
+        };
+        assert!(defer_plain_delivery_text(true, &closing));
+        assert!(!defer_plain_delivery_text(false, &closing));
+
+        let tool_request = Chunk {
+            text: Some("我会修改目标文件".into()),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "edit".into(),
+                args: serde_json::json!({"path": "src/lib.rs"}),
+            }],
+            ..Default::default()
+        };
+        assert!(!defer_plain_delivery_text(true, &tool_request));
     }
 
     #[test]

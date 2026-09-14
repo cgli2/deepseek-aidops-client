@@ -74,6 +74,14 @@ pub(super) struct AppState {
     pub(super) f_context_budget: String,
     pub(super) f_max_steps: String,
     pub(super) f_max_tokens: String,
+    /// 自我监控门禁开关（「参数配置」页勾选）：true = 每轮采集 + 停滞保护。
+    /// 保存时持久化到 settings.db 并写入进程级开关，即时生效。
+    pub(super) f_self_monitor: bool,
+    /// 自我监控模式（off / observe / protect / evolve）：保存时同样持久化并即时生效。
+    pub(super) f_self_monitor_mode: String,
+    /// 目标执行框架（V4 受控任务）门禁开关：true = 受控交付，false = 关闭。
+    /// 保存时持久化到 settings.db 并写入进程级开关，即时生效。
+    pub(super) f_goal_executor: bool,
     /// 权限 chip 下拉菜单是否展开。用自定义 chip + Area 弹层代替默认 ComboBox，
     /// 保证与模型 chip 同 28px 高度 / 同圆角 / 同边框，水平基线对齐。
     pub(super) perm_menu_open: bool,
@@ -280,6 +288,22 @@ impl AppState {
             f_context_budget: settings.get("runtime.context_budget").unwrap_or_default(),
             f_max_steps: settings.get("runtime.max_steps").unwrap_or_default(),
             f_max_tokens: settings.get("runtime.max_tokens").unwrap_or_default(),
+            // 门禁开关：UI 显式保存过则以其为准，否则跟随配置文件 `[self_monitor].enabled`。
+            f_self_monitor: settings
+                .get("runtime.self_monitor_enabled")
+                .map(|v| v != "false")
+                .or_else(|| Config::load().ok().map(|c| c.self_monitor.enabled))
+                .unwrap_or(true),
+            // 监控模式：UI 显式保存过则以其为准，否则跟随配置文件 `[self_monitor].mode`。
+            f_self_monitor_mode: settings
+                .get("runtime.self_monitor_mode")
+                .or_else(|| Config::load().ok().map(|c| c.self_monitor.mode))
+                .unwrap_or_else(|| "protect".into()),
+            // 目标执行框架开关：UI 显式保存过则以其为准，否则回退默认启用。
+            f_goal_executor: settings
+                .get("runtime.goal_executor_enabled")
+                .map(|v| v != "false")
+                .unwrap_or(true),
             plugin_rows: Self::load_plugin_rows(settings, &host.wasm_plugins, &host.trellis),
             plugin_tab: "sys".into(),
             modal_panel_rect: None,
@@ -425,6 +449,9 @@ impl AppState {
         harness_core::tuning::set_context_budget_chars(state.f_context_budget.parse().ok());
         harness_core::tuning::set_max_steps(state.f_max_steps.parse().ok());
         harness_core::tuning::set_max_output_tokens(state.f_max_tokens.parse().ok());
+        harness_core::tuning::set_self_monitor_enabled(Some(state.f_self_monitor));
+        harness_core::tuning::set_self_monitor_mode(Some(state.f_self_monitor_mode.clone()));
+        harness_core::tuning::set_goal_executor_enabled(Some(state.f_goal_executor));
         state.refresh_history();
         state
     }

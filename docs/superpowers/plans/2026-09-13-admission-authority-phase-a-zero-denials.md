@@ -27,7 +27,15 @@ spec `2026-09-13-agent-admission-authority-consolidation-design.md` 的 §5 有 
 7. 三条红测试（实测 `cargo test -p harness-runtime --no-fail-fast`）：`delivery_workflow::repair_reproduces_edits_retries_and_verifies_in_one_request`（拦停文本 `[execution gate] 该调用未关联任何验收标准`）、`agent_tool_loop::concrete_problem_replay_starts_with_locate_not_shell_verification`、`agent_tool_loop::quoted_menu_shortening_starts_from_the_grounded_file_not_repository_search`。其余 300 单测与 10 个集成二进制全绿。
 8. 测试样板（**逐字复制来源，勿自造**）：ctx 装配样板取 `harness-runtime/tests/agent_tool_loop.rs:476-495`（`AppContext::new` + `SessionLog::new` + `ctx.provide(log.clone())` + `Arc<dyn LlmProvider>` + `ToolRegistry::new()` + `Arc<dyn Hook>`/`AllowHook` + `AgentLoop::new().run_turn(&ctx, UserInput{ text, attachments: vec![] }).await.unwrap()`）；脚本化模型取 `ScriptedLlm`（`:98-141`）与 `scripted_call`（`:143-149`）；静态工具取 `StaticTool { name, output }`（`:77-96`）；真实磁盘场景取 `harness-runtime/tests/delivery_workflow.rs:14-35`（`Script`）与 `:37-`（`DiskTool`）。
 9. 回放入口：`harness-runtime/tests/session_replay.rs:182` `async fn replay_session_with(fixture: &str, mode: GovernorMode) -> Arc<SessionLog>`、`:243` `replay_session(fixture)`（默认 On）、`:10` `const FIXTURES`；现有 5 个 fixture 在 `harness-runtime/tests/fixtures/`。
-10. 工作区是 git 仓（main）；`harness/harness-runtime/src/delivery_workflow.rs` 与 `tests/delivery_workflow.rs` 目前是**未跟踪**文件，属用户进行中的工作，改动前须先 `git status` 确认。
+10. 分支基线：`feat/admission-phase-a`（自 `6fc9cbb` 起），已有 `d34b3b9` 文档、`defb121` 代码基线、`a120540` Task 1 红线三个提交；`delivery_workflow.rs` 与 `tests/delivery_workflow.rs` 已随基线入库。仓库外备份：`%LOCALAPPDATA%/Temp/aidops-baseline-20260913/{tracked.patch,untracked.tar}`。
+11. **Task 1 实测（新增事实）**：跨 5 个 fixture 共 84 次拦停。分布：`[target-anchor gate]` 64（76%；其中阶段预算耗尽 inspect 18 + change 8、目录枚举 12、回根泛搜 12、路径不在已确认调用链 8、状态白名单 4、当前阶段不允许写入 2）、`[controlled-delivery guard]` 18、`[execution gate]` 2。**`ScriptedLlm` + 静态脚本工具走不到阶段预算耗尽**，`agent_tool_loop` 侧测不到主犯分支。
+12. **缓存复用不是拦停**：同签名 search 命中 `SEARCH_MEMO`（`agent_loop.rs:1617` 区域，`is_search_like` `:149`）时直接复用上次输出、不进工具层，结果 `ok=true` 且不含 `gate]`/`guard]`。这是 Fix2 的既有设计目的（取证：同回合扫描被跑 13 次），**不得**为凑派发计数而废除。
+
+## 计划修正（Task 1 实测后，执行时以本节为准）
+
+- **修正 1**：派发计数断言只对**非记忆化工具**成立。search 类只断言「配对完整 + 无拦停文本」，`fs read`/`edit`/`shell` 仍断言必须真实派发。已提交的 Task 1 测试按此收紧，见 Task 1b。
+- **修正 2**：阶段预算（Task 4）的红线测试改到 `harness-runtime/tests/session_replay.rs` 用真实 fixture 驱动；`agent_tool_loop.rs` 只保留能走到的分支。
+- **修正 3**：`SEARCH_MEMO` 复用路径保持现状，复用时只追加一条提示，并加断言防止将来把复用改回拦停。
 
 ## 决策边界（不得越界）
 
@@ -58,7 +66,7 @@ spec `2026-09-13-agent-admission-authority-consolidation-design.md` 的 §5 有 
 - Modify: `harness-runtime/tests/agent_tool_loop.rs`（文件末尾追加）
 - Modify: `harness-runtime/tests/session_replay.rs`（`:243` 之后追加）
 
-- [ ] **Step 1: 写失败测试（工具确实被派发，且无拒绝文本）**
+- [x] **Step 1: 写失败测试（工具确实被派发，且无拒绝文本）**
 
 追加到 `harness-runtime/tests/agent_tool_loop.rs` 末尾。`CountingTool` 是本计划新定义的测试工具，用来证明动作「照常执行」而不是被吞掉：
 
@@ -147,7 +155,7 @@ async fn advisory_gates_never_replace_a_dispatched_tool_result() {
 }
 ```
 
-- [ ] **Step 2: 对现有 fixture 同样断言零拦停**
+- [x] **Step 2: 对现有 fixture 同样断言零拦停**
 
 追加到 `harness-runtime/tests/session_replay.rs`（`:245` 之后）。`FIXTURES` 常量在 `:10`：
 
@@ -178,7 +186,7 @@ async fn replayed_sessions_emit_no_denied_tool_results() {
 }
 ```
 
-- [ ] **Step 3: 跑红并记录实际违例集合**
+- [x] **Step 3: 跑红并记录实际违例集合**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test agent_tool_loop advisory_gates_never_replace
@@ -187,11 +195,42 @@ cd harness && cargo test -p harness-runtime --test delivery_workflow
 ```
 Expected: 三条全部 **FAIL**。把每条实际出现的拦停文本原样抄进下一步的提交说明，作为「哪些门禁在吞动作」的实测清单（预期至少含 `[tool-loop guard]`、`[execution gate] 该调用未关联任何验收标准`）。若某条意外为绿，说明该路径本就不拦停——记录事实，继续。
 
-- [ ] **Step 4: 不改实现，提交红线**
+- [x] **Step 4: 不改实现，提交红线**
 
 ```bash
 git add harness/harness-runtime/tests/agent_tool_loop.rs harness/harness-runtime/tests/session_replay.rs
 git commit -m "test(governance): 零拦停红线入册，实测列出仍在吞动作的门禁"
+```
+
+### Task 1b: 收紧 Task 1 的派发断言（记忆化豁免）
+
+**Files:**
+- Modify: `harness-runtime/tests/agent_tool_loop.rs`（`advisory_gates_never_replace_a_dispatched_tool_result` 内）
+
+- [x] **Step 1: 删掉对可记忆化工具的派发计数断言**
+
+原 `assert_eq!(search_hits.hits.load(Ordering::SeqCst), 3, "三次 search 必须全部到达工具层");` 整条替换为：
+
+```rust
+    // search 属 is_search_like，命中 SEARCH_MEMO 时合法地不进工具层（复用同查询输出），
+    // 它不是拦停。此处只允许用「无拦停文本」约束它；非记忆化工具才断言真实派发。
+    let _ = &search_hits;
+```
+
+保留 `assert_eq!(fs_hits.hits.load(Ordering::SeqCst), 3, ...)`——`fs` 不属 `is_search_like`，三次读取必须全部到达工具层，这条正是抓 `[tool-loop guard]` 的牙齿。
+
+- [x] **Step 2: 确认仍然红，且失败原因变成 fs 那条断言**
+
+```bash
+cd harness && cargo test -p harness-runtime --test agent_tool_loop advisory_gates_never_replace
+```
+Expected: FAIL，且 panic 指向 `fs_hits` 计数（3 期望 / 2 实际），不再指向 search。
+
+- [x] **Step 3: 提交**
+
+```bash
+git add harness/harness-runtime/tests/agent_tool_loop.rs
+git commit -m "test(governance): 派发计数豁免可记忆化的 search 类调用"
 ```
 
 ### Task 2: `GateDecision::Advise` 与 `authorize_impl` 分支归类
@@ -200,7 +239,7 @@ git commit -m "test(governance): 零拦停红线入册，实测列出仍在吞�
 - Modify: `harness-runtime/src/execution.rs:1373-1443`
 - Test: `harness-runtime/tests/agent_tool_loop.rs`
 
-- [ ] **Step 1: 加变体并写明语义**
+- [x] **Step 1: 加变体并写明语义**
 
 `execution.rs:1373` 改为：
 
@@ -225,21 +264,21 @@ pub enum GateDecision {
         }
 ```
 
-- [ ] **Step 2: 编译并按编译器定位漏改的匹配点**
+- [x] **Step 2: 编译并按编译器定位漏改的匹配点**
 
 ```bash
 cd harness && cargo test -p harness-runtime --no-fail-fast 2>&1 | grep -E "^error|non-exhaustive" | head -20
 ```
 Expected: 若干 `non-exhaustive patterns` 错误，逐个补 `Advise` 分支。`agent_loop.rs:1552` 的 `if let GateDecision::Deny(reason)` 不报错但仍只处理 Deny——Task 3 处理，此处先记录为待办，**不要**顺手改成通配。
 
-- [ ] **Step 3: 全量跑一次，确认只有 Task 1 的红线仍然红**
+- [x] **Step 3: 全量跑一次，确认只有 Task 1 的红线仍然红**
 
 ```bash
 cd harness && cargo test -p harness-runtime --no-fail-fast 2>&1 | grep -E "^test result|FAILED" | head
 ```
 Expected: `advisory_gates_never_replace_a_dispatched_tool_result` 仍红（消费点尚未放行 Advise），其余测试不得新增失败。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add harness/harness-runtime/src/execution.rs
@@ -252,7 +291,7 @@ git commit -m "refactor(governance): GateDecision 增加 Advise，真实约束�
 - Modify: `harness-runtime/src/agent_loop.rs:1541-1575`
 - Test: `harness-runtime/tests/agent_tool_loop.rs`
 
-- [ ] **Step 1: 写失败测试（提示进请求，动作仍执行）**
+- [x] **Step 1: 写失败测试（提示进请求，动作仍执行）**
 
 追加到 `agent_tool_loop.rs`。本测试需要看到出站请求，故用带 `requests` 捕获的 provider（形态抄 `ProgressAtCapLlm` 的 `stream` 捕获写法，`:251-252`）：
 
@@ -360,7 +399,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test agent_tool_loop zero_gain_advice
@@ -368,7 +407,7 @@ cd harness && cargo test -p harness-runtime --lib delivery_workflow
 ```
 Expected: 集成测试 FAIL（当前动作被 `[tool-loop guard]` 吞掉，`hits` 远小于 4）；单元测试 **编译失败**（`cannot find function note_advice`），这是预期的红。
 
-- [ ] **Step 3: 改造消费点**
+- [x] **Step 3: 改造消费点**
 
 `agent_loop.rs:1552` 起，把只处理 `Deny` 的分支改成三态，且 `Advise` 不产生工具结果：
 
@@ -402,7 +441,7 @@ Expected: 集成测试 FAIL（当前动作被 `[tool-loop guard]` 吞掉，`hits
             }
 ```
 
-- [ ] **Step 4: 落 `delivery_workflow` 的两个函数（spec D1）**
+- [x] **Step 4: 落 `delivery_workflow` 的两个函数（spec D1）**
 
 `delivery_workflow.rs` 末尾追加：
 
@@ -425,7 +464,7 @@ pub(crate) fn render_advisories(advisories: &[String]) -> Vec<String> {
 }
 ```
 
-- [ ] **Step 5: 跑绿 + 提交**
+- [x] **Step 5: 跑绿 + 提交**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test agent_tool_loop zero_gain_advice
@@ -442,7 +481,7 @@ Expected: 两条均 PASS。
 - Modify: `harness-runtime/src/agent_loop.rs:1477-1500`
 - Test: `harness-runtime/tests/agent_tool_loop.rs`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `agent_tool_loop.rs`：阶段预算（默认 locate 2 / inspect 4）用尽后，第 5 次定向读取仍须派发。
 
@@ -497,14 +536,14 @@ async fn phase_budget_exhaustion_no_longer_blocks_reads() {
 }
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test agent_tool_loop phase_budget_exhaustion
 ```
 Expected: FAIL（第 3/5 次起被 `[target-anchor gate] 当前 … 阶段预算已耗尽` 拦下）。
 
-- [ ] **Step 3: 改错误类型并归类**
+- [x] **Step 3: 改错误类型并归类**
 
 `allows_tool_call` 签名改为返回 `Result<(), GateDecision>`（在 `goal_execution.rs` 头部 `use crate::execution::{.., GateDecision}` 补上该项），按下列归类逐点改写（`goal_execution.rs`）：
 
@@ -520,7 +559,7 @@ Expected: FAIL（第 3/5 次起被 `[target-anchor gate] 当前 … 阶段预算
 
 `agent_loop.rs:1477` 的调用点同步改为三态，`Advise` 走 Task 3 的 `note_advice`，`Deny` 保持 `[target-anchor gate]` 通道不变。
 
-- [ ] **Step 4: 跑绿 + 全量**
+- [x] **Step 4: 跑绿 + 全量**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test agent_tool_loop phase_budget_exhaustion
@@ -528,7 +567,7 @@ cd harness && cargo test -p harness-runtime --no-fail-fast 2>&1 | grep -E "^test
 ```
 Expected: 新测试绿；Task 1 两条红线转绿；`delivery_workflow` 与两条遥测测试仍红（Task 6 处理），**不得出现新的失败**。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add harness/harness-runtime/src/goal_execution.rs harness/harness-runtime/src/agent_loop.rs harness/harness-runtime/tests/agent_tool_loop.rs
@@ -541,7 +580,7 @@ git commit -m "refactor(governance): 阶段预算与锚点判断退位为提示�
 - Modify: `harness-runtime/src/agent_loop.rs:496`、`:1436`、`:1512`
 - Test: `harness-runtime/tests/agent_tool_loop.rs`
 
-- [ ] **Step 1: 写失败测试（连续同签名仍派发，但只提示一次）**
+- [x] **Step 1: 写失败测试（连续同签名仍派发，但只提示一次）**
 
 ```rust
 #[tokio::test]
@@ -590,20 +629,20 @@ async fn repeated_identical_calls_run_and_produce_exactly_one_hint() {
 }
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test agent_tool_loop repeated_identical_calls
 ```
 Expected: FAIL（`[tool-loop guard]` 在重复命中时替换了工具结果）。
 
-- [ ] **Step 3: 三处改为只产信号**
+- [x] **Step 3: 三处改为只产信号**
 
 - `:1436` `if repeat_guard.should_block(&sig)`：保留判定与 `note_recovery`，但分支体不再构造 `blocked` 工具结果，改为 `note_advice(&mut advisories, "相同参数的调用不会带来新信息；换参数、换工具或基于现有结果收尾")`，**不 `continue`**，让动作继续走到 `pending`。
 - `:1512` `if !locate_step_gate.allows(true, &sig)`：同样改为 `note_advice(..)`，不再替换结果；`LocateStepGate` 仍计数（遥测）。
 - `:496` `locate_probes_exhausted`：从 `should_block` 的返回式中移除（`repeated_success || failed_retries_exhausted`），`consecutive_locate` 字段保留并继续自增，供 §6 指标观测。`MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN`（`:97`）保留为遥测阈值常量。
 
-- [ ] **Step 4: 跑绿 + 全量**
+- [x] **Step 4: 跑绿 + 全量**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test agent_tool_loop repeated_identical_calls
@@ -611,7 +650,7 @@ cd harness && cargo test -p harness-runtime --no-fail-fast 2>&1 | grep -E "^test
 ```
 Expected: 新测试绿；Task 1/3/4 全绿；仅余 Task 6 的三条既有红测试。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add harness/harness-runtime/src/agent_loop.rs harness/harness-runtime/tests/agent_tool_loop.rs
@@ -625,7 +664,7 @@ git commit -m "refactor(governance): 重复与定位守卫退位为信号，终�
 - Modify: `harness-runtime/tests/delivery_workflow.rs`
 - Modify: `docs/superpowers/specs/2026-09-13-agent-admission-authority-consolidation-design.md`
 
-- [ ] **Step 1: 判读两条遥测断言的实际取值（spec §10 的未核实项）**
+- [x] **Step 1: 判读两条遥测断言的实际取值（spec §10 的未核实项）**
 
 临时在 `quoted_menu_shortening_starts_from_the_grounded_file_not_repository_search` 断言前打印，跑一次后**立即还原**：
 
@@ -643,19 +682,19 @@ cd harness && cargo test -p harness-runtime --test agent_tool_loop quoted_menu_s
 ```
 判定：断言是「测试超前于实现」还是「实现有缺口」，逐条写下结论。
 
-- [ ] **Step 2: 按结论二选一处理**
+- [x] **Step 2: 按结论二选一处理**
 
 - 属测试超前：把断言改为当前真实契约，并在注释写明该行为何时由哪个切片补齐（不得只放宽以图省事）。
 - 属实现缺口：先补实现（预期落在 `execution.rs` 的遥测映射或 `delivery_workflow::tools`），保持断言不变。
 
-- [ ] **Step 3: `delivery_workflow` 红线转绿**
+- [x] **Step 3: `delivery_workflow` 红线转绿**
 
 ```bash
 cd harness && cargo test -p harness-runtime --test delivery_workflow
 ```
 Expected: 两个测试全绿。若仍出现 `gate]`，回到 Task 3–5 找出未归类干净的分支——**禁止修改 `delivery_workflow.rs` 测试的断言**。
 
-- [ ] **Step 4: 全量验证**
+- [x] **Step 4: 全量验证**
 
 ```bash
 cd harness && cargo test --workspace
@@ -672,7 +711,13 @@ cd harness && python -X utf8 scripts/governance_ab_run.py --scenarios S1,S2,S3 -
 ```
 Expected: `exit=0`。记录三场景各自的调用数、首次写入前调用数、`gate]`/`guard]` 计数——阶段 B 的交付率红线要用同一份口径对照。
 
-- [ ] **Step 6: spec 状态回写 + 提交**
+**2026-09-14 未执行**：`%LOCALAPPDATA%/DeepSeekAIOps1/settings.db` 的 `model_profiles` 表为空，
+`governance_ab_run.py` 无可用端点（`--profile` 无处可取），故 Step 4 之外的实机复跑仍未做。
+Step 4 已跑并全绿：`cargo test --workspace` exit=0、`cargo clippy -p harness-runtime
+--all-targets` exit=0（改动涉及文件零新警告，仓库存量 108 条与本轮无关）、`git diff --check` 干净。
+需要端点后补跑，并把三场景的 `gate]`/`guard]` 计数记回本节。
+
+- [x] **Step 6: spec 状态回写 + 提交**
 
 spec 头部状态追加「阶段 A（拦停归零）已落地；§6 交付率与 §4.3/§4.4 待阶段 B」，并在 §10 勾掉已核实的未核实项。
 
@@ -687,3 +732,49 @@ git commit -m "docs(governance): 阶段 A 收官，零拦停实测数据回写 s
 2. 每回合单条提示可能不足以纠正模型：若实机出现同形态空转，调 `render_advisories` 的上限而不是把判断改回 `Deny`。
 3. `Advise` 走 `Message::user` 注入，会被 `apply_context_budget` 计入预算并在下一回合被压缩掉——阶段 B 的 §4.3 事实级记忆处理，本阶段不重复解决。
 4. 工作区含用户未提交的 `delivery_workflow.rs`/`tests/delivery_workflow.rs`，且它们正被本次改动直接修改；执行前须与用户确认这两个文件的改动是否可以入库，避免混提。
+
+## 收官补记（Task 4/5/6 实测，2026-09-14）
+
+**新增提交**：`714b330`（Task 4）、`9a5ed9f`（Task 5）。
+
+### 被实测推翻的计划前提
+
+- **修正 4**：Task 4 Step 1 的 `phase_budget_exhaustion_no_longer_blocks_reads` 未采用。该形态
+  在 `agent_tool_loop` 里根本不经过 `allows_tool_call`（实测该二进制零条 target-anchor 结果），
+  写出来只会是一条恒绿的空测试。阶段预算改由两处承担：`goal_execution` 单元层的
+  `anchor_and_counter_rules_advise_while_only_real_constraints_deny`（逐分支断言变体，非
+  `is_err`），与 fixture 回放红线。与修正 2 同向，但比「换到 session_replay」更严。
+- **修正 5**（用户裁定 A）：本计划的红线「工具结果零 `gate]`/`guard]`」与「真实约束保留 `Deny`」
+  在字面上互斥——拒绝必须产工具结果，否则 `tool_call` 无响应直接 400。解法是分流标记：
+  `gate]`/`guard]` 永久专指吞动作，真实约束拒绝改 `[constraint denied]`、写入未生效观察改
+  `[write-not-counted]`。计划里「这些分支的现有行为一字不改」按此让步于标记名，行为未动。
+- **修正 6**（用户裁定 A）：Step 2 的 `replayed_sessions_emit_no_denied_tool_results` 原样写下去
+  永不可满足。82 条 `[target-anchor gate]` 里只有 2 条是运行时产物，其余是 fixture 录制的旧
+  运行时拒绝文本（`ReplayTool` 按 `call_id` 原样返回），改门禁消不掉；另有 2 条经
+  `SEARCH_MEMO` 以「同参数复用」身份跨 `call_id` 送出。口径因此改为「内容不属于本 fixture
+  录制值集合才判红」，派发是否被吞交给计数工具那条红线。
+- **修正 7**：`SEARCH_MEMO` 是进程级 `static` 且键不含会话，同二进制内两个测试共用
+  pattern `"save_draft"` 会互相污染，`repeated_search_replays_from_memo_without_denial`
+  因此偶发 `hits=0`。已给该测试换独有 pattern 隔离；根因（跨会话复用陈旧搜索结果）记入
+  spec §4.1.1 待办，S3 处理。
+
+### 计划遗漏、本轮一并摘除的吞动作通道
+
+- `[goal-execution gate] 该调用没有关联当前工作项`（agent_loop 关联判断，回放实测 0 次但同样
+  违红线）→ 降级为提示。
+- `execution.rs` 四条 legacy 原子规则（禁 plan/delegate、禁列目录、search 须限定目录、
+  shell 须先写入）→ 全部降级。它们只在测试里被 `ActionGate::authorize` 触达，但留着就是
+  第四条能把动作变成错误结果的通道；测试名 `atomic_gate_blocks_*` 随之改为 `advises`。
+
+### 与计划文字的一处有意偏离
+
+计划要求把 `locate_probes_exhausted` 从 `should_block` 返回式移除。该方法现已改名
+`flags_repeat` 且只产提示，保留这条判断才能让模型看见「已连续只定位 10 次」（6fc9cbb 的原始
+意图），拦停效力则随分支体不再 `continue` 而消失。摘掉它只会丢信息，不会更"归零"。
+
+### 仍未闭合
+
+- 风险 1 未验证：实机三场景复跑受端点阻塞（见 Step 5 补记）。放行重复调用后真·死循环仅由
+  `TurnGovernor` 兜底，这条必须在阶段 B 用实机数据证实或证伪。
+- 风险 3 未动：`Advise` 提示仍会被 `apply_context_budget` 压缩掉，留 §4.3。
+- 风险 4 已消解：`delivery_workflow.rs` 与 `tests/delivery_workflow.rs` 已随基线 `defb121` 入库。

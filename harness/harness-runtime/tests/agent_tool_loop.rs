@@ -956,11 +956,20 @@ async fn concrete_problem_replay_starts_with_locate_not_shell_verification() {
     );
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("none"));
     let events = log.replay();
+    // 阶段 A 之后阶段只作提示、不作准入：locate 不再把模型可见的工具收窄成
+    // search+fs——那正是被摘掉的吞动作机制。因此这里锁定两件真实契约：
+    // 遥测报出 locate（作为下一步建议），而工具集仍是实施工作流全集。
     assert!(events.iter().any(|event| matches!(event,
         SessionEvent::Telemetry { telemetry, .. }
             if telemetry.intent == "AtomicRegression"
                 && telemetry.phase == "locate"
-                && telemetry.allowed_tools == vec!["search", "fs"]
+                && telemetry.allowed_tools
+                    == vec![
+                        "search".to_string(),
+                        "fs".to_string(),
+                        "edit".to_string(),
+                        "shell".to_string()
+                    ]
     )));
 }
 
@@ -1010,6 +1019,9 @@ async fn quoted_menu_shortening_starts_from_the_grounded_file_not_repository_sea
         "运行时已从旧文案直接落到 composer.rs，首步应读取候选而非从仓库根搜索"
     );
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("none"));
+    // 遥测 phase 与 active_work_item 同源后，工作区把旧文案直接落到 composer.rs
+    // 就该报 inspect（而非旧状态机的 locate）：这是「已定位到候选、下一步是读」的
+    // 可观测契约。
     assert!(log.replay().iter().any(|event| matches!(event,
         SessionEvent::Telemetry { telemetry, .. }
             if telemetry.intent == "AtomicRegression"

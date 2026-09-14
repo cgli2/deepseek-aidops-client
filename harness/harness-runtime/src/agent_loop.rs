@@ -2513,9 +2513,12 @@ fn append_telemetry(
                 "{:?}",
                 crate::IntentProfile::compile(&execution.contract.objective).kind
             ),
-            phase: if crate::delivery_workflow::owns(execution) || execution.solve_mode == crate::execution::SolveMode::OpenEnded {
+            phase: if execution.solve_mode == crate::execution::SolveMode::OpenEnded {
                 execution.tool_phase().as_str()
             } else {
+                // 与同一事件的 active_work_item 同源。旧的 ExecutionState.tool_phase()
+                // 只由本回合已获得的证据推进，工作区已经把目标落到具体文件时仍报
+                // locate，观测上像「阶段没走」，而它其实不是准入依据。
                 goal_execution.phase_name()
             }
             .into(),

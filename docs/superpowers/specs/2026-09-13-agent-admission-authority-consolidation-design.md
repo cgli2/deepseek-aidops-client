@@ -1,6 +1,6 @@
 # Agent 准入权唯一化与证据驱动推进（治理重构阶段 3 收口）
 
-> 状态：已评审（2026-09-13）· 决策点 D1–D4 已裁定（见 §9）· 进入实施计划
+> 状态：已评审（2026-09-13）· 决策点 D1–D4 已裁定（见 §9）· **阶段 A（S1+S2 拦停归零）已落地（2026-09-14，见 §4.1.1）**；§6 交付率、§4.3/§4.4 与阶段 A 的实机三场景复跑（本机 `model_profiles` 为空，待可用端点）留待阶段 B
 > 前序：`2026-08-31-agent-governance-redesign-design.md`、`docs/superpowers/plans/2026-09-01-governance-phase3-counter-retirement.md`、`docs/AGENT_GOAL_SOLVING_MECHANISM_V5.md`、`docs/agent-target-gate-repair-2026-09-13.md`
 > 基座：继续推进工作区在途的 `harness-runtime/src/delivery_workflow.rs`，不另起控制面
 > 实施切片与验收见 §5、§6；每片的代码动作以对应计划文件为准
@@ -83,6 +83,32 @@
 
 红线（升级为全量回归断言，不只 `delivery_workflow`）：`SessionEvent::ToolResult.content` 不得出现 `gate]` / `guard]`。
 
+#### 4.1.1 阶段 A 落地结果（2026-09-14 实测）
+
+- 词汇表按 D1 落在既有类型上，未新造 `Admission`：`GateDecision::Advise(reason)` 承载
+  `Proceed(hint)`，提示的唯一出口是 `delivery_workflow::{note_advice, render_advisories}`
+  （同类去重、每步至多一条）。`ActionGate::authorize_with_tools` 与
+  `GoalExecution::allows_tool_call` 共用这一套词汇，`agent_loop.rs` 的准入段是唯一消费点。
+- 已摘除拒绝能力的判断：动态工具白名单、未关联验收项、绝对调用上限、OpenEnded 三条搜索
+  封顶、阶段预算耗尽、阶段工具白名单、目录枚举、锚点外与回根泛搜、读取目标不在候选、
+  路径不在已确认调用链、`ToolRepeatGuard`、`LocateStepGate`、连续定位计数、execution.rs
+  四条 legacy 原子规则。计数字段全部保留为遥测（D2）。
+- 仍保留 `Deny` 的真实外部约束：`read_only` 任务的写入、未确认目标的盲写（edit 精确锚点）、
+  访问策略、钩子阻断、沙箱/IO、同一回复内完全相同调用的去重（写冲突类）。
+- **标记分类法（本轮新增约定）**：`gate]` / `guard]` 专指「门禁吞掉动作」，因此红线可以
+  字面成立且长期守住；真实外部约束改用 `[constraint denied]`，写入未生效观察改用
+  `[write-not-counted]`，同回复重复调用改用 `[duplicate-call]`。系统提示的故障标签清单同步。
+- 实测拦停归零：五个 fixture 重放后运行时合成的 `gate]`/`guard]` 结果为 0（改动前 82 条
+  `[target-anchor gate]` + 18 条 `[controlled-delivery guard]`）；`harness-runtime` 全绿
+  （lib 302 + 12 个集成二进制 79）。
+- **回放红线口径**：fixture 里录制的工具结果本身就是旧运行时的拒绝文本，重放时以工具输出
+  身份原样返回，且 `SEARCH_MEMO` 按 (工具名, 参数) 复用会把别处录制的拒绝文本给到另一个
+  `call_id`。因此回放红线只判定「内容不属于本 fixture 录制值集合」的拦停文本；派发是否被
+  吞由 `agent_tool_loop::advisory_gates_never_replace_a_dispatched_tool_result` 用计数工具
+  直接判定，不依赖文本口径。
+- 待办（S3 处理）：`SEARCH_MEMO` 是进程级 `static`，键不含会话与工作区，跨会话可复用陈旧
+  搜索结果；注释称「会话级」与实现不符。
+
 ### 4.2 度量换成信息增益
 
 判定一个动作是否推进，看它是否向 `CaseFile` 新增了**事实**：新文件、未覆盖过的行区间、新的失败签名、首次成功验证。`CaseFile`（`case_file.rs`，阶段 2 已落地且与真实日志对拍过 6 项）就是这件事的现成载体，不需要新子系统。
@@ -115,8 +141,8 @@
 
 | 切片 | 内容 | 该片的可见结果 |
 |---|---|---|
-| S1 | 把 `ActionGate` 对实施类任务的硬拒改成 `Proceed(hint)`；判读并收敛 §2.2 三条红测试（先定"测试超前"还是"实现缺口"） | `delivery_workflow` 红线转绿；三条遥测测试自洽 |
-| S2 | `deny → annotate` 全量化；`PhaseBudget` / `phase_attempts` 剥除拒绝能力；删除 `MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN` 的准入用途 | `gate]` / `guard]` 全量零出现 |
+| S1 | 把 `ActionGate` 对实施类任务的硬拒改成 `Proceed(hint)`；判读并收敛 §2.2 三条红测试（先定"测试超前"还是"实现缺口"） | ✅ 已落地（2026-09-14）：`delivery_workflow` 红线转绿；三条遥测测试自洽（两条按 §10 补记分别改为锁定新契约、补遥测同源） |
+| S2 | `deny → annotate` 全量化；`PhaseBudget` / `phase_attempts` 剥除拒绝能力；删除 `MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN` 的准入用途 | ✅ 已落地（2026-09-14）：运行时合成的 `gate]`/`guard]` 全量零出现；该常量留在提示信号里、拦停效力已摘 |
 | S3 | 增益事实进 `CaseFile`；压缩豁免与重读复用 | 同文件重复读 ≤1；重复读不消耗预算 |
 | S4 | 完成判定改验收项↔证据映射 | 零写入但正确定位不再被要求"补授权" |
 | S5 | 5c / 5d / T6 / T7 + 10 fixture 重放红线收官 | `GovernorMode` 消失；Legacy 守卫代码不存在 |
@@ -176,4 +202,17 @@
 
 已核实（本机实测）：§2.1 五个会话的回合数、调用数、写入数、门禁拒绝分类与交付结果（脚本解析全量 jsonl，脚本为一次性诊断、未落库）；§2.2 三条红测试与其失败文本；§2.3 与 §3 全部代码锚点的当前行号；今日协议修复的回归结果。
 
-未核实：`concrete_problem_replay` / `quoted_menu_shortening` 两条遥测断言的**实际** `phase`/`allowed_tools` 取值（需要临时探针，本文档未改测试文件），已列为 S1 首项；示例日志对应会话的模型与参数配置（jsonl 未记录 profile）。
+阶段 A 补记（临时探针实测后已还原）：
+
+- `concrete_problem_replay` 的遥测实际取值 `intent="AtomicRegression" phase="locate"
+  allowed_tools=["search","fs","edit","shell"]`。原断言要求 `allowed_tools==["search","fs"]`
+  ——那是「阶段即准入」的旧语义，与 §8「阶段只作为提示内容」直接冲突，属**测试语义过期**，
+  已改为锁定「阶段=提示 + 工具集=实施工作流全集」。
+- `quoted_menu_shortening` 实际 `phase="locate"`（期望 `inspect`），属**实现缺口**：同一遥测
+  事件里 `active_work_item` 来自求解图而 `phase` 来自旧 `ExecutionState.tool_phase()`，两个
+  状态机混在一个事件中；已改为非 OpenEnded 一律报 `goal_execution.phase_name()`，同源后
+  工作区已把旧文案落到 `composer.rs` 即报 `inspect`。
+- 回放基线的拦停分类已核实为 `64 [target-anchor gate] + 18 [controlled-delivery guard]
+  + 2 [execution gate]`，且其中绝大多数是 fixture 录制内容而非本次运行时产物（见 §4.1.1）。
+
+未核实：示例日志对应会话的模型与参数配置（jsonl 未记录 profile）。

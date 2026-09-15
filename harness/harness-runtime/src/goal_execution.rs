@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::execution::{ActionProposal, GateDecision, TaskContract, edit_has_substantive_delta};
+use crate::execution::{
+    ActionProposal, GateDecision, StrategyKind, TaskContract, edit_has_substantive_delta,
+};
 use crate::intent::{
     Clarification, InspectVerdict, IntentKind, IntentProfile, ObservedBehavior, inspect_diff,
 };
@@ -524,6 +526,9 @@ pub struct GoalExecution {
     pub confirmed_target_files: Vec<String>,
     /// 诊断/解释任务只允许定位和读取，读取证据不会把工作项推进到 Change。
     pub read_only: bool,
+    /// 纯核验任务的交付物是可复核的命令结果，而不是一次工作区写入。这个标记
+    /// 由运行时已经选定的策略注入，避免再从工具名称或“test”之类词面猜测。
+    verification_only: bool,
     pub no_information_count: usize,
     pub correction_count: usize,
     /// S5/G2+G5：本回合内已把动作归属到的交付面 id（按准入顺序）。用于让单个 step
@@ -583,10 +588,22 @@ impl GoalExecution {
             confirmed_target_files: Vec::new(),
             read_only: IntentProfile::compile(&contract.objective).kind
                 == IntentKind::Investigation,
+            verification_only: false,
             no_information_count: 0,
             correction_count: 0,
             step_attributed: Vec::new(),
         }
+    }
+
+    /// 让求解图与 ExecutionState 使用同一份任务策略。以前两者各自推断，纯核验
+    /// 的成功结果会写入 ExecutionState，却无法把求解图推进到 Verified。
+    pub fn apply_execution_strategy(&mut self, strategy: StrategyKind) {
+        self.verification_only = strategy == StrategyKind::Verification;
+    }
+
+    fn is_verification_proposal(&self, proposal: &ActionProposal) -> bool {
+        is_verification(&proposal.signature)
+            || (self.verification_only && proposal.signature.starts_with("shell:"))
     }
 
     /// 调用方显式注入的求解图已经是结构化执行输入，其面级 candidate_targets
@@ -1281,7 +1298,11 @@ impl GoalExecution {
     /// - 非验证动作优先归属到**本步已准入且尚未被本步其它动作占用的就绪面**，
     ///   实现多面并发推进；若无可用准入面则退回单一活动面（兼容旧串行行为）。
     pub fn link_proposal(&mut self, proposal: &mut ActionProposal) {
-        let is_verify = is_verification(&proposal.signature);
+        let is_verify = self.is_verification_proposal(proposal);
+        if is_verify && self.verification_only {
+            proposal.supports = self.items.keys().cloned().collect();
+            return;
+        }
         proposal.supports = if is_verify {
             let changed = self
                 .items
@@ -1318,7 +1339,7 @@ impl GoalExecution {
     pub fn action_spec(&self, call: &ToolCall, proposal: &ActionProposal) -> Option<ActionSpec> {
         let item_id = proposal.supports.first()?;
         let item = self.items.get(item_id)?;
-        let is_verify = is_verification(&proposal.signature);
+        let is_verify = self.is_verification_proposal(proposal);
         let active = self.active_item()?;
         // 共享验证可覆盖多个工作项；非验证动作必须服务活动面**或本步已准入的并发面**
         // （S5/G2+G5：多面并发推进，归属由 link_proposal 保证不串面）。
@@ -1326,6 +1347,7 @@ impl GoalExecution {
             return None;
         }
         if is_verify
+            && !self.verification_only
             && (proposal.supports.is_empty()
                 || self.items.values().any(|work_item| {
                     matches!(
@@ -1355,7 +1377,11 @@ impl GoalExecution {
         } else {
             ("推进当前交付面", "产生可复用的新证据")
         };
-        let phase = action_phase(call, item.state, &proposal.signature);
+        let phase = if self.verification_only && call.name == "shell" {
+            SolvePhase::Verify
+        } else {
+            action_phase(call, item.state, &proposal.signature)
+        };
         let hypothesis_id = item
             .hypotheses
             .get(item.active_hypothesis)
@@ -1398,6 +1424,14 @@ impl GoalExecution {
     /// 受控任务的工具阶段只由活动工作项决定。这是 V4 的唯一阶段源；旧
     /// ExecutionState 的全局阶段仍保留给开放式兼容路径和遥测。
     pub fn allowed_tools(&self) -> Vec<String> {
+        // 纯核验直接允许 shell；若用户要求自建复现/验证脚本，也允许在工作区
+        // 创建它。完成判定仍只依赖命令结果和验收项，不要求这些辅助写入存在。
+        if self.verification_only {
+            if self.can_conclude() {
+                return Vec::new();
+            }
+            return vec!["shell".into(), "fs".into(), "edit".into()];
+        }
         // Per-action budgets are checked in allows_tool_call. Exhausting reads must
         // not hide editing or reproduction tools from the model.
         // S4：静态可证的交付面在验证阶段额外放开 `fs`。此前只给 `shell`，等于强迫
@@ -1823,7 +1857,8 @@ impl GoalExecution {
         let is_search = action.tool == "search";
         let is_read = action.tool == "fs" && !proposal.signature.contains("\"op\":\"write\"");
         let is_write = action.tool == "edit" || proposal.signature.contains("\"op\":\"write\"");
-        let is_verify = action.phase == SolvePhase::Verify || is_verification(&proposal.signature);
+        let is_verify = action.phase == SolvePhase::Verify
+            || self.is_verification_proposal(proposal);
         let substantive_write = !is_write
             || edit_has_substantive_delta(&proposal.signature)
             || [
@@ -1929,10 +1964,11 @@ impl GoalExecution {
                 item.read_evidence = item.read_evidence.saturating_add(1);
             }
             item.state = if is_verify
-                && matches!(
-                    item.state,
-                    WorkItemState::Changed | WorkItemState::Satisfied
-                ) {
+                && (self.verification_only
+                    || matches!(
+                        item.state,
+                        WorkItemState::Changed | WorkItemState::Satisfied
+                    )) {
                 WorkItemState::Verified
             } else if is_verify {
                 // ReadyToChange 阶段的 shell 是基线探针。成功只能证明当前代码可通过
@@ -3061,6 +3097,7 @@ mod tests {
             target_files: files.clone(),
             confirmed_target_files: files.clone(),
             read_only: false,
+            verification_only: false,
             no_information_count: 0,
             correction_count: 0,
             step_attributed: vec![],

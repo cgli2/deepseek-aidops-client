@@ -756,6 +756,9 @@ impl AgentLoop {
                 ge
             }
         };
+        // 任务策略由 ExecutionState 统一裁决；求解图只消费这个结构化结果。纯验证
+        // 任务的验收依据是实际命令结果，不能再被“必须先写入”的变更路径卡住。
+        goal_execution.apply_execution_strategy(strategy);
         // S3 分面预算供给：交付面已经切分出来了，此时才知道"这个任务实际有几个面"。
         // 求解计划的硬熔断常量对面数是次线性且被截断的，多面任务的尾部面在算术上
         // 拿不到跑完四个相位的步数（V5 §2.2）。这里按 Σ 每面独立预算抬升硬熔断，
@@ -1991,8 +1994,7 @@ impl AgentLoop {
                 && (implementation_workflow || goal_execution.can_conclude());
             if let Some(correction) = unsupported_runtime_claim_correction(
                 &assistant_text,
-                execution.requires_workspace_change() || execution.write_attempts > 0,
-                execution.write_operations,
+                &execution,
                 completion_ready,
                 sandbox_denial_observed,
                 access_denial_observed,
@@ -2427,9 +2429,8 @@ impl AgentLoop {
             let status = concise_incomplete_status(
                 &raw_outcome,
                 raw_reason.as_deref(),
-                execution.write_operations,
-                execution.write_attempts,
-                goal_execution.phase(),
+                &execution,
+                &goal_execution,
             );
             log.append(SessionEvent::Assistant {
                 id: log.gen_id(),
@@ -2548,9 +2549,8 @@ impl AgentLoop {
 fn concise_incomplete_status(
     outcome: &DeliveryOutcome,
     reason: Option<&str>,
-    successful_writes: usize,
-    write_attempts: usize,
-    _phase: crate::goal_execution::SolvePhase,
+    execution: &ExecutionState,
+    goal_execution: &GoalExecution,
 ) -> String {
     if *outcome == DeliveryOutcome::NeedsUserInput {
         return "未完成：执行证据不足，无法安全修改。\n下一步：保留现有证据，继续由 Agent 检查相邻调用链或切换定位策略。".into();
@@ -2563,15 +2563,12 @@ fn concise_incomplete_status(
         return "已停止空转：模型连续两次没有执行任何允许动作，任务状态和证据没有变化。\n结论：本轮未形成可验证交付；已保留现有分析与证据，可从当前断点继续。"
             .into();
     }
+    let acceptance = acceptance_progress(execution);
+    let next = goal_execution.next_action_hint();
     if reason.is_some_and(|text| text.contains("baseline_verified_without_change")) {
-        return "已完成基线核验：验证命令通过，但本轮没有产生代码修改。\n结论：现有证据只能证明当前基线可构建或通过测试，不能证明用户要求的变更已交付；已停止继续空转。"
-            .into();
-    }
-    if successful_writes > 0 {
-        return "本轮未完成交付：已有文件改动，但尚未通过完整验证。Agent 应继续修复或验证，不能声明完成。".into();
-    }
-    if write_attempts > 0 {
-        return "本轮未完成交付：Agent 已尝试编辑，但运行时未确认可关联的文件变更与完整验证；因此不采信任何“已修复”声明。原请求已包含修改授权，无需再次确认写入。".into();
+        return format!(
+            "本轮只完成了当前基线核验，尚未形成目标交付。{acceptance}\n下一步：{next}"
+        );
     }
     let cause = if reason.is_some_and(|text| text.contains("预算") || text.contains("窗口")) {
         "执行预算已耗尽"
@@ -2580,7 +2577,42 @@ fn concise_incomplete_status(
     } else {
         "执行器未获得有效修复结果"
     };
-    format!("本轮修复失败：{cause}，没有产生文件改动。原请求已包含修改授权，无需补充“修改写入”；这是 Agent 未完成工作。")
+    let writes = if execution.write_operations > 0 {
+        format!("已观察到 {} 次实质写入", execution.write_operations)
+    } else if execution.write_attempts > 0 {
+        format!("已尝试 {} 次写入，但未观察到有效净变化", execution.write_attempts)
+    } else {
+        "本轮没有写入动作".into()
+    };
+    format!("本轮尚未形成完整交付：{cause}；{acceptance}；{writes}。\n下一步：{next}")
+}
+
+/// 仅呈现运行时可观察到的验收状态。它服务于纠偏与收尾摘要，不能以模型文本、
+/// 写入次数或固定话术替代验收本身。
+fn acceptance_progress(execution: &ExecutionState) -> String {
+    let total = execution.contract.acceptance_criteria.len();
+    let satisfied = execution
+        .contract
+        .acceptance_criteria
+        .iter()
+        .filter(|criterion| execution.satisfied_criteria.contains(&criterion.id))
+        .count();
+    let missing = execution
+        .contract
+        .acceptance_criteria
+        .iter()
+        .filter(|criterion| !execution.satisfied_criteria.contains(&criterion.id))
+        .map(|criterion| criterion.description.as_str())
+        .take(3)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        format!("验收进度 {satisfied}/{total}，所有验收项均已有通过证据")
+    } else {
+        format!(
+            "验收进度 {satisfied}/{total}，尚缺：{}",
+            missing.join("；")
+        )
+    }
 }
 
 fn append_telemetry(
@@ -3261,8 +3293,7 @@ fn format_tool_dispatch_error(error: harness_core::Error) -> String {
 /// “沙箱/权限拒绝”必须有对应 ToolResult，“已落实/已写入”必须有成功写操作计数。
 fn unsupported_runtime_claim_correction(
     text: &str,
-    change_required: bool,
-    write_operations: usize,
+    execution: &ExecutionState,
     completion_ready: bool,
     sandbox_denial_observed: bool,
     access_denial_observed: bool,
@@ -3293,18 +3324,23 @@ fn unsupported_runtime_claim_correction(
     .iter()
     .any(|marker| compact.contains(marker));
 
-    let mut facts = Vec::new();
+    let mut facts: Vec<String> = Vec::new();
     if claims_sandbox_denial && !sandbox_denial_observed {
-        facts.push("没有任何带 [sandbox denied] 标签的工具结果，不能归因为沙箱拦截");
+        facts.push("没有任何带 [sandbox denied] 标签的工具结果，不能归因为沙箱拦截".into());
     }
     if claims_access_denial && !access_denial_observed {
-        facts.push("没有任何带 [access-policy denied] 标签的工具结果，不能归因为访问权限拒绝");
+        facts.push("没有任何带 [access-policy denied] 标签的工具结果，不能归因为访问权限拒绝".into());
     }
-    if change_required && claims_change_applied {
-        if write_operations == 0 {
-            facts.push("当前成功写操作计数为 0，不能声称修改已经落实或代码已经落盘");
-        } else if !completion_ready {
-            facts.push("虽然已有部分写操作，但全部验收项尚未完成并验证，不能声称整个任务已完成");
+    if claims_change_applied && !completion_ready {
+        // “已完成”是否成立只由验收证据决定。写入是实施型任务的一个必要事实，
+        // 但不能把测试、脚本或 Git 核验这些可零业务写入的交付混为一谈。
+        let acceptance = acceptance_progress(execution);
+        if execution.requires_workspace_change() && execution.write_operations == 0 {
+            facts.push(format!(
+                "当前任务要求工作区变更，但尚未观察到有效净变化；{acceptance}"
+            ));
+        } else {
+            facts.push(format!("尚不能确认任务完成；{acceptance}"));
         }
     }
     (!facts.is_empty()).then(|| facts.join("；"))
@@ -3449,6 +3485,17 @@ fn max_steps_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_execution_and_goal(
+        objective: &str,
+        strategy: crate::execution::StrategyKind,
+    ) -> (ExecutionState, GoalExecution) {
+        let contract = TaskContract::from_input(objective);
+        let execution = ExecutionState::new(contract.clone(), strategy);
+        let mut goal = GoalExecution::from_contract(&contract);
+        goal.apply_execution_strategy(strategy);
+        (execution, goal)
+    }
 
     #[test]
     fn v4_executor_has_an_explicit_legacy_fallback() {
@@ -3815,17 +3862,18 @@ mod tests {
 
     #[test]
     fn incomplete_delivery_names_only_the_missing_step() {
+        let (execution, goal) = test_execution_and_goal(
+            "修复输入框的内边距",
+            crate::execution::StrategyKind::Transformative,
+        );
         let status = concise_incomplete_status(
             &DeliveryOutcome::PartialDelivery,
             Some("已有修改，但尚未获得覆盖全部验收项的验证证据"),
-            1,
-            1,
-            crate::goal_execution::SolvePhase::Conclude,
+            &execution,
+            &goal,
         );
-        assert_eq!(
-            status,
-            "本轮未完成交付：已有文件改动，但尚未通过完整验证。Agent 应继续修复或验证，不能声明完成。"
-        );
+        assert!(status.contains("验收进度 0/1"), "{status}");
+        assert!(status.contains("修复输入框的内边距"), "{status}");
         for internal_label in ["【资产】", "锚点：", "假设：", "补丁建议：", "问项："]
         {
             assert!(!status.contains(internal_label));
@@ -3833,13 +3881,60 @@ mod tests {
     }
 
     #[test]
+    fn verification_task_accepts_actual_script_result_without_business_write() {
+        let (mut execution, mut goal) = test_execution_and_goal(
+            "全面检查并运行验证脚本",
+            crate::execution::StrategyKind::Verification,
+        );
+        let call = ToolCall {
+            id: "verify-script".into(),
+            name: "shell".into(),
+            args: serde_json::json!({"command":"python scripts/verify_contract.py"}),
+        };
+        let mut proposal = ActionProposal::from_tool_call(&call, &execution);
+        goal.link_proposal(&mut proposal);
+        let action = goal
+            .action_spec(&call, &proposal)
+            .expect("纯核验 shell 应获得验收动作");
+
+        assert_eq!(action.phase, crate::goal_execution::SolvePhase::Verify);
+        assert_eq!(proposal.supports.len(), 1);
+        execution.record_tool_result_observed(&proposal, true, "verification passed", None);
+        let result = goal.record_action_result_observed(
+            &action,
+            &proposal,
+            true,
+            "verification passed",
+            None,
+            false,
+        );
+
+        assert_eq!(result, EvidenceKind::VerificationPassed);
+        assert_eq!(execution.write_operations, 0);
+        assert!(execution.can_complete());
+        assert!(goal.can_conclude());
+        assert!(goal.allowed_tools().is_empty());
+        assert!(unsupported_runtime_claim_correction(
+            "验证任务已完成。",
+            &execution,
+            true,
+            false,
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn provider_failure_is_summarized_without_dumping_gateway_details() {
+        let (execution, goal) = test_execution_and_goal(
+            "修复输入框的内边距",
+            crate::execution::StrategyKind::Transformative,
+        );
         let status = concise_incomplete_status(
             &DeliveryOutcome::SystemFailure,
             Some("llm provider error: HTTP 400 invalid_tool_call_history messages[9]"),
-            0,
-            0,
-            crate::goal_execution::SolvePhase::Change,
+            &execution,
+            &goal,
         );
         assert!(status.contains("模型服务"));
         assert!(!status.contains("messages[9]"));
@@ -3848,12 +3943,15 @@ mod tests {
 
     #[test]
     fn terminal_needs_input_does_not_ask_the_user_to_locate_code() {
+        let (execution, goal) = test_execution_and_goal(
+            "修复输入框的内边距",
+            crate::execution::StrategyKind::Transformative,
+        );
         let status = concise_incomplete_status(
             &DeliveryOutcome::NeedsUserInput,
             Some("完成用户目标（门禁校正：读取 model_catalog.rs 不在候选文件中）"),
-            0,
-            0,
-            crate::goal_execution::SolvePhase::Locate,
+            &execution,
+            &goal,
         );
         assert!(status.contains("继续由 Agent"));
         for forbidden in [
@@ -4141,23 +4239,25 @@ mod tests {
 
     #[test]
     fn unsupported_runtime_claims_require_structured_evidence() {
+        let (unverified_change, _) = test_execution_and_goal(
+            "修复输入框的内边距",
+            crate::execution::StrategyKind::Transformative,
+        );
         let correction = unsupported_runtime_claim_correction(
             "此前因为沙箱拦截，但三项修改已经落实。",
-            true,
-            0,
+            &unverified_change,
             false,
             false,
             false,
         )
         .expect("无证据沙箱归因和零写入完成声明都必须被拦截");
         assert!(correction.contains("不能归因为沙箱拦截"), "{correction}");
-        assert!(correction.contains("成功写操作计数为 0"), "{correction}");
+        assert!(correction.contains("尚未观察到有效净变化"), "{correction}");
 
         assert!(
             unsupported_runtime_claim_correction(
                 "沙箱明确拒绝了写入，但修改随后已经落实。",
-                true,
-                1,
+                &unverified_change,
                 true,
                 true,
                 false,
@@ -4167,25 +4267,23 @@ mod tests {
 
         let correction = unsupported_runtime_claim_correction(
             "已完成输入框高度与内边距的紧凑化调整。",
-            true,
-            0,
+            &unverified_change,
             false,
             false,
             false,
         )
         .expect("‘已完成某项修改’也必须要求成功写操作");
-        assert!(correction.contains("成功写操作计数为 0"), "{correction}");
+        assert!(correction.contains("验收进度 0/1"), "{correction}");
 
         let correction = unsupported_runtime_claim_correction(
             "代码已经写入，任务已完成。",
-            true,
-            1,
+            &unverified_change,
             false,
             false,
             false,
         )
         .expect("只有部分写入、验收未闭环时不得宣布完成");
-        assert!(correction.contains("全部验收项尚未完成"), "{correction}");
+        assert!(correction.contains("验收进度 0/1"), "{correction}");
     }
 
     #[test]

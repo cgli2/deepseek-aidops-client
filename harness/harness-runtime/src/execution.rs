@@ -600,7 +600,10 @@ impl ExecutionState {
                 self.changed_criteria
                     .extend(proposal.supports.iter().cloned());
             }
-            if self.is_verification(proposal) && effective_ok
+            let is_verification = self.is_verification(proposal)
+                || (self.strategy == StrategyKind::Verification
+                    && proposal.signature.starts_with("shell:"));
+            if is_verification && effective_ok
                 && (self.write_operations > 0 || self.strategy == StrategyKind::Verification)
             {
                 let evidence = format!(

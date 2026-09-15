@@ -1287,6 +1287,7 @@ impl AgentLoop {
         let controlled_delivery_turn = implementation_workflow
             || execution.solve_mode == crate::execution::SolveMode::AtomicDelivery
             || (goal_executor_enabled()
+                && execution.strategy != crate::execution::StrategyKind::RepositoryOperation
                 && execution.solve_mode != crate::execution::SolveMode::OpenEnded);
         while debt > 0 {
             // R3 前置：本执行回合到顶后暂停，不再向模型发请求。下一条用户消息会新建

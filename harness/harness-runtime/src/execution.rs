@@ -81,6 +81,10 @@ pub enum StrategyKind {
     Transformative,
     Generative,
     Verification,
+    /// A bounded local repository action such as `git commit`.  This is not a
+    /// code-change request and must never be routed through the implementation
+    /// workflow merely because a successful commit changes Git metadata.
+    RepositoryOperation,
     Monitoring,
 }
 
@@ -210,6 +214,19 @@ impl SolvePlan {
         let text = contract.objective.as_str();
         let intent = IntentProfile::compile(text);
         let shape = TaskShape::for_contract(contract);
+        if strategy == StrategyKind::RepositoryOperation {
+            return Self {
+                // Use the normal completion judge, but keep the tool surface
+                // closed to shell below.  The goal graph is intentionally not
+                // involved: it models source delivery, not Git state.
+                mode: SolveMode::OpenEnded,
+                initial_steps: 4,
+                initial_tool_calls: 4,
+                hard_max_steps: 6,
+                hard_max_tool_calls: 6,
+                instructions: "[Git 提交操作] 这是一次本地仓库操作，不是代码修改任务。只允许使用 shell，禁止读取源码、搜索文件、运行构建/测试、制定实施计划或修改业务文件。先运行 `git status --porcelain --untracked-files=all`：若输出为空，立即简洁说明“没有待提交的改动，未创建提交”，然后结束；若有改动，直接执行 `git add -A && git commit -m \"chore: save changes\"`，成功后简洁报告提交结果。除非用户明确要求，否则绝不执行 git push。".into(),
+            };
+        }
         // 交付面数量由验收项（契约真实单元）给出，而非机制层词表数 UI 名词。
         let extra_surfaces = contract.acceptance_criteria.len().saturating_sub(1).min(4);
         let is_atomic_regression =
@@ -618,11 +635,17 @@ impl ExecutionState {
                 self.changed_criteria
                     .extend(proposal.supports.iter().cloned());
             }
-            let is_verification = self.is_verification(proposal)
+            let repository_operation_satisfied = self.strategy == StrategyKind::RepositoryOperation
+                && repository_operation_satisfies(proposal, summary);
+            let is_verification = repository_operation_satisfied || self.is_verification(proposal)
                 || (self.strategy == StrategyKind::Verification
                     && proposal.signature.starts_with("shell:"));
             if is_verification && effective_ok
-                && (self.write_operations > 0 || self.strategy == StrategyKind::Verification)
+                && (self.write_operations > 0
+                    || matches!(
+                        self.strategy,
+                        StrategyKind::Verification | StrategyKind::RepositoryOperation
+                    ))
             {
                 let evidence = format!(
                     "{} => {}",
@@ -706,6 +729,12 @@ impl ExecutionState {
     pub fn tool_phase(&self) -> ToolPhase {
         if self.can_complete() && !self.satisfied_criteria.is_empty() {
             return ToolPhase::Conclude;
+        }
+        // Git operations have no source-level Locate/Inspect/Change phase.
+        // Sending them into one is what previously made a clean repository
+        // look like an unfinished code repair.
+        if self.strategy == StrategyKind::RepositoryOperation {
+            return ToolPhase::Verify;
         }
         // 纯核验请求（如“检查目录”）的首个动作本来就是受控 shell/test，
         // 不能强迫它先做一次无意义搜索再获得验证工具。
@@ -809,7 +838,9 @@ impl ExecutionState {
     fn requires_verification(&self) -> bool {
         matches!(
             self.strategy,
-            StrategyKind::Transformative | StrategyKind::Verification
+            StrategyKind::Transformative
+                | StrategyKind::Verification
+                | StrategyKind::RepositoryOperation
         ) || self.solve_mode == SolveMode::AtomicDelivery
             // 语言分类只是路由提示，工具事实才是硬边界。任何写入尝试都会关闭
             // read_only_verified 捷径，直到至少一次写入真正成功且随后验证通过。
@@ -1005,6 +1036,31 @@ impl ExecutionState {
     }
 }
 
+fn shell_command(signature: &str) -> Option<String> {
+    let raw = signature.strip_prefix("shell:")?;
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()?
+        .get("command")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// A repository operation is complete only after an actual commit, or after a
+/// porcelain status proves there was nothing to commit.  A successful dirty
+/// `git status` is deliberately *not* evidence of completion.
+fn repository_operation_satisfies(proposal: &ActionProposal, summary: &str) -> bool {
+    let Some(command) = shell_command(&proposal.signature) else {
+        return false;
+    };
+    let command = command.to_ascii_lowercase();
+    if command.contains("git commit") && !command.contains("--dry-run") {
+        return true;
+    }
+    command.contains("git status")
+        && command.contains("--porcelain")
+        && summary.trim().is_empty()
+}
+
 #[derive(Debug, Clone)]
 pub struct ActionProposal {
     pub signature: String,
@@ -1196,6 +1252,7 @@ impl BudgetManager {
         let (base_steps, base_calls) = match strategy {
             StrategyKind::Direct => (12, 16),
             StrategyKind::Transformative | StrategyKind::Verification => (24, 32),
+            StrategyKind::RepositoryOperation => (4, 4),
             StrategyKind::Generative | StrategyKind::Comparative => (28, 36),
             StrategyKind::Investigative => (40, 48),
             StrategyKind::Monitoring => (16, 20),
@@ -1316,7 +1373,10 @@ impl BudgetManager {
         // 证据续期，因为它们的交付物本来就是结论而非写入。
         let read_only_delivery = matches!(
             state.strategy,
-            StrategyKind::Investigative | StrategyKind::Comparative | StrategyKind::Verification
+            StrategyKind::Investigative
+                | StrategyKind::Comparative
+                | StrategyKind::Verification
+                | StrategyKind::RepositoryOperation
         );
         let meaningful_progress =
             write_delta > 0 || (read_only_delivery && evidence_delta > 0 && success_delta > 0);
@@ -1572,6 +1632,9 @@ impl DomainPolicy for GeneralDomainPolicy {
     fn select_strategy(&self, contract: &TaskContract) -> StrategyKind {
         let text = contract.objective.as_str();
         let intent = IntentProfile::compile(text);
+        if is_local_git_commit_request(text) {
+            return StrategyKind::RepositoryOperation;
+        }
         if ["只分析", "仅分析", "不要修改", "不修改代码", "只读诊断"]
             .iter().any(|constraint| text.contains(constraint))
         {
@@ -1630,6 +1693,29 @@ impl DomainPolicy for GeneralDomainPolicy {
             StrategyKind::Direct
         }
     }
+}
+
+fn is_local_git_commit_request(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("git commit") {
+        return true;
+    }
+    // Pushing is a distinct external action.  Do not treat it as an implicit
+    // request to commit, especially when the user explicitly named a remote.
+    if lower.contains("git push") || text.contains("推送") || text.contains("远端") {
+        return false;
+    }
+    [
+        "提交一下代码",
+        "提交代码",
+        "提交改动",
+        "提交更改",
+        "提交所有改动",
+        "提交当前改动",
+        "提交一次代码",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 #[cfg(test)]
@@ -2442,6 +2528,49 @@ mod tests {
         assert_eq!(state.write_operations, 0);
         assert!(state.verification_evidence.is_empty());
         assert!(!state.can_complete());
+    }
+
+    #[test]
+    fn git_commit_request_is_a_bounded_repository_operation() {
+        let contract = TaskContract::from_input("提交一下代码");
+        let strategy = GeneralDomainPolicy.select_strategy(&contract);
+        assert_eq!(strategy, StrategyKind::RepositoryOperation);
+
+        let plan = SolvePlan::for_contract(&contract, strategy);
+        assert_eq!(plan.mode, SolveMode::OpenEnded);
+        let mut state = ExecutionState::new(contract, strategy);
+        assert_eq!(state.allowed_tools(), vec!["shell"]);
+
+        let status = ActionProposal {
+            signature: "shell:{\"command\":\"git status --porcelain --untracked-files=all\"}".into(),
+            question: "确认是否有待提交改动".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result(&status, true, " M src/lib.rs");
+        assert!(
+            !state.can_complete(),
+            "有待提交改动的 status 不能被误记成完成"
+        );
+
+        state.record_tool_result(&status, true, "");
+        assert!(state.can_complete());
+        assert!(state.satisfied_criteria.contains("user-objective"));
+    }
+
+    #[test]
+    fn successful_git_commit_satisfies_repository_operation() {
+        let contract = TaskContract::from_input("git commit 当前改动");
+        let mut state = ExecutionState::new(contract, StrategyKind::RepositoryOperation);
+        let commit = ActionProposal {
+            signature: "shell:{\"command\":\"git add -A && git commit -m 'chore: save changes'\"}".into(),
+            question: "提交当前改动".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+
+        state.record_tool_result(&commit, true, "[main abc123] chore: save changes");
+        assert!(state.can_complete());
     }
 
     #[test]

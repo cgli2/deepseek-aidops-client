@@ -69,6 +69,60 @@ impl DynTool for DiskTool {
     }
 }
 
+/// A clean porcelain status is the terminal evidence for a commit request when
+/// there is nothing to commit.  Keep this tool intentionally narrow so the
+/// regression proves the Agent does not inspect source files or run tests.
+struct CleanGitStatusTool {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+struct CommitGitTool {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl DynTool for CommitGitTool {
+    fn name(&self) -> &'static str { "shell" }
+
+    async fn call(&self, call: &ToolCall) -> Result<ToolResult> {
+        let command = call.args["command"].as_str().unwrap_or_default().to_owned();
+        let index = {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(command.clone());
+            seen.len() - 1
+        };
+        let content = match index {
+            0 => {
+                assert_eq!(command, "git status --porcelain --untracked-files=all");
+                " M src/lib.rs".into()
+            }
+            1 => {
+                assert_eq!(command, "git add -A && git commit -m \"chore: save changes\"");
+                "[main abc123] chore: save changes".into()
+            }
+            _ => panic!("unexpected repository command: {command}"),
+        };
+        Ok(ToolResult { call_id: call.id.clone(), ok: true, content, continuation_debt: 0 })
+    }
+}
+
+#[async_trait]
+impl DynTool for CleanGitStatusTool {
+    fn name(&self) -> &'static str { "shell" }
+
+    async fn call(&self, call: &ToolCall) -> Result<ToolResult> {
+        let command = call.args["command"].as_str().unwrap_or_default().to_owned();
+        self.seen.lock().unwrap().push(command.clone());
+        assert_eq!(command, "git status --porcelain --untracked-files=all");
+        Ok(ToolResult {
+            call_id: call.id.clone(),
+            ok: true,
+            content: String::new(),
+            continuation_debt: 0,
+        })
+    }
+}
+
 async fn run_repair(no_op: bool) {
     let root = std::env::temp_dir().join(format!("delivery-workflow-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
@@ -144,3 +198,97 @@ async fn repair_reproduces_edits_retries_and_verifies_in_one_request() { run_rep
 
 #[tokio::test]
 async fn successful_tool_messages_without_disk_changes_cannot_deliver() { run_repair(true).await; }
+
+#[tokio::test]
+async fn clean_git_commit_request_finishes_without_source_workflow() {
+    let root = std::env::temp_dir().join(format!("git-operation-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let model = Arc::new(Script {
+        calls: vec![ToolCall {
+            id: "status".into(),
+            name: "shell".into(),
+            args: serde_json::json!({"command":"git status --porcelain --untracked-files=all"}),
+        }],
+        index: AtomicUsize::new(0),
+        options: Mutex::new(vec![]),
+    });
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let _log = ctx.provide(log.clone());
+    let _workspace = ctx.provide(Workspace::new(root.clone()));
+    let provider: Arc<dyn LlmProvider> = model.clone();
+    let _model = ctx.provide(provider);
+    let tools = ToolRegistry::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    tools.register(Arc::new(CleanGitStatusTool { seen: seen.clone() }));
+    let _tools = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(NullHook);
+    let _hook = ctx.provide(hook);
+
+    AgentLoop::new().run_turn(&ctx, UserInput {
+        text: "提交一下代码".into(), attachments: vec![],
+    }).await.unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), vec!["git status --porcelain --untracked-files=all"]);
+    assert!(log.replay().iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. } if report.outcome == DeliveryOutcome::Verified
+    )));
+    assert!(model.options.lock().unwrap().iter().all(|options| {
+        options.allowed_tools.as_ref().is_none_or(|tools| {
+            tools.is_empty() || tools == &["shell".to_string()]
+        })
+    }));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn dirty_git_commit_request_commits_instead_of_entering_repair_workflow() {
+    let root = std::env::temp_dir().join(format!("git-operation-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let model = Arc::new(Script {
+        calls: vec![
+            ToolCall {
+                id: "status".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"command":"git status --porcelain --untracked-files=all"}),
+            },
+            ToolCall {
+                id: "commit".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"command":"git add -A && git commit -m \"chore: save changes\""}),
+            },
+        ],
+        index: AtomicUsize::new(0),
+        options: Mutex::new(vec![]),
+    });
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let _log = ctx.provide(log.clone());
+    let _workspace = ctx.provide(Workspace::new(root.clone()));
+    let provider: Arc<dyn LlmProvider> = model.clone();
+    let _model = ctx.provide(provider);
+    let tools = ToolRegistry::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    tools.register(Arc::new(CommitGitTool { seen: seen.clone() }));
+    let _tools = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(NullHook);
+    let _hook = ctx.provide(hook);
+
+    AgentLoop::new().run_turn(&ctx, UserInput {
+        text: "提交一下代码".into(), attachments: vec![],
+    }).await.unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), vec![
+        "git status --porcelain --untracked-files=all",
+        "git add -A && git commit -m \"chore: save changes\"",
+    ]);
+    assert!(log.replay().iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. } if report.outcome == DeliveryOutcome::Verified
+    )));
+    assert!(model.options.lock().unwrap().iter().all(|options| {
+        options.allowed_tools.as_ref().is_none_or(|tools| {
+            tools.is_empty() || tools == &["shell".to_string()]
+        })
+    }));
+    std::fs::remove_dir_all(&root).unwrap();
+}

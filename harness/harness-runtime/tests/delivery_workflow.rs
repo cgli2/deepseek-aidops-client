@@ -132,7 +132,9 @@ async fn run_repair(no_op: bool) {
     }
     for options in model.options.lock().unwrap().iter() {
         let tools = options.allowed_tools.as_ref().unwrap();
-        for name in ["fs", "edit", "shell"] { assert!(tools.iter().any(|tool| tool == name)); }
+        // 范围受限修复改由阶段化执行器提供最小工具面；每一轮不再同时暴露全部
+        // fs/edit/shell；收尾轮允许为空，但运行时仍会把必要动作派发并完成闭环。
+        assert!(!tools.iter().any(|tool| tool == "plan" || tool == "delegate"));
     }
     std::fs::remove_dir_all(&root).unwrap();
 }

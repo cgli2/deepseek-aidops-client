@@ -785,7 +785,11 @@ impl AgentLoop {
             solve_plan.hard_max_tool_calls,
         );
         let mut execution = ExecutionState::new(contract, strategy);
-        let implementation_workflow = crate::delivery_workflow::owns(&execution);
+        // 实施工作流曾覆盖所有 Transformative 任务，导致单点 UI 改动绕开 V4 的
+        // 阶段/工具/总预算约束，实测会跑到 27 步、36 次工具调用。它只保留给确实
+        // 开放的交付；明确、范围受限任务一律走受控执行器。
+        let implementation_workflow = crate::delivery_workflow::owns(&execution)
+            && execution.solve_mode == crate::execution::SolveMode::OpenEnded;
         if let Some(state) = &resume {
             execution.restore_verified_criteria(&state.report);
         }
@@ -1245,6 +1249,11 @@ impl AgentLoop {
         let mut absolute_budget_hit = false;
         // Fix1：断点后进展基线。硬熔断时比较“写入+证据”与基线的增量，有进展才自动续跑。
         let mut hard_baseline = execution_progress_units(&execution);
+        // 编辑工具的“old_text 未精确匹配”会返回当前磁盘候选。这不是交付进展，不能
+        // 无限换取预算；但它是足够明确、可立即执行的恢复线索。保留至多两次受限恢复，
+        // 防止一个简单 UI 改动恰好在拿到候选后被硬熔断。
+        let mut hard_write_attempt_baseline = execution.write_attempts;
+        let mut recoverable_write_autorenews = 0u32;
         // prompt 安全边界同样是“执行窗口”而不是人工交互边界。窗口内出现可验证进展时，
         // 先压缩为最小断点再自动续期；连续无进展或续期封顶才真正暂停并交回用户。
         // 这避免大上下文任务每 3~4 次模型往返就要求用户手工输入“继续”。
@@ -1263,6 +1272,7 @@ impl AgentLoop {
         let mut baseline_verification_observed = false;
         /// Fix1：硬熔断自动续跑硬上限，超过则强制交回用户，防止失控。
         const MAX_HARD_AUTORENEWS: u32 = 8;
+        const MAX_RECOVERABLE_WRITE_AUTORENEWS: u32 = 2;
         /// 单个用户请求内的 prompt 窗口续期上限；每次续期仍受 300k 窗口边界约束。
         const MAX_PROMPT_AUTORENEWS: u32 = 4;
         // 模型请求失败不能直接改写任务状态。独立恢复状态机负责区分普通协议空包和
@@ -1272,8 +1282,12 @@ impl AgentLoop {
         // 每个写目标只保存首次写入前的内容指纹。最终交付前再读一次，阻止“先改、
         // 后回滚到原样”仍靠中间态写入计数获得 Verified。
         let mut artifact_baselines: HashMap<String, String> = HashMap::new();
-        let controlled_delivery_turn = implementation_workflow || (goal_executor_enabled()
-            && execution.solve_mode != crate::execution::SolveMode::OpenEnded);
+        // 原子任务不能因用户关闭“高级目标执行器”退回无约束的 legacy 路径；其安全
+        // 与可预测性依赖于闭合工具面和状态机，因此始终受控。
+        let controlled_delivery_turn = implementation_workflow
+            || execution.solve_mode == crate::execution::SolveMode::AtomicDelivery
+            || (goal_executor_enabled()
+                && execution.solve_mode != crate::execution::SolveMode::OpenEnded);
         while debt > 0 {
             // R3 前置：本执行回合到顶后暂停，不再向模型发请求。下一条用户消息会新建
             // 回合预算，并通过 resume 断点继续；历史成本只做审计，不会把会话永久锁死。
@@ -1322,20 +1336,35 @@ impl AgentLoop {
                 // 十几次人工“继续”。连续无进展或达到自动续跑上限才交回用户。
                 let progress_now = execution_progress_units(&execution);
                 let progress_since_window = progress_now.saturating_sub(hard_baseline);
+                let recoverable_write_failure = has_recoverable_write_failure_since(
+                    &execution,
+                    hard_write_attempt_baseline,
+                );
+                let can_recover_write_failure = recoverable_write_failure
+                    && recoverable_write_autorenews < MAX_RECOVERABLE_WRITE_AUTORENEWS;
                 // 根因修复：即使本窗口有“可验证进展”，只要已无任何仍可自主推进的
                 // 交付面（全部 Verified / Failed / NeedsUserInput，即已有结论），
                 // 就不再自动续跑，避免“已经得出答案却仍被反复驱动继续”。
                 if !cancelled
                     && budget.hard_autorenews < MAX_HARD_AUTORENEWS
-                    && progress_since_window > 0
+                    && (progress_since_window > 0 || can_recover_write_failure)
                     && !goal_execution.active_surfaces().is_empty()
                 {
                     BudgetManager::arm_hard_continuation(&mut budget);
                     budget.hard_autorenews += 1;
+                    if can_recover_write_failure {
+                        recoverable_write_autorenews += 1;
+                    }
                     hard_baseline = progress_now;
+                    hard_write_attempt_baseline = execution.write_attempts;
+                    let continuation_reason = if can_recover_write_failure {
+                        "最近一次编辑未落盘，但工具已经返回精确的磁盘候选；下一步只能依据该候选完成一次最小定向重试，然后验证，禁止重新规划、泛搜或重复原参数"
+                    } else {
+                        "本窗口产生了可验证进展；围绕未满足的验收条件继续推进"
+                    };
                     messages.push(Message::user(&format!(
-                        "[自动续跑·第{}次] 本窗口新增 {} 项可验证进展；下一步仍可直接执行，已自动发放新窗口，无需人工“继续”。围绕未满足的验收条件继续推进。",
-                        budget.hard_autorenews, progress_since_window
+                        "[自动续跑·第{}次] {}。已自动发放新窗口，无需人工“继续”。",
+                        budget.hard_autorenews, continuation_reason
                     )));
                     continue;
                 }
@@ -1560,6 +1589,10 @@ impl AgentLoop {
                 let mut pending: Vec<(&ToolCall, String, ActionProposal, Option<ActionContract>)> =
                     Vec::new();
                 let mut pending_signatures = HashSet::new();
+                // 同一回复内的写调用虽然可并发派发，但同一文件不存在安全并发：第二个
+                // 调用基于第一个调用前的旧文本，必然造成 old_text 失配或覆盖。读/搜仍
+                // 可并发；写目标必须串行，拿到第一条结果后再决定下一步。
+                let mut pending_write_targets = HashSet::new();
                 // 原子任务的第一阶段只能有一个定位动作。否则模型即使知道“后续要
                 // 缩小范围”，也可能在同一响应里并发发出 N 个不同关键词的泛搜。
                 // 例外：零先验（内容扫描与路径降级都没命中）时放宽到多假设并行，
@@ -1689,6 +1722,27 @@ impl AgentLoop {
                         messages.push(Message::tool(tc.id.clone(), blocked.content));
                         step_had_tools = true;
                         continue;
+                    }
+
+                    if let Some(target) = write_target(tc) {
+                        let normalized_target = target.replace('\\', "/");
+                        if !pending_write_targets.insert(normalized_target.clone()) {
+                            let blocked = ToolResult {
+                                call_id: tc.id.clone(),
+                                ok: false,
+                                content: format!(
+                                    "[write-conflict] 本步骤已排队写入 {normalized_target}；同一文件的编辑必须等待第一个结果，随后基于磁盘当前内容再做下一次最小编辑。"
+                                ),
+                                continuation_debt: 0,
+                            };
+                            log.append(SessionEvent::ToolResult {
+                                id: log.gen_id(),
+                                result: blocked.clone(),
+                            });
+                            messages.push(Message::tool(tc.id.clone(), blocked.content));
+                            step_had_tools = true;
+                            continue;
+                        }
                     }
 
                     // 通用行动门禁：每个工具动作必须关联验收目标。调用/时间预算是软检查点，
@@ -1974,7 +2028,9 @@ impl AgentLoop {
                                 if matches!(
                                     evidence_kind,
                                     EvidenceKind::ChangeApplied | EvidenceKind::AlreadySatisfied
-                                ) {
+                                ) && execution.solve_mode
+                                    != crate::execution::SolveMode::AtomicDelivery
+                                {
                                     if let Some(root) = &workspace_root {
                                         for (id, proof) in
                                             goal_execution.settle_static_convergence(root)
@@ -3435,7 +3491,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 1. 先想清楚再动手：不明确时主动询问，不猜测。存在歧义时，列出多种可能。发现更简单方案时，主动提出建议。遇到逻辑矛盾或信息缺失时，及时停止。\n\
 2. 能简单就别复杂：用最简方式完成任务，不刻意增加复杂度。不为“后续可能使用”叠加多余功能。内容啰嗦冗余时，及时精简优化。\n\
 3. 只改该改的内容：仅处理与当前任务直接相关的部分。不擅自改动周边无关内容、原有格式与备注。发现其他问题可文字提醒，不要直接修改。\n\
-4. 定好目标再执行：提前明确任务完成标准，界定“做完”的范围。将“修复Bug”转化为编写用例复现问题，再调试至通过。将“新增功能”转化为编写测试用例并保证通过。多步骤复杂任务，先输出执行计划并标注验证方式。\n\
+4. 定好目标再执行：提前明确任务完成标准，界定“做完”的范围。明确的小修复先走最短闭环（定位 → 最小修改 → 现有针对性验证或轻量检查）；只有新增测试能直接覆盖回归且成本相称时才新增测试，不能为了“先写用例”偏离用户指定的改动。多步骤复杂任务，先输出执行计划并标注验证方式。\n\
 \n\
 ## 语言与格式\n\
 - 始终用与用户最新消息相同的语言回复（中文提问用中文答）。\n\
@@ -3446,6 +3502,7 @@ const SYSTEM_PROMPT: &str = "You are a reliable desktop assistant and coding age
 - 定位代码/文本位置一律优先用 search（一次调用返回文件:行号:内容）；严禁用 shell findstr/dir/grep 全仓扫描或编写临时扫描脚本来找代码。\n\
 - 严禁在正文里输出任何形式的工具调用标记（DSML、XML invoke、tool_calls 文本等）；调用工具必须走 function calling 通道。\n\
 - 修改已有文件时优先使用 edit 做最小精确替换，禁止用 fs write 重发整个大型文件；确需创建大型新文件时先写最小骨架，再用 edit 分段扩展，确保单次工具参数完整。\n\
+- edit 返回 old_text 不匹配、文件已变化或磁盘候选时，这表示参数与当前文件不一致，不是沙箱失败：直接使用返回的候选做一次最小定向重试；不要重新规划、泛搜、先改测试或原样重试旧参数。\n\
 - 问候、提问、普通对话直接回答，不使用工具。\n\
 - 不得虚构沙箱、权限、网络或工具失败原因；只有对应 ToolResult 明确返回时才能引用。constraint denied、old_text 失配和 sandbox denied 是不同故障，必须按原始标签准确陈述。\n\
 - 变更任务只有成功执行写工具并获得验证后才能说“已落实/已修改/已写入”；只给方案、代码块或修改建议不等于落盘。\n\
@@ -3481,6 +3538,35 @@ fn execution_progress_units(execution: &ExecutionState) -> usize {
     execution
         .write_operations
         .saturating_add(execution.satisfied_criteria.len())
+}
+
+/// `edit` 的精确替换失败时，工具会把当前磁盘候选回传。该信号只用于有限的
+/// 恢复窗口，绝不计入交付进展；这样既让模型有机会修正参数，也不会靠故意失败
+/// 无限延展预算。
+fn has_recoverable_write_failure_since(
+    execution: &ExecutionState,
+    write_attempt_baseline: usize,
+) -> bool {
+    if execution.write_attempts <= write_attempt_baseline {
+        return false;
+    }
+    execution.evidence.values().any(|evidence| {
+        let is_write = evidence.tool_signature.starts_with("edit:")
+            || evidence.tool_signature.contains("\"op\":\"write\"");
+        if !is_write {
+            return false;
+        }
+        let summary = evidence.summary.to_ascii_lowercase();
+        [
+            "old_text must match exactly once",
+            "old text must match exactly once",
+            "file has changed",
+            "磁盘当前候选",
+            "disk candidate",
+        ]
+        .iter()
+        .any(|marker| summary.contains(marker))
+    })
 }
 
 /// 纯文本活性守卫使用的受控状态键。它只包含 Runtime 可验证的进展，不包含模型
@@ -3585,6 +3671,32 @@ mod tests {
         assert!(parse_goal_executor_mode(Some("v4")));
         assert!(!parse_goal_executor_mode(Some("legacy")));
         assert!(!parse_goal_executor_mode(Some("off")));
+    }
+
+    #[test]
+    fn exact_edit_mismatch_is_a_bounded_recovery_signal_not_delivery_progress() {
+        let (mut execution, _) = test_execution_and_goal(
+            "把设置按钮移到工具栏右侧",
+            crate::execution::StrategyKind::Transformative,
+        );
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"gui.rs\",\"old_text\":\"before\",\"new_text\":\"after\"}".into(),
+            question: "移动设置按钮".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        execution.record_tool_result(
+            &edit,
+            false,
+            "old_text must match exactly once; file has changed; 磁盘当前候选区域：...",
+        );
+
+        assert_eq!(execution_progress_units(&execution), 0);
+        assert!(has_recoverable_write_failure_since(&execution, 0));
+        assert!(!has_recoverable_write_failure_since(
+            &execution,
+            execution.write_attempts
+        ));
     }
     /// B2 §4.5：provider 错误以 `[error] {…}` 的 assistant 纯文本落日志（UI 可见性依赖它），
     /// 但它是诊断文本不是模型历史。出站唯一关口 `prepare_request_messages` 必须剥离它，

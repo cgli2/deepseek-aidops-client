@@ -9,9 +9,9 @@ use crate::intent::{IntentKind, IntentProfile};
 use harness_llm::ToolCall;
 use harness_session::{DeliveryCriterion, DeliveryOutcome, DeliveryReport};
 
-/// 判断 edit 是否真正改变了非注释产物。它不是完整语法分析器，只负责挡住最危险的
-/// 假绿：在任意源码文件里加一行注释来满足“发生过写入”的计数。无法解析或整文件
-/// 写入时保守视为实质变更，避免误伤未知工具 schema。
+/// 判断 edit 是否真正改变了可执行的非注释产物。它不是完整语法分析器，只负责挡住
+/// 两类最危险的假绿：在源码里加注释，或用 `if false` 新包一层死代码来伪造修改。
+/// 无法解析或整文件写入时保守视为实质变更，避免误伤未知工具 schema。
 pub(crate) fn edit_has_substantive_delta(signature: &str) -> bool {
     let Some(raw) = signature.strip_prefix("edit:") else {
         return true;
@@ -42,6 +42,21 @@ pub(crate) fn edit_has_substantive_delta(signature: &str) -> bool {
             .join("\n")
     }
     without_comment_only_lines(old_text) != without_comment_only_lines(new_text)
+        && !edit_introduces_obvious_dead_code(old_text, new_text)
+}
+
+/// 明确的常量假条件不会改变用户可观察行为。它们常被模型用来“移除”旧 UI 分支，
+/// 却把分支留在源码中；这种编辑必须回到 Change 阶段，而非记为成功交付。
+pub(crate) fn edit_introduces_obvious_dead_code(old_text: &str, new_text: &str) -> bool {
+    fn has_dead_guard(text: &str) -> bool {
+        text.lines().map(str::trim).any(|line| {
+            matches!(
+                line,
+                "if false {" | "if false{" | "if cfg!(false) {" | "if cfg!(false){"
+            )
+        })
+    }
+    has_dead_guard(new_text) && !has_dead_guard(old_text)
 }
 
 fn objective_allows_comment_only_change(objective: &str) -> bool {
@@ -211,9 +226,12 @@ impl SolvePlan {
                 // 写入，后续验证仍可正常继续；没有写入的泛搜则不能靠续期维持空转。
                 initial_steps: 6,
                 initial_tool_calls: 8,
-                hard_max_steps: 8,
-                hard_max_tool_calls: 10,
-                instructions: "[原子交付模式] 这是一个单点回归，不要创建计划、委派子代理或解释长篇思路。严格按：1) 用一个与用户描述直接对应的高信号符号/路径定位；2) 仅读取命中处及紧邻调用链；3) 做最小修复；4) 运行一次相关验证并交付。首次 search 命中后，不得再做无目录限定的搜索；成功调用不得重试，写入后才可重跑相同验证。每一步只执行当前阶段唯一必要的动作。".into(),
+                // 8 步不足以容纳真实工具闭环：一次定位、读取、参数精确替换失败后的
+                // 定向重试、再验证，就可能已经用完。这里仍是严格的小任务上限，只是
+                // 给一次受工具错误驱动的修复留下空间，不把它误判为需要用户“继续”。
+                hard_max_steps: 16,
+                hard_max_tool_calls: 20,
+                instructions: "[原子交付模式] 这是一个单点回归，不要创建计划、委派子代理或解释长篇思路。严格按：1) 用一个与用户描述直接对应的高信号符号/路径定位；2) 仅读取命中处及紧邻调用链；3) 做最小修复；4) 运行一次相关验证并交付。首次 search 命中后，不得再做无目录限定的搜索；成功调用不得重试。若 edit 返回 old_text 不匹配或磁盘候选，必须以该候选为准做一次最小定向重试，不能重建计划、泛搜或先改测试。每一步只执行当前阶段唯一必要的动作。".into(),
             };
         }
         let mentions_surface = ["界面", "面板", "UI", "显示", "结果"]
@@ -1876,6 +1894,8 @@ mod tests {
         assert_eq!(plan.mode, SolveMode::AtomicDelivery);
         assert_eq!(plan.initial_steps, 6);
         assert_eq!(plan.initial_tool_calls, 8);
+        assert_eq!(plan.hard_max_steps, 16);
+        assert_eq!(plan.hard_max_tool_calls, 20);
         assert!(plan.instructions.contains("不要创建计划"));
     }
 
@@ -2422,6 +2442,23 @@ mod tests {
         assert_eq!(state.write_operations, 0);
         assert!(state.verification_evidence.is_empty());
         assert!(!state.can_complete());
+    }
+
+    #[test]
+    fn dead_code_wrapper_is_not_a_substantive_edit() {
+        let signature = concat!(
+            "edit:{\"path\":\"settings_view.rs\",",
+            "\"old_text\":\"if accent_button(ui) {\\n    save();\\n}\",",
+            "\"new_text\":\"if false {\\n    if accent_button(ui) {\\n        save();\\n    }\\n}\"}"
+        );
+        assert!(edit_introduces_obvious_dead_code(
+            "if accent_button(ui) {\n    save();\n}",
+            "if false {\n    if accent_button(ui) {\n        save();\n    }\n}"
+        ));
+        assert!(
+            !edit_has_substantive_delta(signature),
+            "不可达包装不能记为实际交付"
+        );
     }
 
     #[test]

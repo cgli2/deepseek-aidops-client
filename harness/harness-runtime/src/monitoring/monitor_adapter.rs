@@ -26,7 +26,6 @@ pub struct MonitorTurn {
     turn: String,
     session: String,
     guard: HotGuard,
-    governor: Governor,
     protect: bool,
     evidence: usize,
     sidecar: bool,
@@ -42,7 +41,6 @@ impl MonitorTurn {
         let mut state = Self { tap: None, registration: None, writer: None, spool: None,
             turn: uuid::Uuid::new_v4().to_string(), session: log.id().to_string(),
             guard: HotGuard::new(config.repeat_stop.clamp(2, 64) - 1),
-            governor: governor_for(&mode, harness_core::tuning::self_monitor_evolution().unwrap_or(false)),
             protect: enabled && mode == "protect", evidence: 0, sidecar: config.sidecar };
         if !enabled || mode == "off" { return state; }
         let Some(workspace) = ctx.try_get::<Workspace>() else { return state; };

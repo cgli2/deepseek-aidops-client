@@ -19,7 +19,9 @@ pub fn safe_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
             return Err(invalid());
         }
     }
-    // Reject symlinks/reparse points, including existing ancestors of the root.
+    // Reject symlinks/reparse points inside the sandbox. Stop at `root`: a symlinked
+    // ancestor above it (e.g. macOS `/var` → `private/var`, where `temp_dir()` lives)
+    // belongs to the host environment and is not an escape of the boundary we own.
     let target = root.join(rel);
     for ancestor in target.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -36,6 +38,7 @@ pub fn safe_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        if ancestor == root { break; }
     }
     Ok(target)
 }

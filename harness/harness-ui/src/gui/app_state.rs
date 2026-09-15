@@ -656,6 +656,9 @@ impl AppState {
             }
         }
         self.last_event = next;
+        if !trace_worthy(details.len(), prompt_tokens, completion_tokens) {
+            return;
+        }
         let mut line = format!("[log] +{} events", events.len());
         if assistant_chunks > 0 {
             line.push_str(&format!(
@@ -1382,6 +1385,37 @@ fn brief(s: &str, n: usize) -> String {
     } else {
         let head: String = flat.chars().take(n).collect();
         format!("{head}…")
+    }
+}
+
+/// 判断一批日志事件是否值得写 trace：仅当含结构性事件（`details` 非空）或产生了
+/// token 用量时才落盘。纯思考 / 回复的流式增量会被丢弃，这正是旧日志里那批
+/// 「+N events | thinking(Xch)」无意义计数行的来源。
+fn trace_worthy(details_len: usize, prompt_tokens: u64, completion_tokens: u64) -> bool {
+    details_len > 0 || prompt_tokens > 0 || completion_tokens > 0
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::trace_worthy;
+
+    #[test]
+    fn pure_streaming_increments_are_not_traced() {
+        // 只有 thinking / assistant 流式增量：不写 trace，避免刷屏。
+        assert!(!trace_worthy(0, 0, 0));
+    }
+
+    #[test]
+    fn structural_events_are_traced() {
+        assert!(trace_worthy(1, 0, 0));
+        assert!(trace_worthy(12, 0, 0));
+    }
+
+    #[test]
+    fn token_usage_alone_is_traced() {
+        assert!(trace_worthy(0, 128, 0));
+        assert!(trace_worthy(0, 0, 64));
+        assert!(trace_worthy(0, 128, 64));
     }
 }
 

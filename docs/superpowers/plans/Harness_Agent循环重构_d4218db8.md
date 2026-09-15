@@ -77,3 +77,9 @@
 - DSML 标记以截图实际格式 `<｜DSML｜…>` 为准，兼容 `<|DSML|` ASCII 变体。
 - 不引入新外部 crate（除 tokio time feature，workspace 已有 tokio）。
 - `PreStep`/waterfall、沙箱、hook 管线保持不变；改动均落在 Consumer 可见行为与 Provider 流层，符合「换 Provider 不改 Consumer」不变量。
+
+## 交付状态（补记）
+
+- 实现随计划一并入库推送：`17465e2 fix(runtime): 统一任务策略到求解图，纯核验任务凭命令结果收口`（3 files，+199/-61）。
+- 本文档自身入库提交：`4559172 docs(runtime): 归档 Harness Agent 循环重构计划文档`。
+- 推送核对：远端 `refs/heads/main` 与本地 HEAD 一致（`git ls-remote` 实测同一哈希，`origin/main...HEAD` 双向计数 0 0）。

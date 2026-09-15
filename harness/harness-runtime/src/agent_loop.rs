@@ -2813,7 +2813,23 @@ fn insert_assistant_at_step_boundary(
 /// 任何上游缺陷（取消留下的残缺宣告、门禁跳过执行、日志回放）都只能在这里收敛为
 /// 合法请求，而不是变成之后每一步都复用的 400。
 fn prepare_request_messages(messages: Vec<Message>) -> Vec<Message> {
-    enforce_tool_call_protocol(apply_context_budget(messages))
+    enforce_tool_call_protocol(apply_context_budget(strip_error_text(messages)))
+}
+
+/// provider 错误与「上游未返回可执行 tool_call」的合成文本以 Assistant 事件落日志，
+/// 供 UI 展示（缺失会让轮询死循环）。但它是**诊断文本不是模型历史**：回喂会诱导模型
+/// 复述错误，连续失败时上下文既非法又自增殖（spec §4.5 R6）。出站唯一关口剥离它，
+/// 日志事件本身保留不动。只剥离以 `[error]` 开头的**纯文本** assistant 消息；
+/// `[需要澄清]` 与回放耗尽回退文本语义不同，不受影响。
+fn strip_error_text(messages: Vec<Message>) -> Vec<Message> {
+    messages
+        .into_iter()
+        .filter(|m| {
+            !(m.role == Role::Assistant
+                && m.tool_calls.is_empty()
+                && m.content.trim_start().starts_with("[error]"))
+        })
+        .collect()
 }
 
 /// assistant 宣告的每个 tool_call 必须由紧随其后的 tool 消息逐一应答，且同一
@@ -3441,6 +3457,38 @@ mod tests {
         assert!(!parse_goal_executor_mode(Some("legacy")));
         assert!(!parse_goal_executor_mode(Some("off")));
     }
+    /// B2 §4.5：provider 错误以 `[error] {…}` 的 assistant 纯文本落日志（UI 可见性依赖它），
+    /// 但它是诊断文本不是模型历史。出站唯一关口 `prepare_request_messages` 必须剥离它，
+    /// 否则连续失败时上下文既非法又自增殖；语义不同的 `[需要澄清]` 与普通结论不受影响。
+    #[test]
+    fn error_text_is_stripped_from_outbound_requests() {
+        let out = prepare_request_messages(vec![
+            Message::user("继续"),
+            Message::assistant("[error] provider 500: upstream closed"),
+            Message::assistant("[需要澄清] 请确认目标文件"),
+            Message::assistant("结论：定位到 server/routers/strategy.py"),
+        ]);
+        assert!(
+            !out.iter().any(|m| m.role == Role::Assistant
+                && m.content.trim_start().starts_with("[error]")),
+            "出站请求不得回喂 [error] 诊断文本"
+        );
+        assert!(
+            out.iter().any(|m| m.content.starts_with("[需要澄清]")),
+            "[需要澄清] 语义不同，必须保留"
+        );
+        assert!(out.iter().any(|m| m.content.starts_with("结论")));
+
+        // 直接锁死剥离语义：仅命中「以 `[error]` 开头的纯文本 assistant」。
+        let kept = strip_error_text(vec![
+            Message::assistant("[error] x"),
+            Message::assistant("normal"),
+            Message::user("[error] 用户输入不应被剥离"),
+        ]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|m| m.content != "[error] x"));
+    }
+
     use harness_capability::assets::Skill;
     use harness_llm::ToolCall;
 

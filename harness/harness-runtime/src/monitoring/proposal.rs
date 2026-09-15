@@ -100,7 +100,7 @@ impl ImprovementProposal {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::monitoring::incident::IncidentState;
     #[test]
     fn test_proposal_generation_and_validation() {
         let incident = Incident {

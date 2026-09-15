@@ -160,6 +160,7 @@ impl DeterministicRunner {
 mod tests {
     use super::*;
     use crate::monitoring::event::{EventClass, EventKind};
+    use crate::monitoring::incident::IncidentState;
 
     #[test]
     fn test_replay_spec_from_incident_and_deterministic_run() {

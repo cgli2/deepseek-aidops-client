@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod builtin_profile;
 pub mod case_file;
 pub mod concept_registry;
+pub mod concurrent_scheduler;
 pub mod controller;
 pub mod council;
 mod delivery_workflow;
@@ -28,6 +29,11 @@ pub mod workspace_index;
 
 pub use agent_loop::{AgentLoop, DeterministicCompaction, GovernorMode, parse_governor_mode};
 pub use case_file::{CaseFile, TriedEntry, extract_anchors, normalize_question};
+pub use concurrent_scheduler::{
+    ConcurrentSurfaceScheduler, ENV_SURFACE_CONCURRENCY, ResidentSurfaceOutcome,
+    SurfaceConcurrencyMode, SurfaceSharedState, parse_surface_concurrency_mode,
+    surface_concurrency_mode,
+};
 pub use controller::SessionController;
 pub use events::{PreStep, TurnStopping};
 pub use execution::{

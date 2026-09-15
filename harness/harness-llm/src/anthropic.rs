@@ -122,6 +122,10 @@ impl LlmProvider for Anthropic {
                         return;
                     }
                 };
+                // 心跳帧：不含模型内容，跳过业务解析。
+                let Some(data) = data else {
+                    continue;
+                };
                 let v: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,

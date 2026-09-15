@@ -223,6 +223,11 @@ fn inner_stream_chat(
                 }
             };
             received_frame = true;
+            // 心跳帧：只证明连接仍存活（上面的 received_frame 已重置空闲看门狗），
+            // 不含模型内容，跳过业务解析。
+            let Some(data) = data else {
+                continue;
+            };
             if data == "[DONE]" {
                 break;
             }

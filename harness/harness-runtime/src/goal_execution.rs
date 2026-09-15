@@ -1580,6 +1580,15 @@ impl GoalExecution {
         self.active_item().is_some() && !self.allowed_tools().is_empty()
     }
 
+    /// 续跑需要保留已定位的目标和状态，却不应继承上一窗口已经耗尽的动作次数。
+    /// 否则“继续修复”在第一步就只收到过期预算告警，等同于再次卡死。
+    pub fn reset_phase_attempts_for_resume(&mut self) {
+        for item in self.items.values_mut() {
+            item.phase_attempts = PhaseAttempts::default();
+            item.no_information_streak = 0;
+        }
+    }
+
     /// 受控任务的唯一完成判定。旧 ExecutionState 只保留统计与 legacy 路径，
     /// 不再与 SolveGraph 竞争控制阶段或终态。
     pub fn evaluate_completion(&self, step_had_tools: bool) -> GoalCompletion {
@@ -1695,13 +1704,10 @@ impl GoalExecution {
                 self.next_action_hint()
             )));
         }
-        // Once two concrete reads have confirmed editable source files, another
-        // search cannot be the shortest path to delivery.  In replayed failures
-        // the model kept searching for display text after it had already read
-        // the view, component, and route, spending dozens of turns without ever
-        // attempting an edit.  This is a mechanical no-progress loop, not a
-        // judgment about the product: exact fs.read calls remain available for
-        // a known dependency, as do edits and runtime probes.
+        // 已有两个具体读取与可编辑目标后，搜索通常不是最短路径。但这不是外部
+        // 安全约束：调用链可能仍缺一个接口/事件边界。过去把它设为 `Deny`，会吞掉
+        // 合理的定向搜索，并让模型在拒绝与重复读取间烧光回合。保留收敛提醒，但
+        // 让调用实际执行、由结果决定是否应继续修改。
         if call.name == "search"
             && self.active_item().is_some_and(|item| {
                 item.state == WorkItemState::ReadyToChange
@@ -1709,8 +1715,8 @@ impl GoalExecution {
                     && !self.confirmed_target_files.is_empty()
             })
         {
-            return Err(GateDecision::Deny(format!(
-                "已读取 {} 个实现片段并确认编辑目标 [{}]；停止额外 search。下一步只能编辑已确认文件、fs.read 一个明确依赖，或运行接口/测试验证。",
+            return Err(GateDecision::Advise(format!(
+                "已读取 {} 个实现片段并确认编辑目标 [{}]；此 search 只有能补齐明确调用链时才有价值。优先编辑已确认文件、fs.read 一个明确依赖，或运行接口/测试验证。",
                 self.active_item().map(|item| item.read_evidence).unwrap_or_default(),
                 self.confirmed_target_files.join("、"),
             )));
@@ -4799,7 +4805,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_edit_target_stops_search_only_loops_but_keeps_precise_reads_available() {
+    fn confirmed_edit_target_advises_against_search_but_does_not_swallow_it() {
         use crate::execution::GateDecision;
 
         let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复市场列表名称展示"));
@@ -4823,7 +4829,7 @@ mod tests {
         };
         assert!(matches!(
             plan.allows_tool_call(&search, &proposal),
-            Err(GateDecision::Deny(reason)) if reason.contains("停止额外 search")
+            Err(GateDecision::Advise(reason)) if reason.contains("此 search")
         ));
 
         let direct_dependency = ToolCall {

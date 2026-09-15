@@ -133,6 +133,9 @@ const MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN: u8 = 10;
 struct ResumeState {
     objective: String,
     report: DeliveryReport,
+    /// 根任务在会话事件流中的起点。续跑时只回放这一任务之后的无副作用定位证据，
+    /// 不能把更早、无关任务的搜索结果混进当前求解图。
+    history_start: usize,
 }
 
 /// 用户指出“刚才只给方案/没有真正修改”时，语义上仍是在推进上一条未完成任务，
@@ -148,6 +151,10 @@ fn is_execution_correction_request(text: &str) -> bool {
         "还是要实际改",
         "没有看到你有什么改动",
         "自己执行修改",
+        "既然发现问题",
+        "发现问题那就",
+        "进行修复优化",
+        "那就修复",
         "这个功能未实现",
         "右击文件没有",
         "右键没有",
@@ -411,6 +418,7 @@ fn latest_resumable_task(events: &[SessionEvent]) -> Option<ResumeState> {
             return Some(ResumeState {
                 objective,
                 report: latest_report.unwrap_or(report),
+                history_start: turn_index,
             });
         }
         latest_report.get_or_insert(report);
@@ -498,6 +506,60 @@ fn resume_instruction(resume: &ResumeState) -> String {
         },
         resume.report.reason.as_deref().unwrap_or("未提供")
     )
+}
+
+/// 续跑不是重新开一轮搜索。`DeliveryReport` 只保存验收结论，不能承载“已经读过
+/// 哪些文件”的技术前沿；如果只恢复它，模型会再次搜索、列目录、读同一段文件，直到
+/// 新窗口再次耗尽。这里仅回放根任务以来真实成功的 `search` 与 `fs.read` 结果：
+/// 它们不会改变工作区，也不会把未经验证的旧写入伪装成新交付。
+///
+/// 回放完成后重置相位计数。新用户回合应有新的动作窗口，但必须从已确认目标和
+/// `ReadyToChange` 状态继续，而不是从空白的 `Pending` 重新开始。
+fn restore_resume_frontier(
+    events: &[SessionEvent],
+    history_start: usize,
+    execution: &ExecutionState,
+    goal_execution: &mut GoalExecution,
+) -> usize {
+    let mut calls = HashMap::<String, ToolCall>::new();
+    let mut restored = 0usize;
+
+    for event in events.iter().skip(history_start) {
+        match event {
+            SessionEvent::ToolCall { call, .. } => {
+                calls.insert(call.id.clone(), call.clone());
+            }
+            SessionEvent::ToolResult { result, .. } if result.ok => {
+                let Some(call) = calls.get(&result.call_id) else {
+                    continue;
+                };
+                let is_read = call.name == "fs"
+                    && call.args.get("op").and_then(|value| value.as_str()) == Some("read");
+                if call.name != "search" && !is_read {
+                    continue;
+                }
+                let mut proposal = ActionProposal::from_tool_call(call, execution);
+                goal_execution.link_proposal(&mut proposal);
+                let Some(action) = goal_execution.action_spec(call, &proposal) else {
+                    continue;
+                };
+                goal_execution.record_action_result_observed(
+                    &action,
+                    &proposal,
+                    true,
+                    &result.content,
+                    None,
+                    false,
+                );
+                restored = restored.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    if restored > 0 {
+        goal_execution.reset_phase_attempts_for_resume();
+    }
+    restored
 }
 
 /// 单次模型响应内的受控定位门禁。它补足跨步骤状态机的时间差：首个 search 的
@@ -877,6 +939,17 @@ impl AgentLoop {
         if let Some(grounding) = &workspace_grounding {
             goal_execution.apply_grounding(grounding);
         }
+        let resumed_frontier = resume
+            .as_ref()
+            .map(|state| {
+                restore_resume_frontier(
+                    &history,
+                    state.history_start,
+                    &execution,
+                    &mut goal_execution,
+                )
+            })
+            .unwrap_or_default();
 
         // 方案B·Phase 2：已落地的任务，用运行期观察（静态核对已定位文件是否已含期望终态）
         // 取代关键词猜异常。若观察与目标不一致且可推断，提出单个带上下文的澄清问题，
@@ -1053,6 +1126,15 @@ impl AgentLoop {
             id: log.gen_id(),
             text: "正在理解你的问题…".into(),
         });
+        if resumed_frontier > 0 {
+            log.append(SessionEvent::Thinking {
+                id: log.gen_id(),
+                text: format!(
+                    "已恢复上一轮 {} 条成功定位/读取证据；从已确认目标继续，不重复探索。",
+                    resumed_frontier
+                ),
+            });
+        }
         append_telemetry(
             &log,
             &execution,
@@ -4498,11 +4580,61 @@ mod tests {
         ];
 
         assert!(is_resumable_follow_up("我提供不了，你自己执行修改。"));
+        assert!(is_resumable_follow_up("既然发现问题那就进行修复优化呀"));
         let resumed = latest_resumable_task(&events).expect("should recover original goal");
         assert_eq!(
             resumed.objective,
             "增加文件树右键菜单，把选定文件添加到对话框附件"
         );
+    }
+
+    #[test]
+    fn resume_frontier_restores_successful_targets_without_reusing_old_budget() {
+        let contract = TaskContract::from_input("修复工作台重复加载");
+        let execution = ExecutionState::new(
+            contract.clone(),
+            crate::execution::StrategyKind::Transformative,
+        );
+        let mut goal = GoalExecution::from_contract(&contract);
+        let search = ToolCall {
+            id: "search-dashboard".into(),
+            name: "search".into(),
+            args: serde_json::json!({"pattern":"DashboardView"}),
+        };
+        let read = ToolCall {
+            id: "read-dashboard".into(),
+            name: "fs".into(),
+            args: serde_json::json!({"op":"read","path":"webui/src/views/DashboardView.vue"}),
+        };
+        let events = vec![
+            SessionEvent::TurnStart { id: 1, input: "修复工作台重复加载".into() },
+            SessionEvent::ToolCall { id: 2, call: search },
+            SessionEvent::ToolResult {
+                id: 3,
+                result: ToolResult {
+                    call_id: "search-dashboard".into(), ok: true,
+                    content: "webui/src/views/DashboardView.vue:8: export default {}".into(),
+                    continuation_debt: 0,
+                },
+            },
+            SessionEvent::ToolCall { id: 4, call: read },
+            SessionEvent::ToolResult {
+                id: 5,
+                result: ToolResult {
+                    call_id: "read-dashboard".into(), ok: true,
+                    content: "const load = () => api.overview()".into(),
+                    continuation_debt: 0,
+                },
+            },
+        ];
+
+        assert_eq!(restore_resume_frontier(&events, 0, &execution, &mut goal), 2);
+        assert!(goal.confirmed_target_files.contains(&"webui/src/views/DashboardView.vue".into()));
+        assert_eq!(
+            goal.active_item().unwrap().state,
+            crate::goal_execution::WorkItemState::ReadyToChange
+        );
+        assert_eq!(goal.active_item().unwrap().phase_attempts.inspect, 0);
     }
 
     #[test]

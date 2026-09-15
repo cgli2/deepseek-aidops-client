@@ -84,8 +84,13 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                         {
                             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                 let s = path.display().to_string();
-                                let _ = state.host.settings.add_project(&path);
-                                state.switch_project(&s);
+                                // 与左侧「新建项目」菜单同一条确认流程：选中目录后登记为待创建并
+                                // 打开新建项目面板，由「确定」按钮完成创建/切换，避免误点目录被直接建档。
+                                super::settings_view::stage_pending_project_dir(ctx, &s);
+                                state.settings_page = "新建项目".into();
+                                state.settings_open = true;
+                                ctx.request_repaint();
+                                // 项目创建与切换统一由「确定」按钮完成。
                             }
                         }
                     });

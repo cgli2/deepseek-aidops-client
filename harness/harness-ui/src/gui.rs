@@ -51,7 +51,8 @@ use model::{
 };
 use theme::{Palette, palette};
 use widgets::{
-    SidebarActionIcon, accent_button, close_button, field_label, ghost_button, nav_item,
+    SidebarActionIcon, accent_button, accent_button_ex, close_button, field_label, ghost_button,
+    nav_item,
     plugin_row_ui, sidebar_control_height, sidebar_icon_button, sidebar_search_field,
     sidebar_text_button,
 };

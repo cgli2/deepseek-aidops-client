@@ -24,6 +24,14 @@ fn panel_size(page: &str, system_page: bool, screen: egui::Vec2) -> (f32, f32) {
             (screen.x - 320.0).clamp(460.0, 560.0),
             (screen.y - 40.0).clamp(140.0, 220.0),
         )
+    } else if page == "插件管理" {
+        // 插件管理用滚动区承载内容，弹窗无需占满屏幕高度；给定适中上限，
+        // 避免弹窗过高（原通用高度最高可达 914px，明显过大）。
+        // 高度在原基准上再上调 20px：滚动区下沿的「保存插件设置」按钮此前被遮挡。
+        (
+            (screen.x - 320.0).clamp(520.0, 660.0),
+            (screen.y - 200.0).clamp(380.0, 580.0),
+        )
     } else if system_page {
         (
             (screen.x - 180.0).clamp(700.0, 860.0),
@@ -35,6 +43,45 @@ fn panel_size(page: &str, system_page: bool, screen: egui::Vec2) -> (f32, f32) {
             (screen.y - 56.0).clamp(534.0, 914.0),
         )
     }
+}
+
+/// 新建项目页「已选目录」的帧内临时存储键：页面读写、面板高度自适应，
+/// 以及侧栏「添加新项目」入口共用同一 Id，保证两个入口走同一条确认流程。
+pub(super) const NEW_PROJECT_PENDING_ID: &str = "new_project_pending_dir";
+
+/// 面板固定占高：标题行 + 分隔线 + 间距 + 反馈区 + 内边距与项间距。
+const PANEL_FIXED_CHROME_H: f32 = 94.0;
+/// 新建项目页底部固定底栏高度：「确定」按钮 + 间距。
+const NEW_PROJECT_FOOTER_H: f32 = 45.0;
+/// 滚动区最小可用高度：屏幕极矮时兜底，保证仍留有可滚动内容区。
+const NEW_PROJECT_MIN_SCROLL_H: f32 = 40.0;
+
+/// 记录待创建的项目目录（由侧栏「添加新项目」选好目录后调用）：
+/// 只登记待确认目录，真正创建/切换项目由新建项目面板的「确定」按钮完成。
+pub(super) fn stage_pending_project_dir(ctx: &egui::Context, dir: &str) {
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new(NEW_PROJECT_PENDING_ID),
+            Some(dir.to_string()),
+        )
+    });
+}
+
+/// 读取新建项目页当前待创建的项目目录（None = 尚未选择目录）。
+fn new_project_pending_dir(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(NEW_PROJECT_PENDING_ID)))
+        .flatten()
+}
+
+/// 新建项目面板最终高度：未选目录时保持紧凑；选好目录后会多出
+/// 「待创建项目目录 + 确定」行；该行现已恒常渲染，紧凑高度会把「确定」挤出可视区（只剩滚动条），
+/// 故新建项目页始终传入需要增高（见 show()），并以屏幕可用高度为上限。
+fn new_project_panel_height(base: f32, screen: egui::Vec2, has_pending: bool) -> f32 {
+    if !has_pending {
+        return base;
+    }
+    let available = (screen.y - 40.0).max(base);
+    300.0_f32.min(available)
 }
 
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
@@ -68,8 +115,26 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
         };
         let screen = ctx.screen_rect();
         // 系统管理采用紧凑、稳定的双栏尺寸；新建项目等简易单页采用紧凑高度。
-        let (panel_w, panel_h) = panel_size(&page, system_page, screen.size());
-        let scroll_h = panel_h - 94.0;
+        let (panel_w, base_panel_h) = panel_size(&page, system_page, screen.size());
+        // 「确定」按钮在该页恒常渲染，紧凑高度会把
+        // 「确定」挤出可视区（只剩滚动条），故始终按含确认行的页高渲染。
+        let panel_h = if page == "新建项目" {
+            new_project_panel_height(
+                base_panel_h,
+                screen.size(),
+                // 含确认行的页高：该页恒常渲染「确定」，高度不再随是否已选目录变化。
+                true,
+            )
+        } else {
+            base_panel_h
+        };
+        // 新建项目页的「确定」移出滚动区、改由面板底部固定底栏渲染（见 show() 末尾），
+        // 滚动区需额外让出底栏高度，避免底栏把内容顶出面板底部。
+        let scroll_h = if page == "新建项目" {
+            (panel_h - PANEL_FIXED_CHROME_H - NEW_PROJECT_FOOTER_H).max(NEW_PROJECT_MIN_SCROLL_H)
+        } else {
+            panel_h - PANEL_FIXED_CHROME_H
+        };
         // 内容变化（插件行、提示文字、滚动条）不能影响面板位置；否则居中锚点会
         // 和自动尺寸互相反馈，在 Windows 上表现为持续抖动。
         let panel_pos = egui::pos2(
@@ -498,17 +563,19 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                 .color(pal.text),
                                         );
                                         ui.add_space(12.0);
-                                        let pending_id = egui::Id::new("new_project_pending_dir");
+                                        let pending_id = egui::Id::new(NEW_PROJECT_PENDING_ID);
                                         let mut pending: Option<String> =
-                                            ui.ctx().data_mut(|d| d.get_temp(pending_id));
+                                            ui.ctx().data_mut(|d| d.get_temp::<Option<String>>(pending_id)).flatten();
                                         if accent_button(ui, &pal, "选择项目目录") {
                                             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                                 let s = path.display().to_string();
                                                 pending = Some(s.clone());
                                                 ui.ctx().data_mut(|d| d.insert_temp(pending_id, pending.clone()));
+                                                // 立刻请求重绘：让本帧渲染出「确定」由置灰变为可点的状态。
+                                                ui.ctx().request_repaint();
                                             }
                                         }
-                                        if let Some(dir) = pending {
+                                        if let Some(dir) = pending.clone() {
                                             ui.add_space(8.0);
                                             ui.label(
                                                 egui::RichText::new(format!("待创建项目目录: {dir}"))
@@ -516,13 +583,6 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                     .color(pal.text),
                                             );
                                             ui.add_space(8.0);
-                                            if accent_button(ui, &pal, "确定") {
-                                                let path = std::path::PathBuf::from(dir.clone());
-                                                let _ = state.host.settings.add_project(&path);
-                                                state.switch_project(&dir);
-                                                state.settings_open = false;
-                                                ui.ctx().data_mut(|d| d.insert_temp::<Option<String>>(pending_id, None));
-                                            }
                                         }
                                         ui.add_space(8.0);
                                         ui.label(
@@ -1437,6 +1497,33 @@ if state.mem_tab == "code" {
                                 });
                             });
                             // 记录面板矩形：供下一帧“点外部关闭”守卫判定。
+                            // ── 新建项目页固定底栏：「确定」锚定面板右下角 ──
+                            // 滚动区已让出 NEW_PROJECT_FOOTER_H；底栏不参与滚动，
+                            // 目录名再长也不会把确认按钮顶出可视区。恒常渲染（未选目录置灰）。
+                            if page == "新建项目" {
+                                let pending = new_project_pending_dir(ctx);
+                                ui.add_space(5.0);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if accent_button_ex(ui, &pal, "确定", pending.is_some()) {
+                                            if let Some(dir) = pending {
+                                                let path = std::path::PathBuf::from(dir.clone());
+                                                let _ = state.host.settings.add_project(&path);
+                                                state.switch_project(&dir);
+                                                state.settings_open = false;
+                                                ctx.data_mut(|d| {
+                                                    d.insert_temp::<Option<String>>(
+                                                        egui::Id::new(NEW_PROJECT_PENDING_ID),
+                                                        None,
+                                                    )
+                                                });
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                            // 记录面板矩形：供下一帧“点外部关闭”守卫判定。
                             state.modal_panel_rect = Some(ui.min_rect());
                         });
                 });
@@ -1448,7 +1535,47 @@ if state.mem_tab == "code" {
 
 #[cfg(test)]
 mod tests {
-    use super::panel_size;
+    use super::{new_project_panel_height, panel_size};
+
+    #[test]
+    fn pending_project_dir_survives_until_the_next_frame() {
+        // 侧栏「添加新项目」/本页「选择项目目录」都只登记“待创建目录”，面板要到**下一帧**
+        // 重绘时才按已选目录渲染出「确定」按钮。若登记值只活一帧，确定按钮就永远不出现。
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        ctx.run(input(), |_| {
+            super::stage_pending_project_dir(&ctx, "C:\\demo-project");
+        });
+        // 下一帧：面板重绘时必须仍能读到待创建目录，否则「确定」不会出现。
+        ctx.run(input(), |_| {});
+        assert_eq!(
+            super::new_project_pending_dir(&ctx).as_deref(),
+            Some("C:\\demo-project")
+        );
+    }
+
+    #[test]
+    fn new_project_dialog_grows_so_confirm_button_stays_visible() {
+        let screen = egui::vec2(1_440.0, 900.0);
+        let (_, base) = panel_size("新建项目", false, screen);
+        // 未选目录：保持原紧凑高度，面板不无故变高。
+        // 未选目录时不再回落到紧凑高度：该页恒常渲染「确定」，调用方始终传入需要增高。
+        // 选好目录：增高到可完整容纳「待创建项目目录 + 确定」，确定按钮无需滚动即见。
+        assert_eq!(new_project_panel_height(base, screen, true), 300.0);
+        // 「确定」必须无需滚动即可见：面板高 300 - 94（标题/提示/反馈区固定占高）≥ 页内容高。
+        assert!(new_project_panel_height(base, screen, true) - 94.0 >= 156.0);
+
+        // 屏幕过矮时以可用高度为上限，避免面板溢出屏幕。
+        let short = egui::vec2(800.0, 170.0);
+        let (_, base_short) = panel_size("新建项目", false, short);
+        assert_eq!(new_project_panel_height(base_short, short, true), base_short);
+    }
 
     #[test]
     fn new_project_dialog_uses_a_compact_bounded_height() {
@@ -1462,5 +1589,19 @@ mod tests {
 
         let (_, short_screen_h) = panel_size("新建项目", false, egui::vec2(800.0, 170.0));
         assert_eq!(short_screen_h, 140.0);
+    }
+
+    #[test]
+    fn plugin_panel_height_is_reduced_and_bounded() {
+        let screen = egui::vec2(1_440.0, 900.0);
+        let (w, h) = panel_size("插件管理", false, screen);
+        // 宽度沿用通用单页。
+        assert_eq!(w, 660.0);
+        // 高度封顶 580（原 560 +20px），远小于通用页面（原最高 914），避免弹窗过高。
+        assert_eq!(h, 580.0);
+
+        // 屏幕越矮，弹窗越矮，但保留最小可用高度。
+        assert_eq!(panel_size("插件管理", false, egui::vec2(1_440.0, 600.0)).1, 400.0);
+        assert_eq!(panel_size("插件管理", false, egui::vec2(1_440.0, 300.0)).1, 380.0);
     }
 }

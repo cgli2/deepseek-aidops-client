@@ -73,6 +73,18 @@ pub(super) fn close_button(ui: &mut egui::Ui, pal: &Palette) -> bool {
 
 /// 主操作按钮（柔和青底、内容自适应宽度，不再占满整行）。
 pub(super) fn accent_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
+    accent_button_ex(ui, pal, label, true)
+}
+
+/// 主操作按钮（可禁用）：禁用时尺寸与位置完全不变，只换成低对比配色。
+/// 用于「条件未满足但也必须让用户看见按钮」的场景（如新建项目的「确定」）：
+/// 按钮提前消失会让用户以为弹窗没有确认入口。
+pub(super) fn accent_button_ex(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    enabled: bool,
+) -> bool {
     // 宽度按文字估算：CJK 约 13.5px、ASCII 约 7.5px，再加左右内边距。
     let text_w: f32 = label
         .chars()
@@ -80,7 +92,9 @@ pub(super) fn accent_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bo
         .sum();
     let w = (text_w + 44.0).max(130.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
-    let fill = if resp.hovered() {
+    let fill = if !enabled {
+        pal.field
+    } else if resp.hovered() {
         pal.btn_hover
     } else {
         pal.btn_fill
@@ -98,9 +112,9 @@ pub(super) fn accent_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bo
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(13.0),
-        pal.btn_text,
+        if enabled { pal.btn_text } else { pal.dim },
     );
-    resp.clicked()
+    enabled && resp.clicked()
 }
 
 /// 插件列表单行：返回（是否移除、启用状态是否变化）。

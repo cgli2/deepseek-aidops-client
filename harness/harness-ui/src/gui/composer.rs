@@ -82,6 +82,11 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 // TextEdit 本身没有最大高度约束，需由 ScrollArea 提供固定上限。
                 // 关闭滚动到光标时的补间动画，防止长文本输入时卡片位置逐帧来回变化。
                 const COMPOSER_MAX_H: f32 = 96.0;
+                // 裸 Enter 必须在 TextEdit 之前消费：egui 的多行编辑器会把 '\n'
+                // 插到光标处，光标不在末尾时就把一句话从中间断开。按焦点拦截后，
+                // 提交内容与光标位置无关；Shift+Enter 不匹配 NONE，仍照常换行。
+                let composer_id = egui::Id::new("composer-input");
+                let enter = consume_submit_enter(ctx, composer_id);
                 let response = egui::ScrollArea::vertical()
                     .id_salt("composer-input-scroll")
                     .max_height(COMPOSER_MAX_H)
@@ -93,6 +98,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         ui.add_enabled(
                             !state.optimizing,
                             egui::TextEdit::multiline(&mut state.input)
+                                .id(composer_id)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(2)
                                 .font(egui::FontId::proportional(13.5))
@@ -109,9 +115,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         )
                     })
                     .inner;
-                // Enter 发送 / Shift+Enter 换行：egui 会先插入换行，这里去掉尾随 \n 再提交。
-                let enter = response.has_focus()
-                    && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                // enter 已在上方按焦点消费（见 composer_id），此处不再依赖
+                // TextEdit 插入的换行，因此光标位置不会影响提交内容。
                 // Egui 只会把部分剪贴板内容转换为文本 Paste 事件。这里保留文本路径
                 // 的兼容逻辑，同时在 Windows 上读取资源管理器复制文件使用的 CF_HDROP。
                 // 普通文本粘贴仍保留在编辑器中，不会误变成附件。
@@ -1018,9 +1023,25 @@ fn uuid_like_suffix() -> String {
         .unwrap_or_else(|_| "image".into())
 }
 
+/// 在 `TextEdit` 之前按焦点消费裸 Enter：egui 的多行编辑器会把换行插到光标处，
+/// 光标不在末尾时就会把一句话从中间断开；先消费可让提交内容与光标位置无关，
+/// 而 `Shift+Enter` 不匹配 `Modifiers::NONE`，仍照常交给编辑器插入换行。
+fn consume_submit_enter(ctx: &egui::Context, composer_id: egui::Id) -> bool {
+    if !ctx.memory(|m| m.has_focus(composer_id)) {
+        return false;
+    }
+    // 必须真正消费事件：只读 `key_pressed` 不会把 Enter 从输入队列里摘掉，
+    // egui 仍会把 '\n' 插到光标处。`consume_key(NONE, Enter)` 既消费事件又能
+    // 让 Shift+Enter（修饰键不为 NONE）继续走编辑器的换行路径。
+    ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clear_input_if_it_only_contains_paths, is_paste_shortcut, save_rgba_as_png};
+    use super::{
+        clear_input_if_it_only_contains_paths, consume_submit_enter, is_paste_shortcut,
+        save_rgba_as_png,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -1072,5 +1093,66 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         let _ = std::fs::remove_file(path);
+    }
+
+    fn composer_raw(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            focused: true,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// 光标停在文本中间时按 Enter：应识别为“提交”，且不得把文本从光标处断开。
+    #[test]
+    fn bare_enter_submits_without_splitting_text_at_cursor() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("composer-input");
+        let mut text = "abcdef".to_string();
+
+        // 第一帧：注册控件。
+        let _ = ctx.run(composer_raw(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut text).id(id));
+            });
+        });
+        // 第二帧：取得焦点（聚焦瞬间 egui 可能重排光标）。
+        ctx.memory_mut(|m| m.request_focus(id));
+        let _ = ctx.run(composer_raw(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut text).id(id));
+            });
+        });
+        // 聚焦稳定后把光标放到中间（字符索引 3）。
+        let mut edit_state = egui::text_edit::TextEditState::load(&ctx, id).unwrap_or_default();
+        edit_state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(3))));
+        edit_state.store(&ctx, id);
+
+        // 第三帧：带裸 Enter；先消费再渲染编辑器。
+        let mut enter = false;
+        let _ = ctx.run(
+            composer_raw(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |ctx| {
+                enter = consume_submit_enter(ctx, id);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut text).id(id));
+                });
+            },
+        );
+
+        assert!(enter, "光标在中间时按 Enter 也应识别为提交");
+        assert_eq!(text, "abcdef", "提交不得把文本从光标处断开");
     }
 }

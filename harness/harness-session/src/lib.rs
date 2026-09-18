@@ -8,7 +8,7 @@ mod log;
 pub use log::{
     Observation,
     CouncilEvent, CouncilGateResult, CouncilTaskSpec, CouncilTaskState, DeliveryCriterion,
-    DeliveryOutcome, DeliveryReport, EventId, ExecutionTelemetry, PlanItem, SessionEvent,
+    DeliveryOutcome, DeliveryReport, EventId, ExecutionTelemetry, PlanItem, SessionEvent, TaskCheckpoint,
     SessionId, SessionLog, SessionMeta, WorkItemTelemetry, delete_session, list_sessions,
     prune_sessions, rename_session,
 };

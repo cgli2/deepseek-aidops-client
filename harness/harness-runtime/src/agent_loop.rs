@@ -14,7 +14,7 @@ use harness_core::{AppContext, Workspace, error::Result, types::UserInput};
 use harness_llm::{Chunk, LlmProvider, Message, RequestOptions, Role, ToolCall, ToolResult, Usage};
 use harness_session::{
     DeliveryOutcome, DeliveryReport, ExecutionTelemetry, SessionEvent, SessionLog,
-    WorkItemTelemetry,
+    TaskCheckpoint, WorkItemTelemetry,
 };
 use harness_tool::ToolRegistry;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +54,49 @@ pub fn parse_governor_mode(value: Option<&str>) -> GovernorMode {
 /// `Turn` = 0..n `Step`；`debt` 计数控制续跑；`agent/turn-stopping` 为唯一串行终止点。
 pub struct AgentLoop {
     governor: GovernorMode,
+}
+
+/// One projection for what the model may do next.  `ExecutionState` keeps
+/// runtime facts and delivery evidence; `GoalExecution` owns the per-criterion
+/// phase for controlled work.  Callers must use this instead of choosing a
+/// tool list independently for prompts, gates, telemetry, or completion.
+#[derive(Debug, Clone)]
+struct NextAction {
+    phase: String,
+    allowed_tools: Vec<String>,
+    hint: String,
+    controlled: bool,
+}
+
+fn uses_goal_execution_authority(execution: &ExecutionState) -> bool {
+    crate::delivery_workflow::owns(execution)
+        || execution.solve_mode == crate::execution::SolveMode::AtomicDelivery
+        || (goal_executor_enabled()
+            && execution.strategy != crate::execution::StrategyKind::RepositoryOperation
+            && execution.solve_mode != crate::execution::SolveMode::OpenEnded)
+}
+
+fn next_action(execution: &ExecutionState, goal: &GoalExecution) -> NextAction {
+    let controlled = uses_goal_execution_authority(execution);
+    if controlled {
+        NextAction {
+            phase: goal.phase_name().into(),
+            allowed_tools: goal.allowed_tools(),
+            hint: goal.next_action_hint(),
+            controlled,
+        }
+    } else {
+        NextAction {
+            phase: execution.tool_phase().as_str().into(),
+            allowed_tools: execution.allowed_tools(),
+            hint: goal.next_action_hint(),
+            controlled,
+        }
+    }
+}
+
+fn delivery_ready(execution: &ExecutionState, goal: &GoalExecution) -> bool {
+    execution.can_complete() && (!uses_goal_execution_authority(execution) || goal.can_conclude())
 }
 
 impl Default for AgentLoop {
@@ -133,6 +176,7 @@ const MAX_CONSECUTIVE_LOCATE_CALLS_PER_TURN: u8 = 10;
 struct ResumeState {
     objective: String,
     report: DeliveryReport,
+    checkpoint: Option<TaskCheckpoint>,
     /// 根任务在会话事件流中的起点。续跑时只回放这一任务之后的无副作用定位证据，
     /// 不能把更早、无关任务的搜索结果混进当前求解图。
     history_start: usize,
@@ -170,12 +214,9 @@ fn is_resumable_follow_up(text: &str) -> bool {
 
 const CLARIFICATION_REASON_PREFIX: &str = "需要补充执行信息：";
 
-/// Fix2：搜索/扫描类调用的会话级记忆化缓存。键=工具名+归一化参数；命中即返回
+/// 搜索/扫描类调用的回合级记忆化缓存。键=工具名+归一化参数；命中即返回
 /// 缓存结果、不重跑真实工具，消除单窗口重复扫描（取证：同回合扫描被跑 13 次）
 /// 与续跑重扫。作用域=当前 `SessionLog` 会话：同一会话跨多次“继续”共享，切换会话即清空；
-/// 会话切换时旧条目会被丢弃，因此 A 会话的搜索结果不会被 B 会话复用；
-/// 只读搜索命中不重复记证据/写入，避免污染 Fix1 的进展度量与预算计数。
-///
 /// 值刻意只存可复用的输出载荷，不含 `call_id`：调用身份属于本次 tool_call，
 /// 缓存它会让后续命中把上一次调用的 id 写进本步日志，assistant 的 tool_call
 /// 因此永远等不到响应，历史重建后 Provider 直接回 HTTP 400。
@@ -185,33 +226,7 @@ struct CachedSearchOutput {
     content: String,
 }
 
-static SEARCH_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<(String, std::collections::HashMap<String, CachedSearchOutput>)>,
-> = std::sync::OnceLock::new();
-
-fn with_search_memo<R>(
-    session: &str,
-    f: impl FnOnce(&mut std::collections::HashMap<String, CachedSearchOutput>) -> R,
-) -> R
-{
-    let cell = SEARCH_MEMO
-        .get_or_init(|| std::sync::Mutex::new((String::new(), std::collections::HashMap::new())));
-    let mut guard = cell.lock().unwrap();
-    if guard.0 != session {
-        // 会话变了：上一次会话的搜索结果一律作废，既是隔离也是缓存上限。
-        guard.1.clear();
-        guard.0 = session.to_string();
-    }
-    f(&mut guard.1)
-}
-
 /// 识别搜索/扫描/定位类工具（易产生重复空转调用）。
-fn memo_put(session: &str, key: String, value: CachedSearchOutput) {
-    with_search_memo(session, |memo| {
-        memo.insert(key, value);
-    });
-}
-
 fn is_search_like(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.contains("search")
@@ -235,8 +250,7 @@ fn is_locate_signature(signature: &str) -> bool {
 }
 
 /// 搜索缓存键：工具名 + 归一化参数（Debug 表示即可，足以区分不同查询）。
-/// 会话隔离由 `search_memo` 实现：会话切换（`SessionLog` 生命周期变化）时清空缓存表，
-/// 因此键本身无需带会话 id，A 会话的结果不可能被 B 会话命中。
+/// 缓存只存在当前 run_turn，跨回合的定位前沿由 SessionLog 重建。
 fn search_cache_key(name: &str, args: &impl std::fmt::Debug) -> String {
     format!("{}::{:?}", name, args)
 }
@@ -288,10 +302,13 @@ fn artifact_key(workspace: &Path, target: &str) -> Option<String> {
 /// 或读取时返回 None，让上层按未获得变更证据处理，而不是信任工具自述。
 fn artifact_fingerprint(workspace: &Path, target: &str) -> Option<String> {
     let path = artifact_path(workspace, target)?;
+    let canonical_root = workspace.canonicalize().ok()?;
     if !path.exists() {
-        return Some("missing".into());
+        let parent = path.parent()?.canonicalize().ok()?;
+        return parent.starts_with(&canonical_root).then(|| "missing".into());
     }
-    if !path.is_file() {
+    let path = path.canonicalize().ok()?;
+    if !path.starts_with(&canonical_root) || !path.is_file() {
         return None;
     }
     std::fs::read(path)
@@ -385,7 +402,7 @@ fn latest_resumable_task(events: &[SessionEvent]) -> Option<ResumeState> {
     let mut end = events.len();
     // 目标文本要穿透“继续”找到根任务，但验收状态必须采用最近一次 Delivery；
     // 新版续跑回合的 TurnStart 仍记录用户原话，而其 Delivery 已是根任务的报告。
-    let mut latest_report: Option<DeliveryReport> = None;
+    let mut latest_report: Option<(DeliveryReport, Option<TaskCheckpoint>)> = None;
     loop {
         let delivery_index = (0..end).rev().find(|&index| {
             matches!(
@@ -414,14 +431,20 @@ fn latest_resumable_task(events: &[SessionEvent]) -> Option<ResumeState> {
             SessionEvent::TurnStart { input, .. } => input.clone(),
             _ => unreachable!("turn index was matched above"),
         };
+        let checkpoint = events[turn_index..delivery_index].iter().rev().find_map(|event| match event {
+            SessionEvent::TaskCheckpoint { checkpoint, .. } => Some(checkpoint.clone()),
+            _ => None,
+        });
         if !is_resumable_follow_up(&objective) {
+            let (report, checkpoint) = latest_report.unwrap_or((report, checkpoint));
             return Some(ResumeState {
                 objective,
-                report: latest_report.unwrap_or(report),
+                report,
+                checkpoint,
                 history_start: turn_index,
             });
         }
-        latest_report.get_or_insert(report);
+        latest_report.get_or_insert((report, checkpoint));
         end = turn_index;
     }
 }
@@ -508,6 +531,83 @@ fn resume_instruction(resume: &ResumeState) -> String {
     )
 }
 
+fn workspace_identity(root: &Path) -> String {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf()).to_string_lossy().to_string()
+}
+
+fn task_checkpoint(
+    execution: &ExecutionState,
+    goal: &GoalExecution,
+    root: &Path,
+    report: &DeliveryReport,
+) -> TaskCheckpoint {
+    let mut criterion_files = HashMap::new();
+    for criterion in report.criteria.iter().filter(|criterion| criterion.satisfied) {
+        let targets = goal.items.get(&criterion.id)
+            .map(|item| item.candidate_targets.as_slice())
+            .filter(|targets| !targets.is_empty())
+            .unwrap_or(&goal.confirmed_target_files);
+        let files = targets.iter().filter_map(|path| {
+            artifact_fingerprint(root, path)
+                .filter(|fingerprint| fingerprint != "missing")
+                .map(|fingerprint| (path.clone(), fingerprint))
+        }).collect::<HashMap<_, _>>();
+        if !files.is_empty() {
+            criterion_files.insert(criterion.id.clone(), files);
+        }
+    }
+    TaskCheckpoint {
+        version: 1,
+        objective: execution.contract.objective.clone(),
+        workspace: workspace_identity(root),
+        criterion_files,
+    }
+}
+
+fn validated_resume_report(
+    report: &DeliveryReport,
+    checkpoint: Option<&TaskCheckpoint>,
+    root: Option<&Path>,
+    requested_outcome: crate::execution::RequestedOutcome,
+    objective: &str,
+) -> DeliveryReport {
+    if requested_outcome != crate::execution::RequestedOutcome::Change {
+        return report.clone();
+    }
+    let valid_checkpoint = checkpoint.zip(root).filter(|(checkpoint, root)| {
+        checkpoint.version == 1
+            && checkpoint.objective == objective
+            && checkpoint.workspace == workspace_identity(root)
+    });
+    let mut restored = report.clone();
+    let mut invalidated = false;
+    for criterion in &mut restored.criteria {
+        if !criterion.satisfied {
+            continue;
+        }
+        let valid = valid_checkpoint
+            .and_then(|(checkpoint, root)| {
+                checkpoint.criterion_files.get(&criterion.id).map(|files| (files, root))
+            })
+            .is_some_and(|(files, root)| {
+                !files.is_empty() && files.iter().all(|(path, hash)| {
+                    artifact_fingerprint(root, path).as_deref() == Some(hash.as_str())
+                })
+            });
+        if !valid {
+            criterion.satisfied = false;
+            criterion.evidence.clear();
+            invalidated = true;
+        }
+    }
+    if invalidated {
+        restored.verification = restored.criteria.iter().filter(|criterion| criterion.satisfied)
+            .flat_map(|criterion| criterion.evidence.iter().cloned()).collect();
+        restored.reason = Some("续跑时文件版本或检查点不匹配，相关验收项需要重新验证".into());
+    }
+    restored
+}
+
 /// 续跑不是重新开一轮搜索。`DeliveryReport` 只保存验收结论，不能承载“已经读过
 /// 哪些文件”的技术前沿；如果只恢复它，模型会再次搜索、列目录、读同一段文件，直到
 /// 新窗口再次耗尽。这里仅回放根任务以来真实成功的 `search` 与 `fs.read` 结果：
@@ -518,6 +618,7 @@ fn resume_instruction(resume: &ResumeState) -> String {
 fn restore_resume_frontier(
     events: &[SessionEvent],
     history_start: usize,
+    workspace_root: Option<&std::path::Path>,
     execution: &ExecutionState,
     goal_execution: &mut GoalExecution,
 ) -> usize {
@@ -537,6 +638,14 @@ fn restore_resume_frontier(
                     && call.args.get("op").and_then(|value| value.as_str()) == Some("read");
                 if call.name != "search" && !is_read {
                     continue;
+                }
+                if let Some(root) = workspace_root {
+                    // Old logs do not carry a workspace revision. Only replay a
+                    // read whose exact view still matches the current file.
+                    // Search output has no such proof and must be refreshed.
+                    if !is_read || !read_view_still_current(root, call, &result.content) {
+                        continue;
+                    }
                 }
                 let mut proposal = ActionProposal::from_tool_call(call, execution);
                 goal_execution.link_proposal(&mut proposal);
@@ -560,6 +669,33 @@ fn restore_resume_frontier(
         goal_execution.reset_phase_attempts_for_resume();
     }
     restored
+}
+
+fn read_view_still_current(root: &std::path::Path, call: &ToolCall, observed: &str) -> bool {
+    let Some(path) = call.args.get("path").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let relative = std::path::Path::new(path);
+    if relative.is_absolute()
+        || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return false;
+    }
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(target) = root.join(relative).canonicalize() else {
+        return false;
+    };
+    if !target.starts_with(&canonical_root) {
+        return false;
+    }
+    let Ok(current) = std::fs::read_to_string(target) else {
+        return false;
+    };
+    let start = call.args.get("start_line").and_then(|value| value.as_u64()).map(|n| n as usize);
+    let end = call.args.get("end_line").and_then(|value| value.as_u64()).map(|n| n as usize);
+    harness_tool::fs_slice_view(&current, start, end) == observed
 }
 
 /// 单次模型响应内的受控定位门禁。它补足跨步骤状态机的时间差：首个 search 的
@@ -743,7 +879,7 @@ impl AgentLoop {
         let history = log.replay();
         let is_follow_up = is_resumable_follow_up(&input_text);
         let is_clarification_reply = !is_follow_up && awaiting_clarification(&history);
-        let resume = (is_follow_up || is_clarification_reply)
+        let mut resume = (is_follow_up || is_clarification_reply)
             .then(|| latest_resumable_task(&history))
             .flatten();
         let clarification_answer = is_clarification_reply
@@ -763,6 +899,16 @@ impl AgentLoop {
         // 先把自然语言请求编译成通用执行契约，再由可替换的领域策略选择执行方式。
         // 没有注册领域策略时使用通用分类器，不把代码修复等场景写死在 Agent Loop。
         let contract = TaskContract::from_input(&task_text);
+        if let Some(state) = resume.as_mut() {
+            let root = ctx.try_get::<Workspace>().map(|workspace| workspace.root());
+            state.report = validated_resume_report(
+                &state.report,
+                state.checkpoint.as_ref(),
+                root.as_deref(),
+                contract.requested_outcome,
+                &contract.objective,
+            );
+        }
         let default_policy = GeneralDomainPolicy;
         let strategy = ctx
             .try_get::<dyn DomainPolicy>()
@@ -949,6 +1095,7 @@ impl AgentLoop {
                 restore_resume_frontier(
                     &history,
                     state.history_start,
+                    workspace_root.as_deref(),
                     &execution,
                     &mut goal_execution,
                 )
@@ -1247,17 +1394,10 @@ impl AgentLoop {
         let mut claim_correction_notified = false;
         let mut budget_exhausted = false;
         let mut absolute_budget_hit = false;
-        // Fix1：断点后进展基线。硬熔断时比较“写入+证据”与基线的增量，有进展才自动续跑。
-        let mut hard_baseline = execution_progress_units(&execution);
-        // 编辑工具的“old_text 未精确匹配”会返回当前磁盘候选。这不是交付进展，不能
-        // 无限换取预算；但它是足够明确、可立即执行的恢复线索。保留至多两次受限恢复，
-        // 防止一个简单 UI 改动恰好在拿到候选后被硬熔断。
-        let mut hard_write_attempt_baseline = execution.write_attempts;
-        let mut recoverable_write_autorenews = 0u32;
         // prompt 安全边界同样是“执行窗口”而不是人工交互边界。窗口内出现可验证进展时，
         // 先压缩为最小断点再自动续期；连续无进展或续期封顶才真正暂停并交回用户。
         // 这避免大上下文任务每 3~4 次模型往返就要求用户手工输入“继续”。
-        let mut prompt_baseline = hard_baseline;
+        let mut prompt_baseline = execution_progress_units(&execution);
         let mut prompt_autorenews = 0u32;
         let mut convergence_notified = false;
         let mut goal_correction_notified = false;
@@ -1270,9 +1410,6 @@ impl AgentLoop {
         let mut text_only_no_progress_streak = 0u8;
         let mut stalled_without_action = false;
         let mut baseline_verification_observed = false;
-        /// Fix1：硬熔断自动续跑硬上限，超过则强制交回用户，防止失控。
-        const MAX_HARD_AUTORENEWS: u32 = 8;
-        const MAX_RECOVERABLE_WRITE_AUTORENEWS: u32 = 2;
         /// 单个用户请求内的 prompt 窗口续期上限；每次续期仍受 300k 窗口边界约束。
         const MAX_PROMPT_AUTORENEWS: u32 = 4;
         // 模型请求失败不能直接改写任务状态。独立恢复状态机负责区分普通协议空包和
@@ -1282,13 +1419,10 @@ impl AgentLoop {
         // 每个写目标只保存首次写入前的内容指纹。最终交付前再读一次，阻止“先改、
         // 后回滚到原样”仍靠中间态写入计数获得 Verified。
         let mut artifact_baselines: HashMap<String, String> = HashMap::new();
+        let mut search_memo: HashMap<String, CachedSearchOutput> = HashMap::new();
         // 原子任务不能因用户关闭“高级目标执行器”退回无约束的 legacy 路径；其安全
         // 与可预测性依赖于闭合工具面和状态机，因此始终受控。
-        let controlled_delivery_turn = implementation_workflow
-            || execution.solve_mode == crate::execution::SolveMode::AtomicDelivery
-            || (goal_executor_enabled()
-                && execution.strategy != crate::execution::StrategyKind::RepositoryOperation
-                && execution.solve_mode != crate::execution::SolveMode::OpenEnded);
+        let controlled_delivery_turn = uses_goal_execution_authority(&execution);
         while debt > 0 {
             // R3 前置：本执行回合到顶后暂停，不再向模型发请求。下一条用户消息会新建
             // 回合预算，并通过 resume 断点继续；历史成本只做审计，不会把会话永久锁死。
@@ -1332,43 +1466,6 @@ impl AgentLoop {
                 }
             }
             if BudgetManager::hard_exhausted(&execution, &budget) {
-                // Fix1：硬熔断不再一律打断等用户。若本窗口产生了可验证进展
-                // （写入或新证据），自动发放新探索窗口继续推进，避免把任务切碎成
-                // 十几次人工“继续”。连续无进展或达到自动续跑上限才交回用户。
-                let progress_now = execution_progress_units(&execution);
-                let progress_since_window = progress_now.saturating_sub(hard_baseline);
-                let recoverable_write_failure = has_recoverable_write_failure_since(
-                    &execution,
-                    hard_write_attempt_baseline,
-                );
-                let can_recover_write_failure = recoverable_write_failure
-                    && recoverable_write_autorenews < MAX_RECOVERABLE_WRITE_AUTORENEWS;
-                // 根因修复：即使本窗口有“可验证进展”，只要已无任何仍可自主推进的
-                // 交付面（全部 Verified / Failed / NeedsUserInput，即已有结论），
-                // 就不再自动续跑，避免“已经得出答案却仍被反复驱动继续”。
-                if !cancelled
-                    && budget.hard_autorenews < MAX_HARD_AUTORENEWS
-                    && (progress_since_window > 0 || can_recover_write_failure)
-                    && !goal_execution.active_surfaces().is_empty()
-                {
-                    BudgetManager::arm_hard_continuation(&mut budget);
-                    budget.hard_autorenews += 1;
-                    if can_recover_write_failure {
-                        recoverable_write_autorenews += 1;
-                    }
-                    hard_baseline = progress_now;
-                    hard_write_attempt_baseline = execution.write_attempts;
-                    let continuation_reason = if can_recover_write_failure {
-                        "最近一次编辑未落盘，但工具已经返回精确的磁盘候选；下一步只能依据该候选完成一次最小定向重试，然后验证，禁止重新规划、泛搜或重复原参数"
-                    } else {
-                        "本窗口产生了可验证进展；围绕未满足的验收条件继续推进"
-                    };
-                    messages.push(Message::user(&format!(
-                        "[自动续跑·第{}次] {}。已自动发放新窗口，无需人工“继续”。",
-                        budget.hard_autorenews, continuation_reason
-                    )));
-                    continue;
-                }
                 absolute_budget_hit = true;
                 hard_stop = true;
                 let terminal_reason =
@@ -1432,14 +1529,9 @@ impl AgentLoop {
             // 受控交付按求解规模限制单次推理和输出。过去只有 AtomicDelivery 会覆盖，
             // 大量用户眼中的“小修复”实际落在 ScopedDelivery，仍沿用 high/xhigh 与大输出，
             // 几轮就触发 prompt 总预算。OpenEnded 才保留用户的完整探索配置。
-            let controlled_delivery = controlled_delivery_turn;
-            let runtime_allowed_tools = if implementation_workflow {
-                crate::delivery_workflow::tools(&execution)
-            } else if controlled_delivery {
-                goal_execution.allowed_tools()
-            } else {
-                execution.allowed_tools()
-            };
+            let action = next_action(&execution, &goal_execution);
+            let controlled_delivery = action.controlled;
+            let runtime_allowed_tools = action.allowed_tools.clone();
             let request_options = request_options_for_solve_mode(
                 execution.solve_mode,
                 runtime_allowed_tools.clone(),
@@ -1830,11 +1922,11 @@ impl AgentLoop {
                         continue;
                     }
 
-                    // Fix2：搜索类调用先查会话级记忆化缓存；命中直接返回缓存结果，
+                    // 搜索类调用先查当前回合缓存；命中直接返回缓存结果，
                     // 不重跑真实工具，消除重复扫描与续跑重扫。只读搜索不重复记证据/写入。
                     if is_search_like(&tc.name) {
                         let key = search_cache_key(&tc.name, &tc.args);
-                        if let Some(cached) = with_search_memo(&log.id().to_string(), |memo| memo.get(&key).cloned()) {
+                        if let Some(cached) = search_memo.get(&key).cloned() {
                             // 复用输出，身份必须换成本次调用：否则本步 assistant 的
                             // tool_call 没有响应，而日志多出一条上一条 assistant 的孤儿结果。
                             let replayed = ToolResult {
@@ -1964,16 +2056,13 @@ impl AgentLoop {
                                     result: res.clone(),
                                 });
                                 repeat_guard.record_result(sig, &res);
-                                // Fix2：把搜索类调用结果写入会话级记忆化缓存，供后续同查询直接复用。
+                                // 把搜索结果写入当前回合缓存，写入工作区后立即失效。
                                 if is_search_like(&tc.name) {
                                     let key = search_cache_key(&tc.name, &tc.args);
-                                    memo_put(&log.id().to_string(), 
-                                        key,
-                                        CachedSearchOutput {
+                                    search_memo.insert(key, CachedSearchOutput {
                                             ok: res.ok,
                                             content: res.content.clone(),
-                                        },
-                                    );
+                                        });
                                 }
                                 execution.record_tool_result_observed(
                                     proposal,
@@ -1983,6 +2072,9 @@ impl AgentLoop {
                                         .then_some(false)
                                         .or(workspace_changed),
                                 );
+                                if workspace_changed == Some(true) {
+                                    search_memo.clear();
+                                }
                                 let evidence_kind = if let Some(action) = action {
                                     goal_execution.record_action_result_observed(
                                         action,
@@ -2129,8 +2221,7 @@ impl AgentLoop {
                 }
             }
             let mut claim_recovery_requested = false;
-            let completion_ready = execution.can_complete()
-                && (implementation_workflow || goal_execution.can_conclude());
+            let completion_ready = delivery_ready(&execution, &goal_execution);
             if let Some(correction) = unsupported_runtime_claim_correction(
                 &assistant_text,
                 &execution,
@@ -2302,30 +2393,36 @@ impl AgentLoop {
                 // 恢复重试已经重新记账，不能再被“本步没有工具”误判为完成。
             } else if claim_recovery_requested {
                 // 事实校正已经发放一次续跑；本步正文不能作为完成结论继续裁决。
-            } else if implementation_workflow && !hard_stop {
-                // One completion authority for implementation: observed writes and
-                // verification, not the advisory phase or the model's closing prose.
-                if completion_ready && !step_had_tools {
-                    delivery_verified = true;
-                    debt = 0;
-                } else if !step_had_tools {
-                    messages.push(Message::user(crate::delivery_workflow::next_action(&execution)));
-                    debt += 1;
-                }
             } else if controlled_delivery {
                 match goal_execution.evaluate_completion(step_had_tools) {
                     GoalCompletion::Complete => {
-                        delivery_verified = true;
-                        debt = 0;
+                        if completion_ready {
+                            delivery_verified = true;
+                            debt = 0;
+                        } else if !hard_stop {
+                            goal_correction_notified = true;
+                            messages.push(Message::user(format!(
+                                "[运行时验收校正] 工作项已无下一步，但证据尚未覆盖交付。{}",
+                                next_action(&execution, &goal_execution).hint
+                            )));
+                            debt += 1;
+                        }
                     }
                     GoalCompletion::Correct(hint) if !hard_stop => {
+                        let delivery_hint = crate::delivery_workflow::owns(&execution)
+                            .then(|| crate::delivery_workflow::next_action(&execution))
+                            .unwrap_or("");
+                        let actionable = format!(
+                            " {delivery_hint} {}",
+                            next_action(&execution, &goal_execution).hint
+                        );
                         let correction = if goal_correction_notified {
                             format!(
-                                "[自动推进] 当前任务仍未验收。{hint} 下一步不需要用户决策，直接执行并验证，不要等待用户回复。"
+                                "[自动推进] 当前任务仍未验收。{hint}{actionable} 下一步不需要用户决策，直接执行并验证，不要等待用户回复。"
                             )
                         } else {
                             goal_correction_notified = true;
-                            format!("[V4 目标状态校正] 当前回复没有满足求解图终态。{hint}")
+                            format!("[V4 目标状态校正] 当前回复没有满足求解图终态。{hint}{actionable}")
                         };
                         messages.push(Message::user(correction));
                         debt += 1;
@@ -2450,7 +2547,12 @@ impl AgentLoop {
 
         execution.record_direct_answer(&last_assistant);
         let terminal_reason = goal_execution.actionable_terminal_reason();
-        let (raw_outcome, raw_reason) = if provider_error_seen {
+        let (raw_outcome, raw_reason) = if cancelled {
+            (
+                harness_session::DeliveryOutcome::Cancelled,
+                Some("用户取消了回合；未获得完整验收证据".into()),
+            )
+        } else if provider_error_seen {
             // provider 流错误优先级最高：错误文本非模型回答，绝不可 Verified；
             // On 模式下游出口会把 SystemFailure 收口为 PartialDelivery；内部诊断资产
             // 只写遥测，用户看到的是简短的缺失步骤。
@@ -2507,11 +2609,6 @@ impl AgentLoop {
                 terminal_reason
                     .or_else(|| Some("已达到安全探索预算，但未形成可验证的目标路径".into()))
                     .map(|reason| format!("{reason}{evidence_hint}")),
-            )
-        } else if cancelled {
-            (
-                harness_session::DeliveryOutcome::Cancelled,
-                Some("用户取消了回合；未获得完整验收证据".into()),
             )
         } else if hard_stop {
             (
@@ -2617,6 +2714,12 @@ impl AgentLoop {
                 },
             });
         }
+        if let Some(root) = workspace_root.as_deref() {
+            log.append(SessionEvent::TaskCheckpoint {
+                id: log.gen_id(),
+                checkpoint: task_checkpoint(&execution, &goal_execution, root, &report),
+            });
+        }
         log.append(SessionEvent::Delivery {
             id: log.gen_id(),
             report,
@@ -2703,7 +2806,17 @@ fn concise_incomplete_status(
             .into();
     }
     let acceptance = acceptance_progress(execution);
-    let next = goal_execution.next_action_hint();
+    // 写入已被运行时观察到、但求解图意外没有活动项时，不能把“没有工作项”
+    // 呈现给用户。这会与“已写入”并列，既掩盖了事实，也让后续不知道该验证
+    // 还是该重做。此时唯一可靠的下一步是围绕已经落盘的变更完成验证。
+    let next = if execution.write_operations > 0
+        && !execution.can_complete()
+        && !goal_execution.can_auto_advance()
+    {
+        crate::delivery_workflow::next_action(execution).to_owned()
+    } else {
+        goal_execution.next_action_hint()
+    };
     if reason.is_some_and(|text| text.contains("baseline_verified_without_change")) {
         return format!(
             "本轮只完成了当前基线核验，尚未形成目标交付。{acceptance}\n下一步：{next}"
@@ -2723,6 +2836,11 @@ fn concise_incomplete_status(
     } else {
         "本轮没有写入动作".into()
     };
+    if execution.write_operations > 0 {
+        return format!(
+            "本轮已修改工作区，但尚不能确认目标已完成：{acceptance}；{writes}。\n下一步：{next}"
+        );
+    }
     format!("本轮尚未形成完整交付：{cause}；{acceptance}；{writes}。\n下一步：{next}")
 }
 
@@ -2761,6 +2879,7 @@ fn append_telemetry(
     ledger: &TaskLedger,
     detail: &str,
 ) {
+    let action = next_action(execution, goal_execution);
     let current = ledger
         .current_item()
         .map(|item| format!("{}：{}", item.id, item.description))
@@ -2782,22 +2901,8 @@ fn append_telemetry(
                 "{:?}",
                 crate::IntentProfile::compile(&execution.contract.objective).kind
             ),
-            phase: if execution.solve_mode == crate::execution::SolveMode::OpenEnded {
-                execution.tool_phase().as_str()
-            } else {
-                // 与同一事件的 active_work_item 同源。旧的 ExecutionState.tool_phase()
-                // 只由本回合已获得的证据推进，工作区已经把目标落到具体文件时仍报
-                // locate，观测上像「阶段没走」，而它其实不是准入依据。
-                goal_execution.phase_name()
-            }
-            .into(),
-            allowed_tools: if crate::delivery_workflow::owns(execution) {
-                crate::delivery_workflow::tools(execution)
-            } else if execution.solve_mode == crate::execution::SolveMode::OpenEnded {
-                execution.allowed_tools()
-            } else {
-                goal_execution.allowed_tools()
-            },
+            phase: action.phase,
+            allowed_tools: action.allowed_tools,
             step: execution.steps,
             tool_calls: execution.tool_calls,
             evidence_count: execution.evidence.len(),
@@ -2817,7 +2922,7 @@ fn append_telemetry(
                     evidence_count: item.evidence.len(),
                 })
                 .collect(),
-            next_action: goal_execution.next_action_hint(),
+            next_action: action.hint,
             active_hypothesis: goal_execution.active_hypothesis_summary(),
             no_information_count: goal_execution.no_information_count,
             correction_count: goal_execution.correction_count,
@@ -3541,35 +3646,6 @@ fn execution_progress_units(execution: &ExecutionState) -> usize {
         .saturating_add(execution.satisfied_criteria.len())
 }
 
-/// `edit` 的精确替换失败时，工具会把当前磁盘候选回传。该信号只用于有限的
-/// 恢复窗口，绝不计入交付进展；这样既让模型有机会修正参数，也不会靠故意失败
-/// 无限延展预算。
-fn has_recoverable_write_failure_since(
-    execution: &ExecutionState,
-    write_attempt_baseline: usize,
-) -> bool {
-    if execution.write_attempts <= write_attempt_baseline {
-        return false;
-    }
-    execution.evidence.values().any(|evidence| {
-        let is_write = evidence.tool_signature.starts_with("edit:")
-            || evidence.tool_signature.contains("\"op\":\"write\"");
-        if !is_write {
-            return false;
-        }
-        let summary = evidence.summary.to_ascii_lowercase();
-        [
-            "old_text must match exactly once",
-            "old text must match exactly once",
-            "file has changed",
-            "磁盘当前候选",
-            "disk candidate",
-        ]
-        .iter()
-        .any(|marker| summary.contains(marker))
-    })
-}
-
 /// 纯文本活性守卫使用的受控状态键。它只包含 Runtime 可验证的进展，不包含模型
 /// 措辞；相同结论即使换一种说法，只要状态、工具面和证据都没变，仍会被识别为空转。
 fn controlled_progress_key(execution: &ExecutionState, goal_execution: &GoalExecution) -> String {
@@ -3675,7 +3751,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_edit_mismatch_is_a_bounded_recovery_signal_not_delivery_progress() {
+    fn exact_edit_mismatch_is_not_delivery_progress() {
         let (mut execution, _) = test_execution_and_goal(
             "把设置按钮移到工具栏右侧",
             crate::execution::StrategyKind::Transformative,
@@ -3693,11 +3769,6 @@ mod tests {
         );
 
         assert_eq!(execution_progress_units(&execution), 0);
-        assert!(has_recoverable_write_failure_since(&execution, 0));
-        assert!(!has_recoverable_write_failure_since(
-            &execution,
-            execution.write_attempts
-        ));
     }
     /// B2 §4.5：provider 错误以 `[error] {…}` 的 assistant 纯文本落日志（UI 可见性依赖它），
     /// 但它是诊断文本不是模型历史。出站唯一关口 `prepare_request_messages` 必须剥离它，
@@ -4073,6 +4144,38 @@ mod tests {
         {
             assert!(!status.contains(internal_label));
         }
+    }
+
+    #[test]
+    fn incomplete_delivery_distinguishes_applied_write_from_unverified_completion() {
+        let (mut execution, mut goal) = test_execution_and_goal(
+            "修改文档的二、阻塞项（开工前必须修）",
+            crate::execution::StrategyKind::Transformative,
+        );
+        // 模拟编辑已经成功、但求解图在验收前意外耗尽工作项的场景。用户需要知道
+        // “写入发生了”与“目标已验证”是两个不同事实，且不应收到空泛的收尾指令。
+        execution.write_operations = 1;
+        goal.items
+            .values_mut()
+            .next()
+            .expect("测试契约应有一个验收项")
+            .state = crate::goal_execution::WorkItemState::NeedsUserInput;
+
+        let status = concise_incomplete_status(
+            &DeliveryOutcome::PartialDelivery,
+            Some("回合结束前未形成完整验收证据"),
+            &execution,
+            &goal,
+        );
+
+        assert!(status.contains("本轮已修改工作区"), "{status}");
+        assert!(status.contains("已观察到 1 次实质写入"), "{status}");
+        assert!(status.contains("运行对应验证"), "{status}");
+        assert!(!status.contains("未获得有效修复结果"), "{status}");
+        assert!(
+            !status.contains("没有可继续执行的工作项"),
+            "{status}"
+        );
     }
 
     #[test]
@@ -4741,13 +4844,75 @@ mod tests {
             },
         ];
 
-        assert_eq!(restore_resume_frontier(&events, 0, &execution, &mut goal), 2);
+        assert_eq!(restore_resume_frontier(&events, 0, None, &execution, &mut goal), 2);
         assert!(goal.confirmed_target_files.contains(&"webui/src/views/DashboardView.vue".into()));
         assert_eq!(
             goal.active_item().unwrap().state,
             crate::goal_execution::WorkItemState::ReadyToChange
         );
         assert_eq!(goal.active_item().unwrap().phase_attempts.inspect, 0);
+    }
+
+    #[test]
+    fn resume_read_requires_current_file_view() {
+        let root = std::env::temp_dir().join(format!(
+            "resume-read-version-{}", uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("target.rs");
+        std::fs::write(&file, "old target\n").unwrap();
+        let call = ToolCall {
+            id: "read-target".into(),
+            name: "fs".into(),
+            args: serde_json::json!({"op":"read","path":"target.rs"}),
+        };
+        let old_view = harness_tool::fs_slice_view("old target\n", None, None);
+        assert!(read_view_still_current(&root, &call, &old_view));
+        std::fs::write(&file, "new target\n").unwrap();
+        assert!(!read_view_still_current(&root, &call, &old_view));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn change_checkpoint_restores_only_matching_file_versions() {
+        let root = std::env::temp_dir().join(format!(
+            "resume-criterion-version-{}", uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("target.rs"), "fixed\n").unwrap();
+        let hash = artifact_fingerprint(&root, "target.rs").unwrap();
+        let checkpoint = TaskCheckpoint {
+            version: 1,
+            objective: "修复目标".into(),
+            workspace: workspace_identity(&root),
+            criterion_files: HashMap::from([(
+                "user-objective".into(),
+                HashMap::from([("target.rs".into(), hash)]),
+            )]),
+        };
+        let report = DeliveryReport {
+            outcome: DeliveryOutcome::PartialDelivery,
+            criteria: vec![harness_session::DeliveryCriterion {
+                id: "user-objective".into(),
+                description: "修复目标".into(),
+                satisfied: true,
+                evidence: vec!["targeted test passed".into()],
+            }],
+            verification: vec!["targeted test passed".into()],
+            reason: None,
+        };
+        let validated = |checkpoint: Option<&TaskCheckpoint>| validated_resume_report(
+            &report,
+            checkpoint,
+            Some(&root),
+            crate::execution::RequestedOutcome::Change,
+            "修复目标",
+        );
+        assert!(validated(Some(&checkpoint)).criteria[0].satisfied);
+        assert!(!validated(None).criteria[0].satisfied, "旧日志不能凭自述恢复验收");
+        std::fs::write(root.join("target.rs"), "regressed\n").unwrap();
+        assert!(!validated(Some(&checkpoint)).criteria[0].satisfied);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

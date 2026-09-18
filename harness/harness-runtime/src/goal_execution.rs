@@ -526,6 +526,7 @@ pub struct GoalExecution {
     pub confirmed_target_files: Vec<String>,
     /// 诊断/解释任务只允许定位和读取，读取证据不会把工作项推进到 Change。
     pub read_only: bool,
+    evidence_requirement: crate::execution::EvidenceRequirement,
     /// 纯核验任务的交付物是可复核的命令结果，而不是一次工作区写入。这个标记
     /// 由运行时已经选定的策略注入，避免再从工具名称或“test”之类词面猜测。
     verification_only: bool,
@@ -587,7 +588,9 @@ impl GoalExecution {
             target_files: Vec::new(),
             confirmed_target_files: Vec::new(),
             read_only: IntentProfile::compile(&contract.objective).kind
-                == IntentKind::Investigation,
+                == IntentKind::Investigation
+                || contract.requested_outcome == crate::execution::RequestedOutcome::Diagnose,
+            evidence_requirement: contract.evidence_requirement,
             verification_only: false,
             no_information_count: 0,
             correction_count: 0,
@@ -599,6 +602,7 @@ impl GoalExecution {
     /// 的成功结果会写入 ExecutionState，却无法把求解图推进到 Verified。
     pub fn apply_execution_strategy(&mut self, strategy: StrategyKind) {
         self.verification_only = strategy == StrategyKind::Verification;
+        self.read_only |= strategy == StrategyKind::Investigative;
     }
 
     fn is_verification_proposal(&self, proposal: &ActionProposal) -> bool {
@@ -1043,6 +1047,9 @@ impl GoalExecution {
     ///
     /// 返回本次静态收敛成功的交付面 id 与证明摘要。
     pub fn settle_static_convergence(&mut self, root: &Path) -> Vec<(String, String)> {
+        if self.evidence_requirement != crate::execution::EvidenceRequirement::Static {
+            return Vec::new();
+        }
         let candidates: Vec<String> = self
             .items
             .iter()
@@ -1704,10 +1711,10 @@ impl GoalExecution {
                 self.next_action_hint()
             )));
         }
-        // 已有两个具体读取与可编辑目标后，搜索通常不是最短路径。但这不是外部
-        // 安全约束：调用链可能仍缺一个接口/事件边界。过去把它设为 `Deny`，会吞掉
-        // 合理的定向搜索，并让模型在拒绝与重复读取间烧光回合。保留收敛提醒，但
-        // 让调用实际执行、由结果决定是否应继续修改。
+        // 已有两个具体读取与可编辑目标后，继续搜索不能推进当前交付面：这时
+        // `search` 只会让模型绕开已明确的 edit/verify 闭环，最终耗尽预算而未产生
+        // diff。确需补依赖时仍可读取一个明确文件；但搜索必须等编辑或验证失败后
+        // 才重新开放。
         if call.name == "search"
             && self.active_item().is_some_and(|item| {
                 item.state == WorkItemState::ReadyToChange
@@ -1715,8 +1722,8 @@ impl GoalExecution {
                     && !self.confirmed_target_files.is_empty()
             })
         {
-            return Err(GateDecision::Advise(format!(
-                "已读取 {} 个实现片段并确认编辑目标 [{}]；此 search 只有能补齐明确调用链时才有价值。优先编辑已确认文件、fs.read 一个明确依赖，或运行接口/测试验证。",
+            return Err(GateDecision::Deny(format!(
+                "已读取 {} 个实现片段并确认编辑目标 [{}]；停止继续搜索，直接编辑已确认文件，或读取一个明确依赖/运行验证。",
                 self.active_item().map(|item| item.read_evidence).unwrap_or_default(),
                 self.confirmed_target_files.join("、"),
             )));
@@ -1900,6 +1907,12 @@ impl GoalExecution {
                 .expected_values
                 .iter()
                 .all(|expected| summary.contains(&expected.value));
+        let verification_matches_goal = match self.evidence_requirement {
+            crate::execution::EvidenceRequirement::Visual => false,
+            crate::execution::EvidenceRequirement::Behavior => self.verification_only
+                || crate::execution::is_behavior_verification_signature(&proposal.signature),
+            _ => true,
+        };
         let kind = if is_search && !effective_ok {
             EvidenceKind::HypothesisRejected
         } else if is_search
@@ -1911,8 +1924,10 @@ impl GoalExecution {
             EvidenceKind::NoInformation
         } else if already_satisfied {
             EvidenceKind::AlreadySatisfied
-        } else if is_verify && effective_ok {
+        } else if is_verify && effective_ok && verification_matches_goal {
             EvidenceKind::VerificationPassed
+        } else if is_verify && effective_ok {
+            EvidenceKind::NoInformation
         } else if is_verify {
             EvidenceKind::VerificationFailed
         } else if is_write && effective_ok && write_changed {
@@ -1969,7 +1984,7 @@ impl GoalExecution {
             if is_read {
                 item.read_evidence = item.read_evidence.saturating_add(1);
             }
-            item.state = if is_verify
+            item.state = if kind == EvidenceKind::VerificationPassed
                 && (self.verification_only
                     || matches!(
                         item.state,
@@ -2826,7 +2841,7 @@ mod tests {
             &["src/list.tsx", "src/create.tsx", "src/edit.tsx"],
         );
 
-        // 未声明类别（默认）+ 有断言 + 有产物 → 判据允许静态收敛。
+        // 旧提示可建议读取产物，但不能代替界面行为验收。
         let active = plan.active_item().unwrap().clone();
         assert!(
             matches!(
@@ -2843,23 +2858,8 @@ mod tests {
         );
 
         let settled = plan.settle_static_convergence(&root);
-        assert_eq!(
-            settled.len(),
-            surfaces,
-            "全部面都能在产物里复核到断言，应全部收敛，实际 {settled:?}"
-        );
-        assert!(
-            plan.items
-                .values()
-                .all(|item| item.state == WorkItemState::Verified),
-            "静态收敛成功后交付面应置为已验证"
-        );
-        assert!(
-            settled
-                .iter()
-                .all(|(_, proof)| proof.contains("appCode") && proof.contains("src/")),
-            "证明摘要应指明命中的断言与产物文件，实际 {settled:?}"
-        );
+        assert!(settled.is_empty(), "界面展示须有行为证据，实际 {settled:?}");
+        assert!(plan.items.values().all(|item| item.state == WorkItemState::Changed));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2911,13 +2911,9 @@ mod tests {
             "复核失败应保持原状态，继续走执行验证"
         );
 
-        // 真正改到磁盘之后，同一份计划立刻能复核通过 —— 证据来自磁盘当前内容。
+        // 即便磁盘含有字串，也不能证明界面确实显示了字段。
         std::fs::write(&file, "<Column title=\"应用编码\" dataIndex=\"appCode\" />").unwrap();
-        assert_eq!(
-            plan.settle_static_convergence(&root).len(),
-            1,
-            "磁盘产物补齐后应立即复核通过，说明读的是磁盘而非陈旧索引"
-        );
+        assert!(plan.settle_static_convergence(&root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3103,6 +3099,7 @@ mod tests {
             target_files: files.clone(),
             confirmed_target_files: files.clone(),
             read_only: false,
+            evidence_requirement: crate::execution::EvidenceRequirement::Static,
             verification_only: false,
             no_information_count: 0,
             correction_count: 0,
@@ -3393,6 +3390,8 @@ mod tests {
             objective: "为 User 增加 email 字段，在 UI 列表、Schema 结构、API 响应中展示，\
                          并让行为面 on_click 后刷新 email，另含一处非法声明面"
                 .to_string(),
+            requested_outcome: crate::execution::RequestedOutcome::Change,
+            evidence_requirement: crate::execution::EvidenceRequirement::Behavior,
             deliverables: vec!["email 字段端到端贯通".to_string()],
             acceptance_criteria: vec![
                 Criterion {
@@ -3613,6 +3612,8 @@ mod tests {
         use crate::execution::{Criterion, RiskLevel, TaskContract};
         let contract = TaskContract {
             objective: "为 User 增加 email 字段，在 UI、Schema、API 展示".to_string(),
+            requested_outcome: crate::execution::RequestedOutcome::Change,
+            evidence_requirement: crate::execution::EvidenceRequirement::Behavior,
             deliverables: vec!["email 贯通".into()],
             acceptance_criteria: vec![
                 Criterion {
@@ -4046,7 +4047,7 @@ mod tests {
             serde_json::json!({"command":"cargo check -p harness-ui"}),
             "Finished",
         );
-        assert!(plan.can_conclude());
+        assert!(!plan.can_conclude(), "cargo check cannot prove the copy button is usable");
     }
 
     #[test]
@@ -4388,7 +4389,7 @@ mod tests {
         assert!(plan.allows_tool_call(&call, &proposal).is_ok());
         assert_eq!(
             plan.record_action_result(&action, &proposal, true, "cargo check passed"),
-            EvidenceKind::VerificationPassed
+            EvidenceKind::NoInformation
         );
         assert_eq!(
             plan.items[&id].state,
@@ -4805,7 +4806,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_edit_target_advises_against_search_but_does_not_swallow_it() {
+    fn confirmed_edit_target_blocks_search_until_edit_or_verification() {
         use crate::execution::GateDecision;
 
         let mut plan = GoalExecution::from_contract(&TaskContract::from_input("修复市场列表名称展示"));
@@ -4829,7 +4830,7 @@ mod tests {
         };
         assert!(matches!(
             plan.allows_tool_call(&search, &proposal),
-            Err(GateDecision::Advise(reason)) if reason.contains("此 search")
+            Err(GateDecision::Deny(reason)) if reason.contains("停止继续搜索")
         ));
 
         let direct_dependency = ToolCall {

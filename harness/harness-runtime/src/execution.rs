@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::intent::{IntentKind, IntentProfile};
+use crate::intent::{is_explanatory_question, IntentKind, IntentProfile};
 use harness_llm::ToolCall;
 use harness_session::{DeliveryCriterion, DeliveryOutcome, DeliveryReport};
 
@@ -86,6 +86,32 @@ pub enum StrategyKind {
     /// workflow merely because a successful commit changes Git metadata.
     RepositoryOperation,
     Monitoring,
+}
+
+/// The result requested by the user. This is fixed before tool execution and
+/// must not be inferred from whichever tool the model happened to call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedOutcome {
+    Undetermined,
+    Answer,
+    Diagnose,
+    Change,
+    Verify,
+    RepositoryOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceRequirement {
+    /// An explicit old/new value or document artifact can be checked on disk.
+    Static,
+    /// A reported malfunction needs an executed check of the resulting behavior.
+    Behavior,
+    /// UI appearance cannot be established by compilation or unit tests alone.
+    Visual,
+    /// The user only asked to run an existing check.
+    Command,
+    /// A direct answer or diagnosis has no write verification requirement.
+    Explanation,
 }
 
 /// 求解模式决定默认的探索强度，而非业务领域。明确、可比较的异常优先走短闭环，
@@ -227,6 +253,16 @@ impl SolvePlan {
                 instructions: "[Git 提交操作] 这是一次本地仓库操作，不是代码修改任务。只允许使用 shell，禁止读取源码、搜索文件、运行构建/测试、制定实施计划或修改业务文件。先运行 `git status --porcelain --untracked-files=all`：若输出为空，立即简洁说明“没有待提交的改动，未创建提交”，然后结束；若有改动，直接执行 `git add -A && git commit -m \"chore: save changes\"`，成功后简洁报告提交结果。除非用户明确要求，否则绝不执行 git push。".into(),
             };
         }
+        if strategy == StrategyKind::Direct && crate::intent::is_explanatory_question(text) {
+            return Self {
+                mode: SolveMode::OpenEnded,
+                initial_steps: 2,
+                initial_tool_calls: 0,
+                hard_max_steps: 3,
+                hard_max_tool_calls: 1,
+                instructions: "[直接解释] 用户要求解释其已提供的提示或文本。直接基于该文本作答，不读取工作区、不调用工具、不把其中的技术词或‘改动’字样误作代码修改任务。".into(),
+            };
+        }
         // 交付面数量由验收项（契约真实单元）给出，而非机制层词表数 UI 名词。
         let extra_surfaces = contract.acceptance_criteria.len().saturating_sub(1).min(4);
         let is_atomic_regression =
@@ -358,6 +394,8 @@ pub struct Criterion {
 #[derive(Debug, Clone)]
 pub struct TaskContract {
     pub objective: String,
+    pub requested_outcome: RequestedOutcome,
+    pub evidence_requirement: EvidenceRequirement,
     pub deliverables: Vec<String>,
     pub acceptance_criteria: Vec<Criterion>,
     /// 由同一问题中列出的多个界面自动拆分的验收项；它们可共享一次整体验证。
@@ -374,6 +412,49 @@ impl TaskContract {
     pub fn from_input(input: &str) -> Self {
         let objective = input.trim().to_string();
         let exact_transformation = crate::goal_execution::extract_exact_transformation(input);
+        let intent = IntentProfile::compile(&objective);
+        let requested_outcome = if is_local_git_commit_request(&objective) {
+            RequestedOutcome::RepositoryOperation
+        } else if is_explanatory_question(&objective) {
+            RequestedOutcome::Answer
+        } else if ["只分析", "仅分析", "不要修改", "不修改代码", "只读诊断"]
+            .iter()
+            .any(|constraint| objective.contains(constraint))
+            || ["排查", "调查", "分析根因"]
+                .iter()
+                .any(|prefix| objective.starts_with(prefix))
+            || intent.is_explicit_question
+        {
+            RequestedOutcome::Diagnose
+        } else if ["运行测试", "执行测试", "运行编译", "执行编译"]
+            .iter()
+            .any(|prefix| objective.starts_with(prefix))
+        {
+            RequestedOutcome::Verify
+        } else if matches!(objective.as_str(), "你好" | "您好" | "hello" | "hi") {
+            RequestedOutcome::Answer
+        } else if matches!(intent.kind, IntentKind::AtomicRegression | IntentKind::ScopedChange)
+            || ["修改", "修复", "重构", "实现", "实施", "开发", "改造", "新增", "添加"]
+                .iter()
+                .any(|action| objective.contains(action))
+            || ["看不到", "不可见", "不显示", "无法", "失效", "报错", "异常", "闪黑", "未刷新"]
+                .iter()
+                .any(|failure| objective.contains(failure))
+        {
+            RequestedOutcome::Change
+        } else {
+            RequestedOutcome::Undetermined
+        };
+        let evidence_requirement = match requested_outcome {
+            RequestedOutcome::Change if exact_transformation.is_some()
+                || objective_allows_comment_only_change(&objective) => EvidenceRequirement::Static,
+            RequestedOutcome::Change if ["看不到", "不可见", "不显示", "界面回归"]
+                .iter()
+                .any(|symptom| objective.contains(symptom)) => EvidenceRequirement::Visual,
+            RequestedOutcome::Change => EvidenceRequirement::Behavior,
+            RequestedOutcome::Verify | RequestedOutcome::RepositoryOperation => EvidenceRequirement::Command,
+            RequestedOutcome::Answer | RequestedOutcome::Diagnose | RequestedOutcome::Undetermined => EvidenceRequirement::Explanation,
+        };
         let listed_items: Vec<String> = input
             .lines()
             .filter_map(|line| {
@@ -485,6 +566,8 @@ impl TaskContract {
         };
         Self {
             objective: objective.clone(),
+            requested_outcome,
+            evidence_requirement,
             deliverables,
             acceptance_criteria,
             inferred_surface_criteria,
@@ -640,7 +723,13 @@ impl ExecutionState {
             let is_verification = repository_operation_satisfied || self.is_verification(proposal)
                 || (self.strategy == StrategyKind::Verification
                     && proposal.signature.starts_with("shell:"));
-            if is_verification && effective_ok
+            let evidence_matches_goal = match self.contract.evidence_requirement {
+                EvidenceRequirement::Visual => false,
+                EvidenceRequirement::Behavior => self.strategy == StrategyKind::Verification
+                    || is_behavior_verification_signature(&proposal.signature),
+                _ => true,
+            };
+            if is_verification && effective_ok && evidence_matches_goal
                 && (self.write_operations > 0
                     || matches!(
                         self.strategy,
@@ -701,6 +790,12 @@ impl ExecutionState {
     /// SolveGraph 与 ExecutionState 都参与最终完成裁决；只更新前者会出现“求解图
     /// 已无下一步，但执行投影仍缺验证”的死区，迫使用户反复输入“继续”。
     pub fn record_static_verification(&mut self, criterion_id: &str, evidence: impl Into<String>) {
+        if matches!(
+            self.contract.evidence_requirement,
+            EvidenceRequirement::Behavior | EvidenceRequirement::Visual
+        ) {
+            return;
+        }
         if !self
             .contract
             .acceptance_criteria
@@ -1056,9 +1151,23 @@ fn repository_operation_satisfies(proposal: &ActionProposal, summary: &str) -> b
     if command.contains("git commit") && !command.contains("--dry-run") {
         return true;
     }
+
     command.contains("git status")
         && command.contains("--porcelain")
         && summary.trim().is_empty()
+}
+
+pub(crate) fn is_behavior_verification_signature(signature: &str) -> bool {
+    if !signature.starts_with("shell:") {
+        return false;
+    }
+    let signature = signature.to_ascii_lowercase();
+    [
+        "cargo test", "npm test", "npm run test", "pnpm test", "yarn test",
+        "pytest", "python -m unittest", "go test", "mvn test", "gradle test",
+    ]
+    .iter()
+    .any(|marker| signature.contains(marker))
 }
 
 #[derive(Debug, Clone)]
@@ -1221,12 +1330,6 @@ pub struct Budget {
     /// （实测一个简单任务跑出 1000+ 步）；用尽后必须强制收尾。
     pub max_renewals: u32,
     pub renewals_used: u32,
-    /// 硬熔断后的进展驱动自动续跑次数：有可验证进展时自动发放新探索窗口，
-    /// 避免把任务切碎成十几次人工“继续”；达到上限才强制交回用户。
-    pub hard_autorenews: u32,
-    /// 进展延展已用次数：常规续期耗尽后，最近窗口只要产生可验证的写入或新证据，
-    /// 就继续按窗口延展。排障、测试、审查本来就未必会修改代码，不能把它们误杀。
-    pub delivery_extensions: u32,
     step_window: usize,
     tool_window: usize,
     duration_window: Duration,
@@ -1282,8 +1385,6 @@ impl BudgetManager {
                 .unwrap_or(2)
                 .clamp(0, 6),
             renewals_used: 0,
-            hard_autorenews: 0,
-            delivery_extensions: 0,
             step_window: max_steps,
             tool_window: max_tool_calls,
             duration_window: max_duration,
@@ -1361,26 +1462,8 @@ impl BudgetManager {
         let success_delta = state
             .successful_tool_results
             .saturating_sub(state.checkpoint_successes);
-        let write_delta = state
-            .write_operations
-            .saturating_sub(state.checkpoint_writes);
         let repeated_or_low_value = call_delta.saturating_sub(evidence_delta);
         let stagnant = evidence_delta == 0 || success_delta == 0;
-        // “进展”不等同于“写了代码”：成功测试、定位到新根因、得到新的只读证据
-        // 都能实质推进任务。仅在没有任何可验证进展时才记为停滞。
-        // 交付型任务中，“又成功读到一个文件/搜索到一条命中”不是续期理由；否则模型
-        // 只要不断换关键词泛搜，就能把预算无限延长。调查/比较/验证类任务则允许由独立
-        // 证据续期，因为它们的交付物本来就是结论而非写入。
-        let read_only_delivery = matches!(
-            state.strategy,
-            StrategyKind::Investigative
-                | StrategyKind::Comparative
-                | StrategyKind::Verification
-                | StrategyKind::RepositoryOperation
-        );
-        let meaningful_progress =
-            write_delta > 0 || (read_only_delivery && evidence_delta > 0 && success_delta > 0);
-
         state.checkpoint_steps = state.steps;
         state.checkpoint_tool_calls = state.tool_calls;
         state.checkpoint_evidence = state.evidence.len();
@@ -1388,22 +1471,6 @@ impl BudgetManager {
         state.checkpoint_writes = state.write_operations;
 
         if budget.renewals_used >= budget.max_renewals {
-            // 进展延展：常规续期已用尽，但窗口内仍有可验证进展就继续。
-            // 不能只认代码写入，否则排障/测试/审查等任务会在完成前被错误中断。
-            if meaningful_progress {
-                budget.delivery_extensions += 1;
-                Self::extend_window(budget);
-                let progress = if write_delta > 0 {
-                    format!("{write_delta} 次成功的代码修改")
-                } else {
-                    format!("{evidence_delta} 条新证据和 {success_delta} 次成功结果")
-                };
-                return Some(format!(
-                    "[进展延展·第{}次] 最近窗口检测到 {progress}，任务仍在有效推进：预算已自动延展。围绕未满足验收条件继续，完成后进行必要验证并输出总结。{}",
-                    budget.delivery_extensions,
-                    evidence_digest(state)
-                ));
-            }
             return None;
         }
         budget.renewals_used += 1;
@@ -1423,32 +1490,23 @@ impl BudgetManager {
         })
     }
 
-    /// 按一个窗口延展步数/工具/时长预算（常规续期、交付延展共用）。
+    /// 按一个窗口延展软预算，但总量永远受硬上限约束。
     pub fn extend_window(budget: &mut Budget) {
-        budget.max_steps = budget.max_steps.saturating_add(budget.step_window);
-        budget.max_tool_calls = budget.max_tool_calls.saturating_add(budget.tool_window);
+        budget.max_steps = budget
+            .max_steps
+            .saturating_add(budget.step_window)
+            .min(budget.hard_max_steps);
+        budget.max_tool_calls = budget
+            .max_tool_calls
+            .saturating_add(budget.tool_window)
+            .min(budget.hard_max_tool_calls);
         budget.max_duration = budget.max_duration.saturating_add(budget.duration_window);
     }
 
-    /// 续期耗尽后的最终收尾窗口：给足步骤完成汇总交付，不再扩张。
+    /// 续期耗尽后的最终收尾窗口：只允许整理已有证据，且绝不越过总额。
     pub fn arm_final_window(state: &ExecutionState, budget: &mut Budget) {
-        budget.max_steps = state.steps + 6;
-        budget.max_tool_calls = state.tool_calls + 4;
-        budget.max_duration = budget.max_duration + Duration::from_secs(300);
-    }
-
-    /// Fix1：硬熔断后的进展驱动自动续跑。有可验证进展时，把硬窗口与阶段窗口
-    /// 各抬升一个步长，使回合在不突破单次窗口成本的前提下继续推进；总续跑次数
-    /// 由 `Budget::hard_autorenews` 上限约束，防止失控（不依赖 `ABSOLUTE_MAX_*`，
-    /// 因为续跑本就是允许突破单次固定硬预算、但受次数封顶的受控扩张）。
-    pub fn arm_hard_continuation(budget: &mut Budget) {
-        budget.hard_max_steps = budget.hard_max_steps.saturating_add(budget.step_window);
-        budget.hard_max_tool_calls = budget
-            .hard_max_tool_calls
-            .saturating_add(budget.tool_window);
-        // 同步抬升阶段软预算，避免硬窗口刚续上、阶段却先 Exhausted 再次触发续期。
-        budget.max_steps = budget.max_steps.max(budget.hard_max_steps);
-        budget.max_tool_calls = budget.max_tool_calls.max(budget.hard_max_tool_calls);
+        budget.max_steps = (state.steps + 6).min(budget.hard_max_steps);
+        budget.max_tool_calls = (state.tool_calls + 4).min(budget.hard_max_tool_calls);
     }
 }
 
@@ -1640,6 +1698,15 @@ impl DomainPolicy for GeneralDomainPolicy {
         {
             return StrategyKind::Investigative;
         }
+        // Explanations of a supplied warning/message are complete in the
+        // response itself.  Do not force a source search just because the
+        // quoted text happens to contain a word such as “改动”.
+        if is_explanatory_question(text) {
+            return StrategyKind::Direct;
+        }
+        if contract.requested_outcome == RequestedOutcome::Diagnose {
+            return StrategyKind::Investigative;
+        }
         // 变更请求优先于同一句中的“测试/验证”。“按文档开发并测试”首先是开发任务，
         // 不能因为包含测试二字退化成允许零改动的纯 Verification。
         let requests_change = matches!(
@@ -1674,10 +1741,7 @@ impl DomainPolicy for GeneralDomainPolicy {
         // “检查 / 审查 / 确认”常是普通提问或代码探索的对象，不能仅凭一个
         // 词就收窄成只能运行 shell 的验证阶段。只有明确的验证动作才进入
         // Verification；其余请求保留完整的探索工具面。
-        } else if ["验证", "测试", "编译", "构建", "lint", "格式检查"]
-            .iter()
-            .any(|word| text.contains(word))
-        {
+        } else if contract.requested_outcome == RequestedOutcome::Verify {
             StrategyKind::Verification
         } else if ["创建", "生成", "编写", "设计"]
             .iter()
@@ -1689,6 +1753,8 @@ impl DomainPolicy for GeneralDomainPolicy {
             .any(|word| text.contains(word))
         {
             StrategyKind::Monitoring
+        } else if contract.requested_outcome == RequestedOutcome::Change {
+            StrategyKind::Transformative
         } else {
             StrategyKind::Direct
         }
@@ -1735,10 +1801,10 @@ mod tests {
             policy.select_strategy(&TaskContract::from_input("修复 ModelForm 的校验规则")),
             StrategyKind::Transformative
         );
-        // 无封闭信号、又非提问 → 开放式（不臆测，交由 Phase 1 门禁追问定位）。
+        // 明确要求排查根因是只读诊断，不能擅自进入修改流程。
         assert_eq!(
             policy.select_strategy(&TaskContract::from_input("排查服务变慢的根因")),
-            StrategyKind::Direct
+            StrategyKind::Investigative
         );
     }
 
@@ -2280,17 +2346,11 @@ mod tests {
     }
 
     #[test]
-    fn delivery_extension_granted_only_when_writes_progress() {
+    fn exhausted_renewal_budget_never_extends_for_progress() {
         let contract = TaskContract::from_input("修改界面布局");
         let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
-        budget.renewals_used = budget.max_renewals; // 常规续期耗尽
-
-        // 无写入的空转：不延展，交给收尾。
-        state.steps = 10;
-        assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
-
-        // 有写入的活跃交付：自动延展一个窗口。
+        budget.renewals_used = budget.max_renewals;
         let proposal = ActionProposal {
             signature: "edit:harness-ui/src/gui/model.rs".into(),
             question: "拆分枚举".into(),
@@ -2298,62 +2358,10 @@ mod tests {
             estimated_cost: 1,
         };
         state.record_tool_result(&proposal, true, "edit ok");
-        state.steps = 12;
+        state.steps = budget.max_steps;
         let before = budget.max_steps;
-        let msg = BudgetManager::diagnose_and_renew(&mut state, &mut budget);
-        assert!(msg.unwrap().contains("进展延展"));
-        assert!(budget.max_steps > before);
-        assert_eq!(budget.delivery_extensions, 1);
-
-        // 持续写入 → 持续延展（不设上限）：未完成但正在产出的任务不被截断。
-        state.record_tool_result(&proposal, true, "edit ok");
-        state.steps = 14;
-        let msg2 = BudgetManager::diagnose_and_renew(&mut state, &mut budget);
-        assert!(msg2.unwrap().contains("进展延展"));
-        assert_eq!(budget.delivery_extensions, 2);
-
-        // 写入停止（空转）→ 不再延展，交给收尾。
-        state.steps = 16;
         assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
-    }
-
-    #[test]
-    fn evidence_progress_extends_without_code_changes() {
-        let contract = TaskContract::from_input("排查服务延迟的根因");
-        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Investigative);
-        budget.renewals_used = budget.max_renewals;
-        let mut state = ExecutionState::new(contract, StrategyKind::Investigative);
-        let proposal = ActionProposal {
-            signature: "shell:{\"command\":\"collect latency metrics\"}".into(),
-            question: "收集延迟指标".into(),
-            supports: vec!["user-objective".into()],
-            estimated_cost: 1,
-        };
-        state.record_tool_result(&proposal, true, "发现数据库连接池等待是主要耗时");
-        state.steps = 10;
-
-        let message = BudgetManager::diagnose_and_renew(&mut state, &mut budget).unwrap();
-        assert!(message.contains("进展延展"));
-        assert_eq!(state.write_operations, 0);
-    }
-
-    #[test]
-    fn delivery_task_does_not_extend_for_read_only_exploration() {
-        let contract = TaskContract::from_input("调整一个会话气泡的对齐方式");
-        let mut budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
-        budget.renewals_used = budget.max_renewals;
-        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
-        let proposal = ActionProposal {
-            signature: "search:{\"pattern\":\"bubble\"}".into(),
-            question: "搜索候选文件".into(),
-            supports: vec!["user-objective".into()],
-            estimated_cost: 1,
-        };
-        state.record_tool_result(&proposal, true, "找到若干候选文件");
-        state.steps = 10;
-
-        assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
-        assert_eq!(budget.delivery_extensions, 0);
+        assert_eq!(budget.max_steps, before);
     }
 
     #[test]
@@ -2409,7 +2417,7 @@ mod tests {
 
     #[test]
     fn successful_verification_unlocks_change_delivery() {
-        let contract = TaskContract::from_input("修复一个确定的界面回归");
+        let contract = TaskContract::from_input("修复一个确定的服务处理回归");
         let budget = BudgetManager::for_contract(&contract, StrategyKind::Transformative);
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         let edit = ActionProposal {
@@ -2443,7 +2451,7 @@ mod tests {
 
     #[test]
     fn static_disk_verification_updates_the_completion_projection() {
-        let contract = TaskContract::from_input("修复一个确定的界面回归");
+        let contract = TaskContract::from_input("把按钮文案从「取消」改为「确定」");
         let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
         let edit = ActionProposal {
             signature: "edit:{\"path\":\"ui.rs\"}".into(),
@@ -2528,6 +2536,41 @@ mod tests {
         assert_eq!(state.write_operations, 0);
         assert!(state.verification_evidence.is_empty());
         assert!(!state.can_complete());
+    }
+
+    #[test]
+    fn visual_fault_is_not_verified_by_unrelated_green_tests() {
+        let contract = TaskContract::from_input("新建项目确定按钮看不到");
+        assert_eq!(contract.evidence_requirement, EvidenceRequirement::Visual);
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let edit = ActionProposal {
+            signature: "edit:{\"path\":\"src/settings_view.rs\"}".into(),
+            question: "调整按钮布局".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        let test = ActionProposal {
+            signature: "shell:{\"command\":\"cargo test -p harness-runtime\"}".into(),
+            question: "运行单元测试".into(),
+            supports: vec!["user-objective".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result_observed(&edit, true, "edit applied", Some(true));
+        state.record_tool_result(&test, true, "test result: ok");
+        assert!(!state.can_complete());
+        assert!(state.verification_evidence.is_empty());
+    }
+
+    #[test]
+    fn explanatory_warning_question_is_a_direct_answer_not_a_code_task() {
+        let policy = GeneralDomainPolicy;
+        let contract = TaskContract::from_input(
+            "这个提示是什么意思？仅剩 Git 提示的 LF will be replaced by CRLF（既有 core.autocrlf 行为，未改动配置）。",
+        );
+        assert_eq!(policy.select_strategy(&contract), StrategyKind::Direct);
+        let state = ExecutionState::new(contract, StrategyKind::Direct);
+        assert_eq!(state.solve_mode, SolveMode::OpenEnded);
+        assert!(state.can_complete());
     }
 
     #[test]
@@ -2776,9 +2819,12 @@ mod tests {
         state.steps = budget.max_steps;
         assert!(BudgetManager::diagnose_and_renew(&mut state, &mut budget).is_none());
 
-        // 最终收尾窗口给足 6 步完成汇总交付，不再扩张。
+        // 最终收尾窗口也不会跨过总额。
+        state.steps = budget.hard_max_steps;
+        state.tool_calls = budget.hard_max_tool_calls;
         BudgetManager::arm_final_window(&state, &mut budget);
-        assert_eq!(budget.max_steps, state.steps + 6);
+        assert_eq!(budget.max_steps, budget.hard_max_steps);
+        assert_eq!(budget.max_tool_calls, budget.hard_max_tool_calls);
     }
 
     #[test]

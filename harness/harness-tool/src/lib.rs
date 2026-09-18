@@ -16,6 +16,7 @@ pub use bash::BashTool;
 pub use delegate::DelegateTool;
 pub use edit::EditTool;
 pub use fs::FsTool;
+pub use fs::slice_view as fs_slice_view;
 pub use memory::MemoryTool;
 pub use plan::PlanTool;
 pub use registry::{DynTool, ToolRegistry};

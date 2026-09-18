@@ -58,6 +58,13 @@ pub enum SessionEvent {
         id: EventId,
         report: DeliveryReport,
     },
+    /// Versioned file evidence for resuming a partially completed task.
+    /// Old logs without this event remain readable but their change criteria
+    /// must be revalidated before being restored as complete.
+    TaskCheckpoint {
+        id: EventId,
+        checkpoint: TaskCheckpoint,
+    },
     TurnStopping {
         id: EventId,
         will_stop: bool,
@@ -204,6 +211,15 @@ pub struct DeliveryReport {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCheckpoint {
+    pub version: u32,
+    pub objective: String,
+    pub workspace: String,
+    /// criterion id -> (workspace-relative file -> BLAKE3 content hash).
+    pub criterion_files: HashMap<String, HashMap<String, String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutionTelemetry {
     #[serde(default)]
@@ -270,6 +286,7 @@ fn event_id(ev: &SessionEvent) -> EventId {
         | SessionEvent::ToolResult { id, .. }
         | SessionEvent::PlanUpdate { id, .. }
         | SessionEvent::Delivery { id, .. }
+        | SessionEvent::TaskCheckpoint { id, .. }
         | SessionEvent::TurnStopping { id, .. }
         | SessionEvent::TurnEnd { id }
         | SessionEvent::Usage { id, .. }
@@ -936,6 +953,29 @@ mod tests {
         let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, SessionEvent::Telemetry { telemetry, .. }
             if telemetry.phase == "verify" && telemetry.allowed_tools == ["shell"]));
+    }
+
+    #[test]
+    fn task_checkpoint_round_trips_without_affecting_old_events() {
+        let event = SessionEvent::TaskCheckpoint {
+            id: 8,
+            checkpoint: TaskCheckpoint {
+                version: 1,
+                objective: "修复目标".into(),
+                workspace: "workspace-a".into(),
+                criterion_files: HashMap::from([(
+                    "user-objective".into(),
+                    HashMap::from([("src/view.rs".into(), "hash".into())]),
+                )]),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, SessionEvent::TaskCheckpoint { checkpoint, .. }
+            if checkpoint.version == 1
+                && checkpoint.criterion_files["user-objective"]["src/view.rs"] == "hash"));
+        let old = serde_json::to_string(&SessionEvent::TurnEnd { id: 9 }).unwrap();
+        assert!(matches!(serde_json::from_str::<SessionEvent>(&old).unwrap(), SessionEvent::TurnEnd { .. }));
     }
 
     #[test]

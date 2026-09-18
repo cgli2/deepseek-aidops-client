@@ -35,6 +35,45 @@ impl LlmProvider for Script {
 }
 
 struct DiskTool { name: &'static str, root: PathBuf, no_op: bool }
+
+struct ReadOnlyEvidenceTool { name: &'static str }
+
+struct UiEditAndBuildTool { name: &'static str, root: PathBuf }
+
+#[async_trait]
+impl DynTool for UiEditAndBuildTool {
+    fn name(&self) -> &'static str { self.name }
+
+    async fn call(&self, call: &ToolCall) -> Result<ToolResult> {
+        let content = match self.name {
+            "search" => "共 1 条命中（格式：相对路径:行号: 内容）：\nsrc/settings_view.rs:1: ui.button(\"确定\")".to_owned(),
+            "fs" => std::fs::read_to_string(self.root.join("src/settings_view.rs"))?,
+            "edit" => {
+                let path = self.root.join("src/settings_view.rs");
+                let before = std::fs::read_to_string(&path)?;
+                std::fs::write(path, before.replace("ui.button(\"确定\")", "ui.add_sized([80.0, 28.0], Button::new(\"确定\"))"))?;
+                "edit applied".to_owned()
+            }
+            "shell" => "Finished `dev` profile [unoptimized + debuginfo] target(s)".to_owned(),
+            _ => unreachable!(),
+        };
+        Ok(ToolResult { call_id: call.id.clone(), ok: true, content, continuation_debt: 0 })
+    }
+}
+
+#[async_trait]
+impl DynTool for ReadOnlyEvidenceTool {
+    fn name(&self) -> &'static str { self.name }
+
+    async fn call(&self, call: &ToolCall) -> Result<ToolResult> {
+        let content = if self.name == "search" {
+            "共 1 条命中（格式：相对路径:行号: 内容）：\nsrc/settings_view.rs:1: ui.button(\"确定\")".to_owned()
+        } else {
+            "[文件共 1 行，当前显示 1-1 行]\nui.button(\"确定\")".to_owned()
+        };
+        Ok(ToolResult { call_id: call.id.clone(), ok: true, content, continuation_debt: 0 })
+    }
+}
 #[async_trait]
 impl DynTool for DiskTool {
     fn name(&self) -> &'static str { self.name }
@@ -291,4 +330,122 @@ async fn dirty_git_commit_request_commits_instead_of_entering_repair_workflow() 
         })
     }));
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn explanatory_warning_question_completes_without_tools_or_stall_message() {
+    let root = std::env::temp_dir().join(format!("direct-explanation-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let model = Arc::new(Script {
+        calls: vec![],
+        index: AtomicUsize::new(0),
+        options: Mutex::new(vec![]),
+    });
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let _log = ctx.provide(log.clone());
+    let _workspace = ctx.provide(Workspace::new(root.clone()));
+    let provider: Arc<dyn LlmProvider> = model;
+    let _model = ctx.provide(provider);
+    let _tools = ctx.provide(ToolRegistry::new());
+    let hook: Arc<dyn Hook> = Arc::new(NullHook);
+    let _hook = ctx.provide(hook);
+
+    AgentLoop::new().run_turn(&ctx, UserInput {
+        text: "这个提示是什么意思？仅剩 Git 提示的 LF will be replaced by CRLF（既有 core.autocrlf 行为，未改动配置）。".into(),
+        attachments: vec![],
+    }).await.unwrap();
+
+    let events = log.replay();
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. } if report.outcome == DeliveryOutcome::Verified
+    )), "{events:#?}");
+    assert!(!events.iter().any(|event| matches!(event, SessionEvent::ToolCall { .. })));
+    assert!(!events.iter().any(|event| matches!(event,
+        SessionEvent::Assistant { chunk, .. }
+            if chunk.text.as_deref().is_some_and(|text| text.contains("已停止空转"))
+    )));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn invisible_button_is_not_verified_by_search_and_read_alone() {
+    let root = std::env::temp_dir().join(format!("invisible-button-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/settings_view.rs"), "ui.button(\"确定\")\n").unwrap();
+    let model = Arc::new(Script {
+        calls: vec![
+            ToolCall { id: "locate".into(), name: "search".into(), args: serde_json::json!({"pattern":"确定"}) },
+            ToolCall { id: "inspect".into(), name: "fs".into(), args: serde_json::json!({"op":"read","path":"src/settings_view.rs"}) },
+        ],
+        index: AtomicUsize::new(0),
+        options: Mutex::new(vec![]),
+    });
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let _log = ctx.provide(log.clone());
+    let _workspace = ctx.provide(Workspace::new(root.clone()));
+    let provider: Arc<dyn LlmProvider> = model;
+    let _model = ctx.provide(provider);
+    let tools = ToolRegistry::new();
+    tools.register(Arc::new(ReadOnlyEvidenceTool { name: "search" }));
+    tools.register(Arc::new(ReadOnlyEvidenceTool { name: "fs" }));
+    let _tools = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(NullHook);
+    let _hook = ctx.provide(hook);
+
+    AgentLoop::new().run_turn(&ctx, UserInput {
+        text: "新建项目弹出窗口，确定按钮看不到！".into(),
+        attachments: vec![],
+    }).await.unwrap();
+
+    let events = log.replay();
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. } if report.outcome != DeliveryOutcome::Verified
+    )), "search/read are not visual repair evidence: {events:#?}");
+    assert!(!events.iter().any(|event| matches!(event,
+        SessionEvent::ToolCall { call, .. } if call.name == "edit"
+    )));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn invisible_button_edit_and_build_are_not_visual_verification() {
+    let root = std::env::temp_dir().join(format!("button-build-only-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/settings_view.rs"), "ui.button(\"确定\")\n").unwrap();
+    let model = Arc::new(Script {
+        calls: vec![
+            ToolCall { id: "locate".into(), name: "search".into(), args: serde_json::json!({"pattern":"确定"}) },
+            ToolCall { id: "inspect".into(), name: "fs".into(), args: serde_json::json!({"op":"read","path":"src/settings_view.rs"}) },
+            ToolCall { id: "edit".into(), name: "edit".into(), args: serde_json::json!({"path":"src/settings_view.rs","old_text":"ui.button(\"确定\")","new_text":"ui.add_sized([80.0, 28.0], Button::new(\"确定\"))"}) },
+            ToolCall { id: "build".into(), name: "shell".into(), args: serde_json::json!({"command":"cargo check"}) },
+        ],
+        index: AtomicUsize::new(0),
+        options: Mutex::new(vec![]),
+    });
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let _log = ctx.provide(log.clone());
+    let _workspace = ctx.provide(Workspace::new(root.clone()));
+    let provider: Arc<dyn LlmProvider> = model;
+    let _model = ctx.provide(provider);
+    let tools = ToolRegistry::new();
+    for name in ["search", "fs", "edit", "shell"] {
+        tools.register(Arc::new(UiEditAndBuildTool { name, root: root.clone() }));
+    }
+    let _tools = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(NullHook);
+    let _hook = ctx.provide(hook);
+
+    AgentLoop::new().run_turn(&ctx, UserInput {
+        text: "新建项目弹出窗口，确定按钮看不到！".into(),
+        attachments: vec![],
+    }).await.unwrap();
+
+    let events = log.replay();
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Delivery { report, .. } if report.outcome != DeliveryOutcome::Verified
+    )), "build success is not proof that the button is visible: {events:#?}");
+    std::fs::remove_dir_all(root).unwrap();
 }

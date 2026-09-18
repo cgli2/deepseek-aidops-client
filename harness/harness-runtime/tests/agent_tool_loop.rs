@@ -952,24 +952,18 @@ async fn concrete_problem_replay_starts_with_locate_not_shell_verification() {
     assert!(!options.is_empty());
     assert_eq!(
         options[0].allowed_tools.as_deref(),
-        Some(["search".into(), "fs".into(), "edit".into(), "shell".into()].as_slice())
+        Some(["search".into(), "fs".into()].as_slice())
     );
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("none"));
     let events = log.replay();
-    // 阶段 A 之后阶段只作提示、不作准入：locate 不再把模型可见的工具收窄成
-    // search+fs——那正是被摘掉的吞动作机制。因此这里锁定两件真实契约：
-    // 遥测报出 locate（作为下一步建议），而工具集仍是实施工作流全集。
+    // 工具面与当前工作项阶段一致：定位阶段只公开 search+fs。
+    // 遥测与模型请求共用同一动作裁决，不能再报告另一套全工具列表。
     assert!(events.iter().any(|event| matches!(event,
         SessionEvent::Telemetry { telemetry, .. }
             if telemetry.intent == "AtomicRegression"
                 && telemetry.phase == "locate"
                 && telemetry.allowed_tools
-                    == vec![
-                        "search".to_string(),
-                        "fs".to_string(),
-                        "edit".to_string(),
-                        "shell".to_string()
-                    ]
+                    == vec!["search".to_string(), "fs".to_string()]
     )));
 }
 
@@ -1015,7 +1009,7 @@ async fn quoted_menu_shortening_starts_from_the_grounded_file_not_repository_sea
     assert!(!options.is_empty());
     assert_eq!(
         options[0].allowed_tools.as_deref(),
-        Some(["search".into(), "fs".into(), "edit".into(), "shell".into()].as_slice()),
+        Some(["fs".into(), "search".into()].as_slice()),
         "运行时已从旧文案直接落到 composer.rs，首步应读取候选而非从仓库根搜索"
     );
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("none"));
@@ -1069,7 +1063,7 @@ async fn grounded_candidate_replay_skips_redundant_search() {
     assert!(!options.is_empty());
     assert_eq!(
         options[0].allowed_tools.as_deref(),
-        Some(["search".into(), "fs".into(), "edit".into(), "shell".into()].as_slice())
+        Some(["fs".into(), "search".into()].as_slice())
     );
     assert_eq!(options[0].max_output_tokens, Some(3_072));
     assert_eq!(options[0].reasoning_effort.as_deref(), Some("low"));
@@ -1721,8 +1715,7 @@ async fn repeated_search_replays_from_memo_without_denial() {
         calls: AtomicUsize::new(0),
         requests: Mutex::new(vec![]),
         script: vec![
-            // pattern 必须本测试独有：SEARCH_MEMO 是进程级 static 且键只含 (工具名, 参数)，
-            // 与同二进制其它测试共用 pattern 会随并发顺序污染缓存，使首次派发数不确定。
+            // 即使其它回合使用同名查询，本回合也应独立执行首次搜索。
             scripted_call("s1", "search", serde_json::json!({"pattern": "memo_contract_unique"})),
             scripted_call("f1", "fs", serde_json::json!({"op": "read", "path": "a.py"})),
             scripted_call("s2", "search", serde_json::json!({"pattern": "memo_contract_unique"})),

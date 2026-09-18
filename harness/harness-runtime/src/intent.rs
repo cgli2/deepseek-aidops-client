@@ -39,6 +39,24 @@ const STRUCTURAL_ACTIONS: [&str; 25] = [
 /// 不枚举任何话题。任一命中即视为纯提问（Investigation），交由只读诊断流程处理。
 const QUESTION_LEAD: [&str; 6] = ["为什么", "为何", "怎么", "如何", "啥", "怎样"];
 
+/// “X 是什么意思？”是解释一个已给出的文本，不要求搜索工作区。它和“为什么
+/// 某个功能失效”不同：前者的答案就在用户输入里，后者才需要代码证据。
+const EXPLANATORY_QUESTION_ENDINGS: [&str; 4] = ["什么意思", "是什么", "何意", "含义"];
+
+fn leading_question_sentence(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    let end = trimmed.find(['?', '？'])?;
+    Some(trimmed[..end].trim())
+}
+
+pub(crate) fn is_explanatory_question(input: &str) -> bool {
+    leading_question_sentence(input).is_some_and(|sentence| {
+        EXPLANATORY_QUESTION_ENDINGS
+            .iter()
+            .any(|ending| sentence.ends_with(ending))
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct IntentProfile {
     pub kind: IntentKind,
@@ -62,7 +80,12 @@ impl IntentProfile {
             || input.trim_end_matches('。').trim_end().ends_with('？')
             || QUESTION_LEAD
                 .iter()
-                .any(|lead| input.trim().starts_with(lead));
+                .any(|lead| input.trim().starts_with(lead))
+            // The question mark can be followed by the quoted warning or a
+            // factual qualifier.  Requiring it to be the final character
+            // turned “这个提示是什么意思？……未改动配置” into a code-change
+            // task solely because the qualifier contained “改动”.
+            || is_explanatory_question(input);
 
         // 纯提问不进入任务闸门（Investigation 由 Solve 循环自行定位+读取，不需要
         // 任务式追问）。任何"非纯提问"都视为任务——哪怕暂时没有可定位信号，
@@ -336,6 +359,16 @@ mod tests {
         assert_eq!(profile.kind, IntentKind::Investigation);
         assert!(profile.is_explicit_question);
         assert!(!profile.is_task);
+    }
+
+    #[test]
+    fn question_with_a_following_warning_context_is_still_a_question() {
+        let input = "这个提示是什么意思？仅剩 Git 提示的 LF will be replaced by CRLF（既有 core.autocrlf 行为，未改动配置）。";
+        let profile = IntentProfile::compile(input);
+        assert_eq!(profile.kind, IntentKind::Investigation);
+        assert!(profile.is_explicit_question);
+        assert!(!profile.is_task);
+        assert!(is_explanatory_question(input));
     }
 
     #[test]

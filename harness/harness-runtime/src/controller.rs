@@ -8,7 +8,7 @@ use futures::FutureExt;
 use harness_core::types::UserInput;
 use harness_core::ui_input::{QueuedInput, UiInputSink};
 use harness_core::{AppContext, Registration};
-use harness_session::{SessionId, SessionLog};
+use harness_session::{DeliveryOutcome, DeliveryReport, SessionEvent, SessionId, SessionLog};
 use harness_tool::{PlanTool, ToolRegistry};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -244,6 +244,8 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
         } else {
             format!("{clean_text}{note}")
         };
+        let report_input = run_text.clone();
+        let turn_log_cursor = ctx.get::<SessionLog>().replay().len();
         let outcome = std::panic::AssertUnwindSafe(async {
             let runner_cancellation = cancellation.clone();
             let turn = async {
@@ -306,14 +308,14 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
             Err(_) => Some("后台回合发生异常，已自动恢复界面".into()),
         } {
             let log = ctx.get::<SessionLog>();
-            log.append(harness_session::SessionEvent::Assistant {
-                id: log.gen_id(),
-                chunk: harness_llm::Chunk {
-                    text: Some(format!("[error] {error}")),
-                    ..Default::default()
-                },
-            });
-            log.append(harness_session::SessionEvent::TurnEnd { id: log.gen_id() });
+            let failure = if error.contains("回合超过显式配置") {
+                DeliveryOutcome::Interrupted
+            } else if cancellation.is_cancelled() {
+                DeliveryOutcome::Cancelled
+            } else {
+                DeliveryOutcome::SystemFailure
+            };
+            close_failed_turn(&log, turn_log_cursor, &report_input, failure, &error);
         }
         if let Ok(mut queues) = inner.queues.lock() {
             if let Some(queue) = queues.get_mut(&id) {
@@ -321,6 +323,37 @@ async fn run_turn_queue(inner: Arc<Inner>, id: SessionId, scope: SessionScope) {
             }
         }
     }
+}
+
+fn close_failed_turn(log: &SessionLog, cursor: usize, input: &str, outcome: DeliveryOutcome, error: &str) {
+    let events = log.replay();
+    let current = events.get(cursor..).unwrap_or(&[]);
+    let has_start = current.iter().any(|event| matches!(event, SessionEvent::TurnStart { .. }));
+    if current.iter().any(|event| matches!(event, SessionEvent::TurnEnd { .. })) {
+        return;
+    }
+    if !has_start {
+        log.append(SessionEvent::TurnStart { id: log.gen_id(), input: input.to_owned() });
+    }
+    if !current.iter().any(|event| matches!(event, SessionEvent::Delivery { .. })) {
+        log.append(SessionEvent::Delivery {
+            id: log.gen_id(),
+            report: DeliveryReport {
+                outcome,
+                criteria: Vec::new(),
+                verification: Vec::new(),
+                reason: Some(error.to_owned()),
+            },
+        });
+    }
+    log.append(SessionEvent::Assistant {
+        id: log.gen_id(),
+        chunk: harness_llm::Chunk {
+            text: Some(format!("[error] {error}")),
+            ..Default::default()
+        },
+    });
+    log.append(SessionEvent::TurnEnd { id: log.gen_id() });
 }
 
 fn attachment_note(attachments: &[harness_core::Attachment]) -> String {
@@ -343,4 +376,53 @@ fn attachment_note(attachments: &[harness_core::Attachment]) -> String {
         .collect::<Vec<_>>()
         .join("；");
     format!("\n\n[用户附件，必须作为任务输入条件处理：{files}]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_turn_gets_one_structured_report() {
+        let log = SessionLog::new();
+        close_failed_turn(&log, 0, "修复按钮", DeliveryOutcome::Cancelled, "用户取消");
+        close_failed_turn(&log, 0, "修复按钮", DeliveryOutcome::SystemFailure, "重复出口");
+        let events = log.replay();
+        let reports: Vec<_> = events.iter().filter_map(|event| match event {
+            SessionEvent::Delivery { report, .. } => Some(report),
+            _ => None,
+        }).collect();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, DeliveryOutcome::Cancelled);
+        assert!(matches!(events.last(), Some(SessionEvent::TurnEnd { .. })));
+    }
+
+    #[test]
+    fn controller_preserves_existing_delivery_on_error() {
+        let log = SessionLog::new();
+        log.append(SessionEvent::TurnStart { id: log.gen_id(), input: "任务".into() });
+        log.append(SessionEvent::Delivery {
+            id: log.gen_id(),
+            report: DeliveryReport {
+                outcome: DeliveryOutcome::PartialDelivery,
+                criteria: Vec::new(),
+                verification: Vec::new(),
+                reason: Some("尚未验证".into()),
+            },
+        });
+        close_failed_turn(&log, 0, "任务", DeliveryOutcome::SystemFailure, "Provider 故障");
+        assert_eq!(log.replay().iter().filter(|event| matches!(event, SessionEvent::Delivery { .. })).count(), 1);
+    }
+
+    #[test]
+    fn failure_before_new_turn_start_is_not_hidden_by_previous_turn_end() {
+        let log = SessionLog::new();
+        log.append(SessionEvent::TurnStart { id: log.gen_id(), input: "上一任务".into() });
+        log.append(SessionEvent::TurnEnd { id: log.gen_id() });
+        let cursor = log.replay().len();
+        close_failed_turn(&log, cursor, "当前任务", DeliveryOutcome::SystemFailure, "启动失败");
+        let events = log.replay();
+        assert!(matches!(&events[cursor], SessionEvent::TurnStart { input, .. } if input == "当前任务"));
+        assert!(events[cursor..].iter().any(|event| matches!(event, SessionEvent::Delivery { report, .. } if report.outcome == DeliveryOutcome::SystemFailure)));
+    }
 }

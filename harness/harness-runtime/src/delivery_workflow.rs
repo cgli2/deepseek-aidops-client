@@ -1,17 +1,9 @@
 //! Implementation workflow policy. ExecutionState owns delivery facts; GoalExecution
 //! supplies the work breakdown only. A phase is guidance, never write authorization.
-use crate::execution::{ExecutionState, StrategyKind};
+use crate::execution::{EvidenceRequirement, ExecutionState, StrategyKind};
 
 pub(crate) fn owns(state: &ExecutionState) -> bool {
     matches!(state.strategy, StrategyKind::Transformative | StrategyKind::Generative)
-}
-
-pub(crate) fn tools(state: &ExecutionState) -> Vec<String> {
-    let mut tools = vec!["search", "fs", "edit", "shell"];
-    if state.contract.acceptance_criteria.len() > 1 {
-        tools.push("plan");
-    }
-    tools.into_iter().map(str::to_owned).collect()
 }
 
 pub(crate) fn instructions(state: &ExecutionState) -> String {
@@ -24,6 +16,9 @@ pub(crate) fn instructions(state: &ExecutionState) -> String {
 }
 
 pub(crate) fn next_action(state: &ExecutionState) -> &'static str {
+    if state.write_operations > 0 && state.contract.evidence_requirement == EvidenceRequirement::Visual {
+        return "代码已修改；编译或单元测试不能证明界面可见。需实际打开对应界面检查目标状态；当前没有视觉证据时明确标记为待验证。";
+    }
     if state.write_operations > 0 {
         "继续完成尚未覆盖的修改，运行对应验证；若测试失败，修正代码后重新验证。"
     } else if state.write_attempts > 0 {

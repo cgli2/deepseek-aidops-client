@@ -31,7 +31,7 @@ impl FsTool {
 /// - 指定 start_line/end_line（1 基，含端点）时返回该区间（限宽 `MAX_RANGE_LINES`）；
 /// - 未指定且超过 `DEFAULT_VIEW_LINES` 行时返回首部窗口；
 /// - 头部始终标注总行数与当前展示区间，尾部提示如何读剩余部分。
-fn slice_view(content: &str, start_line: Option<usize>, end_line: Option<usize>) -> String {
+pub fn slice_view(content: &str, start_line: Option<usize>, end_line: Option<usize>) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let (from, to, clamped) = match (start_line, end_line) {

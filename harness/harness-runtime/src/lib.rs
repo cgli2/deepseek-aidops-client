@@ -7,6 +7,7 @@ pub mod concept_registry;
 pub mod concurrent_scheduler;
 pub mod controller;
 pub mod council;
+pub mod delivery_decision;
 mod delivery_workflow;
 pub mod events;
 pub mod execution;

@@ -467,7 +467,13 @@ mod tests {
         let goal = GoalContract::compile("后台管理->多端拼装，菜单名称修改为智能体装配");
         let grounding = WorkspaceGrounder::ground(&root, &goal);
         assert_eq!(grounding.status, GroundingStatus::Grounded);
-        assert_eq!(grounding.literal_hits, vec!["src\\menu.ts"]);
+        // relative 跟随平台分隔符（Windows 为 '\'，CI/Linux 为 '/'），统一成 '/' 再比较。
+        let hits: Vec<String> = grounding
+            .literal_hits
+            .iter()
+            .map(|hit| hit.replace('\\', "/"))
+            .collect();
+        assert_eq!(hits, vec!["src/menu.ts"]);
         let _ = fs::remove_dir_all(&root);
     }
     #[test]
@@ -487,7 +493,12 @@ mod tests {
         let grounding = WorkspaceGrounder::ground_exact_literal(&root, &goal)
             .expect("双引号旧值应进入精确字面量通道");
         assert_eq!(grounding.status, GroundingStatus::Grounded);
-        assert_eq!(grounding.literal_hits, vec!["src\\composer.rs"]);
+        let hits: Vec<String> = grounding
+            .literal_hits
+            .iter()
+            .map(|hit| hit.replace('\\', "/"))
+            .collect();
+        assert_eq!(hits, vec!["src/composer.rs"]);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -16,7 +16,7 @@ jobs:
       run:
         working-directory: harness
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Check all features
         run: cargo check --workspace --all-features

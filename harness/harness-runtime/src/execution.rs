@@ -200,6 +200,74 @@ fn has_single_delivery_statement(objective: &str) -> bool {
         == 1
 }
 
+/// 文档类交付物的扩展名白名单（封闭集合，跨领域恒定）。
+const DOCUMENT_EXTENSIONS: [&str; 8] = [
+    ".md", ".markdown", ".txt", ".rst", ".adoc", ".doc", ".docx", ".pdf",
+];
+
+/// 文档“交付动词”——只覆盖“产出一个文件”这一结构化动作，不含任何领域话题。
+/// 必须命中其一才可能是文档交付物：这样“按 docs/DESIGN.md 实施开发”里被引用的
+/// 设计文档是**输入**而非产物（无交付动词），不会被误判为出文档。
+const DOCUMENT_DELIVER_VERBS: [&str; 9] = [
+    "输出", "产出", "生成", "编写", "撰写", "形成", "交付", "写入", "写成",
+];
+
+/// 文档“产物名词”——只覆盖明确的文档载体，排除“方案/建议”这类可能只是代码任务
+/// 附帶描述的词，避免把普通变更任务误判为出文档。
+const DOCUMENT_NOUNS: [&str; 7] = [
+    "报告", "文档", "说明书", "md", "markdown", "readme", "报表",
+];
+
+fn is_document_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    DOCUMENT_EXTENSIONS
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
+/// 识别用户是否明确要求产出一个**文档文件**作为本回合交付物。
+///
+/// 只使用封闭的结构信号，不枚举任何话题。**前提是命中一个“交付动词”**（输出/生成/
+/// 写入…），以此把“产出文档”与“按某文档去改代码”区分开；在此基础上再看产物：
+/// - (a) 出现以文档扩展名结尾的显式文件名 token（如 `报告.md`、`design.docx`）；或
+/// - (b) 出现“文档产物名词”（如“输出 md 报告”“生成设计文档”）。
+///
+/// 命中返回交付物描述（显式文件名优先），供契约把验收锚点从“代码行为”改为“磁盘文档”。
+fn detect_document_deliverable(input: &str) -> Option<String> {
+    // 交付动词是硬前提：没有被“引用”的设计文档（按/根据 X.md 实施）不构成产物。
+    if !DOCUMENT_DELIVER_VERBS.iter().any(|verb| input.contains(verb)) {
+        return None;
+    }
+    // (a) 显式文件名 token：分隔符切词后，凡以文档扩展名结尾且扩展名前仍有名字者命中。
+    for token in input.split(|ch: char| ch.is_whitespace() || "，。；;、:：)）(（【】\"'`".contains(ch)) {
+        let token = token.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '.' && ch != '_' && ch != '-');
+        let lower = token.to_ascii_lowercase();
+        if let Some(extension) = DOCUMENT_EXTENSIONS.iter().find(|extension| lower.ends_with(**extension)) {
+            // 排除“裸扩展名”（如单独一个 `.md`），它不构成可定位的交付物名。
+            if token.chars().count() > extension.chars().count() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    // (b) 文档产物名词。
+    if let Some(noun) = DOCUMENT_NOUNS.iter().find(|noun| input.contains(**noun)) {
+        return Some(format!("{noun}文档"));
+    }
+    None
+}
+
+/// 从写入类工具签名里取出目标路径，仅当它确实是一个文档文件时返回。
+fn document_write_path(signature: &str) -> Option<String> {
+    if !(signature.starts_with("edit:") || signature.contains("\"op\":\"write\"")) {
+        return None;
+    }
+    let (_, json) = signature.split_once(':')?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let path = value.get("path").and_then(|path| path.as_str())?;
+    is_document_path(path).then(|| path.to_string())
+}
+
+
 /// 工具调用的运行时阶段。它是实际执行状态的投影，不接受模型的计划文本推动。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPhase {
@@ -400,6 +468,11 @@ pub struct TaskContract {
     pub acceptance_criteria: Vec<Criterion>,
     /// 由同一问题中列出的多个界面自动拆分的验收项；它们可共享一次整体验证。
     pub inferred_surface_criteria: bool,
+    /// 用户明确要求产出的文档类交付物（如“输出 md 报告”“生成设计文档”或显式
+    /// 文件名 `报告.md`）。命中时本回合的可交付产物是磁盘上的一个文档文件，而不是
+    /// 一次业务代码修改：证据降为 `Static`（文件即锚点），并新增一条 `document-artifact`
+    /// 验收项，避免“研究+出报告”类任务被误判为代码变更、在只读探索里烧尽预算却零写入。
+    pub document_deliverable: Option<String>,
     pub scope: Vec<String>,
     pub constraints: Vec<String>,
     pub uncertainties: Vec<String>,
@@ -413,6 +486,15 @@ impl TaskContract {
         let objective = input.trim().to_string();
         let exact_transformation = crate::goal_execution::extract_exact_transformation(input);
         let intent = IntentProfile::compile(&objective);
+        // 文档类交付物（“输出 md 报告”“生成设计文档”/显式文件名）优先于普通代码变更
+        // 分类：它把本回合的可交付产物锚定为磁盘上的一个文档文件，而不是业务代码修改。
+        // Git 提交与纯解释问题不出文档，明确排除，避免误伤其既有闭合语义。
+        let document_deliverable =
+            if is_local_git_commit_request(&objective) || is_explanatory_question(&objective) {
+                None
+            } else {
+                detect_document_deliverable(&objective)
+            };
         let requested_outcome = if is_local_git_commit_request(&objective) {
             RequestedOutcome::RepositoryOperation
         } else if is_explanatory_question(&objective) {
@@ -564,6 +646,34 @@ impl TaskContract {
                 description: format!("完成用户目标并验证可观察结果：{objective}"),
             }]
         };
+        // 文档类交付物覆盖：交付物是磁盘上的一个文档文件，不是一次业务代码修改。
+        // - 请求结果强制为 `Change`（必须真正写入一个文件，故不能是只读诊断）；
+        // - 证据降为 `Static`（文件落盘即可复核，报告没有可运行的行为面）；
+        // - 单条 `document-artifact` 验收项，写入成功后由运行时按磁盘产物置为 Verified。
+        let (requested_outcome, evidence_requirement, deliverables, acceptance_criteria) =
+            if let Some(document) = &document_deliverable {
+                (
+                    RequestedOutcome::Change,
+                    EvidenceRequirement::Static,
+                    vec![document.clone()],
+                    vec![Criterion {
+                        id: "document-artifact".into(),
+                        description: format!(
+                            "将根因分析、结论与解决方案写入报告文档（{document}）以供评审；评审通过前不改动业务代码"
+                        ),
+                    }],
+                )
+            } else {
+                (
+                    requested_outcome,
+                    evidence_requirement,
+                    deliverables,
+                    acceptance_criteria,
+                )
+            };
+        // 文档交付物是单一产物，不参与“多个界面自动拆分”的验收面语义。
+        let inferred_surface_criteria =
+            if document_deliverable.is_some() { false } else { inferred_surface_criteria };
         Self {
             objective: objective.clone(),
             requested_outcome,
@@ -571,6 +681,7 @@ impl TaskContract {
             deliverables,
             acceptance_criteria,
             inferred_surface_criteria,
+            document_deliverable,
             scope: Vec::new(),
             constraints,
             uncertainties: Vec::new(),
@@ -717,6 +828,32 @@ impl ExecutionState {
                 self.satisfied_criteria.clear();
                 self.changed_criteria
                     .extend(proposal.supports.iter().cloned());
+                // 文档类交付物：一次成功写入目标文档文件本身就是可复核的产物证据。
+                // 报告没有可运行的行为面（build/test 证明不了它），磁盘上的文件即验收
+                // 锚点，故直接以 Static 证据把 `document-artifact` 置为已验证；写入路径
+                // 必须确实是文档扩展名，避免把无关代码写入误记为报告交付。
+                if self.contract.document_deliverable.is_some() {
+                    if let Some(path) = document_write_path(&proposal.signature) {
+                        let criterion_id = "document-artifact";
+                        if self
+                            .contract
+                            .acceptance_criteria
+                            .iter()
+                            .any(|criterion| criterion.id == criterion_id)
+                        {
+                            let proof = format!(
+                                "报告文档已写入磁盘：{path}（{}）",
+                                summary.chars().take(160).collect::<String>()
+                            );
+                            self.verification_evidence
+                                .entry(criterion_id.to_string())
+                                .or_default()
+                                .push(proof);
+                            self.satisfied_criteria.insert(criterion_id.to_string());
+                            self.changed_criteria.insert(criterion_id.to_string());
+                        }
+                    }
+                }
             }
             let repository_operation_satisfied = self.strategy == StrategyKind::RepositoryOperation
                 && repository_operation_satisfies(proposal, summary);
@@ -2892,5 +3029,96 @@ mod tests {
             &state,
         );
         assert_eq!(p1.signature, p2.signature);
+    }
+
+    #[test]
+    fn codeloop_report_request_becomes_a_document_deliverable_not_a_code_change() {
+        // 取证：真实 Codeloop 任务“……梳理分析，找出根因……输出md报告，解决方案。
+        // 评审后再动手改造。”旧实现被判为 Change/Behavior，steering 一直催“对已确认
+        // 文件执行一次最小编辑”，与“评审后再动手改造”的延后约束冲突，只读探索烧尽
+        // 预算却零写入（验收 0/1）。文档交付物必须锚定到磁盘上的报告文件。
+        let contract = TaskContract::from_input(
+            "目前系统Agent工作台Codeloop工作机制存在一些严重问题，一运行就报错，现需要你对项目代码和文档进行梳理分析，找出根因。然后制定可行有效的解决机制。输出md报告，解决方案。评审后再动手改造。",
+        );
+        assert!(
+            contract.document_deliverable.is_some(),
+            "应识别出文档类交付物"
+        );
+        assert_eq!(contract.requested_outcome, RequestedOutcome::Change);
+        assert_eq!(contract.evidence_requirement, EvidenceRequirement::Static);
+        assert_eq!(contract.acceptance_criteria.len(), 1);
+        assert_eq!(contract.acceptance_criteria[0].id, "document-artifact");
+        assert!(!contract.inferred_surface_criteria);
+    }
+
+    #[test]
+    fn explicit_document_filename_is_detected_as_deliverable() {
+        let contract = TaskContract::from_input("把架构分析写入 design.md");
+        assert_eq!(contract.document_deliverable.as_deref(), Some("design.md"));
+        assert_eq!(contract.evidence_requirement, EvidenceRequirement::Static);
+    }
+
+    #[test]
+    fn plain_code_change_has_no_document_deliverable() {
+        // 防误报：普通代码变更（无交付动词+文档名词、无文档文件名）不得被误判为出文档，
+        // 否则会绕过行为验证门禁。
+        for text in [
+            "修改登录逻辑，把超时时间改为 30 秒",
+            "修复列表页滚动抖动",
+            "阅读文档并重构配置加载",
+        ] {
+            let contract = TaskContract::from_input(text);
+            assert!(
+                contract.document_deliverable.is_none(),
+                "不应把普通代码任务判为文档交付物：{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn referenced_design_doc_is_an_input_not_a_deliverable() {
+        // 防误报：“按 docs/DESIGN.md 实施开发”里被引用的设计文档是**输入**，不是产物。
+        // 没有交付动词，绝不能因为出现 .md 文件名就把它当成出文档任务（否则会绕过
+        // 行为验证、把一次代码实现降级为写文件）。
+        let contract = TaskContract::from_input(
+            "按 docs/LOCAL_KNOWLEDGE_BASE_DESIGN.md 实施开发，补齐实现并增加测试",
+        );
+        assert!(contract.document_deliverable.is_none());
+        assert_eq!(contract.evidence_requirement, EvidenceRequirement::Behavior);
+        assert_eq!(contract.requested_outcome, RequestedOutcome::Change);
+    }
+
+    #[test]
+    fn successful_document_write_satisfies_artifact_criterion() {
+        let contract = TaskContract::from_input("分析根因并输出md报告");
+        assert!(contract.document_deliverable.is_some());
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let proposal = ActionProposal {
+            signature: "fs:{\"op\":\"write\",\"path\":\"Codeloop根因分析报告.md\"}".into(),
+            question: "写入报告".into(),
+            supports: vec!["document-artifact".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result_observed(&proposal, true, "已写入 4200 字节", Some(true));
+        assert!(state.satisfied_criteria.contains("document-artifact"));
+        assert!(!state.verification_evidence.is_empty());
+        assert_eq!(state.write_operations, 1);
+        assert!(state.can_complete(), "报告落盘后应可完成");
+    }
+
+    #[test]
+    fn non_document_write_does_not_satisfy_artifact_criterion() {
+        // 写入非文档文件（业务代码）不能满足报告交付物：评审通过前不应改业务代码，
+        // 也不能用一次无关写入伪造报告已交付。
+        let contract = TaskContract::from_input("分析根因并输出md报告");
+        let mut state = ExecutionState::new(contract, StrategyKind::Transformative);
+        let proposal = ActionProposal {
+            signature: "edit:{\"path\":\"src/agent_loop.rs\"}".into(),
+            question: "改代码".into(),
+            supports: vec!["document-artifact".into()],
+            estimated_cost: 1,
+        };
+        state.record_tool_result_observed(&proposal, true, "edit ok", Some(true));
+        assert!(!state.satisfied_criteria.contains("document-artifact"));
     }
 }

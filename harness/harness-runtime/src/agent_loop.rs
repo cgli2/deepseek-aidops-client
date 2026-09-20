@@ -2184,6 +2184,34 @@ impl AgentLoop {
                                         }
                                     }
                                 }
+                                // 文档类交付物：报告文档成功落盘即完成本回合交付面。
+                                // `record_tool_result_observed` 已把 `document-artifact`
+                                // 记为 Static 已验证；这里把求解图对应面同步置 Verified，
+                                // 否则 `can_conclude` 仍要求所有面 Verified，回合会继续
+                                // 催促一次报告根本跑不了的 build/test，直到预算耗尽。
+                                if execution.contract.document_deliverable.is_some()
+                                    && execution.satisfied_criteria.contains("document-artifact")
+                                {
+                                    let proof = execution
+                                        .verification_evidence
+                                        .get("document-artifact")
+                                        .and_then(|items| items.last())
+                                        .cloned()
+                                        .unwrap_or_else(|| "报告文档已写入磁盘".into());
+                                    if goal_execution
+                                        .mark_document_delivered("document-artifact", proof.clone())
+                                    {
+                                        ledger.add_evidence("document-artifact", proof.clone());
+                                        ledger.verify("document-artifact");
+                                        append_telemetry(
+                                            &log,
+                                            &execution,
+                                            &goal_execution,
+                                            &ledger,
+                                            &format!("document-artifact {proof}"),
+                                        );
+                                    }
+                                }
                                 for criterion in &proposal.supports {
                                     ledger.activate(criterion);
                                     if res.ok && execution.satisfied_criteria.contains(criterion) {

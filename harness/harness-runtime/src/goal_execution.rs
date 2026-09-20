@@ -1143,6 +1143,28 @@ impl GoalExecution {
         settled
     }
 
+    /// 文档类交付物（`document-artifact` 验收项）是否仍未落盘。用于让 `next_action_hint`
+    /// 在“研究+出报告”任务里把下一步指向写报告，而不是修改业务代码。
+    pub fn document_artifact_pending(&self) -> bool {
+        self.items
+            .get("document-artifact")
+            .is_some_and(|item| item.state != WorkItemState::Verified)
+    }
+
+    /// 报告文档成功写入磁盘后，把该交付面直接置为 `Verified`。
+    ///
+    /// 文档没有可运行的行为面，磁盘上的文件本身即验收锚点（契约已把证据降为 `Static`）。
+    /// 这与 `settle_static_convergence` 的“断言逐字复核”不同：报告的正文不是固定期望串，
+    /// 因此以“目标文档已写入”这一事实收敛，避免让报告任务卡在无法执行的 build/test 门禁上。
+    pub fn mark_document_delivered(&mut self, id: &str, proof: impl Into<String>) -> bool {
+        let Some(item) = self.items.get_mut(id) else {
+            return false;
+        };
+        item.state = WorkItemState::Verified;
+        item.evidence.push(proof.into());
+        true
+    }
+
     /// S4 / D4：把模型声明的判据类别写入交付面，经白名单校验。
     /// 返回是否为**合法**声明；非法声明会被记为 `Unknown`（强制执行验证）。
     pub fn declare_surface_kind(&mut self, id: &str, raw: &str) -> bool {
@@ -1571,6 +1593,12 @@ impl GoalExecution {
             ),
             WorkItemState::ReadyToChange if self.read_only => {
                 "基于已确认的最短调用链形成证据结论；如仍有一个关键缺口，只读取对应候选。".into()
+            }
+            // 文档类交付物（“输出 md 报告”）：本回合的产物是磁盘上的一份报告，而不是
+            // 一次业务代码修改。此前统一提示“对已确认文件执行一次最小编辑”，与用户
+            // “评审后再动手改造”的延后约束冲突，导致只读探索烧尽预算却零写入。
+            WorkItemState::ReadyToChange if self.document_artifact_pending() => {
+                "本回合的交付物是一份报告文档：基于已读取的证据，用单次 fs write 新建一个 .md 文件，写入根因分析、结论与解决方案；评审通过前不要修改任何业务代码。".into()
             }
             WorkItemState::ReadyToChange if self.confirmed_target_files.is_empty() =>
                 "读取具体候选文件确认实现后直接编辑；尚无具体文件时执行一次带目录约束的 search。".into(),
@@ -3458,6 +3486,7 @@ mod tests {
                 },
             ],
             inferred_surface_criteria: false,
+            document_deliverable: None,
             scope: vec![],
             constraints: vec![],
             uncertainties: vec![],
@@ -3672,6 +3701,7 @@ mod tests {
                 },
             ],
             inferred_surface_criteria: false,
+            document_deliverable: None,
             scope: vec![],
             constraints: vec![],
             uncertainties: vec![],
@@ -4924,5 +4954,48 @@ mod tests {
         assert!(plan
             .allows_tool_call_with_new_file(&create, &proposal, true)
             .is_ok());
+    }
+
+    #[test]
+    fn document_deliverable_steers_ready_to_change_toward_writing_the_report() {
+        // 取证：Codeloop“输出md报告……评审后再动手改造”任务旧 steering 在 ReadyToChange
+        // 一直提示“对已确认文件执行一次最小编辑”，与延后改代码的约束冲突，导致零写入
+        // 烧尽预算。文档交付物必须把下一步指向写报告，而不是改业务代码。
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input(
+            "梳理分析找出根因，输出md报告，评审后再动手改造",
+        ));
+        assert!(plan.document_artifact_pending());
+        assert!(!plan.read_only, "文档交付物需要写入，不能是只读诊断");
+        let item = plan.items.get_mut("document-artifact").unwrap();
+        item.state = WorkItemState::ReadyToChange;
+        item.read_evidence = 3;
+        let hint = plan.next_action_hint();
+        assert!(hint.contains("报告文档"), "应提示写报告：{hint}");
+        assert!(hint.contains("fs write"), "应指向单次写盘：{hint}");
+        assert!(
+            !hint.contains("最小编辑"),
+            "不得再催促修改业务代码：{hint}"
+        );
+        // 写盘能力必须开放。
+        assert!(plan.allowed_tools().contains(&"fs".into()));
+    }
+
+    #[test]
+    fn mark_document_delivered_converges_the_solver_graph() {
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input(
+            "分析根因并输出md报告",
+        ));
+        assert!(plan.document_artifact_pending());
+        assert!(!plan.can_conclude(), "报告未落盘前不得收尾");
+        assert!(plan.mark_document_delivered("document-artifact", "报告文档已写入磁盘：报告.md"));
+        assert!(!plan.document_artifact_pending());
+        assert!(plan.can_conclude(), "报告落盘后应收敛");
+        // 已无活动工作项：提示应转向收尾/生成交付结论，而不是继续探索或改代码。
+        let hint = plan.next_action_hint();
+        assert!(
+            hint.contains("收尾") || hint.contains("交付结论"),
+            "报告落盘后应提示收尾：{hint}"
+        );
+        assert!(plan.allowed_tools().is_empty(), "收敛后不再开放工具");
     }
 }

@@ -449,3 +449,145 @@ async fn invisible_button_edit_and_build_are_not_visual_verification() {
     )), "build success is not proof that the button is visible: {events:#?}");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// 文档类交付物端到端回归（取证：真实 Codeloop 任务）。
+///
+/// 旧行为：`……梳理分析，找出根因……输出md报告……评审后再动手改造。` 被判为
+/// Change/Behavior，steering 一直催“对已确认文件执行一次最小编辑”，与“评审后再动手
+/// 改造”的延后约束冲突，只读探索烧尽预算却零写入（部分交付·验收 0/1）。
+///
+/// 新行为：契约把交付物锚定为磁盘上的报告文档（Static 证据 + `document-artifact`
+/// 验收项），steering 指向“单次 fs write 写报告”，报告落盘即 Verified——且全程不改
+/// 任何业务代码。模型是脚本化的，但报告写盘是真实的。
+struct DocReportTool {
+    name: &'static str,
+    root: PathBuf,
+}
+
+#[async_trait]
+impl DynTool for DocReportTool {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn call(&self, call: &ToolCall) -> Result<ToolResult> {
+        let content = match self.name {
+            "search" => {
+                "共 2 条命中（格式：相对路径:行号: 内容）：\nsrc/codeloop.rs:1: fn run_codeloop() {}\nsrc/agent.rs:2: fn step() {}"
+                    .to_owned()
+            }
+            "fs" => {
+                let path = self.root.join(call.args["path"].as_str().unwrap_or(""));
+                if call.args["op"] == "read" {
+                    std::fs::read_to_string(path)?
+                } else {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, call.args["content"].as_str().unwrap_or(""))?;
+                    "written".into()
+                }
+            }
+            // 文档任务在评审前不得改动业务代码；脚本也不会调用 edit，这里兜底断言。
+            "edit" => panic!("document deliverable must not edit business code before review"),
+            _ => unreachable!(),
+        };
+        Ok(ToolResult {
+            call_id: call.id.clone(),
+            ok: true,
+            content,
+            continuation_debt: 0,
+        })
+    }
+}
+
+#[tokio::test]
+async fn research_task_converges_by_writing_the_requested_report() {
+    let root = std::env::temp_dir().join(format!("doc-deliverable-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let codeloop_before = "fn run_codeloop() {}\n";
+    let agent_before = "fn step() {}\n";
+    std::fs::write(root.join("src/codeloop.rs"), codeloop_before).unwrap();
+    std::fs::write(root.join("src/agent.rs"), agent_before).unwrap();
+
+    let mut calls = Vec::new();
+    let mut add = |name: &str, args| {
+        calls.push(ToolCall {
+            id: format!("call-{}", calls.len()),
+            name: name.into(),
+            args,
+        })
+    };
+    add("search", serde_json::json!({"dir":"src","pattern":"codeloop"}));
+    add("fs", serde_json::json!({"op":"read","path":"src/codeloop.rs"}));
+    add("fs", serde_json::json!({"op":"read","path":"src/agent.rs"}));
+    add(
+        "fs",
+        serde_json::json!({"op":"write","path":"Codeloop根因分析报告.md","content":"# 根因\n预算烧尽零写入。\n# 解决方案\n文档交付物收敛。\n"}),
+    );
+
+    let model = Arc::new(Script {
+        calls,
+        index: AtomicUsize::new(0),
+        options: Mutex::new(vec![]),
+    });
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let _log = ctx.provide(log.clone());
+    let _workspace = ctx.provide(Workspace::new(root.clone()));
+    let provider: Arc<dyn LlmProvider> = model;
+    let _model = ctx.provide(provider);
+    let tools = ToolRegistry::new();
+    for name in ["search", "fs"] {
+        tools.register(Arc::new(DocReportTool {
+            name,
+            root: root.clone(),
+        }));
+    }
+    let _tools = ctx.provide(tools);
+    let hook: Arc<dyn Hook> = Arc::new(NullHook);
+    let _hook = ctx.provide(hook);
+
+    AgentLoop::new()
+        .run_turn(
+            &ctx,
+            UserInput {
+                text: "目前系统Agent工作台Codeloop工作机制存在严重问题，一运行就报错，请对项目代码梳理分析找出根因，输出md报告与解决方案，评审后再动手改造。".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = log.replay();
+    // 报告落盘即交付：单一裁决判 Verified。
+    assert!(
+        events.iter().any(|event| matches!(event,
+            SessionEvent::Delivery { report, .. } if report.outcome == DeliveryOutcome::Verified)),
+        "写报告任务应交付成功：{events:#?}"
+    );
+    // 报告文件真实存在于磁盘，且内容非空。
+    let report = root.join("Codeloop根因分析报告.md");
+    assert!(report.is_file(), "报告文档必须真实写盘");
+    assert!(
+        std::fs::read_to_string(&report).unwrap().contains("解决方案"),
+        "报告应包含实质内容"
+    );
+    // 评审前不得改动任何业务代码。
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/codeloop.rs")).unwrap(),
+        codeloop_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/agent.rs")).unwrap(),
+        agent_before
+    );
+    // document-artifact 验收项被判满足。
+    assert!(
+        events.iter().any(|event| matches!(event,
+            SessionEvent::Delivery { report, .. } if report.criteria.iter()
+                .any(|c| c.id == "document-artifact" && c.satisfied))),
+        "document-artifact 验收项应满足：{events:#?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

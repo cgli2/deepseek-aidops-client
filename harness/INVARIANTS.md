@@ -89,7 +89,10 @@
 ## 交互式 Agent 过渡期安全规则
 
 - `Delivery` 是交付结论，`TurnEnd` 只表示回合闭合。控制器捕获的取消、超时和异常在尚无 `Delivery` 时先补结构化报告；已有报告不得重复生成。
+- **唯一交付裁决**：终态由纯函数 `evaluate_delivery(&DeliveryFacts) -> DeliveryDecision` 单点裁决，不读时钟/工作区/日志，相同输入必得相同结论。`CompletionJudge`、`GoalExecution`、模型文本只能提出候选（`solver_claims_complete`），无权直接产出 `Verified`。终态 `DeliveryReport` 的验收项与证据由 `DeliveryDecision::into_report()` 单一来源生成；`ExecutionState::can_complete`/`delivery_report` 只作 fail-closed 降级防线（可把 `Verified` 降为 `PartialDelivery`，绝不反向升级）。
 - 视觉故障不能靠源码字串、`cargo check` 或无关单元测试进入 `Verified`。缺少实际界面证据时保留为未验证。
-- 搜索结果缓存只在当前回合有效，观察到工作区写入后失效。历史 `fs.read` 只有在当前磁盘视图逐字一致时才可恢复；无版本信息的历史搜索不能当作当前事实。变更任务从 v1 `TaskCheckpoint` 恢复验收项时，关联文件指纹必须全部匹配；旧日志缺少指纹则重验。
+- 搜索结果缓存只在当前回合有效，观察到工作区写入后失效。历史 `fs.read` 只有在当前磁盘视图逐字一致时才可恢复；无版本信息的历史搜索不能当作当前事实。变更任务从 `TaskCheckpoint` 恢复验收项时，关联文件指纹必须全部匹配；旧日志缺少指纹则重验。
+- **版本化断点与续跑守恒**：`TaskCheckpoint` 当前为 v2，携带各验收项文件 BLAKE3 指纹、已否定假设（`rejected_hypotheses`）与落盘时硬预算剩余（`remaining_steps`/`remaining_tool_calls`）；读取兼容 v1（新字段缺省回落，`version ∈ {1,2}` 均接受）。续跑重建执行前沿后回灌已否定假设（不再把已排除路径当新方向重试），并在 v2 断点存在时用剩余成本收紧新窗口硬上限，使总额守恒而非重获无界预算；v1 断点不收紧，避免把旧日志误判为总额耗尽。
+- **任务级总成本与出口类型不丢失**：唯一终态出口写入一份成本快照（模型请求数、总 token、墙钟耗时）到遥测，与 `Budget` 持有的步数/工具调用总额共同构成每任务指标。控制器把 `SystemFailure`/`Interrupted`/`Blocked` 对用户收敛为 `PartialDelivery` 时，归一化前的具体终态类型必须保留在遥测 `terminal_outcome`，不得因收敛而丢失故障/暂停区分。
 - 预算分为有次数上限的软窗口和不可续期的硬总额：软窗口最多使用 `max_renewals` 次；常规续期和最终收尾窗口的步数/工具调用额度都不得越过硬总额。命中硬总额立即停止，不因进展、失败重试线索或模型文本自动获配新额度。
-- 上述规则是当前防护边界，不表示版本化任务断点、统一预算和唯一交付裁决已全部实现；完整门槛见 `docs/agent-runtime-reconstruction-implementation-plan-2026-09-18.md`。
+- 上述规则是当前防护边界。唯一交付裁决、版本化断点（v2）与任务级总成本已落地并由测试覆盖；结构化模型解释、可重复的视觉/行为验证器、任务关系精确匹配与灰度真实 UI 对照尚未实现，视觉验收仍为“待验证”。完整门槛见 `docs/agent-runtime-reconstruction-implementation-plan-2026-09-18.md`。

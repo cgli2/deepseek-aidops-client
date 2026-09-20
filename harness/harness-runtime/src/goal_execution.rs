@@ -624,6 +624,48 @@ impl GoalExecution {
         }
     }
 
+    /// P3 续跑：把上一回合检查点里已否定的假设重新标记为 `Rejected`，使重建的
+    /// 执行前沿不再把已被证据排除的路径当作全新方向重试。若当前活跃假设恰好在
+    /// 否定集合内，则前移到第一个未被否定的假设；全部被否定时保持原样，交由
+    /// `advance_hypothesis` 的有界重开逻辑处理。
+    pub fn restore_rejected_hypotheses(&mut self, rejected: &[String]) {
+        if rejected.is_empty() {
+            return;
+        }
+        for item in self.items.values_mut() {
+            for hypothesis in item.hypotheses.iter_mut() {
+                if rejected.iter().any(|description| *description == hypothesis.description) {
+                    hypothesis.state = HypothesisState::Rejected;
+                }
+            }
+            let active_rejected = item
+                .hypotheses
+                .get(item.active_hypothesis)
+                .is_some_and(|hypothesis| hypothesis.state == HypothesisState::Rejected);
+            if !active_rejected {
+                continue;
+            }
+            match item
+                .hypotheses
+                .iter()
+                .position(|hypothesis| hypothesis.state != HypothesisState::Rejected)
+            {
+                Some(next) => {
+                    item.active_hypothesis = next;
+                    item.hypotheses[next].state = HypothesisState::Active;
+                }
+                // 全部假设都被否定：不留“零活跃假设”的退化前沿，按有界重开语义把
+                // 首个假设重新置为活跃（与 `advance_hypothesis` 耗尽分支一致）。
+                None => {
+                    item.active_hypothesis = 0;
+                    if let Some(first) = item.hypotheses.first_mut() {
+                        first.state = HypothesisState::Active;
+                    }
+                }
+            }
+        }
+    }
+
     /// S5/G1：按 LLM 生成的 `SolveSketch` 构建求解图。草图里每个面携带独立类别、
     /// 依赖、预算与风险；未出现在草图中的验收项保留 `from_contract` 的默认面。
     ///

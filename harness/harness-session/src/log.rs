@@ -218,6 +218,17 @@ pub struct TaskCheckpoint {
     pub workspace: String,
     /// criterion id -> (workspace-relative file -> BLAKE3 content hash).
     pub criterion_files: HashMap<String, HashMap<String, String>>,
+    /// 已被证据否定的假设描述。续跑重建执行前沿时不得重试这些路径，避免把
+    /// 上一回合已经排除的假设当作全新方向再跑一遍。v1 检查点缺省为空。
+    #[serde(default)]
+    pub rejected_hypotheses: Vec<String>,
+    /// 落盘时任务硬预算的剩余步数（hard_max_steps - 已用步数）。续跑据此收紧
+    /// 新窗口，使总额守恒，而不是重新获得一份无界预算；v1 检查点缺省为 0。
+    #[serde(default)]
+    pub remaining_steps: usize,
+    /// 落盘时任务硬预算的剩余工具调用数；语义同 `remaining_steps`。
+    #[serde(default)]
+    pub remaining_tool_calls: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -246,6 +257,19 @@ pub struct ExecutionTelemetry {
     pub no_information_count: usize,
     #[serde(default)]
     pub correction_count: usize,
+    /// P4 任务级总成本（回合快照）：模型请求数、总 token、墙钟耗时（毫秒）。
+    /// 只在唯一终态出口填充；中间遥测保持缺省 0，避免与终值混淆。旧日志缺省为 0。
+    #[serde(default)]
+    pub model_requests: usize,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// P4 出口归一化前的具体终态类型（`DeliveryOutcome` 的调试名）。控制器把
+    /// SystemFailure/Interrupted/Blocked 等对用户收敛为 PartialDelivery，此字段保留
+    /// 被收敛掉的具体暂停/故障类型，供诊断与指标区分“基础设施失败”和“部分交付”。
+    #[serde(default)]
+    pub terminal_outcome: String,
     pub detail: String,
 }
 
@@ -946,13 +970,24 @@ mod tests {
                 phase: "verify".into(),
                 allowed_tools: vec!["shell".into()],
                 verified_count: 1,
+                model_requests: 4,
+                total_tokens: 1234,
+                elapsed_ms: 567,
                 ..Default::default()
             },
         };
         let json = serde_json::to_string(&event).unwrap();
         let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, SessionEvent::Telemetry { telemetry, .. }
-            if telemetry.phase == "verify" && telemetry.allowed_tools == ["shell"]));
+            if telemetry.phase == "verify" && telemetry.allowed_tools == ["shell"]
+                && telemetry.model_requests == 4
+                && telemetry.total_tokens == 1234
+                && telemetry.elapsed_ms == 567));
+        // 兼容读取：缺少成本字段的旧遥测仍须反序列化，成本回落缺省 0。
+        let old = r#"{"Telemetry":{"id":7,"telemetry":{"intent":"","phase":"verify","allowed_tools":[],"step":0,"tool_calls":0,"evidence_count":0,"verified_count":0,"blocked_count":0,"detail":""}}}"#;
+        let decoded_old: SessionEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(decoded_old, SessionEvent::Telemetry { telemetry, .. }
+            if telemetry.total_tokens == 0 && telemetry.model_requests == 0));
     }
 
     #[test]
@@ -960,20 +995,33 @@ mod tests {
         let event = SessionEvent::TaskCheckpoint {
             id: 8,
             checkpoint: TaskCheckpoint {
-                version: 1,
+                version: 2,
                 objective: "修复目标".into(),
                 workspace: "workspace-a".into(),
                 criterion_files: HashMap::from([(
                     "user-objective".into(),
                     HashMap::from([("src/view.rs".into(), "hash".into())]),
                 )]),
+                rejected_hypotheses: vec!["目标位于具体交付面或边界映射中".into()],
+                remaining_steps: 3,
+                remaining_tool_calls: 4,
             },
         };
         let json = serde_json::to_string(&event).unwrap();
         let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, SessionEvent::TaskCheckpoint { checkpoint, .. }
+            if checkpoint.version == 2
+                && checkpoint.criterion_files["user-objective"]["src/view.rs"] == "hash"
+                && checkpoint.remaining_steps == 3
+                && checkpoint.rejected_hypotheses.len() == 1));
+        // 兼容读取：v1 检查点（缺少新字段）仍须反序列化，新字段回落到 serde 缺省。
+        let v1 = r#"{"TaskCheckpoint":{"id":8,"checkpoint":{"version":1,"objective":"修复目标","workspace":"workspace-a","criterion_files":{}}}}"#;
+        let decoded_v1: SessionEvent = serde_json::from_str(v1).unwrap();
+        assert!(matches!(decoded_v1, SessionEvent::TaskCheckpoint { checkpoint, .. }
             if checkpoint.version == 1
-                && checkpoint.criterion_files["user-objective"]["src/view.rs"] == "hash"));
+                && checkpoint.rejected_hypotheses.is_empty()
+                && checkpoint.remaining_steps == 0
+                && checkpoint.remaining_tool_calls == 0));
         let old = serde_json::to_string(&SessionEvent::TurnEnd { id: 9 }).unwrap();
         assert!(matches!(serde_json::from_str::<SessionEvent>(&old).unwrap(), SessionEvent::TurnEnd { .. }));
     }

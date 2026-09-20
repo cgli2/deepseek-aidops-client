@@ -930,7 +930,7 @@ impl ExecutionState {
 
     /// 对需要实际变更或核验的任务，最终回复前必须有成功验证，且每个验收项均被
     /// 该验证覆盖。这样“模型停止调用工具”不再能伪造成成功交付。
-    fn requires_verification(&self) -> bool {
+    pub(crate) fn requires_verification(&self) -> bool {
         matches!(
             self.strategy,
             StrategyKind::Transformative

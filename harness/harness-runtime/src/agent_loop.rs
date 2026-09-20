@@ -20,12 +20,13 @@ use harness_tool::ToolRegistry;
 use tokio_util::sync::CancellationToken;
 
 use crate::case_file::CaseFile;
+use crate::delivery_decision::{DeliveryFacts, StopCause, evaluate_delivery};
 use crate::events::{PreStep, TurnStopping};
 use crate::execution::{
-    ActionGate, ActionProposal, BudgetManager, Completion, CompletionJudge, DomainPolicy,
+    ActionGate, ActionProposal, Budget, BudgetManager, Completion, CompletionJudge, DomainPolicy,
     ExecutionState, GateDecision, GeneralDomainPolicy, SolvePlan, TaskContract,
 };
-use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion};
+use crate::goal_execution::{ActionContract, EvidenceKind, GoalCompletion, HypothesisState};
 use crate::governor::{Decision, TurnGovernor, artifact_text, is_continuation_request};
 use crate::intent::ClarificationKind;
 use crate::response_recovery::{RecoveryDecision, RecoveryPlan, ResponseRecovery};
@@ -540,6 +541,7 @@ fn task_checkpoint(
     goal: &GoalExecution,
     root: &Path,
     report: &DeliveryReport,
+    budget: &Budget,
 ) -> TaskCheckpoint {
     let mut criterion_files = HashMap::new();
     for criterion in report.criteria.iter().filter(|criterion| criterion.satisfied) {
@@ -556,11 +558,27 @@ fn task_checkpoint(
             criterion_files.insert(criterion.id.clone(), files);
         }
     }
+    // 只记录真正被探索过（attempts>0）又否定的假设；`default_hypotheses` 里预置为
+    // Rejected 的占位假设 attempts==0，不代表已排除的路径，不应污染续跑前沿。
+    let mut rejected_hypotheses: Vec<String> = goal
+        .items
+        .values()
+        .flat_map(|item| item.hypotheses.iter())
+        .filter(|hypothesis| {
+            hypothesis.state == HypothesisState::Rejected && hypothesis.attempts > 0
+        })
+        .map(|hypothesis| hypothesis.description.clone())
+        .collect();
+    rejected_hypotheses.sort();
+    rejected_hypotheses.dedup();
     TaskCheckpoint {
-        version: 1,
+        version: 2,
         objective: execution.contract.objective.clone(),
         workspace: workspace_identity(root),
         criterion_files,
+        rejected_hypotheses,
+        remaining_steps: budget.hard_max_steps.saturating_sub(execution.steps),
+        remaining_tool_calls: budget.hard_max_tool_calls.saturating_sub(execution.tool_calls),
     }
 }
 
@@ -575,7 +593,7 @@ fn validated_resume_report(
         return report.clone();
     }
     let valid_checkpoint = checkpoint.zip(root).filter(|(checkpoint, root)| {
-        checkpoint.version == 1
+        (1..=2).contains(&checkpoint.version)
             && checkpoint.objective == objective
             && checkpoint.workspace == workspace_identity(root)
     });
@@ -986,6 +1004,21 @@ impl AgentLoop {
             surface_demand
         };
         BudgetManager::provision_hard_limits(&mut budget, demand.steps, demand.tool_calls);
+        // P3 续跑守恒：检查点携带的“已否定假设”和“剩余成本”在重建执行前沿后回灌。
+        // 只有 v2 检查点带这两项；v1（旧日志）缺省为 0/空，此时不收紧预算，避免把
+        // 历史检查点误判为“总额已耗尽”而立即硬停。
+        if let Some(state) = &resume {
+            if let Some(checkpoint) = &state.checkpoint {
+                goal_execution.restore_rejected_hypotheses(&checkpoint.rejected_hypotheses);
+                if checkpoint.version >= 2 {
+                    // 续跑继续消费原始总额，而不是重新获得一份无界预算：新窗口的
+                    // 硬上限取“本回合重新估算”与“上一回合剩余”的较小者。
+                    budget.hard_max_steps = budget.hard_max_steps.min(checkpoint.remaining_steps);
+                    budget.hard_max_tool_calls =
+                        budget.hard_max_tool_calls.min(checkpoint.remaining_tool_calls);
+                }
+            }
+        }
         let intent = crate::IntentProfile::compile(&task_text);
 
         // L2 裁决：**先于澄清门禁执行**。
@@ -1367,6 +1400,12 @@ impl AgentLoop {
         // 首请求尚无本回合实际用量可作下界，发出后再以真实 Usage 驱动后续前置判顶。
         let mut turn_prompt_tokens = 0u64;
         let mut last_prompt_tokens = 0u64;
+        // P4 任务级总成本：把此前分散在 Usage 事件、步数/工具预算里的成本统一成
+        // 一份回合级快照（模型请求数、总 token、墙钟耗时），在唯一终态出口落盘，
+        // 供 §5 发布门槛做“同一批任务改造前后”对照。步数/工具调用总额仍由 Budget 持有。
+        let turn_started_at = std::time::Instant::now();
+        let mut turn_model_requests = 0usize;
+        let mut turn_total_tokens = 0u64;
         let mut session_case = case_file.clone();
         let mut case_cursor = history.len();
         // 只有“同一调用连续得到相同结果”才被视为停滞；先要求模型换路，不立即终止。
@@ -1575,12 +1614,15 @@ impl AgentLoop {
                             prepare_request_messages(scoped_msgs),
                             request_options.clone(),
                         ));
+                        turn_model_requests += 1;
                     }
                     Box::pin(futures::stream::select_all(streams))
                 } else {
+                    turn_model_requests += 1;
                     llm.stream_with_options(prepare_request_messages(pre_input), request_options)
                 }
             } else {
+                turn_model_requests += 1;
                 llm.stream_with_options(prepare_request_messages(pre_input), request_options)
             };
             let mut assistant_text = String::new();
@@ -2264,6 +2306,7 @@ impl AgentLoop {
                 // 二者都必须在 step_usage 被 move 进事件之前取。
                 last_prompt_tokens = step_usage.prompt_tokens;
                 turn_prompt_tokens += step_usage.prompt_tokens;
+                turn_total_tokens += step_usage.total_tokens;
                 log.append(SessionEvent::Usage {
                     id: log.gen_id(),
                     usage: step_usage,
@@ -2547,85 +2590,32 @@ impl AgentLoop {
 
         execution.record_direct_answer(&last_assistant);
         let terminal_reason = goal_execution.actionable_terminal_reason();
-        let (raw_outcome, raw_reason) = if cancelled {
-            (
-                harness_session::DeliveryOutcome::Cancelled,
-                Some("用户取消了回合；未获得完整验收证据".into()),
-            )
-        } else if provider_error_seen {
-            // provider 流错误优先级最高：错误文本非模型回答，绝不可 Verified；
-            // On 模式下游出口会把 SystemFailure 收口为 PartialDelivery；内部诊断资产
-            // 只写遥测，用户看到的是简短的缺失步骤。
-            (
-                harness_session::DeliveryOutcome::SystemFailure,
-                Some(format!(
-                    "llm provider error（流读取已终止，未获有效模型回答）: {provider_error_summary}"
-                )),
-            )
-        } else if delivery_verified && execution.can_complete() {
-            (harness_session::DeliveryOutcome::Verified, None)
-        } else if delivery_verified {
-            (
-                harness_session::DeliveryOutcome::PartialDelivery,
-                Some("求解图已到终态，但执行证据没有覆盖全部验收项；已拒绝 Verified".into()),
-            )
-        } else if goal_execution.needs_user_input() {
-            (
-                harness_session::DeliveryOutcome::NeedsUserInput,
-                terminal_reason,
-            )
-        } else if stalled_without_action {
-            (
-                harness_session::DeliveryOutcome::PartialDelivery,
-                Some(if baseline_verification_observed {
-                    "baseline_verified_without_change: 验证命令通过，但本轮没有产生代码修改".into()
-                } else {
-                    "stalled_without_action: 模型连续两次只返回文本，任务状态与证据均未推进".into()
-                }),
-            )
-        } else if !execution.changed_criteria.is_empty() {
-            (
-                harness_session::DeliveryOutcome::PartialDelivery,
-                terminal_reason
-                    .or_else(|| Some("已有修改，但尚未获得覆盖全部验收项的验证证据".into())),
-            )
-        } else if absolute_budget_hit {
-            // Fix4（轻量）：把已探索证据要点并入停止原因，使下一次续跑的
-            // resume_instruction 能直接展示，模型从证据前沿继续而非从零重探。
-            let evidence_hint = if execution.evidence.is_empty() {
-                String::new()
-            } else {
-                let keys: Vec<&String> = execution.evidence.keys().collect();
-                format!(
-                    "；已探索证据：{}",
-                    keys.iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join("、")
-                )
-            };
-            (
-                harness_session::DeliveryOutcome::SystemFailure,
-                terminal_reason
-                    .or_else(|| Some("已达到安全探索预算，但未形成可验证的目标路径".into()))
-                    .map(|reason| format!("{reason}{evidence_hint}")),
-            )
-        } else if hard_stop {
-            (
-                harness_session::DeliveryOutcome::Interrupted,
-                Some("回合因取消、模型异常或重复调用保护而中断；未获得完整验收证据".into()),
-            )
-        } else if budget_exhausted {
-            (
-                harness_session::DeliveryOutcome::SystemFailure,
-                terminal_reason.or_else(|| Some("执行窗口结束前未形成完整验收证据".into())),
-            )
-        } else {
-            (
-                harness_session::DeliveryOutcome::SystemFailure,
-                terminal_reason.or_else(|| Some("回合异常结束，未形成完整验收证据".into())),
-            )
-        };
+        // 单一终止/交付裁决入口（spec §3.2）：此前由十路 if/else 按书写顺序交织七个
+        // 布尔量拼出 DeliveryOutcome，任何一处放宽都会把搜索命中或绿色构建误记为成功。
+        // 现在「为什么停止」收敛为 StopCause，「证据是否覆盖目标」由 evaluate_delivery
+        // 纯函数裁决，它是唯一能宣布 Completed 的地方；下游 delivery_report 只能
+        // fail-closed 降级，不能反向升级。
+        let stop_cause = derive_stop_cause(
+            cancelled,
+            provider_error_seen,
+            &provider_error_summary,
+            delivery_verified,
+            goal_execution.needs_user_input(),
+            terminal_reason,
+            stalled_without_action,
+            baseline_verification_observed,
+            !execution.changed_criteria.is_empty(),
+            absolute_budget_hit,
+            hard_stop,
+            budget_exhausted,
+        );
+        let delivery_facts =
+            build_delivery_facts(&execution, &goal_execution, stop_cause, delivery_verified);
+        let decision = evaluate_delivery(&delivery_facts);
+        let (raw_outcome, raw_reason) = (decision.outcome(), decision.status_reason());
+        // 归一化会把具体终态收敛为 PartialDelivery 并在 else 分支 move 掉 raw_outcome；
+        // 先留存具体类型标签，供唯一终态出口写入遥测（诊断/指标不被收敛丢失）。
+        let specific_outcome = format!("{raw_outcome:?}");
         // 出口收口（spec §4.2）：控制器模式下只剩两个出口。Verified 即 Delivered；
         // 用户取消保持 Cancelled（强行改判会剥夺取消语义，且它不是治理失败）；
         // 其余一律收敛为 PartialDelivery。R4 四要素是内部诊断资产，写入 Telemetry；
@@ -2685,7 +2675,19 @@ impl AgentLoop {
         } else {
             (raw_outcome, raw_reason)
         };
-        let report = execution.delivery_report(outcome, reason);
+        // 单一报告来源（spec §3.2）：验收项与证据由同一裁决 `into_report()` 生成，
+        // 治理层归一化只覆写用户可见的 outcome 与简洁 reason，不再由 delivery_report
+        // 另建第二套完成投影。fail-closed 兜底：裁决判完成但执行投影不满足时降级
+        //（covered ⟹ can_complete，正常不触发，保留防线以免任何路径反向升级为 Verified）。
+        let mut report = decision.into_report();
+        report.outcome = outcome;
+        report.reason = reason;
+        if report.outcome == DeliveryOutcome::Verified && !execution.can_complete() {
+            report.outcome = DeliveryOutcome::PartialDelivery;
+            report.reason = Some(
+                "求解图声称完成，但执行证据未覆盖全部验收项；已拒绝 Verified，任务仍未完成".into(),
+            );
+        }
         let outcome = report.outcome.clone();
         let memory_content = (controlled_delivery_turn && outcome != DeliveryOutcome::Verified)
             .then(|| {
@@ -2717,7 +2719,7 @@ impl AgentLoop {
         if let Some(root) = workspace_root.as_deref() {
             log.append(SessionEvent::TaskCheckpoint {
                 id: log.gen_id(),
-                checkpoint: task_checkpoint(&execution, &goal_execution, root, &report),
+                checkpoint: task_checkpoint(&execution, &goal_execution, root, &report, &budget),
             });
         }
         log.append(SessionEvent::Delivery {
@@ -2776,15 +2778,105 @@ impl AgentLoop {
                 let _ = conv.remember(card).await;
             }
         }
-        append_telemetry(
-            &log,
+        // 唯一终态出口：写入本回合的任务级总成本快照（模型请求数/总 token/耗时），
+        // 与 Budget 持有的步数/工具调用总额一起构成 §5 发布门槛所需的每任务指标。
+        // 同时保留归一化前的具体终态类型，避免 PartialDelivery 收敛掉故障/暂停区分。
+        let turn_cost = TaskCost {
+            model_requests: turn_model_requests,
+            total_tokens: turn_total_tokens,
+            elapsed_ms: turn_started_at.elapsed().as_millis() as u64,
+        };
+        let mut terminal_telemetry = build_telemetry(
             &execution,
             &goal_execution,
             &ledger,
             "回合结束，交付状态已落盘",
+            Some(turn_cost),
         );
+        terminal_telemetry.terminal_outcome = specific_outcome;
+        log.append(SessionEvent::Telemetry {
+            id: log.gen_id(),
+            telemetry: terminal_telemetry,
+        });
         log.append(SessionEvent::TurnEnd { id: log.gen_id() });
         Ok(())
+    }
+}
+
+/// 把回合结束时交织的停止信号收敛为单一 [`StopCause`]，顺序与改造前的十路出口链
+/// 严格一致：取消与 provider 错误优先于一切证据；求解图自认完成（delivery_verified）
+/// 先于用户决策与空转；有改动但未验证不是独立停止原因，交回 `Settled` 让纯函数按
+/// 证据覆盖度裁决，避免把「已写入」误升级为完成或把完整证据降级为失败。
+#[allow(clippy::too_many_arguments)]
+fn derive_stop_cause(
+    cancelled: bool,
+    provider_error_seen: bool,
+    provider_error_summary: &str,
+    delivery_verified: bool,
+    goal_needs_user_input: bool,
+    terminal_reason: Option<String>,
+    stalled_without_action: bool,
+    baseline_verification_observed: bool,
+    has_unverified_changes: bool,
+    absolute_budget_hit: bool,
+    hard_stop: bool,
+    budget_exhausted: bool,
+) -> StopCause {
+    if cancelled {
+        StopCause::UserCancelled
+    } else if provider_error_seen {
+        StopCause::ProviderError(provider_error_summary.to_string())
+    } else if delivery_verified {
+        StopCause::Settled
+    } else if goal_needs_user_input {
+        StopCause::NeedsUserDecision(
+            terminal_reason.unwrap_or_else(|| "当前工作区中没有找到可确认的目标实现入口".into()),
+        )
+    } else if stalled_without_action {
+        if baseline_verification_observed {
+            StopCause::BaselineVerifiedWithoutChange
+        } else {
+            StopCause::NoProgressStall
+        }
+    } else if has_unverified_changes {
+        StopCause::Settled
+    } else if absolute_budget_hit {
+        StopCause::HardBudgetCeiling
+    } else if hard_stop {
+        StopCause::HardStop("取消、模型异常或重复调用保护".into())
+    } else if budget_exhausted {
+        StopCause::BudgetWindowExhausted
+    } else {
+        StopCause::Abnormal
+    }
+}
+
+/// 从执行投影与求解图采集裁决所需的只读事实。`solver_claims_complete` 只能提出候选
+/// 结论，不能授予完成；`has_execution_evidence` 决定「实现在哪」是否属于 Agent 的
+/// 技术定位问题（一旦运行时已定位或读取过资产，就不得伪装成只有用户能回答的产品决策）。
+fn build_delivery_facts(
+    execution: &ExecutionState,
+    goal_execution: &GoalExecution,
+    stop: StopCause,
+    delivery_verified: bool,
+) -> DeliveryFacts {
+    DeliveryFacts {
+        requested_outcome: execution.contract.requested_outcome,
+        evidence_requirement: execution.contract.evidence_requirement,
+        requires_verification: execution.requires_verification(),
+        requires_workspace_change: execution.requires_workspace_change(),
+        criteria: execution.contract.acceptance_criteria.clone(),
+        changed_criteria: execution.changed_criteria.clone(),
+        verification: execution.verification_evidence.clone(),
+        read_evidence: execution
+            .evidence
+            .values()
+            .map(|item| item.summary.clone())
+            .collect(),
+        write_operations: execution.write_operations,
+        solver_claims_complete: delivery_verified,
+        has_execution_evidence: goal_execution.has_execution_evidence(),
+        stop,
     }
 }
 
@@ -2879,56 +2971,80 @@ fn append_telemetry(
     ledger: &TaskLedger,
     detail: &str,
 ) {
+    log.append(SessionEvent::Telemetry {
+        id: log.gen_id(),
+        telemetry: build_telemetry(execution, goal_execution, ledger, detail, None),
+    });
+}
+
+/// 任务级总成本快照（P4）。把模型请求数、总 token、墙钟耗时与 Budget 持有的
+/// 步数/工具调用总额收敛到一处，只在唯一终态出口写入遥测，供发布门槛对照。
+#[derive(Debug, Clone, Copy, Default)]
+struct TaskCost {
+    model_requests: usize,
+    total_tokens: u64,
+    elapsed_ms: u64,
+}
+
+fn build_telemetry(
+    execution: &ExecutionState,
+    goal_execution: &GoalExecution,
+    ledger: &TaskLedger,
+    detail: &str,
+    cost: Option<TaskCost>,
+) -> ExecutionTelemetry {
     let action = next_action(execution, goal_execution);
     let current = ledger
         .current_item()
         .map(|item| format!("{}：{}", item.id, item.description))
         .unwrap_or_else(|| "全部验收项已处理".into());
-    log.append(SessionEvent::Telemetry {
-        id: log.gen_id(),
-        telemetry: ExecutionTelemetry {
-            executor: if crate::delivery_workflow::owns(execution) {
-                "delivery-workflow".into()
-            } else if goal_executor_enabled()
-                && execution.solve_mode != crate::execution::SolveMode::OpenEnded
-            {
-                "v4".into()
-            } else {
-                "legacy".into()
-            },
-            goal: goal_execution.goal.objective.clone(),
-            intent: format!(
-                "{:?}",
-                crate::IntentProfile::compile(&execution.contract.objective).kind
-            ),
-            phase: action.phase,
-            allowed_tools: action.allowed_tools,
-            step: execution.steps,
-            tool_calls: execution.tool_calls,
-            evidence_count: execution.evidence.len(),
-            verified_count: ledger.verified_count(),
-            blocked_count: ledger.blocked_count(),
-            active_work_item: goal_execution
-                .active_item()
-                .map(|item| format!("{}：{}", item.id, item.description))
-                .unwrap_or_else(|| "无".into()),
-            work_items: goal_execution
-                .items
-                .values()
-                .map(|item| WorkItemTelemetry {
-                    id: item.id.clone(),
-                    description: item.description.clone(),
-                    state: item.state.as_str().into(),
-                    evidence_count: item.evidence.len(),
-                })
-                .collect(),
-            next_action: action.hint,
-            active_hypothesis: goal_execution.active_hypothesis_summary(),
-            no_information_count: goal_execution.no_information_count,
-            correction_count: goal_execution.correction_count,
-            detail: format!("{detail}；当前验收：{current}"),
+    let cost = cost.unwrap_or_default();
+    ExecutionTelemetry {
+        executor: if crate::delivery_workflow::owns(execution) {
+            "delivery-workflow".into()
+        } else if goal_executor_enabled()
+            && execution.solve_mode != crate::execution::SolveMode::OpenEnded
+        {
+            "v4".into()
+        } else {
+            "legacy".into()
         },
-    });
+        goal: goal_execution.goal.objective.clone(),
+        intent: format!(
+            "{:?}",
+            crate::IntentProfile::compile(&execution.contract.objective).kind
+        ),
+        phase: action.phase,
+        allowed_tools: action.allowed_tools,
+        step: execution.steps,
+        tool_calls: execution.tool_calls,
+        evidence_count: execution.evidence.len(),
+        verified_count: ledger.verified_count(),
+        blocked_count: ledger.blocked_count(),
+        active_work_item: goal_execution
+            .active_item()
+            .map(|item| format!("{}：{}", item.id, item.description))
+            .unwrap_or_else(|| "无".into()),
+        work_items: goal_execution
+            .items
+            .values()
+            .map(|item| WorkItemTelemetry {
+                id: item.id.clone(),
+                description: item.description.clone(),
+                state: item.state.as_str().into(),
+                evidence_count: item.evidence.len(),
+            })
+            .collect(),
+        next_action: action.hint,
+        active_hypothesis: goal_execution.active_hypothesis_summary(),
+        no_information_count: goal_execution.no_information_count,
+        correction_count: goal_execution.correction_count,
+        model_requests: cost.model_requests,
+        total_tokens: cost.total_tokens,
+        elapsed_ms: cost.elapsed_ms,
+        terminal_outcome: String::new(),
+        detail: format!("{detail}；当前验收：{current}"),
+    }
 }
 
 fn render_experience(facts: &[MemoryFact]) -> Option<String> {
@@ -4889,6 +5005,9 @@ mod tests {
                 "user-objective".into(),
                 HashMap::from([("target.rs".into(), hash)]),
             )]),
+            rejected_hypotheses: Vec::new(),
+            remaining_steps: 0,
+            remaining_tool_calls: 0,
         };
         let report = DeliveryReport {
             outcome: DeliveryOutcome::PartialDelivery,
@@ -4913,6 +5032,140 @@ mod tests {
         std::fs::write(root.join("target.rs"), "regressed\n").unwrap();
         assert!(!validated(Some(&checkpoint)).criteria[0].satisfied);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// P3 跨进程多验收项恢复：日志落盘后由“新进程”重开，已验证且文件未变的验收项
+    /// 不重做，未完成项继续，变更文件的旧证据不复用；检查点的否定假设与剩余成本随
+    /// 日志完整往返，使续跑在原始总额内守恒而不是重获无界预算。
+    #[test]
+    fn cross_process_resume_restores_verified_criteria_and_conserves_budget() {
+        let dir =
+            std::env::temp_dir().join(format!("cross-process-resume-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fixed-a\n").unwrap();
+        std::fs::write(root.join("b.rs"), "todo-b\n").unwrap();
+        let hash_a = artifact_fingerprint(&root, "a.rs").unwrap();
+
+        let report = DeliveryReport {
+            outcome: DeliveryOutcome::PartialDelivery,
+            criteria: vec![
+                harness_session::DeliveryCriterion {
+                    id: "item-a".into(),
+                    description: "修复 A".into(),
+                    satisfied: true,
+                    evidence: vec!["a test passed".into()],
+                },
+                harness_session::DeliveryCriterion {
+                    id: "item-b".into(),
+                    description: "修复 B".into(),
+                    satisfied: false,
+                    evidence: vec![],
+                },
+            ],
+            verification: vec!["a test passed".into()],
+            reason: Some("下一阶段预算窗口结束".into()),
+        };
+        let checkpoint = TaskCheckpoint {
+            version: 2,
+            objective: "修复 A 和 B".into(),
+            workspace: workspace_identity(&root),
+            criterion_files: HashMap::from([(
+                "item-a".into(),
+                HashMap::from([("a.rs".into(), hash_a)]),
+            )]),
+            rejected_hypotheses: vec!["目标由共享字段、配置或直接符号实现".into()],
+            remaining_steps: 5,
+            remaining_tool_calls: 7,
+        };
+
+        // 第一进程：写入持久日志后退出（作用域结束即 drop）。
+        let log_dir = dir.join("sessions");
+        {
+            let log = harness_session::SessionLog::persistent(&log_dir);
+            log.append(SessionEvent::TurnStart {
+                id: log.gen_id(),
+                input: "修复 A 和 B".into(),
+            });
+            log.append(SessionEvent::TaskCheckpoint {
+                id: log.gen_id(),
+                checkpoint: checkpoint.clone(),
+            });
+            log.append(SessionEvent::Delivery {
+                id: log.gen_id(),
+                report: report.clone(),
+            });
+            log.append(SessionEvent::TurnEnd { id: log.gen_id() });
+        }
+
+        // 第二进程：从磁盘重开日志并重建续跑状态。
+        let reopened = harness_session::SessionLog::open_latest(&log_dir);
+        let events = reopened.replay();
+        let resumed = latest_resumable_task(&events).expect("应从未完成根任务恢复");
+        assert_eq!(resumed.objective, "修复 A 和 B");
+        let restored = resumed.checkpoint.expect("检查点须随日志跨进程恢复");
+        assert_eq!(restored.version, 2);
+        assert_eq!(restored.remaining_steps, 5);
+        assert_eq!(restored.remaining_tool_calls, 7);
+        assert_eq!(
+            restored.rejected_hypotheses,
+            ["目标由共享字段、配置或直接符号实现".to_string()]
+        );
+
+        // 已验证项不重做：a.rs 指纹仍匹配 → item-a 保持 satisfied；item-b 继续。
+        let validated = validated_resume_report(
+            &resumed.report,
+            Some(&restored),
+            Some(&root),
+            crate::execution::RequestedOutcome::Change,
+            "修复 A 和 B",
+        );
+        assert!(
+            validated.criteria.iter().find(|c| c.id == "item-a").unwrap().satisfied,
+            "文件未变更，已验证项应恢复而非重做"
+        );
+        assert!(
+            !validated.criteria.iter().find(|c| c.id == "item-b").unwrap().satisfied,
+            "未完成项须继续处理"
+        );
+
+        // 变更文件的旧证据不复用：改动 a.rs 后 item-a 失效并清空证据。
+        std::fs::write(root.join("a.rs"), "regressed-a\n").unwrap();
+        let invalidated = validated_resume_report(
+            &resumed.report,
+            Some(&restored),
+            Some(&root),
+            crate::execution::RequestedOutcome::Change,
+            "修复 A 和 B",
+        );
+        let a2 = invalidated.criteria.iter().find(|c| c.id == "item-a").unwrap();
+        assert!(!a2.satisfied, "文件已变更，旧验收证据不得复用");
+        assert!(a2.evidence.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// P3：检查点里的否定假设回灌到重建的求解图，已排除路径不再作为活跃假设重试；
+    /// 当活跃假设被否定时前移到下一个未否定假设。
+    #[test]
+    fn restore_rejected_hypotheses_skips_already_excluded_paths() {
+        let contract = TaskContract::from_input("修复登录按钮点击无响应");
+        let mut goal = GoalExecution::from_contract(&contract);
+        // 让第二个假设处于活跃，构造“否定第一个后仍有可推进方向”的前沿。
+        for item in goal.items.values_mut() {
+            if let Some(second) = item.hypotheses.get_mut(1) {
+                second.state = HypothesisState::Active;
+            }
+        }
+        goal.restore_rejected_hypotheses(&["目标由共享字段、配置或直接符号实现".to_string()]);
+        for item in goal.items.values() {
+            let active = &item.hypotheses[item.active_hypothesis];
+            assert_ne!(
+                active.description, "目标由共享字段、配置或直接符号实现",
+                "已否定假设不得仍是活跃假设"
+            );
+            assert_eq!(active.state, HypothesisState::Active);
+        }
     }
 
     #[test]

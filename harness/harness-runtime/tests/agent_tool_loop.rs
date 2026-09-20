@@ -1375,6 +1375,91 @@ async fn provider_error_never_delivers_verified() {
         texts.iter().any(|t| t.contains("[error]")),
         "错误须对用户可见: {texts:?}"
     );
+    // P4：出口归一化把 provider 错误对用户收敛为 PartialDelivery，但具体故障类型
+    // 不得丢失——唯一终态出口的遥测须保留归一化前的 SystemFailure 分类，并带上
+    // 任务级总成本快照（模型请求数已计入）。
+    let terminal = log.replay().into_iter().find_map(|e| match e {
+        SessionEvent::Telemetry { telemetry, .. } if !telemetry.terminal_outcome.is_empty() => {
+            Some(telemetry)
+        }
+        _ => None,
+    });
+    let terminal = terminal.expect("唯一终态出口须写入带具体类型的遥测");
+    assert_eq!(
+        terminal.terminal_outcome, "SystemFailure",
+        "归一化不得丢失具体故障类型"
+    );
+    assert!(
+        terminal.model_requests >= 1,
+        "任务级总成本须计入模型请求数，实际 {}",
+        terminal.model_requests
+    );
+}
+
+/// 永不产出的 Provider：让 `tokio::select!` 只能走取消分支，确定性复现“回合执行中被取消”。
+struct PendingLlm;
+#[async_trait]
+impl LlmProvider for PendingLlm {
+    fn name(&self) -> &'static str {
+        "pending-test"
+    }
+    fn tools(&self) -> Vec<harness_llm::ToolSchema> {
+        vec![]
+    }
+    fn stream(&self, _m: Vec<Message>) -> ChunkStream {
+        Box::pin(futures::stream::pending::<Result<Chunk>>())
+    }
+}
+
+/// P0「取消无报告」回放：执行中取消必须收敛成**恰好一份** Cancelled 交付报告，
+/// 既不能静默结束（UI 轮询死循环），也不能被归一化改写成 PartialDelivery。
+#[tokio::test]
+async fn cancellation_mid_turn_emits_exactly_one_cancelled_report() {
+    let ctx = AppContext::new();
+    let log = SessionLog::new();
+    let tools = ToolRegistry::new();
+    let hook: Arc<dyn Hook> = Arc::new(AllowHook);
+    let mut registrations = vec![];
+    registrations.push(ctx.provide(log.clone()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(PendingLlm);
+    registrations.push(ctx.provide(provider));
+    registrations.push(ctx.provide(tools));
+    registrations.push(ctx.provide(hook));
+
+    // 预取消令牌：Provider 永不产出，select! 确定性命中取消分支。
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let _ = AgentLoop::new()
+        .run_turn_cancellable(
+            &ctx,
+            UserInput {
+                text: "hi".into(),
+                attachments: vec![],
+            },
+            cancellation,
+            None,
+        )
+        .await;
+
+    let events = log.replay();
+    let outcomes: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Delivery { report, .. } => Some(report.outcome.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 1, "取消仍须且只交付一份报告: {outcomes:?}");
+    assert_eq!(
+        outcomes[0],
+        DeliveryOutcome::Cancelled,
+        "取消不得被归一化改写为 PartialDelivery"
+    );
+    // 回合必须闭合，否则 UI 轮询死循环。
+    assert!(
+        matches!(events.last(), Some(SessionEvent::TurnEnd { .. })),
+        "取消回合必须以 TurnEnd 闭合"
+    );
 }
 
 /// 会话日志必须满足 Provider 的硬协议：assistant 宣告的每个 tool_call 都要有且只有一条

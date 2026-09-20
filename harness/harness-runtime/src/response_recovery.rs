@@ -152,4 +152,27 @@ mod tests {
         assert_eq!(plan.max_output_tokens, 8_192);
         assert!(plan.disable_reasoning);
     }
+
+    /// 非法 JSON 参数（非截断）只给一次有界重发机会：扩容输出预算修不好语法错误，
+    /// 反复重试只会烧预算；一次提示后仍损坏就如实终态。
+    #[test]
+    fn invalid_tool_arguments_get_a_single_bounded_retry() {
+        let mut recovery = ResponseRecovery::default();
+        let RecoveryDecision::Retry(plan) = recovery.on_empty(
+            "invalid_tool_arguments: 工具 fs 的 arguments 不是完整 JSON：invalid escape at line 1 column 101",
+            4_096,
+        ) else {
+            panic!("malformed tool arguments should get one bounded re-emit chance");
+        };
+        assert_eq!(plan.max_attempts, 1);
+        assert!(!plan.disable_reasoning);
+        assert!(matches!(
+            recovery.on_empty("invalid_tool_arguments: again", 4_096),
+            RecoveryDecision::Exhausted {
+                class: EmptyResponseClass::ProtocolEmpty,
+                attempts: 1,
+                ..
+            }
+        ));
+    }
 }

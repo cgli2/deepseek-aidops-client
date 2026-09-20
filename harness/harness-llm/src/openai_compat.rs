@@ -433,6 +433,7 @@ fn json_fragment(value: &Value) -> Option<String> {
 struct StreamToolCallError {
     message: String,
     is_eof: bool,
+    invalid_arguments: bool,
 }
 
 impl std::fmt::Display for StreamToolCallError {
@@ -446,6 +447,7 @@ impl StreamToolCallError {
         Self {
             message,
             is_eof: false,
+            invalid_arguments: false,
         }
     }
 
@@ -453,20 +455,30 @@ impl StreamToolCallError {
         Self {
             message: format!("工具 {name} 的 arguments 不是完整 JSON：{error}"),
             is_eof: error.is_eof(),
+            invalid_arguments: true,
         }
     }
 }
 
-/// 只有输出额度耗尽或 JSON 在输入末尾尚未闭合才允许自动恢复。其它语法错误继续
-/// fail-closed，避免把真正损坏或不兼容的调用反复重试，更不能执行部分参数。
+/// 输出额度耗尽、JSON 在输入末尾未闭合、或 arguments 本身是非法 JSON（未转义引号/
+/// 反斜杠等语法错误）都允许自动恢复：残缺或损坏的调用一律丢弃且绝不执行，交由有界
+/// 恢复让模型重发合法调用。其余协议错误（如缺少 function.name）继续 fail-closed，
+/// 避免把真正不兼容的网关格式反复重试。
 fn recoverable_tool_argument_reason(
     finish_reason: Option<&str>,
     error: &StreamToolCallError,
 ) -> Option<String> {
     if matches!(finish_reason, Some("length" | "max_tokens")) {
         Some("length".into())
-    } else if error.is_eof {
-        Some(format!("incomplete_tool_arguments: {}", error.message))
+    } else if error.invalid_arguments {
+        // EOF=传输截断；非 EOF=模型产出的语法错误。二者都意味着这次调用不可执行，
+        // 但都不是网关不兼容，模型有机会在提示后重发合法 JSON。
+        let kind = if error.is_eof {
+            "incomplete_tool_arguments"
+        } else {
+            "invalid_tool_arguments"
+        };
+        Some(format!("{kind}: {}", error.message))
     } else {
         None
     }
@@ -1029,6 +1041,33 @@ mod tests {
             Some("length")
         );
         assert!(recoverable_tool_argument_reason(Some("tool_calls"), &error).is_none());
+    }
+
+    /// 非 EOF 的语法错误（如 Windows 路径未转义反斜杠、未转义引号）同样是模型产出
+    /// 了不可执行的调用：必须丢弃并交给有界恢复重发，而不是把回合硬中止成
+    /// 「模型服务返回错误」。解析本身仍 fail-closed，残缺参数绝不下发执行。
+    #[test]
+    fn non_eof_syntax_error_in_tool_arguments_is_recoverable_but_never_executable() {
+        let mut tools = StreamTools::new();
+        collect_stream_tool_fragments(
+            &json!({"choices":[{"delta":{"tool_calls":[{
+                "index": 0,
+                "function":{
+                    "name":"fs",
+                    "arguments": r#"{"op":"read","path":"C:\work\theme.rs"}"#
+                }
+            }]}}]}),
+            &mut tools,
+        );
+
+        let error = finish_stream_tool_calls(tools).unwrap_err();
+        assert!(!error.is_eof, "未转义反斜杠是语法错误，不是传输截断");
+        assert_eq!(
+            recoverable_tool_argument_reason(Some("tool_calls"), &error)
+                .as_deref()
+                .map(|reason| reason.split(':').next().unwrap_or(reason)),
+            Some("invalid_tool_arguments")
+        );
     }
 
     #[test]

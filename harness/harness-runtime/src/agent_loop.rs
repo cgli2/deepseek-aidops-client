@@ -3607,25 +3607,25 @@ fn compact_for_empty_recovery(
         })
         .filter(|message| seen.insert(message.content.clone()))
         .collect::<Vec<_>>();
-    let truncated_tool_hint = if reason
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("incomplete_tool_arguments")
-    {
-        "上一次工具参数在传输完成前被截断，残缺调用已丢弃且从未执行。不得重发整文件 fs write；修改已有文件时优先用 edit 做最小精确替换。确需创建大型新文件时，先写入最小骨架，再用 edit 分段扩展。"
+    let lowered_reason = reason.trim().to_ascii_lowercase();
+    let (system_hint, user_hint) = if lowered_reason.starts_with("incomplete_tool_arguments") {
+        (
+            "上一次工具参数在传输完成前被截断，残缺调用已丢弃且从未执行。不得重发整文件 fs write；修改已有文件时优先用 edit 做最小精确替换。确需创建大型新文件时，先写入最小骨架，再用 edit 分段扩展。",
+            " 本次必须缩小工具参数，禁止再次发送整文件内容。",
+        )
+    } else if lowered_reason.starts_with("invalid_tool_arguments") {
+        (
+            "上一次工具调用的 arguments 不是合法 JSON（常见原因：字符串内未转义的双引号或反斜杠），损坏调用已丢弃且从未执行。本次只返回一个工具调用：arguments 必须是严格合法的 JSON 对象，字符串内的双引号与反斜杠全部转义，不得拼接多个 JSON 片段或输出注释。",
+            " 本次必须保证 arguments 为合法 JSON：转义所有内嵌引号与反斜杠，且只返回一个工具调用。",
+        )
     } else {
-        ""
+        ("", "")
     };
     compacted.push(Message::system(format!(
-        "[响应恢复 {attempt}/{max_attempts}·最小快照]\nfinish_reason={reason}; next_output_cap={next_output_cap}\n{checkpoint}\n{goal_state}\n旧对话与工具原文已移除，运行时记录的证据和阶段仍有效。禁止重新规划、重复搜索或扩大范围。{truncated_tool_hint}"
+        "[响应恢复 {attempt}/{max_attempts}·最小快照]\nfinish_reason={reason}; next_output_cap={next_output_cap}\n{checkpoint}\n{goal_state}\n旧对话与工具原文已移除，运行时记录的证据和阶段仍有效。禁止重新规划、重复搜索或扩大范围。{system_hint}"
     )));
     compacted.push(Message::user(format!(
-        "继续当前唯一下一动作：需要执行时只返回一个当前阶段允许的工具调用；证据已经充分时给出简短、可验证的最终答复。不得只输出思考过程。{}",
-        if truncated_tool_hint.is_empty() {
-            ""
-        } else {
-            " 本次必须缩小工具参数，禁止再次发送整文件内容。"
-        }
+        "继续当前唯一下一动作：需要执行时只返回一个当前阶段允许的工具调用；证据已经充分时给出简短、可验证的最终答复。不得只输出思考过程。{user_hint}"
     )));
     compacted
 }
@@ -4634,6 +4634,40 @@ mod tests {
         assert!(snapshot.content.contains("next_output_cap=4096"));
         assert!(snapshot.content.contains("读取 composer.rs"));
         assert!(snapshot.content.contains("新状态"));
+    }
+
+    /// 非法 JSON 参数的恢复快照必须告诉模型「参数损坏、从未执行、如何重发合法 JSON」，
+    /// 否则有界重发只是让模型盲猜，烧完重试次数依旧失败。
+    #[test]
+    fn empty_recovery_tells_the_model_how_to_reemit_valid_json_arguments() {
+        let compacted = compact_for_empty_recovery(
+            vec![Message::system("system-contract")],
+            "目标：读取主题文件\n下一步：fs read",
+            "[V4 唯一目标求解图]\n新状态",
+            "invalid_tool_arguments: 工具 fs 的 arguments 不是完整 JSON：invalid escape at line 1 column 101",
+            1,
+            1,
+            4_096,
+        );
+        let snapshot = compacted
+            .iter()
+            .find(|message| message.content.contains("[响应恢复 1/1·最小快照]"))
+            .expect("应生成一次最小恢复快照");
+        assert!(
+            snapshot.content.contains("不是合法 JSON"),
+            "系统快照须说明参数非法：{}",
+            snapshot.content
+        );
+        assert!(snapshot.content.contains("从未执行"));
+        let resume = compacted
+            .iter()
+            .find(|message| message.role == Role::User)
+            .expect("应附带一条继续指令");
+        assert!(
+            resume.content.contains("合法 JSON"),
+            "继续指令须约束重发格式：{}",
+            resume.content
+        );
     }
 
     #[test]

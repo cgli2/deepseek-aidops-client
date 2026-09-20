@@ -84,7 +84,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 const COMPOSER_MAX_H: f32 = 96.0;
                 // 裸 Enter 必须在 TextEdit 之前消费：egui 的多行编辑器会把 '\n'
                 // 插到光标处，光标不在末尾时就把一句话从中间断开。按焦点拦截后，
-                // 提交内容与光标位置无关；Shift+Enter 不匹配 NONE，仍照常换行。
+                // 提交内容与光标位置无关；Shift+Enter 由 consume_submit_enter 按
+                // 事件修饰键精确排除，保留给编辑器插入换行。
                 let composer_id = egui::Id::new("composer-input");
                 let enter = consume_submit_enter(ctx, composer_id);
                 let response = egui::ScrollArea::vertical()
@@ -1024,15 +1025,32 @@ fn uuid_like_suffix() -> String {
 }
 
 /// 在 `TextEdit` 之前按焦点消费裸 Enter：egui 的多行编辑器会把换行插到光标处，
-/// 光标不在末尾时就会把一句话从中间断开；先消费可让提交内容与光标位置无关，
-/// 而 `Shift+Enter` 不匹配 `Modifiers::NONE`，仍照常交给编辑器插入换行。
+/// 光标不在末尾时就会把一句话从中间断开；先消费可让提交内容与光标位置无关。
 fn consume_submit_enter(ctx: &egui::Context, composer_id: egui::Id) -> bool {
     if !ctx.memory(|m| m.has_focus(composer_id)) {
         return false;
     }
+    // egui 0.30 的 `consume_key` 用 `matches_logically` 匹配：模式 shift=false 时会
+    // 忽略实际按下的 Shift，使 Shift+Enter 也被当裸 Enter 消费并触发发送。因此先按
+    // 按键事件自身的修饰键精确判定：仅当存在「不带 Shift 的 Enter 按下」才消费提交；
+    // Shift+Enter 保留事件，交给 TextEdit 的 return_key 路径插入 '\n'。
+    let has_plain_enter = ctx.input(|i| {
+        i.events.iter().any(|event| {
+            matches!(event,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.shift
+            )
+        })
+    });
+    if !has_plain_enter {
+        return false;
+    }
     // 必须真正消费事件：只读 `key_pressed` 不会把 Enter 从输入队列里摘掉，
-    // egui 仍会把 '\n' 插到光标处。`consume_key(NONE, Enter)` 既消费事件又能
-    // 让 Shift+Enter（修饰键不为 NONE）继续走编辑器的换行路径。
+    // egui 仍会把 '\n' 插到光标处。
     ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
 }
 
@@ -1154,5 +1172,66 @@ mod tests {
 
         assert!(enter, "光标在中间时按 Enter 也应识别为提交");
         assert_eq!(text, "abcdef", "提交不得把文本从光标处断开");
+    }
+
+    /// Shift+Enter 必须在编辑器里插入换行、不得触发发送：egui 0.30 的 `consume_key`
+    /// 与 TextEdit 的 `return_key` 都用 `matches_logically`，模式 shift=false 时会忽略
+    /// 实际按下的 Shift；不按事件修饰键精确排除，Shift+Enter 会被当裸 Enter 消费误发送。
+    #[test]
+    fn shift_enter_inserts_newline_instead_of_submitting() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("composer-input");
+        let mut text = "abcdef".to_string();
+
+        let _ = ctx.run(composer_raw(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut text).id(id));
+            });
+        });
+        ctx.memory_mut(|m| m.request_focus(id));
+        let _ = ctx.run(composer_raw(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut text).id(id));
+            });
+        });
+
+        // Shift+Enter：不消费，交给编辑器插入换行。
+        let mut enter = false;
+        let _ = ctx.run(
+            composer_raw(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }]),
+            |ctx| {
+                enter = consume_submit_enter(ctx, id);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut text).id(id));
+                });
+            },
+        );
+        assert!(!enter, "Shift+Enter 不应识别为提交");
+        assert_eq!(text, "abcdef\n", "Shift+Enter 应在文本末尾插入换行");
+
+        // 紧随其后的裸 Enter：仍照常提交，且不再插入换行。
+        let _ = ctx.run(
+            composer_raw(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |ctx| {
+                enter = consume_submit_enter(ctx, id);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut text).id(id));
+                });
+            },
+        );
+        assert!(enter, "裸 Enter 仍应识别为提交");
+        assert_eq!(text, "abcdef\n", "裸 Enter 不得再插入换行");
     }
 }

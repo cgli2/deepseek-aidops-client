@@ -151,6 +151,8 @@ pub(super) struct AppState {
     /// 技能管理数据：当前全部技能（含状态），供技能 tab 管理界面使用。
     pub(super) skill_items: Vec<harness_capability::assets::Skill>,
     // ── 文件预览（纯 UI 本地状态，不持久化、不进 SessionLog）──
+    /// 协同检查器激活的选项卡 (0: 文件预览, 1: 代码变更, 2: 运行时遥测)
+    pub(super) inspector_tab: usize,
     /// 预览窗是否展开。
     pub(super) preview_open: bool,
     /// 预览面板是否仍在开关动画中（动画结束后才真正释放面板，避免关闭瞬间跳变）。
@@ -407,7 +409,8 @@ impl AppState {
             mem_boot_rx: None,
             mem_refresh_rx: None,
             skill_items: Vec::new(),
-            // 文件预览初始状态
+            // 协同检查器与文件预览初始状态
+            inspector_tab: 0,
             preview_open: false,
             preview_animating: false,
             preview_width: 420.0,

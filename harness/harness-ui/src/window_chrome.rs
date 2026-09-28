@@ -14,8 +14,20 @@ pub struct ChromeColors {
     pub text: Color32,
     pub dim: Color32,
     pub accent: Color32,
+    pub card: Color32,
+    pub success: Color32,
+    pub warn: Color32,
     #[cfg(target_os = "windows")]
     pub hover: Color32,
+}
+
+/// 顶部工作台上下文信息（对标 Codex 面包屑与状态指示）
+pub struct WorkbenchContext<'a> {
+    pub project_name: &'a str,
+    pub session_title: &'a str,
+    pub model_name: &'a str,
+    pub status: &'a str,
+    pub busy: bool,
 }
 
 fn enabled_value(value: &str) -> bool {
@@ -131,12 +143,13 @@ fn window_button(ui: &mut Ui, colors: ChromeColors, kind: u8, maximized: bool) -
     response
 }
 
-/// 标题栏可触发的动作：主题切换 / 文件树面板开关。
+/// 标题栏可触发的动作：主题切换 / 文件树面板开关 / 协同检查器开关。
 #[derive(Default)]
 pub struct ChromeActions {
     pub toggle_theme: bool,
     pub toggle_tree: bool,
     pub toggle_sidebar: bool,
+    pub toggle_inspector: bool,
 }
 
 /// 主导航最左侧的侧栏开关，仅绘制图标，文字通过悬停提示呈现。
@@ -191,15 +204,34 @@ fn tree_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
     response.on_hover_text("项目文件树")
 }
 
+/// 协同检查器开关按钮（矢量图标，左右分栏样式）。
+fn inspector_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
+    let border = if response.hovered() {
+        Stroke::new(1.0_f32, colors.border)
+    } else {
+        Stroke::NONE
+    };
+    ui.painter().rect(rect, 6.0, Color32::TRANSPARENT, border);
+    let c = rect.center();
+    let color = if open { colors.accent } else { colors.dim };
+    let s = Stroke::new(1.25_f32, color);
+    let body = egui::Rect::from_center_size(c, egui::vec2(14.0, 12.0));
+    ui.painter().rect_stroke(body, 2.0, s);
+    ui.painter().vline(body.right() - 4.5, body.y_range(), s);
+    response.on_hover_text(if open { "收起协同检查器" } else { "打开协同检查器 (预览/Diff/遥测)" })
+}
+
 /// 绘制全宽标题栏，返回标题栏触发的动作。
 pub fn show(
     ctx: &Context,
     colors: ChromeColors,
     dark: bool,
-    status: &str,
+    wb: &WorkbenchContext,
     integrated: bool,
-    workspace_left: f32,
+    _workspace_left: f32,
     tree_open: bool,
+    preview_open: bool,
     sidebar_expanded: bool,
 ) -> ChromeActions {
     let mut actions = ChromeActions::default();
@@ -223,8 +255,7 @@ pub fn show(
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
 
-            // 高度只由 TopBottomPanel::exact_height 决定。不要把重排中的可用高度
-            // 回写为 min_height，否则最大化/恢复的中间帧会让标题栏先变高再缩回。
+            // 高度只由 TopBottomPanel::exact_height 决定。
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let system_safe_space = if cfg!(target_os = "macos") && integrated {
                     78.0
@@ -235,14 +266,39 @@ pub fn show(
                 if sidebar_button(ui, colors, sidebar_expanded).clicked() {
                     actions.toggle_sidebar = true;
                 }
-                // 标题仍与工作区起点大致对齐，侧栏开关固定在导航最左侧。
-                ui.add_space((workspace_left - system_safe_space - 28.0).max(12.0));
+
+                // ── Codex 式面包屑与当前上下文 ──
+                ui.add_space(10.0);
+                // 项目名
+                let proj_name = if wb.project_name.is_empty() { "默认工作区" } else { wb.project_name };
                 ui.label(
-                    egui::RichText::new("对话工作台")
-                        .size(14.0)
+                    egui::RichText::new(format!("📁 {proj_name}"))
+                        .size(12.0)
+                        .color(colors.dim),
+                );
+                ui.label(
+                    egui::RichText::new("/")
+                        .size(11.0)
+                        .color(colors.border),
+                );
+                // 会话名（截断）
+                let session_display: String = if wb.session_title.is_empty() {
+                    "新会话".to_string()
+                } else {
+                    let mut s: String = wb.session_title.chars().take(20).collect();
+                    if wb.session_title.chars().count() > 20 {
+                        s.push('…');
+                    }
+                    s
+                };
+                ui.label(
+                    egui::RichText::new(session_display)
+                        .size(12.5)
                         .strong()
                         .color(colors.text),
                 );
+
+                // ── 右侧控制栏与状态指示 ──
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     #[cfg(target_os = "windows")]
                     if integrated {
@@ -265,11 +321,61 @@ pub fn show(
                         actions.toggle_tree = true;
                     }
                     ui.add_space(6.0);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(status).size(11.0).color(colors.accent),
-                        )
-                        .truncate(),
+                    if inspector_button(ui, colors, preview_open).clicked() {
+                        actions.toggle_inspector = true;
+                    }
+                    ui.add_space(6.0);
+
+                    // 模型胶囊
+                    if !wb.model_name.is_empty() {
+                        let m_text = format!("🤖 {}", wb.model_name);
+                        let (m_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(m_text.len() as f32 * 6.5 + 16.0, 22.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect(
+                            m_rect,
+                            egui::Rounding::same(11.0),
+                            colors.card,
+                            egui::Stroke::new(1.0_f32, colors.border),
+                        );
+                        ui.painter().text(
+                            m_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &m_text,
+                            egui::FontId::proportional(11.0),
+                            colors.dim,
+                        );
+                        ui.add_space(6.0);
+                    }
+
+                    // Agent 运行状态胶囊
+                    let (status_text, dot_color) = if wb.busy {
+                        let secs = ui.input(|i| i.time);
+                        let glyph = ["◐", "◓", "◑", "◒"][((secs as u64) % 4) as usize];
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                        (format!("{glyph} Agent 执行中"), colors.accent)
+                    } else if wb.status.contains("错误") || wb.status.contains("失败") {
+                        (format!("! {}", wb.status), colors.warn)
+                    } else {
+                        ("● 就绪".to_string(), colors.success)
+                    };
+                    let (pill_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(status_text.len() as f32 * 6.8 + 18.0, 22.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect(
+                        pill_rect,
+                        egui::Rounding::same(11.0),
+                        colors.card,
+                        egui::Stroke::new(1.0_f32, colors.border),
+                    );
+                    ui.painter().text(
+                        pill_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &status_text,
+                        egui::FontId::proportional(11.0),
+                        dot_color,
                     );
                 });
             });

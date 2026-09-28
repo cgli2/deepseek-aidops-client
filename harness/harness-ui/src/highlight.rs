@@ -128,9 +128,9 @@ pub fn highlight_to_job(
     let mut line_no = 1usize;
 
     for line in LinesWithEndings::from(code) {
-        // 行号列（右对齐 + 空格分隔）
+        // 行号列（右对齐 + 工业级垂直细分隔线）
         job.append(
-            &format!("{line_no:>width$} ", width = num_w),
+            &format!("{line_no:>width$} │ ", width = num_w),
             0.0,
             line_no_format(size, dim),
         );

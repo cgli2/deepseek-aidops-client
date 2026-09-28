@@ -31,11 +31,16 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
             let can_send = !state.input.trim().is_empty() || !state.attachments.is_empty();
             // ── 待发送队列：挂在输入框正上方（紧挨输入卡片），有队列时显示 ──
             super::workspace::render_pending_queue(ui, state, pal);
-            // ── 输入卡片：圆角 + 细边框 + 阴影浮起，卡片自身提供 chrome ──
+            // ── 输入卡片：圆角 + 细边框 + 阴影浮起，聚焦时光晕高亮 ──
+            let composer_id = egui::Id::new("composer-input");
+            let is_focused = ctx.memory(|m| m.has_focus(composer_id));
             let card_frame = egui::Frame::default()
-                .fill(pal.panel)
+                .fill(pal.card_bg)
                 .rounding(egui::Rounding::same(12.0))
-                .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                .stroke(egui::Stroke::new(
+                    if is_focused { 1.3_f32 } else { 1.0_f32 },
+                    if is_focused { pal.accent } else { pal.card_border },
+                ))
                 .inner_margin(egui::Margin {
                     left: 12.0,
                     right: 8.0,
@@ -44,9 +49,9 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 })
                 .shadow(egui::epaint::Shadow {
                     offset: egui::vec2(0.0, 4.0),
-                    blur: 14.0,
+                    blur: 16.0,
                     spread: 0.0,
-                    color: egui::Color32::from_black_alpha(if state.dark { 0x44 } else { 0x14 }),
+                    color: egui::Color32::from_black_alpha(if state.dark { 0x48 } else { 0x16 }),
                 });
             card_frame.show(ui, |ui| {
                 // 附件占输入框左上方独立一行，文件名与删除入口始终可见。
@@ -80,19 +85,11 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 }
                 // 文本编辑区：去掉自身边框/背景，由卡片提供 chrome。
                 // TextEdit 本身没有最大高度约束，需由 ScrollArea 提供固定上限。
-                // 关闭滚动到光标时的补间动画，防止长文本输入时卡片位置逐帧来回变化。
-                const COMPOSER_MAX_H: f32 = 96.0;
-                // 裸 Enter 必须在 TextEdit 之前消费：egui 的多行编辑器会把 '\n'
-                // 插到光标处，光标不在末尾时就把一句话从中间断开。按焦点拦截后，
-                // 提交内容与光标位置无关；Shift+Enter 由 consume_submit_enter 按
-                // 事件修饰键精确排除，保留给编辑器插入换行。
-                let composer_id = egui::Id::new("composer-input");
+                const COMPOSER_MAX_H: f32 = 110.0;
                 let enter = consume_submit_enter(ctx, composer_id);
                 let response = egui::ScrollArea::vertical()
                     .id_salt("composer-input-scroll")
                     .max_height(COMPOSER_MAX_H)
-                    // 内容超过上限后固定滚动区尺寸，避免滚动条出现/消失或文本换行重算
-                    // 反复改变底部面板高度，导致输入窗口在长文本输入时抖动。
                     .auto_shrink([false, false])
                     .animated(false)
                     .show(ui, |ui| {
@@ -107,9 +104,9 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                 .margin(egui::Margin::same(0.0))
                                 .hint_text(
                                     egui::RichText::new(if state.optimizing {
-                                        "正在优化输入…（加载中，请稍候）"
+                                        "正在优化提示词…（请稍候）"
                                     } else {
-                                        "描述任务、粘贴代码或提出问题…"
+                                        "描述任务、粘贴代码或提出排障要求 (Enter 发送，Shift+Enter 换行)…"
                                     })
                                     .color(pal.dim),
                                 ),
@@ -618,9 +615,13 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     }
 
                     // ── 附件按钮：与左侧权限 chip 同高(28)/同 chrome，图标更醒目 ──
-                    let (arect, aresp) =
-                        ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click());
-                    let has_att = !state.attachments.is_empty();
+                    let att_count = state.attachments.len();
+                    let (arect, aresp) = if att_count > 0 {
+                        ui.allocate_exact_size(egui::vec2(48.0, 28.0), egui::Sense::click())
+                    } else {
+                        ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click())
+                    };
+                    let has_att = att_count > 0;
                     let afill = if aresp.hovered() {
                         pal.hover
                     } else {
@@ -634,9 +635,29 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         egui::Color32::TRANSPARENT,
                         egui::Stroke::new(1.0_f32, if has_att { pal.accent } else { pal.border }),
                     );
-                    let acolor = if has_att { pal.accent } else { pal.text };
-                    draw_paperclip_icon(ui.painter(), arect.center(), acolor);
-                    let tip = "添加附件";
+                    if has_att {
+                        let acolor = pal.accent;
+                        draw_paperclip_icon(
+                            ui.painter(),
+                            arect.left_center() + egui::vec2(12.0, 0.0),
+                            acolor,
+                        );
+                        ui.painter().text(
+                            arect.left_center() + egui::vec2(24.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{att_count}"),
+                            egui::FontId::proportional(11.5),
+                            acolor,
+                        );
+                    } else {
+                        let acolor = if aresp.hovered() { pal.text } else { pal.dim };
+                        draw_paperclip_icon(ui.painter(), arect.center(), acolor);
+                    }
+                    let tip = if has_att {
+                        format!("已添加 {att_count} 个附件（点击可继续添加）")
+                    } else {
+                        "添加附件 (支持拖拽/截图粘贴)".to_string()
+                    };
                     if aresp.on_hover_text(tip).clicked() {
                         let picked = if state.settings_page == "新建项目" {
                             rfd::FileDialog::new().pick_folder()
@@ -699,7 +720,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
 
                     // 弹性空间 → 圆形发送/停止按钮
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let btn_size = 34.0;
+                        let btn_size = 32.0;
                         let (brect, bresp) = ui.allocate_exact_size(
                             egui::vec2(btn_size, btn_size),
                             egui::Sense::click(),
@@ -708,7 +729,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         let bfill = if can_send {
                             pal.btn_fill
                         } else if state.busy {
-                            egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
+                            pal.warn
                         } else {
                             pal.field
                         };
@@ -717,8 +738,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             // 停止：实心方块
                             ui.painter().rect_filled(
                                 egui::Rect::from_center_size(center, egui::vec2(8.0, 8.0)),
-                                egui::Rounding::same(1.2),
-                                egui::Color32::from_rgb(0x1a, 0x24, 0x30),
+                                egui::Rounding::same(1.5),
+                                egui::Color32::WHITE,
                             );
                         } else {
                             let icon_color = if can_send { pal.btn_text } else { pal.dim };

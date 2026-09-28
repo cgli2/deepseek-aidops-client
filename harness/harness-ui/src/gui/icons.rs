@@ -2,9 +2,8 @@
 
 use super::theme::Palette;
 
-/// 侧栏功能图标：矢量线条绘制（不依赖字体字形，CJK 字体缺字也不会变豆腐块）。
-// Chip/Menu/Update 为预留字形，当前侧栏未使用，保留绘制实现供后续启用。
-#[derive(Clone, Copy)]
+/// 侧栏与功能图标：矢量线条绘制（不依赖字体字形，CJK 字体缺字也不会变豆腐块）。
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(super) enum Icon {
     Chat,
@@ -15,6 +14,14 @@ pub(super) enum Icon {
     Gear,
     Menu,
     Update,
+    Terminal,
+    Code,
+    GitDiff,
+    Sparkles,
+    Pin,
+    CheckCircle,
+    Search,
+    Clock,
 }
 
 pub(super) fn draw_icon(
@@ -233,6 +240,50 @@ pub(super) fn draw_icon(
                 stroke,
             );
         }
+        Icon::Terminal => {
+            draw_terminal_icon(painter, r.center(), color);
+        }
+        Icon::Code => {
+            let c = r.center();
+            // <
+            painter.line_segment([egui::pos2(c.x - 2.0, c.y - 4.0), egui::pos2(c.x - 6.0, c.y)], stroke);
+            painter.line_segment([egui::pos2(c.x - 6.0, c.y), egui::pos2(c.x - 2.0, c.y + 4.0)], stroke);
+            // >
+            painter.line_segment([egui::pos2(c.x + 2.0, c.y - 4.0), egui::pos2(c.x + 6.0, c.y)], stroke);
+            painter.line_segment([egui::pos2(c.x + 6.0, c.y), egui::pos2(c.x + 2.0, c.y + 4.0)], stroke);
+            // /
+            painter.line_segment([egui::pos2(c.x + 1.2, c.y - 4.5), egui::pos2(c.x - 1.2, c.y + 4.5)], thin);
+        }
+        Icon::GitDiff => {
+            let c = r.center();
+            // 左列单点 + 竖线，右列两个点
+            painter.circle_filled(egui::pos2(c.x - 3.5, c.y - 3.5), 1.6, color);
+            painter.circle_filled(egui::pos2(c.x - 3.5, c.y + 3.5), 1.6, color);
+            painter.line_segment([egui::pos2(c.x - 3.5, c.y - 2.0), egui::pos2(c.x - 3.5, c.y + 2.0)], thin);
+            painter.circle_filled(egui::pos2(c.x + 3.5, c.y), 1.6, color);
+            painter.line_segment([egui::pos2(c.x - 3.5, c.y - 2.0), egui::pos2(c.x + 3.5, c.y)], thin);
+        }
+        Icon::Sparkles => {
+            draw_sparkles_icon(painter, r.center(), color);
+        }
+        Icon::Pin => {
+            draw_pin_icon(painter, r.center(), color);
+        }
+        Icon::CheckCircle => {
+            draw_check_circle_icon(painter, r.center(), color, egui::Color32::TRANSPARENT);
+        }
+        Icon::Search => {
+            let c = r.center();
+            let eye_c = egui::pos2(c.x - 1.5, c.y - 1.5);
+            painter.circle(eye_c, 4.0, egui::Color32::TRANSPARENT, stroke);
+            painter.line_segment([eye_c + egui::vec2(2.8, 2.8), c + egui::vec2(5.5, 5.5)], egui::Stroke::new(1.8_f32, color));
+        }
+        Icon::Clock => {
+            let c = r.center();
+            painter.circle(c, 5.5, egui::Color32::TRANSPARENT, stroke);
+            painter.line_segment([c, egui::pos2(c.x, c.y - 3.2)], thin);
+            painter.line_segment([c, egui::pos2(c.x + 2.4, c.y)], thin);
+        }
     }
 }
 
@@ -369,6 +420,63 @@ pub(super) fn draw_copy_icon(
     // 前矩形（左下偏移，bg 填充遮掉后矩形被盖住的边线）
     let front = egui::Rect::from_min_size(egui::pos2(c.x - 3.8, c.y - 1.7), egui::vec2(5.0, 5.5));
     painter.rect(front, egui::Rounding::same(1.0), bg, s);
+}
+
+/// 终端图标（>_）
+pub(super) fn draw_terminal_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3_f32, color);
+    // > 箭头
+    painter.line_segment([egui::pos2(c.x - 4.5, c.y - 3.2), egui::pos2(c.x - 1.5, c.y)], stroke);
+    painter.line_segment([egui::pos2(c.x - 1.5, c.y), egui::pos2(c.x - 4.5, c.y + 3.2)], stroke);
+    // _ 下划光标
+    painter.line_segment([egui::pos2(c.x + 0.5, c.y + 3.5), egui::pos2(c.x + 4.5, c.y + 3.5)], stroke);
+}
+
+/// 提示词优化/魔法棒图标（四个方向尖角的精致星芒）
+pub(super) fn draw_sparkles_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.1_f32, color);
+    // 主星
+    let c1 = c + egui::vec2(-1.0, -1.0);
+    painter.line_segment([egui::pos2(c1.x, c1.y - 5.0), egui::pos2(c1.x, c1.y + 5.0)], stroke);
+    painter.line_segment([egui::pos2(c1.x - 5.0, c1.y), egui::pos2(c1.x + 5.0, c1.y)], stroke);
+    painter.circle_filled(c1, 1.2, color);
+    // 辅星（小星芒）
+    let c2 = c + egui::vec2(3.5, 3.5);
+    let s2 = egui::Stroke::new(0.9_f32, color);
+    painter.line_segment([egui::pos2(c2.x, c2.y - 2.5), egui::pos2(c2.x, c2.y + 2.5)], s2);
+    painter.line_segment([egui::pos2(c2.x - 2.5, c2.y), egui::pos2(c2.x + 2.5, c2.y)], s2);
+}
+
+/// 置顶图钉图标（Pin）
+pub(super) fn draw_pin_icon(painter: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.2_f32, color);
+    // 钉头
+    painter.line_segment([egui::pos2(c.x - 3.5, c.y - 4.5), egui::pos2(c.x + 3.5, c.y - 4.5)], s);
+    // 钉身
+    painter.line_segment([egui::pos2(c.x - 2.5, c.y - 4.5), egui::pos2(c.x - 2.5, c.y - 1.5)], s);
+    painter.line_segment([egui::pos2(c.x + 2.5, c.y - 4.5), egui::pos2(c.x + 2.5, c.y - 1.5)], s);
+    // 钉盘
+    painter.line_segment([egui::pos2(c.x - 4.5, c.y - 1.5), egui::pos2(c.x + 4.5, c.y - 1.5)], s);
+    // 针尖
+    painter.line_segment([egui::pos2(c.x, c.y - 1.5), egui::pos2(c.x, c.y + 5.0)], s);
+}
+
+/// 验收/通过圆圈图标（CheckCircle）
+pub(super) fn draw_check_circle_icon(
+    painter: &egui::Painter,
+    c: egui::Pos2,
+    color: egui::Color32,
+    bg: egui::Color32,
+) {
+    let r = 6.0;
+    if bg != egui::Color32::TRANSPARENT {
+        painter.circle_filled(c, r, bg);
+    }
+    painter.circle_stroke(c, r, egui::Stroke::new(1.3_f32, color));
+    // ✓ 勾线
+    let s = egui::Stroke::new(1.3_f32, color);
+    painter.line_segment([egui::pos2(c.x - 2.8, c.y - 0.2), egui::pos2(c.x - 0.8, c.y + 2.2)], s);
+    painter.line_segment([egui::pos2(c.x - 0.8, c.y + 2.2), egui::pos2(c.x + 3.2, c.y - 2.2)], s);
 }
 
 /// 侧栏品牌标：几何与 `bin/assets/aidops-logo.svg` 保持一致。

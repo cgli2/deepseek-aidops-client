@@ -282,6 +282,25 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         // 渲染之后（见下方 copy_resp），否则会被可选中的
                                         // Markdown 正文抢走点击，表现为“按钮经常点不到”。
                                         let hit_rect = icon_rect.expand(3.0);
+
+                                        let role_tag = match msg.kind.as_str() {
+                                            "user" => Some(("👤 你", pal.dim)),
+                                            "assistant" => Some(("🤖 Agent", pal.accent)),
+                                            "error" => Some(("⚠ 系统异常", pal.err_text)),
+                                            _ => None,
+                                        };
+                                        if let Some((role_name, role_color)) = role_tag {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(role_name)
+                                                        .size(10.5)
+                                                        .strong()
+                                                        .color(role_color),
+                                                );
+                                            });
+                                            ui.add_space(2.0);
+                                        }
+
                                         // 交付状态只接受 Runtime 的 Delivery 事件；TurnEnd 或模型
                                         // 文本出现“完成”都不能推导为成功，避免未验证任务假完成。
                                         let is_final = !state.busy
@@ -291,63 +310,9 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 .skip(index + 1)
                                                 .all(|m| m.text.is_empty());
                                         if is_final && state.delivery.is_some() {
-                                            ui.add_space(2.0);
                                             let delivery =
                                                 state.delivery.as_ref().expect("checked above");
-                                            let (text, color) = match delivery.outcome {
-                                                harness_session::DeliveryOutcome::Verified => (
-                                                    format!(
-                                                        "✓ 已验证交付 · {} 项验证",
-                                                        delivery.verification_count
-                                                    ),
-                                                    pal.accent,
-                                                ),
-                                                harness_session::DeliveryOutcome::NeedsUserInput => (
-                                                    format!(
-                                                        "? 需要你的确认 · 剩余 {} 项验收",
-                                                        delivery.remaining
-                                                    ),
-                                                    pal.warn,
-                                                ),
-                                                harness_session::DeliveryOutcome::PartialDelivery => (
-                                                    format!(
-                                                        "◐ 部分交付 · 剩余 {} 项验收",
-                                                        delivery.remaining
-                                                    ),
-                                                    pal.warn,
-                                                ),
-                                                harness_session::DeliveryOutcome::SystemFailure => (
-                                                    "! 系统执行未完成 · 请查看具体原因".into(),
-                                                    pal.warn,
-                                                ),
-                                                harness_session::DeliveryOutcome::Blocked => (
-                                                    "! 旧会话的阻塞状态 · 请查看具体原因".into(),
-                                                    pal.warn,
-                                                ),
-                                                harness_session::DeliveryOutcome::Interrupted => {
-                                                    ("! 任务中断 · 未验证交付".into(), pal.warn)
-                                                }
-                                                harness_session::DeliveryOutcome::Cancelled => {
-                                                    ("◌ 已取消 · 未验证交付".into(), pal.dim)
-                                                }
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(text)
-                                                    .size(10.5)
-                                                    .strong()
-                                                    .color(color),
-                                            );
-                                            if let Some(reason) = &delivery.reason {
-                                                // Runtime 的最终 assistant 文本通常已经是同一条
-                                                // 简明状态；避免在交付徽标下原样重复一遍。
-                                                if reason.trim() != msg.text.trim() {
-                                                    ui.label(
-                                                        egui::RichText::new(reason)
-                                                            .size(10.0)
-                                                            .color(pal.dim),
-                                                    );
-                                                }
-                                            }
+                                            render_delivery_banner(ui, delivery, &pal);
                                         }
                                         #[cfg(target_os = "macos")]
                                         ui.add_space(2.0);
@@ -818,9 +783,7 @@ fn render_work_batch(
     pal: Palette,
     live: bool,
 ) {
-    let tool_count = messages.iter().filter(|msg| msg.kind == "tool").count();
-    let thinking_count = messages.iter().filter(|msg| msg.kind == "thinking").count();
-    // 计划待办常显：跨 plan 消息合并，按 ✓/…/· 区分完成、进行中、待办。
+    // ── 1. 计划清单（常驻优先展示）──
     let plan_items: Vec<(char, String)> = messages
         .iter()
         .filter(|msg| msg.kind == "plan")
@@ -831,184 +794,617 @@ fn render_work_batch(
         .fold((0usize, 0usize), |(d, t), (mark, _)| {
             (d + usize::from(*mark == '✓'), t + 1)
         });
-    let mut parts: Vec<String> = Vec::new();
-    if thinking_count > 0 {
-        parts.push(format!("思考 {thinking_count} 条"));
+
+    if !plan_items.is_empty() {
+        render_plan_card(ui, &plan_items, plan_done, plan_total, max_w, &pal);
+        ui.add_space(4.0);
     }
-    if tool_count > 0 {
-        parts.push(format!("工具 {tool_count} 次"));
+
+    // ── 2. 思考链过程（CoT 卡片）──
+    let thinking_msgs: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.kind == "thinking" && !m.text.is_empty())
+        .map(|m| m.text.as_str())
+        .collect();
+    if !thinking_msgs.is_empty() {
+        let combined_thought = thinking_msgs.join("\n\n");
+        render_thought_card(ui, &combined_thought, start_index, max_w, &pal, live);
+        ui.add_space(4.0);
     }
-    let summary = if parts.is_empty() {
-        format!("{} 条过程", messages.len())
-    } else {
-        parts.join(" · ")
-    };
+
+    // ── 3. Codex 式结构化工具调用卡片序列 ──
+    let mut tool_actions: Vec<ToolAction> = Vec::new();
+    for msg in messages {
+        if msg.kind != "tool" || msg.text.is_empty() {
+            continue;
+        }
+        if let Some(rest) = msg.text.strip_prefix("调用 ") {
+            if let Some((name, args)) = rest.split_once(':') {
+                tool_actions.push(ToolAction {
+                    name: name.trim().to_string(),
+                    args: args.trim().to_string(),
+                    result: None,
+                });
+            } else {
+                tool_actions.push(ToolAction {
+                    name: rest.trim().to_string(),
+                    args: String::new(),
+                    result: None,
+                });
+            }
+        } else if let Some(rest) = msg.text.strip_prefix("-> 返回: ") {
+            if let Some(last) = tool_actions.last_mut() {
+                if last.result.is_none() {
+                    last.result = Some((true, rest.trim().to_string()));
+                    continue;
+                }
+            }
+            tool_actions.push(ToolAction {
+                name: "result".into(),
+                args: String::new(),
+                result: Some((true, rest.trim().to_string())),
+            });
+        } else if let Some(rest) = msg.text.strip_prefix("X 返回: ") {
+            if let Some(last) = tool_actions.last_mut() {
+                if last.result.is_none() {
+                    last.result = Some((false, rest.trim().to_string()));
+                    continue;
+                }
+            }
+            tool_actions.push(ToolAction {
+                name: "result".into(),
+                args: String::new(),
+                result: Some((false, rest.trim().to_string())),
+            });
+        } else {
+            tool_actions.push(ToolAction {
+                name: "tool".into(),
+                args: msg.text.clone(),
+                result: None,
+            });
+        }
+    }
+
+    if !tool_actions.is_empty() {
+        for (step_idx, action) in tool_actions.iter().enumerate() {
+            let is_last = step_idx == tool_actions.len() - 1;
+            render_tool_action_block(
+                ui,
+                action,
+                start_index,
+                step_idx,
+                max_w,
+                &pal,
+                live && is_last,
+            );
+            ui.add_space(3.0);
+        }
+    }
+}
+
+/// Codex 风格任务执行计划卡片
+fn render_plan_card(
+    ui: &mut egui::Ui,
+    plan_items: &[(char, String)],
+    plan_done: usize,
+    plan_total: usize,
+    max_w: f32,
+    pal: &Palette,
+) {
     egui::Frame::default()
-        .fill(pal.field)
+        .fill(pal.card_bg)
         .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_max_width(max_w * 0.96);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("📋 任务执行计划 (Plan Checklist)")
+                        .size(12.0)
+                        .strong()
+                        .color(pal.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pill_color = if plan_done == plan_total && plan_total > 0 {
+                        pal.success
+                    } else {
+                        pal.accent
+                    };
+                    badge_pill(
+                        ui,
+                        &format!("{plan_done}/{plan_total} 完成"),
+                        pill_color,
+                        pill_color.gamma_multiply(0.12),
+                        pill_color.gamma_multiply(0.35),
+                    );
+                });
+            });
+            ui.add_space(6.0);
+
+            for (mark, item) in plan_items {
+                let (sym, badge_bg, sym_color) = match mark {
+                    '✓' => ("✓", pal.success.gamma_multiply(0.15), pal.success),
+                    '!' => ("!", pal.warn.gamma_multiply(0.15), pal.warn),
+                    '×' | 'x' | 'X' => ("×", pal.err_text.gamma_multiply(0.15), pal.err_text),
+                    '…' => ("…", pal.accent.gamma_multiply(0.15), pal.accent),
+                    _ => ("·", pal.hover, pal.dim),
+                };
+
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(icon_rect, egui::Rounding::same(4.0), badge_bg);
+                    ui.painter().text(
+                        icon_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        sym,
+                        egui::FontId::proportional(11.5),
+                        sym_color,
+                    );
+                    ui.add_space(4.0);
+
+                    let mut text = egui::RichText::new(item)
+                        .size(12.0)
+                        .color(if *mark == '✓' { pal.dim } else { pal.text });
+                    if *mark == '✓' {
+                        text = text.strikethrough();
+                    }
+                    ui.add(egui::Label::new(text).selectable(true));
+                });
+                ui.add_space(2.0);
+            }
+        });
+}
+
+/// 第一类思考链卡片 (Chain of Thought Card)
+fn render_thought_card(
+    ui: &mut egui::Ui,
+    text: &str,
+    start_index: usize,
+    max_w: f32,
+    pal: &Palette,
+    live: bool,
+) {
+    let char_count = text.chars().count();
+    let header_text = if live {
+        let secs = ui.input(|i| i.time);
+        let glyph = ["◐", "◓", "◑", "◒"][((secs as u64) % 4) as usize];
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        format!("{glyph} 深度思考链路 · 正在推理...")
+    } else {
+        format!("💭 深度思考过程 · {char_count} 字符")
+    };
+
+    egui::Frame::default()
+        .fill(pal.thought_bg)
+        .rounding(egui::Rounding::same(8.0))
+        .stroke(egui::Stroke::new(1.0_f32, pal.thought_border))
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
-            // 思考/工具过程内容很短（单行摘要），用 set_max_width 只限制上限、
-            // 让卡片按内容自然宽度收缩，避免撑满整行留下大片空白。
             ui.set_max_width(max_w * 0.96);
-            if !plan_items.is_empty() {
-                ui.label(
-                    // 计划进度来自模型的 PlanUpdate，只能说明“模型声称的执行进度”；
-                    // 真正交付由上方 Delivery 状态在验证后单独标识。
-                    egui::RichText::new(format!(
-                        "📋 执行计划（待验收）· {plan_done}/{plan_total} 自报完成"
-                    ))
-                    .size(11.0)
+            let collapsing = egui::CollapsingHeader::new(
+                egui::RichText::new(header_text)
+                    .size(11.5)
                     .strong()
-                    .color(if plan_done == plan_total {
-                        pal.accent
-                    } else {
-                        pal.text
-                    }),
-                );
-                ui.add_space(3.0);
-                for (mark, item) in &plan_items {
-                    let (sym, color) = match mark {
-                        '✓' => ("✓", pal.accent),
-                        '!' => ("!", pal.warn),
-                        '×' | 'x' | 'X' => ("×", pal.err_text),
-                        '…' => ("…", pal.warn),
-                        _ => ("·", pal.dim),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(sym).size(12.5).strong().color(color));
-                        // egui 0.30 的 strikethrough() 不再接受 bool 参数，改为条件应用。
-                        let mut text = egui::RichText::new(item)
-                            .size(12.0)
-                            .color(if *mark == '✓' { pal.dim } else { pal.text });
-                        if *mark == '✓' {
-                            text = text.strikethrough();
-                        }
-                        ui.add(egui::Label::new(text).selectable(true));
-                    });
-                }
+                    .color(if live { pal.purple } else { pal.dim }),
+            )
+            .id_salt(("thought_card", start_index))
+            .default_open(live);
+
+            let res = collapsing.show(ui, |ui| {
                 ui.add_space(4.0);
-                ui.separator();
-            }
-            // ── 思考/工具中间过程：默认折叠，只占一行 ──
-            // 进行中批次：把静态 ◌ 换成旋转字符帧 + 已用时，折叠态也能看到
-            // SSE 流式动效（与底部状态行/composer 用同一套 ◐◓◑◒ 帧序列）。
-            let header = if live {
+                egui::Frame::default()
+                    .fill(pal.field)
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .size(11.5)
+                                    .color(pal.text),
+                            )
+                            .selectable(true)
+                            .wrap(),
+                        );
+                        if live {
+                            let secs = ui.input(|i| i.time);
+                            let cursor = if ((secs * 2.0) as u64) % 2 == 0 { "▌" } else { " " };
+                            ui.label(
+                                egui::RichText::new(cursor)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(pal.accent),
+                            );
+                        }
+                    });
+                ui.add_space(2.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(egui::RichText::new("复制思考文本").size(10.5).color(pal.dim))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(text.to_string());
+                    }
+                });
+            });
+
+            if live && res.body_returned.is_none() {
+                let preview = one_line_summary(text, 68);
                 let secs = ui.input(|i| i.time);
-                let glyph = ["◐", "◓", "◑", "◒"][((secs as u64) % 4) as usize];
-                // 按 500ms 推进重绘，驱动旋转帧与流式光标的闪烁。
-                let phase_ms = ((secs * 2.0) % 1.0 * 1000.0) as u64;
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(
-                        500 - phase_ms.min(499),
-                    ));
-                egui::RichText::new(format!("{glyph} 工作过程 · {summary} · 进行中"))
-                    .size(11.5)
-                    .color(pal.accent)
+                let cursor = if ((secs * 2.0) as u64) % 2 == 0 { "▌" } else { " " };
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(cursor).size(10.5).color(pal.purple));
+                    ui.label(egui::RichText::new(preview).size(10.5).color(pal.dim));
+                });
+            }
+        });
+}
+
+struct ToolAction {
+    name: String,
+    args: String,
+    result: Option<(bool, String)>,
+}
+
+fn tool_meta(name: &str, pal: &Palette) -> (&'static str, egui::Color32, Icon) {
+    let lower = name.to_lowercase();
+    if lower.contains("bash")
+        || lower.contains("sh")
+        || lower.contains("exec")
+        || lower.contains("cmd")
+        || lower.contains("terminal")
+    {
+        ("Bash", pal.accent, Icon::Terminal)
+    } else if lower.contains("edit")
+        || lower.contains("write")
+        || lower.contains("patch")
+        || lower.contains("create")
+    {
+        ("File Edit", pal.success, Icon::Code)
+    } else if lower.contains("read") || lower.contains("cat") || lower.contains("view") {
+        ("Read", pal.info, Icon::Folder)
+    } else if lower.contains("search")
+        || lower.contains("grep")
+        || lower.contains("find")
+        || lower.contains("glob")
+    {
+        ("Search", pal.purple, Icon::Search)
+    } else if lower.contains("git") {
+        ("Git", pal.warn, Icon::GitDiff)
+    } else {
+        ("Tool", pal.dim, Icon::Chip)
+    }
+}
+
+/// Codex 式结构化工具调用卡片 (Tool Execution Block)
+fn render_tool_action_block(
+    ui: &mut egui::Ui,
+    action: &ToolAction,
+    start_index: usize,
+    step_index: usize,
+    max_w: f32,
+    pal: &Palette,
+    live: bool,
+) {
+    let (badge_label, badge_color, icon) = tool_meta(&action.name, pal);
+
+    let (status_str, status_color) = match &action.result {
+        Some((true, _)) => ("✓ 成功", pal.success),
+        Some((false, _)) => ("× 失败", pal.err_text),
+        None => {
+            if live {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                ("◐ 正在执行", pal.accent)
             } else {
-                egui::RichText::new(format!("◌ 工作过程 · {summary}"))
-                    .size(11.5)
-                    .color(pal.dim)
-            };
-            let collapsing = egui::CollapsingHeader::new(header)
-                .id_salt(("work-batch", start_index))
-                .default_open(false)
+                ("◌ 已调用", pal.dim)
+            }
+        }
+    };
+
+    let title_param = if !action.args.is_empty() {
+        action.args.clone()
+    } else {
+        action.name.clone()
+    };
+    let title_summary = one_line_summary(&title_param, 60);
+
+    egui::Frame::default()
+        .fill(pal.card_bg)
+        .rounding(egui::Rounding::same(8.0))
+        .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
+        .inner_margin(0.0)
+        .show(ui, |ui| {
+            ui.set_max_width(max_w * 0.96);
+
+            // 头部 Bar
+            egui::Frame::default()
+                .fill(pal.tool_header_bg)
+                .rounding(egui::Rounding {
+                    nw: 8.0,
+                    ne: 8.0,
+                    sw: 0.0,
+                    se: 0.0,
+                })
+                .inner_margin(egui::Margin::symmetric(10.0, 7.0))
                 .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    for (position, msg) in messages.iter().enumerate() {
-                        if msg.kind == "plan" {
-                            continue; // 计划已在折叠区外常显
-                        }
-                        if position > 0 {
-                            ui.separator();
-                        }
-                        let label = match msg.kind.as_str() {
-                            "thinking" => "思考",
-                            "tool" => "工具",
-                            _ => "过程",
-                        };
-                        // 收拢：每条过程只显示一行摘要，避免思考/工具内容占满屏幕。
-                        // 完整内容仍可通过右键「复制全部内容」获取。
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(label).size(10.5).color(pal.dim));
-                            let summary = one_line_summary(
-                                &msg.text,
-                                if msg.kind == "tool" { 90 } else { 60 },
+                    ui.horizontal(|ui| {
+                        // 矢量图标
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        draw_icon(ui.painter(), icon_rect.center(), icon, badge_color);
+
+                        // 徽标胶囊
+                        badge_pill(
+                            ui,
+                            badge_label,
+                            badge_color,
+                            badge_color.gamma_multiply(0.12),
+                            badge_color.gamma_multiply(0.35),
+                        );
+
+                        // 参数概览
+                        ui.label(
+                            egui::RichText::new(title_summary)
+                                .monospace()
+                                .size(11.5)
+                                .color(pal.text),
+                        );
+
+                        // 状态指示
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(status_str)
+                                    .size(11.0)
+                                    .strong()
+                                    .color(status_color),
                             );
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&summary).monospace().size(11.5).color(
-                                        if msg.kind == "thinking" {
-                                            pal.dim
-                                        } else {
-                                            pal.text
-                                        },
-                                    ),
-                                )
-                                .selectable(true),
-                            );
+                        });
+                    });
+                });
+
+            // 展开输出抽屉
+            let has_content = !action.args.is_empty() || action.result.is_some();
+            if has_content {
+                let id = ui.id().with(("tool_action_drawer", start_index, step_index));
+                let mut is_open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let toggle_text = if is_open { "▲ 收起" } else { "▼ 展开输出 / 详情" };
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new(toggle_text).size(10.5).color(pal.dim),
+                        ).frame(false))
+                        .clicked()
+                    {
+                        is_open = !is_open;
+                        ui.data_mut(|d| d.insert_temp(id, is_open));
+                    }
+                    if let Some((_, content)) = &action.result {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("复制输出").size(10.5).color(pal.dim),
+                                ).frame(false))
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(content.clone());
+                            }
                         });
                     }
                 });
-            // 折叠头右键：一键复制整个工作过程卡（思考/工具/计划原文）。
-            collapsing.header_response.context_menu(|ui| {
-                if ui.button("📋 复制本批过程内容").clicked() {
-                    let text = messages
-                        .iter()
-                        .filter(|m| !m.text.is_empty())
-                        .map(|m| {
-                            let role = match m.kind.as_str() {
-                                "thinking" => "【思考】",
-                                "tool" => "【工具】",
-                                "plan" => "【计划】",
-                                _ => "【过程】",
-                            };
-                            format!("{role}\n{}", m.text.trim_end())
+
+                if is_open {
+                    egui::Frame::default()
+                        .fill(pal.field)
+                        .rounding(egui::Rounding {
+                            nw: 0.0,
+                            ne: 0.0,
+                            sw: 8.0,
+                            se: 8.0,
                         })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    ui.ctx().copy_text(text);
-                    ui.close_menu();
-                }
-            });
-            // 收起态的 SSE 流式文字：取批次内最后一条正在填充的消息尾部，
-            // 单行预览 + 闪烁光标，让用户不展开也能看到 agent 实时在写什么。
-            // body_returned 为 Some 表示折叠体已渲染（即展开态）。
-            if live && collapsing.body_returned.is_none() {
-                if let Some(last) = messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.kind != "plan" && !m.text.is_empty())
-                {
-                    let secs = ui.input(|i| i.time);
-                    let cursor = if ((secs * 2.0) as u64) % 2 == 0 {
-                        "▌"
-                    } else {
-                        " "
-                    };
-                    let preview = one_line_summary(&last.text, 80);
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(cursor)
-                                .monospace()
-                                .size(11.0)
-                                .strong()
-                                .color(pal.accent),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&preview)
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(pal.text),
-                            )
-                            .truncate(),
-                        );
-                    });
+                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            if !action.args.is_empty() {
+                                ui.label(egui::RichText::new("参数:").size(10.5).color(pal.dim));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&action.args)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(pal.text),
+                                    )
+                                    .selectable(true)
+                                    .wrap(),
+                                );
+                                ui.add_space(4.0);
+                            }
+
+                            if let Some((ok, content)) = &action.result {
+                                ui.label(
+                                    egui::RichText::new(if *ok {
+                                        "输出结果:"
+                                    } else {
+                                        "错误输出:"
+                                    })
+                                    .size(10.5)
+                                    .color(if *ok { pal.dim } else { pal.err_text }),
+                                );
+                                ui.add_space(2.0);
+
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("tool_out_scroll", start_index, step_index))
+                                    .max_height(240.0)
+                                    .auto_shrink(true)
+                                    .show(ui, |ui| {
+                                        let is_diff = content.contains("\n+")
+                                            || content.contains("\n-")
+                                            || content.starts_with("@@");
+                                        let lines: Vec<&str> = content.lines().collect();
+
+                                        for (ln, line) in lines.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!("{:3} |", ln + 1))
+                                                        .monospace()
+                                                        .size(10.5)
+                                                        .color(pal.dim),
+                                                );
+
+                                                if is_diff {
+                                                    let (line_color, line_fill) = if line.starts_with('+') {
+                                                        (pal.success, pal.success.gamma_multiply(0.12))
+                                                    } else if line.starts_with('-') {
+                                                        (pal.err_text, pal.err_text.gamma_multiply(0.12))
+                                                    } else if line.starts_with('@') {
+                                                        (pal.accent, pal.accent.gamma_multiply(0.08))
+                                                    } else {
+                                                        (pal.text, egui::Color32::TRANSPARENT)
+                                                    };
+
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(ui.available_width(), 16.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    if line_fill != egui::Color32::TRANSPARENT {
+                                                        ui.painter().rect_filled(
+                                                            rect,
+                                                            egui::Rounding::same(2.0),
+                                                            line_fill,
+                                                        );
+                                                    }
+                                                    ui.painter().text(
+                                                        rect.left_center(),
+                                                        egui::Align2::LEFT_CENTER,
+                                                        line,
+                                                        egui::FontId::monospace(11.0),
+                                                        line_color,
+                                                    );
+                                                } else {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(*line)
+                                                                .monospace()
+                                                                .size(11.0)
+                                                                .color(if *ok {
+                                                                    pal.text
+                                                                } else {
+                                                                    pal.err_text
+                                                                }),
+                                                        )
+                                                        .selectable(true)
+                                                        .wrap(),
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
+                        });
                 }
             }
+        });
+}
+
+/// Codex 风格任务交付验收卡片 (Delivery Acceptance Card)
+fn render_delivery_banner(
+    ui: &mut egui::Ui,
+    delivery: &DeliveryUi,
+    pal: &Palette,
+) {
+    let (fill, border_color, title, desc, is_verified) = match delivery.outcome {
+        harness_session::DeliveryOutcome::Verified => (
+            pal.success.gamma_multiply(0.12),
+            pal.success,
+            format!(
+                "✓ 任务交付验收通过 · {} 项验证全部符合标准",
+                delivery.verification_count
+            ),
+            "Agent 已完成目标并经由 Runtime 验证门禁检验通过。",
+            true,
+        ),
+        harness_session::DeliveryOutcome::NeedsUserInput => (
+            pal.warn.gamma_multiply(0.12),
+            pal.warn,
+            format!(
+                "? 需要人工确认 · 剩余 {} 项验收标准待核准",
+                delivery.remaining
+            ),
+            "请审查上述步骤和执行结果，并在输入框提供指令以继续或核准交付。",
+            false,
+        ),
+        harness_session::DeliveryOutcome::PartialDelivery => (
+            pal.warn.gamma_multiply(0.12),
+            pal.warn,
+            format!("◐ 部分交付完成 · 剩余 {} 项标准待处理", delivery.remaining),
+            "部分子任务已完成，需继续执行以达成最终目标。",
+            false,
+        ),
+        harness_session::DeliveryOutcome::SystemFailure => (
+            pal.err_text.gamma_multiply(0.12),
+            pal.err_text,
+            "× 系统执行遇到异常 · 交付未达成".to_string(),
+            "执行过程中发生不可恢复异常，请查看日志排障。",
+            false,
+        ),
+        harness_session::DeliveryOutcome::Blocked => (
+            pal.warn.gamma_multiply(0.12),
+            pal.warn,
+            "! 任务处于阻塞状态 · 需要调整条件".to_string(),
+            "前置依赖或外部资源不可用，请根据上述提示提供必要输入。",
+            false,
+        ),
+        harness_session::DeliveryOutcome::Interrupted => (
+            pal.warn.gamma_multiply(0.12),
+            pal.warn,
+            "! 任务已手动或超时中断".to_string(),
+            "本次执行流程已终止。",
+            false,
+        ),
+        harness_session::DeliveryOutcome::Cancelled => (
+            pal.hover,
+            pal.dim,
+            "◌ 任务已取消".to_string(),
+            "用户取消了当前任务。",
+            false,
+        ),
+    };
+
+    ui.add_space(4.0);
+    egui::Frame::default()
+        .fill(fill)
+        .rounding(egui::Rounding::same(8.0))
+        .stroke(egui::Stroke::new(1.2_f32, border_color))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                if is_verified {
+                    draw_icon(ui.painter(), icon_rect.center(), Icon::CheckCircle, pal.success);
+                } else {
+                    draw_icon(ui.painter(), icon_rect.center(), Icon::Sparkles, border_color);
+                }
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(12.5)
+                            .strong()
+                            .color(if is_verified { pal.success } else { pal.text }),
+                    );
+                    ui.label(
+                        egui::RichText::new(delivery.reason.as_deref().unwrap_or(desc))
+                            .size(11.0)
+                            .color(pal.dim),
+                    );
+                });
+            });
         });
 }
 

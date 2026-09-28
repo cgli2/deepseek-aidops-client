@@ -1549,11 +1549,11 @@ mod tests {
             )),
             ..Default::default()
         };
-        ctx.run(input(), |_| {
+        let _ = ctx.run(input(), |_| {
             super::stage_pending_project_dir(&ctx, "C:\\demo-project");
         });
         // 下一帧：面板重绘时必须仍能读到待创建目录，否则「确定」不会出现。
-        ctx.run(input(), |_| {});
+        let _ = ctx.run(input(), |_| {});
         assert_eq!(
             super::new_project_pending_dir(&ctx).as_deref(),
             Some("C:\\demo-project")

@@ -54,6 +54,9 @@ impl eframe::App for AppState {
             text: pal.text,
             dim: pal.dim,
             accent: pal.accent,
+            card: pal.card_bg,
+            success: pal.success,
+            warn: pal.warn,
             #[cfg(target_os = "windows")]
             hover: pal.hover,
         };
@@ -61,15 +64,38 @@ impl eframe::App for AppState {
         let integrated_titlebar = crate::window_chrome::integrated_titlebar_enabled(
             integrated_titlebar_setting.as_deref(),
         );
-        let sidebar_width = if self.sidebar_expanded { 220.0 } else { 56.0 };
+        let sidebar_width = if self.sidebar_expanded { 230.0 } else { 56.0 };
+
+        let active_project_name = self
+            .projects
+            .iter()
+            .find(|p| p.path == self.active_project)
+            .map(|p| p.name.as_str())
+            .unwrap_or("默认工作区");
+        let active_session_title = self
+            .history
+            .iter()
+            .find(|s| s.file == self.current_session)
+            .map(|s| s.title.as_str())
+            .unwrap_or("新对话");
+        let llm_status = self.host.llm_control.status();
+        let wb_ctx = crate::window_chrome::WorkbenchContext {
+            project_name: active_project_name,
+            session_title: active_session_title,
+            model_name: &self.f_model,
+            status: &llm_status,
+            busy: self.busy,
+        };
+
         let chrome_actions = crate::window_chrome::show(
             ctx,
             chrome_colors,
             self.dark,
-            &self.host.llm_control.status(),
+            &wb_ctx,
             integrated_titlebar,
             sidebar_width,
             self.tree_open,
+            self.preview_open,
             self.sidebar_expanded,
         );
         if chrome_actions.toggle_sidebar {
@@ -88,6 +114,12 @@ impl eframe::App for AppState {
             self.tree_open = !self.tree_open;
             if self.tree_open && self.tree_needs_reload() {
                 self.build_tree();
+            }
+        }
+        if chrome_actions.toggle_inspector {
+            self.preview_open = !self.preview_open;
+            if !self.preview_open {
+                self.preview_animating = true;
             }
         }
         sidebar::show(self, ctx, pal, sidebar_width);

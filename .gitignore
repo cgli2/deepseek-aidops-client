@@ -55,6 +55,7 @@ Desktop.ini
 .DS_Store
 .workbuddy
 .qoder
+.zcode/
 .verifytemp
 # Temporary files
 *.tmp

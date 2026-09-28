@@ -400,6 +400,92 @@ pub(super) fn field_label(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     ui.add_space(3.0);
 }
 
+/// 状态徽标胶囊（如 [● Running]、[+12 -4]、[fs.write]）：圆角药丸造型、自适应文本。
+pub(super) fn badge_pill(
+    ui: &mut egui::Ui,
+    text: &str,
+    text_color: egui::Color32,
+    bg_color: egui::Color32,
+    border_color: egui::Color32,
+) -> egui::Response {
+    let font_id = egui::FontId::proportional(11.0);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
+    let padding = egui::vec2(12.0, 5.0);
+    let size = galley.size() + padding;
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(rect.height() / 2.0), bg_color);
+    if border_color != egui::Color32::TRANSPARENT {
+        ui.painter().rect_stroke(
+            rect,
+            egui::Rounding::same(rect.height() / 2.0),
+            egui::Stroke::new(1.0_f32, border_color),
+        );
+    }
+    let text_pos = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(text_pos, galley, text_color);
+    resp
+}
+
+/// 分段式选项卡切换器（Segmented Tabs，如 [ 代码预览 | Git 变更 | 运行时遥测 ]）：
+/// 类似 macOS / Codex 风格的内嵌滑块选项卡。
+pub(super) fn segmented_tabs(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    options: &[&str],
+    selected: usize,
+) -> Option<usize> {
+    let mut clicked = None;
+    let frame_margin = egui::Margin::same(2.0);
+    egui::Frame::default()
+        .fill(pal.field)
+        .rounding(egui::Rounding::same(7.0))
+        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .inner_margin(frame_margin)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (idx, &label) in options.iter().enumerate() {
+                    let is_sel = idx == selected;
+                    let (fill, stroke, text_color) = if is_sel {
+                        (pal.card_bg, egui::Stroke::new(1.0_f32, pal.card_border), pal.text)
+                    } else {
+                        (egui::Color32::TRANSPARENT, egui::Stroke::NONE, pal.dim)
+                    };
+                    let text_w: f32 = label
+                        .chars()
+                        .map(|c| if c.is_ascii() { 7.0 } else { 12.0 })
+                        .sum();
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(text_w + 16.0, 24.0),
+                        egui::Sense::click(),
+                    );
+                    let actual_fill = if resp.hovered() && !is_sel {
+                        pal.hover
+                    } else {
+                        fill
+                    };
+                    ui.painter()
+                        .rect_filled(rect, egui::Rounding::same(5.0), actual_fill);
+                    if stroke != egui::Stroke::NONE {
+                        ui.painter().rect(rect, egui::Rounding::same(5.0), egui::Color32::TRANSPARENT, stroke);
+                    }
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(11.5),
+                        if is_sel { pal.text } else if resp.hovered() { pal.text } else { text_color },
+                    );
+                    if resp.clicked() && !is_sel {
+                        clicked = Some(idx);
+                    }
+                }
+            });
+        });
+    clicked
+}
+
 // ── 记忆面板：浏览本地原生记忆资产（与 harness-provider-memory 落盘结构一致）──
 // 注意：本面板读取 `<cwd>/.harness-memory` 下的本地文件，反映 dsh「不接入后端时的
 // 原生记忆」。若已配置并连接 aidops 后端，后端的记忆以远端为准，此处仅展示本地副本。

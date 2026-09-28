@@ -51,10 +51,9 @@ use model::{
 };
 use theme::{Palette, palette};
 use widgets::{
-    SidebarActionIcon, accent_button, accent_button_ex, close_button, field_label, ghost_button,
-    nav_item,
-    plugin_row_ui, sidebar_control_height, sidebar_icon_button, sidebar_search_field,
-    sidebar_text_button,
+    SidebarActionIcon, accent_button, accent_button_ex, badge_pill, close_button, field_label,
+    ghost_button, nav_item, plugin_row_ui, sidebar_control_height,
+    sidebar_icon_button, sidebar_search_field, sidebar_text_button,
 };
 
 // 窗口 / 任务栏图标 RGBA（自动生成，见 scripts/make_icon.py）。eframe 不会自动读 exe 资源，

@@ -107,12 +107,12 @@ pub(super) fn render(
             }
             ui.label(
                 egui::RichText::new(file_short_name(file))
-                    .size(12.5)
+                    .size(12.0)
                     .strong()
                     .color(pal.text),
             );
             // 文件路径完整显示（dim 小字）。
-            ui.label(egui::RichText::new(file).size(10.5).color(pal.dim));
+            ui.label(egui::RichText::new(file).size(11.0).color(pal.dim));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 count_badge(ui, pal, idxs.len());
             });

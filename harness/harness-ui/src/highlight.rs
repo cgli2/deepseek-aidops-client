@@ -124,7 +124,7 @@ pub fn highlight_to_job(
 
     let line_count = code.lines().count().max(1);
     let num_w = line_count.to_string().len().max(2);
-    let size = 11.5_f32;
+    let size = 12.0_f32;
     let mut line_no = 1usize;
 
     for line in LinesWithEndings::from(code) {

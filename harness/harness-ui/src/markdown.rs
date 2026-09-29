@@ -11,10 +11,10 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-const BODY_SIZE: f32 = 13.5;
-const CODE_SIZE: f32 = 12.5;
-const BLOCK_GAP_SIZE: f32 = 7.0;
-const HEADING_SIZES: [f32; 3] = [18.0, 16.0, 14.5];
+const BODY_SIZE: f32 = 13.0;
+const CODE_SIZE: f32 = 12.0;
+const BLOCK_GAP_SIZE: f32 = 6.0;
+const HEADING_SIZES: [f32; 3] = [15.0, 14.0, 13.0];
 
 /// 渲染所需的主题色（从 gui `Palette` 拷贝，避免模块间循环依赖）。
 #[derive(Clone, Copy)]

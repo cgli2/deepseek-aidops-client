@@ -177,7 +177,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                 .show(ctx, |ui| {
                     egui::Frame::default()
                         .fill(pal.panel)
-                        .rounding(egui::Rounding::same(14.0))
+                        .rounding(egui::Rounding::same(8.0))
                         .stroke(egui::Stroke::new(1.0_f32, pal.border))
                         .shadow(egui::epaint::Shadow {
                             offset: egui::vec2(0.0, 10.0),
@@ -193,7 +193,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(display_title)
-                                        .size(15.5)
+                                        .size(14.0)
                                         .strong()
                                         .color(pal.text),
                                 );
@@ -225,7 +225,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     egui::Sense::hover(),
                                 )
                                 .0;
-                            ui.painter().rect_filled(sep, 0.0, pal.border.gamma_multiply(0.4));
+                            ui.painter().rect_filled(sep, 0.0, pal.line);
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 if system_page {
@@ -257,7 +257,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     let sep_rect = ui
                                         .allocate_exact_size(egui::vec2(1.0, scroll_h), egui::Sense::hover())
                                         .0;
-                                    ui.painter().rect_filled(sep_rect, 0.0, pal.border.gamma_multiply(0.4));
+                                    ui.painter().rect_filled(sep_rect, 0.0, pal.line);
                                     ui.add_space(14.0);
                                 }
                                 egui::ScrollArea::vertical()
@@ -271,13 +271,13 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     "模型配置" | "模型设置" => {
                                         ui.set_min_width(if system_page { panel_w - 220.0 } else { panel_w - 12.0 });
                                         // 表单输入框统一几何：宽度以「模型名称」列为基准（预留右侧按钮位）；
-                                        // 高度 34px 与按钮等高，用对称上下边距撑高（而非 min_size）——
+                                        // 高度 28px 与按钮等高，用对称上下边距撑高（而非 min_size）——
                                         // egui 文本锚定在内框左上角，只有边距对称才能保证垂直居中。
                                         let field_w = (ui.available_width() - 150.0).max(260.0);
                                         let body_row_h = ui.fonts(|f| {
                                             f.row_height(&egui::TextStyle::Body.resolve(ui.style()))
                                         });
-                                        let field_pad_y = ((34.0 - body_row_h) / 2.0).max(2.0);
+                                        let field_pad_y = ((28.0 - body_row_h) / 2.0).max(2.0);
                                         let field_margin = egui::Margin::symmetric(4.0, field_pad_y);
                                         // desired_width 是内框宽：扣除左右边距后外宽恰好 = field_w，
                                         // 否则「模型名称」行总宽溢出，右侧按钮会被压进输入框。
@@ -591,7 +591,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     "新建项目" => {
                                         ui.label(
                                             egui::RichText::new("选择项目目录后点击“确定”，切换到该项目并保存到侧栏项目列表。")
-                                                .size(12.5)
+                                                .size(12.0)
                                                 .color(pal.text),
                                         );
                                         ui.add_space(12.0);
@@ -911,13 +911,13 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                             if accent_button(ui, &pal, "导入技能包（文件夹）") {
                                                 state.import_skill_folder();
                                             }
-                                            if compact_button(ui, &pal, "导入 SKILL.md") {
+                                            if ghost_button(ui, &pal, "导入 SKILL.md") {
                                                 state.import_skill_file();
                                             }
-                                            if compact_button(ui, &pal, "刷新") {
+                                            if ghost_button(ui, &pal, "刷新") {
                                                 state.refresh_skill_items();
                                             }
-                                            if compact_button(ui, &pal, "打开技能目录") {
+                                            if ghost_button(ui, &pal, "打开技能目录") {
                                                 state.open_skills_dir();
                                             }
                                         });
@@ -931,7 +931,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                 egui::Frame::default()
                                                     .fill(pal.card_bg)
                                                     .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
-                                                    .rounding(egui::Rounding::same(6.0))
+                                                    .rounding(egui::Rounding::same(5.0))
                                                     .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                                                     .show(ui, |ui| {
                                                         ui.horizontal(|ui| {
@@ -945,9 +945,9 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                                 state.toggle_skill(&sk.id, enabled);
                                                             }
                                                             ui.label(egui::RichText::new(&sk.name).size(13.0).strong().color(pal.text));
-                                                            ui.label(egui::RichText::new(format!("v{}", sk.version)).size(10.5).color(pal.dim));
+                                                            ui.label(egui::RichText::new(format!("v{}", sk.version)).size(11.0).color(pal.dim));
                                                             if !sk.resource_files.is_empty() {
-                                                                ui.label(egui::RichText::new(format!("· {} 个资源文件", sk.resource_files.len())).size(10.5).color(pal.dim));
+                                                                ui.label(egui::RichText::new(format!("· {} 个资源文件", sk.resource_files.len())).size(11.0).color(pal.dim));
                                                             }
                                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                                 if system_skill {
@@ -977,7 +977,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                                             };
                                                             ui.label(
                                                                 egui::RichText::new(format!("来源: {shown}"))
-                                                                    .size(10.5)
+                                                                    .size(11.0)
                                                                     .color(pal.dim),
                                                             )
                                                             .on_hover_text("约定包以相对技能库根的路径登记，重复导入会更新此技能而非创建副本");
@@ -1125,7 +1125,7 @@ if state.mem_tab == "code" {
                                                                     );
                                                                     ui.label(
                                                                         egui::RichText::new(format!("v{}", sk.version))
-                                                                            .size(10.5)
+                                                                            .size(11.0)
                                                                             .color(pal.dim),
                                                                     );
                                                                     ui.with_layout(
@@ -1170,7 +1170,7 @@ if state.mem_tab == "code" {
                                                     egui::Frame::default()
                                                         .fill(pal.card_bg)
                                                         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
-                                                        .rounding(egui::Rounding::same(6.0))
+                                                        .rounding(egui::Rounding::same(5.0))
                                                         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                                                         .show(ui, |ui| {
                                                             ui.label(
@@ -1181,7 +1181,7 @@ if state.mem_tab == "code" {
                                                             );
                                                             ui.label(
                                                                 egui::RichText::new(&it.meta)
-                                                                    .size(10.5)
+                                                                    .size(11.0)
                                                                     .color(pal.dim),
                                                             );
                                                             ui.label(
@@ -1566,7 +1566,7 @@ if state.mem_tab == "code" {
                                         let footer_sep = ui
                                             .allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover())
                                             .0;
-                                        ui.painter().rect_filled(footer_sep, 0.0, pal.border.gamma_multiply(0.4));
+                                        ui.painter().rect_filled(footer_sep, 0.0, pal.line);
                                         ui.add_space(10.0);
                                         ui.horizontal(|ui| {
                                             if !state.note.is_empty() {

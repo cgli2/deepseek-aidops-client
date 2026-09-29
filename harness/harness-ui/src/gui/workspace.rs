@@ -161,7 +161,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 projection.no_information_count,
                                                 projection.correction_count,
                                             ))
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(pal.dim),
                                         );
                                         ui.label(
@@ -173,7 +173,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                     projection.allowed_tools.join("、")
                                                 }
                                             ))
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(pal.dim),
                                         );
                                     });
@@ -183,7 +183,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 "目标：{}",
                                                 projection.goal
                                             ))
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(pal.dim),
                                         );
                                     }
@@ -193,7 +193,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             projection.active_work_item,
                                             projection.active_hypothesis
                                         ))
-                                        .size(10.5)
+                                        .size(11.0)
                                         .color(pal.dim),
                                     );
                                     if !projection.work_items.is_empty() {
@@ -214,7 +214,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                     .collect::<Vec<_>>()
                                                     .join(" · ")
                                             ))
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(pal.dim),
                                         );
                                     }
@@ -223,13 +223,13 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             "下一动作：{}",
                                             projection.next_action
                                         ))
-                                        .size(10.5)
+                                        .size(11.0)
                                         .color(pal.dim),
                                     );
                                     if !projection.detail.is_empty() {
                                         ui.label(
                                             egui::RichText::new(&projection.detail)
-                                                .size(10.5)
+                                                .size(11.0)
                                                 .color(pal.dim),
                                         );
                                     }
@@ -286,15 +286,23 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                     };
                                 // 所有气泡统一左对齐：用户消息不右对齐，阅读动线更连贯。
                                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    let bubble_stroke = match msg.kind.as_str() {
+                                        "user" => egui::Stroke::new(1.0_f32, pal.line),
+                                        "error" => egui::Stroke::new(
+                                            1.0_f32,
+                                            pal.err_text.gamma_multiply(0.35),
+                                        ),
+                                        _ => egui::Stroke::NONE,
+                                    };
                                     let bubble = egui::Frame::default()
                                         .fill(fill)
-                                        .rounding(egui::Rounding::same(12.0))
+                                        .rounding(egui::Rounding::same(10.0))
                                         .inner_margin(if cfg!(target_os = "macos") {
                                             egui::Margin::symmetric(12.0, 10.0)
                                         } else {
                                             egui::Margin::symmetric(14.0, 12.0)
                                         })
-                                        .stroke(egui::Stroke::new(1.0_f32, pal.border));
+                                        .stroke(bubble_stroke);
                                     bubble.show(ui, |ui| {
                                         // 所有气泡（用户/助手/错误）与工作批次卡统一固定同一宽度，
                                         // 保证最大化时左右边界完全对齐；宽度不随内容收缩。
@@ -402,7 +410,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 ui.add_space(6.0);
                                                 ui.label(
                                                     egui::RichText::new("文件：")
-                                                        .size(10.5)
+                                                        .size(11.0)
                                                         .color(pal.dim),
                                                 );
                                                 for path in file_paths {
@@ -410,7 +418,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                         .monospace()
                                                         .color(pal.accent)
                                                         .underline()
-                                                        .size(12.5);
+                                                        .size(12.0);
                                                     let btn = egui::Button::new(label)
                                                         .fill(egui::Color32::TRANSPARENT)
                                                         .stroke(egui::Stroke::NONE);
@@ -431,7 +439,7 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(&msg.text)
-                                                        .size(13.5)
+                                                        .size(13.0)
                                                         .color(text_color),
                                                 )
                                                 .selectable(true),
@@ -461,18 +469,18 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         // 区域的首行文字遮在下面，hover 时描边加重强调。
                                         ui.painter().rect(
                                             hit_rect,
-                                            egui::Rounding::same(6.0),
+                                            egui::Rounding::same(5.0),
                                             fill,
                                             egui::Stroke::new(
                                                 if copy_resp.hovered() {
-                                                    1.4_f32
+                                                    1.2_f32
                                                 } else {
                                                     1.0_f32
                                                 },
                                                 if copy_resp.hovered() {
                                                     pal.dim
                                                 } else {
-                                                    pal.border
+                                                    pal.line
                                                 },
                                             ),
                                         );
@@ -596,7 +604,7 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                             ui.label(
                                 egui::RichText::new("专家团 DAG")
                                     .strong()
-                                    .size(13.5)
+                                    .size(13.0)
                                     .color(pal.text),
                             );
                             ui.label(
@@ -609,7 +617,7 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                                     "{done}/{total} · 并行 {running}/{} · {elapsed}s",
                                     council.max_parallel
                                 ))
-                                .size(10.5)
+                                .size(11.0)
                                 .color(pal.dim),
                             );
                         });
@@ -675,7 +683,7 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(format!("依赖：{deps}"))
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(pal.dim),
                                     )
                                     .wrap(),
@@ -738,7 +746,7 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                                                 "{} · {}",
                                                 gate.name, gate.evidence
                                             ))
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(color),
                                         )
                                         .wrap(),
@@ -750,7 +758,7 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&council.detail)
-                                        .size(10.5)
+                                        .size(11.0)
                                         .color(if failed > 0 { pal.warn } else { pal.dim }),
                                 )
                                 .wrap(),
@@ -1133,7 +1141,7 @@ fn render_thought_card(
                         pal.purple,
                         ui.input(|input| input.time),
                     );
-                    ui.label(egui::RichText::new(preview).size(10.5).color(pal.dim));
+                    ui.label(egui::RichText::new(preview).size(11.0).color(pal.dim));
                 });
                 ui.ctx().request_repaint();
             }
@@ -1355,7 +1363,7 @@ fn render_tool_action_block(
                                 egui::pos2(c_draw.left() + 17.0, c_draw.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 "复制输出",
-                                egui::FontId::proportional(10.5),
+                                egui::FontId::proportional(11.0),
                                 lerp_color(pal.dim, pal.text, c_hov),
                             );
                             if c_resp.clicked() {
@@ -1377,12 +1385,12 @@ fn render_tool_action_block(
                         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                         .show(ui, |ui| {
                             if !action.args.is_empty() {
-                                ui.label(egui::RichText::new("参数:").size(10.5).color(pal.dim));
+                                ui.label(egui::RichText::new("参数:").size(11.0).color(pal.dim));
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(&action.args)
                                             .monospace()
-                                            .size(11.0)
+                                            .size(12.0)
                                             .color(pal.text),
                                     )
                                     .selectable(true)
@@ -1398,7 +1406,7 @@ fn render_tool_action_block(
                                     } else {
                                         "错误输出:"
                                     })
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(if *ok {
                                         pal.dim
                                     } else {
@@ -1422,7 +1430,7 @@ fn render_tool_action_block(
                                                 ui.label(
                                                     egui::RichText::new(format!("{:3} |", ln + 1))
                                                         .monospace()
-                                                        .size(10.5)
+                                                        .size(11.0)
                                                         .color(pal.dim),
                                                 );
 
@@ -1561,8 +1569,8 @@ fn render_delivery_banner(ui: &mut egui::Ui, delivery: &DeliveryUi, pal: &Palett
     ui.add_space(4.0);
     egui::Frame::default()
         .fill(fill)
-        .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(1.2_f32, border_color))
+        .rounding(egui::Rounding::same(5.0))
+        .stroke(egui::Stroke::new(1.0_f32, border_color))
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1573,7 +1581,7 @@ fn render_delivery_banner(ui: &mut egui::Ui, delivery: &DeliveryUi, pal: &Palett
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new(title)
-                            .size(12.5)
+                            .size(12.0)
                             .strong()
                             .color(if is_verified { pal.success } else { pal.text }),
                     );

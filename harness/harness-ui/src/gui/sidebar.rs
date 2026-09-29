@@ -39,7 +39,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
             // ── Codex 式醒目主操作：新建会话 ──
             if state.sidebar_expanded {
                 let (btn_rect, btn_resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 32.0),
+                    egui::vec2(ui.available_width(), 30.0),
                     egui::Sense::click(),
                 );
                 let (hover_t, active_t) = animate_interaction(ui, btn_resp.id, &btn_resp);
@@ -48,7 +48,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                 let btn_border = lerp_color(pal.btn_border, pal.accent, hover_t * 0.6);
                 ui.painter().rect(
                     draw_rect,
-                    egui::Rounding::same(8.0),
+                    egui::Rounding::same(5.0),
                     btn_fill,
                     egui::Stroke::new(1.0_f32, btn_border),
                 );
@@ -60,14 +60,14 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                     draw_rect.left_center() + egui::vec2(28.0, 0.0),
                     egui::Align2::LEFT_CENTER,
                     "新建对话",
-                    egui::FontId::proportional(12.5),
+                    egui::FontId::proportional(12.0),
                     pal.btn_text,
                 );
                 ui.painter().text(
                     draw_rect.right_center() + egui::vec2(-10.0, 0.0),
                     egui::Align2::RIGHT_CENTER,
                     "⌘N",
-                    egui::FontId::proportional(10.5),
+                    egui::FontId::proportional(10.0),
                     lerp_color(pal.dim, pal.btn_text, hover_t * 0.5),
                 );
                 if btn_resp.clicked() {
@@ -75,7 +75,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                 }
             } else {
                 let (btn_rect, btn_resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 32.0),
+                    egui::vec2(ui.available_width(), 30.0),
                     egui::Sense::click(),
                 );
                 let (hover_t, active_t) = animate_interaction(ui, btn_resp.id, &btn_resp);
@@ -84,7 +84,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                 let btn_border = lerp_color(pal.btn_border, pal.accent, hover_t * 0.6);
                 ui.painter().rect(
                     draw_rect,
-                    egui::Rounding::same(8.0),
+                    egui::Rounding::same(5.0),
                     btn_fill,
                     egui::Stroke::new(1.0_f32, btn_border),
                 );
@@ -209,12 +209,12 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                                 } else {
                                     Color32::from_black_alpha(12)
                                 };
-                                ui.painter().rect_filled(draw_rect, 6.0, sel_bg);
+                                ui.painter().rect_filled(draw_rect, 5.0, sel_bg);
                             }
                             if hover_t > 0.001 {
                                 ui.painter().rect_filled(
                                     draw_rect,
-                                    6.0,
+                                    5.0,
                                     pal.translucent_hover(hover_t),
                                 );
                             }
@@ -319,7 +319,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                     if at.elapsed() < std::time::Duration::from_secs(5) {
                         ui.label(
                             egui::RichText::new(&state.history_note)
-                                .size(10.5)
+                                .size(11.0)
                                 .color(pal.accent),
                         );
                     } else {
@@ -374,7 +374,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                                 ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new(group)
-                                        .size(10.5)
+                                        .size(11.0)
                                         .strong()
                                         .color(pal.dim),
                                 );
@@ -414,7 +414,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                     };
                     ui.label(
                         egui::RichText::new(format!("工作区: {ws_display}"))
-                            .size(10.5)
+                            .size(11.0)
                             .color(pal.dim),
                     );
                 }
@@ -457,11 +457,11 @@ fn render_history_row(
         } else {
             Color32::from_black_alpha(12)
         };
-        ui.painter().rect_filled(draw_rect, 6.0, sel_bg);
+        ui.painter().rect_filled(draw_rect, 5.0, sel_bg);
     }
     if hover_t > 0.001 {
         ui.painter()
-            .rect_filled(draw_rect, 6.0, pal.translucent_hover(hover_t));
+            .rect_filled(draw_rect, 5.0, pal.translucent_hover(hover_t));
     }
     if is_active {
         let bar_h = (draw_rect.height() - 14.0).max(12.0);
@@ -494,7 +494,7 @@ fn render_history_row(
         egui::pos2(draw_rect.min.x + 10.0, draw_rect.max.y - 10.0),
         egui::Align2::LEFT_CENTER,
         relative_time(&meta.mtime),
-        egui::FontId::proportional(9.5),
+        egui::FontId::proportional(10.0),
         pal.dim,
     );
 

@@ -418,7 +418,7 @@ impl AppState {
                             let kb = content.len() as f32 / 1024.0;
                             ui.label(
                                 egui::RichText::new(format!("{line_count} 行 · {kb:.1} KB"))
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(pal.dim),
                             );
                         }
@@ -541,7 +541,7 @@ impl AppState {
                             if self.preview_truncated {
                                 ui.label(
                                     egui::RichText::new("文件过大，仅显示前 512KB")
-                                        .size(10.5)
+                                        .size(11.0)
                                         .color(pal.warn),
                                 );
                                 ui.add_space(4.0);
@@ -570,7 +570,7 @@ impl AppState {
                             if self.preview_truncated {
                                 ui.label(
                                     egui::RichText::new("文件过大，仅显示前 512KB")
-                                        .size(10.5)
+                                        .size(11.0)
                                         .color(pal.warn),
                                 );
                                 ui.add_space(4.0);
@@ -1057,7 +1057,7 @@ impl AppState {
                                         );
                                         ui.label(
                                             egui::RichText::new(format!("(证据 {})", item.evidence_count))
-                                                .size(10.5)
+                                                .size(11.0)
                                                 .color(pal.dim),
                                         );
                                     });
@@ -1115,7 +1115,7 @@ impl AppState {
                                 draw_icon(ui.painter(), icon_rect.center(), Icon::BarChart, pal.accent);
                                 ui.label(
                                     egui::RichText::new("会话资源消耗统计")
-                                        .size(12.5)
+                                        .size(12.0)
                                         .strong()
                                         .color(pal.text),
                                 );
@@ -1352,7 +1352,7 @@ impl AppState {
                     } else {
                         "文件树".to_string()
                     };
-                    ui.label(egui::RichText::new(title).size(12.5).color(pal.text));
+                    ui.label(egui::RichText::new(title).size(12.0).color(pal.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if close_button(ui, pal) {
                             self.tree_open = false;
@@ -1491,7 +1491,7 @@ impl AppState {
                 }
                 ui.label(
                     egui::RichText::new(format!("查询工作区：{}", self.git_workspace))
-                        .size(10.5)
+                        .size(11.0)
                         .color(pal.dim),
                 );
                 return;

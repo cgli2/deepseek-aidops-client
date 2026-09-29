@@ -13,6 +13,7 @@ const TITLEBAR_HEIGHT: f32 = 36.0;
 pub struct ChromeColors {
     pub fill: Color32,
     pub border: Color32,
+    pub line: Color32,
     pub text: Color32,
     pub dim: Color32,
     pub accent: Color32,
@@ -78,7 +79,7 @@ fn theme_button(ui: &mut Ui, colors: ChromeColors, dark: bool) -> Response {
     } else {
         Stroke::NONE
     };
-    ui.painter().rect(draw_rect, 6.0, fill, border);
+    ui.painter().rect(draw_rect, 5.0, fill, border);
 
     let c = egui::pos2(draw_rect.left() + 13.0, draw_rect.center().y);
     let icon_color = crate::gui::widgets::lerp_color(colors.dim, colors.text, hover_t);
@@ -157,7 +158,7 @@ fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response
     } else {
         Stroke::NONE
     };
-    ui.painter().rect(draw_rect, 6.0, fill, border);
+    ui.painter().rect(draw_rect, 5.0, fill, border);
 
     let base_color = if expanded { colors.accent } else { colors.dim };
     let target_color = if expanded { colors.accent } else { colors.text };
@@ -204,7 +205,7 @@ fn tree_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
     } else {
         Stroke::NONE
     };
-    ui.painter().rect(draw_rect, 6.0, fill, border);
+    ui.painter().rect(draw_rect, 5.0, fill, border);
 
     let base_color = if open { colors.accent } else { colors.dim };
     let target_color = if open { colors.accent } else { colors.text };
@@ -251,7 +252,7 @@ fn inspector_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
     } else {
         Stroke::NONE
     };
-    ui.painter().rect(draw_rect, 6.0, fill, border);
+    ui.painter().rect(draw_rect, 5.0, fill, border);
 
     let base_color = if open { colors.accent } else { colors.dim };
     let target_color = if open { colors.accent } else { colors.text };
@@ -286,6 +287,7 @@ pub fn show(
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     egui::TopBottomPanel::top("integrated_workbench_titlebar")
         .exact_height(titlebar_height())
+        .show_separator_line(false)
         .frame(egui::Frame::default().fill(colors.fill))
         .show(ctx, |ui| {
             let full_rect = ui.max_rect();
@@ -347,7 +349,7 @@ pub fn show(
                 };
                 ui.label(
                     egui::RichText::new(session_display)
-                        .size(12.5)
+                        .size(12.0)
                         .strong()
                         .color(colors.text),
                 );
@@ -475,7 +477,7 @@ pub fn show(
             ui.painter().hline(
                 full_rect.x_range(),
                 full_rect.bottom(),
-                Stroke::new(1.0_f32, colors.border),
+                Stroke::new(1.0_f32, colors.line),
             );
         });
     actions

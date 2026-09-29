@@ -103,23 +103,54 @@ pub(super) fn install_cjk_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-#[cfg(target_os = "macos")]
-pub(super) fn install_macos_ui_style(ctx: &egui::Context) {
+// ── Apple HIG 7 级标准字阶规范 ──
+/// 模态窗口大标题、欢迎横幅（对标 macOS 16pt，取代原 18pt）
+#[allow(dead_code)]
+pub const FONT_DISPLAY: f32 = 16.0;
+/// 区块标题、对话框组标题、卡片头部（取代原 15.5/16.0）
+#[allow(dead_code)]
+pub const FONT_TITLE: f32 = 14.0;
+/// 标准正文、默认控件文字（严格对齐 macOS 13pt，彻底取代原 13.5）
+pub const FONT_BODY: f32 = 13.0;
+/// 按钮文字、Tab 标签、树节点、表单控件文字（取代原 12.5/13.0）
+pub const FONT_UI: f32 = 12.0;
+/// 提示文本、次要说明、子文本
+pub const FONT_SECONDARY: f32 = 11.5;
+/// 面包屑、时间戳、状态标签（取代原 10.5）
+pub const FONT_CAPTION: f32 = 11.0;
+/// 快捷键徽标 (⌘N)、微状态点、紧凑计数器（取代原 8.5/9.5）
+pub const FONT_MICRO: f32 = 10.0;
+/// 等宽代码字体（Markdown 行内代码、代码块、Diff、终端输出）
+#[allow(dead_code)]
+pub const FONT_CODE: f32 = 12.0;
+
+pub(super) fn install_ui_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style
         .text_styles
-        .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(15.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(FONT_BODY));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(FONT_UI));
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::proportional(FONT_CAPTION),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::monospace(FONT_CODE),
+    );
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.interact_size.y = 28.0;
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.interact_size.y = 26.0;
     ctx.set_style(style);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(super) fn install_macos_ui_style(ctx: &egui::Context) {
+    install_ui_style(ctx);
 }

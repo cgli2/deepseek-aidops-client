@@ -55,13 +55,13 @@ impl AppState {
             UpdateStatus::ReadyToRestart { version, .. } => {
                 egui::Frame::default()
                     .fill(pal.banner_ok)
-                    .rounding(egui::Rounding::same(12.0))
+                    .rounding(egui::Rounding::same(6.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("已下载 v{version}，重启后生效"))
-                                    .size(12.5)
+                                    .size(12.0)
                                     .strong()
                                     .color(pal.text),
                             );

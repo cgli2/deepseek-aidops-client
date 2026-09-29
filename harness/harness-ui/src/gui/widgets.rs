@@ -1,8 +1,14 @@
 //! Stateless reusable GUI controls with industrial-grade micro-animations.
 
+use super::fonts::{FONT_BODY, FONT_CAPTION, FONT_MICRO, FONT_SECONDARY, FONT_UI};
 use super::icons::{Icon, draw_icon};
 use super::model::{PluginKind, PluginUiRow};
 use super::theme::Palette;
+
+/// 桌面标准控件尺寸常量（macOS 4px 模块化排版）
+pub const BTN_HEIGHT_REGULAR: f32 = 28.0;
+pub const BTN_HEIGHT_COMPACT: f32 = 24.0;
+pub const BTN_ROUNDING: f32 = 5.0;
 
 /// 线性插值颜色（含 Alpha 通道，平滑过渡）。
 pub(crate) fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
@@ -40,10 +46,7 @@ pub(super) fn nav_item(
     enabled: bool,
     accent: bool,
 ) -> bool {
-    #[cfg(target_os = "macos")]
-    let height = 38.0;
-    #[cfg(not(target_os = "macos"))]
-    let height = 36.0;
+    let height = 30.0;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click(),
@@ -61,9 +64,9 @@ pub(super) fn nav_item(
         pal.translucent_hover(hover_t)
     };
     if bg_color != egui::Color32::TRANSPARENT {
-        let draw_rect = rect.shrink(2.0 + 0.4 * active_t);
+        let draw_rect = rect.shrink(1.5 + 0.3 * active_t);
         ui.painter()
-            .rect_filled(draw_rect, egui::Rounding::same(8.0), bg_color);
+            .rect_filled(draw_rect, egui::Rounding::same(BTN_ROUNDING), bg_color);
     }
 
     // 图标与文字随悬停微提亮
@@ -82,21 +85,17 @@ pub(super) fn nav_item(
     };
 
     let icon_center = egui::pos2(
-        rect.min.x + if expanded { 20.0 } else { rect.width() / 2.0 },
-        rect.center().y + 0.3 * active_t,
+        rect.min.x + if expanded { 18.0 } else { rect.width() / 2.0 },
+        rect.center().y + 0.2 * active_t,
     );
     draw_icon(ui.painter(), icon_center, icon, icon_color);
 
     if expanded {
         ui.painter().text(
-            egui::pos2(rect.min.x + 40.0, rect.center().y + 0.3 * active_t),
+            egui::pos2(rect.min.x + 36.0, rect.center().y + 0.2 * active_t),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(if cfg!(target_os = "macos") {
-                13.5
-            } else {
-                13.0
-            }),
+            egui::FontId::proportional(FONT_BODY),
             text_color,
         );
     }
@@ -105,7 +104,7 @@ pub(super) fn nav_item(
 
 /// 模态面板右上角关闭按钮（矢量关闭图标，平滑半透明光晕与微阻尼）。
 pub(super) fn close_button(ui: &mut egui::Ui, pal: &Palette) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
     let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
 
     let bg_color = if active_t > 0.05 {
@@ -114,12 +113,12 @@ pub(super) fn close_button(ui: &mut egui::Ui, pal: &Palette) -> bool {
         pal.translucent_hover(hover_t)
     };
     if bg_color != egui::Color32::TRANSPARENT {
-        let draw_rect = rect.shrink(0.5 * active_t);
+        let draw_rect = rect.shrink(0.4 * active_t);
         ui.painter()
-            .rect_filled(draw_rect, egui::Rounding::same(6.0), bg_color);
+            .rect_filled(draw_rect, egui::Rounding::same(4.5), bg_color);
     }
 
-    let c = rect.center() + egui::vec2(0.0, 0.4 * active_t);
+    let c = rect.center() + egui::vec2(0.0, 0.3 * active_t);
     let cross_color = lerp_color(pal.dim, pal.text, hover_t);
     draw_icon(ui.painter(), c, Icon::X, cross_color);
     resp.clicked()
@@ -130,7 +129,7 @@ pub(super) fn accent_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bo
     accent_button_ex(ui, pal, label, true)
 }
 
-/// 主操作按钮（支持禁用态，尺寸位置严格不变）。
+/// 主操作按钮（支持禁用态，尺寸位置严格不变，对标 macOS 桌面原生按钮）。
 pub(super) fn accent_button_ex(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -139,10 +138,11 @@ pub(super) fn accent_button_ex(
 ) -> bool {
     let text_w: f32 = label
         .chars()
-        .map(|c| if c.is_ascii() { 7.5 } else { 13.5 })
+        .map(|c| if c.is_ascii() { 7.0 } else { 12.0 })
         .sum();
-    let w = (text_w + 44.0).max(130.0);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
+    let w = (text_w + 24.0).max(68.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(w, BTN_HEIGHT_REGULAR), egui::Sense::click());
     let (hover_t, active_t) = if enabled {
         animate_interaction(ui, resp.id, &resp)
     } else {
@@ -162,12 +162,12 @@ pub(super) fn accent_button_ex(
     };
 
     // 按下时发生微量形变，呈现机械按压反馈
-    let draw_rect = rect.shrink(0.6 * active_t);
+    let draw_rect = rect.shrink(0.4 * active_t);
     ui.painter()
-        .rect_filled(draw_rect, egui::Rounding::same(8.0), fill);
+        .rect_filled(draw_rect, egui::Rounding::same(BTN_ROUNDING), fill);
     ui.painter().rect(
         draw_rect,
-        egui::Rounding::same(8.0),
+        egui::Rounding::same(BTN_ROUNDING),
         egui::Color32::TRANSPARENT,
         egui::Stroke::new(1.0_f32, border_color),
     );
@@ -182,7 +182,7 @@ pub(super) fn accent_button_ex(
         draw_rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(FONT_UI),
         text_color,
     );
     enabled && resp.clicked()
@@ -196,12 +196,12 @@ pub(super) fn plugin_row_ui(
 ) -> (bool, bool) {
     let mut removed = false;
     let was_enabled = row.enabled;
-    let margin = egui::Margin::symmetric(12.0, 9.0);
+    let margin = egui::Margin::symmetric(12.0, 8.0);
     let row_w = (ui.available_width() - margin.sum().x).max(200.0);
     egui::Frame::default()
         .fill(pal.field)
-        .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
         .inner_margin(margin)
         .show(ui, |ui| {
             ui.set_min_width(row_w);
@@ -215,14 +215,14 @@ pub(super) fn plugin_row_ui(
                 }
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&row.name).size(13.0).color(pal.text));
+                        ui.label(egui::RichText::new(&row.name).size(FONT_UI).color(pal.text));
                         ui.label(
                             egui::RichText::new(match row.kind {
                                 PluginKind::Core => "核心",
                                 PluginKind::Wasm => "WASM",
                                 PluginKind::Trellis => "Trellis",
                             })
-                            .size(10.0)
+                            .size(FONT_MICRO)
                             .color(pal.accent),
                         );
                         if row.kind != PluginKind::Core {
@@ -234,32 +234,40 @@ pub(super) fn plugin_row_ui(
                                 } else {
                                     "已禁用"
                                 })
-                                .size(10.0)
+                                .size(FONT_MICRO)
                                 .color(pal.dim),
                             );
                         }
                     });
                     ui.add(
-                        egui::Label::new(egui::RichText::new(&row.desc).size(11.0).color(pal.dim))
-                            .wrap_mode(egui::TextWrapMode::Truncate),
+                        egui::Label::new(
+                            egui::RichText::new(&row.desc)
+                                .size(FONT_CAPTION)
+                                .color(pal.dim),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate),
                     );
                 });
                 if row.kind == PluginKind::Wasm {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ghost_button(ui, pal, "移除") {
+                        if compact_button(ui, pal, "移除") {
                             removed = true;
                         }
                     });
                 }
             });
         });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     (removed, was_enabled != row.enabled)
 }
 
 /// 次级幽灵按钮（细描边、平滑半透明底色过渡）。
 pub(super) fn ghost_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
-    let size = egui::vec2(label.chars().count() as f32 * 13.0 + 20.0, 34.0);
+    let text_w: f32 = label
+        .chars()
+        .map(|c| if c.is_ascii() { 7.0 } else { 12.0 })
+        .sum();
+    let size = egui::vec2((text_w + 20.0).max(56.0), BTN_HEIGHT_REGULAR);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
 
@@ -268,15 +276,15 @@ pub(super) fn ghost_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> boo
     } else {
         pal.translucent_hover(hover_t)
     };
-    let draw_rect = rect.shrink(0.5 * active_t);
+    let draw_rect = rect.shrink(0.4 * active_t);
     if bg_color != egui::Color32::TRANSPARENT {
         ui.painter()
-            .rect_filled(draw_rect, egui::Rounding::same(6.0), bg_color);
+            .rect_filled(draw_rect, egui::Rounding::same(BTN_ROUNDING), bg_color);
     }
     let border_color = lerp_color(pal.border, pal.accent.gamma_multiply(0.6), hover_t);
     ui.painter().rect(
         draw_rect,
-        egui::Rounding::same(6.0),
+        egui::Rounding::same(BTN_ROUNDING),
         egui::Color32::TRANSPARENT,
         egui::Stroke::new(1.0_f32, border_color),
     );
@@ -286,7 +294,7 @@ pub(super) fn ghost_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> boo
         draw_rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(FONT_UI),
         text_color,
     );
     resp.clicked()
@@ -299,11 +307,7 @@ pub(super) enum SidebarActionIcon {
 }
 
 pub(super) fn sidebar_control_height() -> f32 {
-    if cfg!(target_os = "macos") {
-        26.0
-    } else {
-        24.0
-    }
+    24.0
 }
 
 /// 侧栏紧凑图标按钮：常态透明、悬停平滑半透明浮出、点击微下沉。
@@ -323,14 +327,14 @@ pub(super) fn sidebar_icon_button(
         pal.translucent_hover(hover_t)
     };
 
-    let draw_rect = rect.shrink(0.4 * active_t);
+    let draw_rect = rect.shrink(0.3 * active_t);
     if bg != egui::Color32::TRANSPARENT {
         ui.painter()
-            .rect_filled(draw_rect, egui::Rounding::same(6.0), bg);
+            .rect_filled(draw_rect, egui::Rounding::same(4.5), bg);
         let border = lerp_color(egui::Color32::TRANSPARENT, pal.border, hover_t);
         ui.painter().rect(
             draw_rect,
-            egui::Rounding::same(6.0),
+            egui::Rounding::same(4.5),
             egui::Color32::TRANSPARENT,
             egui::Stroke::new(1.0_f32, border),
         );
@@ -621,9 +625,9 @@ pub(super) fn settings_nav_item(
     selected: bool,
 ) -> bool {
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
     let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
-    let draw_rect = rect.shrink(0.4 * active_t);
+    let draw_rect = rect.shrink(0.3 * active_t);
 
     if selected {
         let sel_bg = if pal.is_dark {
@@ -632,7 +636,7 @@ pub(super) fn settings_nav_item(
             egui::Color32::from_black_alpha(12)
         };
         ui.painter()
-            .rect_filled(draw_rect, egui::Rounding::same(6.0), sel_bg);
+            .rect_filled(draw_rect, egui::Rounding::same(BTN_ROUNDING), sel_bg);
         let bar_h = (draw_rect.height() - 14.0).max(12.0);
         let bar = egui::Rect::from_min_size(
             egui::pos2(draw_rect.min.x + 2.0, draw_rect.center().y - bar_h / 2.0),
@@ -643,7 +647,7 @@ pub(super) fn settings_nav_item(
     } else if hover_t > 0.001 {
         ui.painter().rect_filled(
             draw_rect,
-            egui::Rounding::same(6.0),
+            egui::Rounding::same(BTN_ROUNDING),
             pal.translucent_hover(hover_t),
         );
     }
@@ -669,7 +673,7 @@ pub(super) fn settings_nav_item(
         egui::pos2(draw_rect.min.x + 32.0, draw_rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(FONT_UI),
         text_color,
     );
 
@@ -685,21 +689,20 @@ pub(super) fn settings_card<R>(
     egui::Frame::default()
         .fill(pal.card_bg)
         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
-        .rounding(egui::Rounding::same(8.0))
+        .rounding(egui::Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
         .show(ui, add_contents)
         .inner
 }
 
-/// 分组卡片内发丝级行分割线（0.5px，极低对比度）。
+/// 分组卡片内发丝级行分割线（1.0px 发丝线，macOS 层叠体系）。
 pub(super) fn settings_hairline(ui: &mut egui::Ui, pal: &Palette) {
-    ui.add_space(5.0);
+    ui.add_space(4.0);
     let sep = ui
-        .allocate_exact_size(egui::vec2(ui.available_width(), 0.5), egui::Sense::hover())
+        .allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover())
         .0;
-    ui.painter()
-        .rect_filled(sep, 0.0, pal.border.gamma_multiply(0.35));
-    ui.add_space(5.0);
+    ui.painter().rect_filled(sep, 0.0, pal.line);
+    ui.add_space(4.0);
 }
 
 /// 分组卡片双列设置行：左侧强标题 + 弱提示；右侧对齐交互控件。
@@ -712,15 +715,10 @@ pub(super) fn settings_row(
 ) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .size(12.5)
-                    .strong()
-                    .color(pal.text),
-            );
+            ui.label(egui::RichText::new(title).size(FONT_UI).color(pal.text));
             if let Some(h) = hint {
                 ui.add(
-                    egui::Label::new(egui::RichText::new(h).size(11.0).color(pal.dim))
+                    egui::Label::new(egui::RichText::new(h).size(FONT_CAPTION).color(pal.dim))
                         .wrap_mode(egui::TextWrapMode::Wrap),
                 );
             }
@@ -769,7 +767,7 @@ pub(super) fn subtle_text_action(
     tooltip: &str,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(label.chars().count() as f32 * 12.0 + 8.0, 22.0),
+        egui::vec2(label.chars().count() as f32 * 11.5 + 8.0, 22.0),
         egui::Sense::click(),
     );
     let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
@@ -788,16 +786,20 @@ pub(super) fn subtle_text_action(
         draw_rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(FONT_CAPTION),
         text_color,
     );
 
     resp.on_hover_text(tooltip).clicked()
 }
 
-/// 紧凑按钮（高度 26px，用于表单内次要动作，替代臃肿的 34px 大按钮）。
+/// 紧凑按钮（高度 24px，对标 macOS 桌面次要控件，解除 130px 臃肿限制）。
 pub(super) fn compact_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
-    let size = egui::vec2(label.chars().count() as f32 * 12.0 + 16.0, 26.0);
+    let text_w: f32 = label
+        .chars()
+        .map(|c| if c.is_ascii() { 6.5 } else { 11.5 })
+        .sum();
+    let size = egui::vec2((text_w + 16.0).max(48.0), BTN_HEIGHT_COMPACT);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
 
@@ -806,15 +808,15 @@ pub(super) fn compact_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> b
     } else {
         pal.translucent_hover(hover_t)
     };
-    let draw_rect = rect.shrink(0.4 * active_t);
+    let draw_rect = rect.shrink(0.3 * active_t);
     if bg_color != egui::Color32::TRANSPARENT {
         ui.painter()
-            .rect_filled(draw_rect, egui::Rounding::same(5.0), bg_color);
+            .rect_filled(draw_rect, egui::Rounding::same(4.5), bg_color);
     }
     let border_color = lerp_color(pal.border, pal.accent.gamma_multiply(0.5), hover_t);
     ui.painter().rect(
         draw_rect,
-        egui::Rounding::same(5.0),
+        egui::Rounding::same(4.5),
         egui::Color32::TRANSPARENT,
         egui::Stroke::new(1.0_f32, border_color),
     );
@@ -824,7 +826,7 @@ pub(super) fn compact_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> b
         draw_rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(11.5),
+        egui::FontId::proportional(FONT_SECONDARY),
         text_color,
     );
     resp.clicked()
@@ -838,7 +840,7 @@ pub(super) fn menu_check_item(
     selected: bool,
 ) -> bool {
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
     let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
     let draw_rect = rect.shrink(0.3 * active_t);
 
@@ -849,11 +851,11 @@ pub(super) fn menu_check_item(
             egui::Color32::from_black_alpha(10)
         };
         ui.painter()
-            .rect_filled(draw_rect, egui::Rounding::same(5.0), sel_bg);
+            .rect_filled(draw_rect, egui::Rounding::same(4.5), sel_bg);
     } else if hover_t > 0.001 {
         ui.painter().rect_filled(
             draw_rect,
-            egui::Rounding::same(5.0),
+            egui::Rounding::same(4.5),
             pal.translucent_hover(hover_t),
         );
     }
@@ -877,7 +879,7 @@ pub(super) fn menu_check_item(
         egui::pos2(text_x, draw_rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(FONT_UI),
         text_color,
     );
 

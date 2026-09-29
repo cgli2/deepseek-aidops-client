@@ -42,8 +42,7 @@ use app_state::AppState;
 #[cfg(all(test, target_os = "macos"))]
 use fonts::available_cjk_font;
 use fonts::install_cjk_fonts;
-#[cfg(target_os = "macos")]
-use fonts::install_macos_ui_style;
+use fonts::install_ui_style;
 use icons::{Icon, draw_brand_logo, draw_icon};
 use model::{
     ChatMsg, CouncilTaskUi, CouncilUi, DeliveryUi, ExecutionProjectionUi, MemItem, MemRefresh,
@@ -278,8 +277,7 @@ impl Ui for EguiUi {
             options,
             Box::new(move |cc| {
                 install_cjk_fonts(&cc.egui_ctx);
-                #[cfg(target_os = "macos")]
-                install_macos_ui_style(&cc.egui_ctx);
+                install_ui_style(&cc.egui_ctx);
                 Ok(Box::new(app))
             }),
         ) {

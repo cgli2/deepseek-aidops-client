@@ -2,6 +2,8 @@
 
 use egui::{Color32, Context, Response, Sense, Stroke, Ui, ViewportCommand};
 
+use crate::gui::icons::{Icon, draw_icon_sized};
+
 #[cfg(target_os = "windows")]
 const TITLEBAR_HEIGHT: f32 = 38.0;
 #[cfg(not(target_os = "windows"))]
@@ -19,6 +21,21 @@ pub struct ChromeColors {
     pub warn: Color32,
     #[cfg(target_os = "windows")]
     pub hover: Color32,
+    pub is_dark: bool,
+}
+
+impl ChromeColors {
+    /// 工业级半透明悬停叠加色（微阻尼柔光，根据 hover_t 渐进呈现）
+    pub fn translucent_hover(&self, hover_t: f32) -> Color32 {
+        if hover_t <= 0.001 {
+            return Color32::TRANSPARENT;
+        }
+        if self.is_dark {
+            Color32::from_white_alpha((24.0 * hover_t).min(255.0) as u8)
+        } else {
+            Color32::from_black_alpha((18.0 * hover_t).min(255.0) as u8)
+        }
+    }
 }
 
 /// 顶部工作台上下文信息（对标 Codex 面包屑与状态指示）
@@ -50,96 +67,70 @@ pub fn titlebar_height() -> f32 {
 
 fn theme_button(ui: &mut Ui, colors: ChromeColors, dark: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(60.0, 24.0), Sense::click());
-    let border = if response.hovered() {
-        Stroke::new(1.0_f32, colors.border)
+    let (hover_t, active_t) = crate::gui::widgets::animate_interaction(ui, response.id, &response);
+    let draw_rect = rect.shrink(0.5 * active_t);
+    let fill = colors.translucent_hover(hover_t);
+    let border = if hover_t > 0.01 {
+        Stroke::new(
+            1.0_f32,
+            crate::gui::widgets::lerp_color(Color32::TRANSPARENT, colors.border, hover_t),
+        )
     } else {
         Stroke::NONE
     };
-    ui.painter().rect(rect, 6.0, Color32::TRANSPARENT, border);
-    let c = egui::pos2(rect.left() + 13.0, rect.center().y);
-    let stroke = Stroke::new(
-        1.25_f32,
-        if response.hovered() {
-            colors.text
-        } else {
-            colors.dim
-        },
+    ui.painter().rect(draw_rect, 6.0, fill, border);
+
+    let c = egui::pos2(draw_rect.left() + 13.0, draw_rect.center().y);
+    let icon_color = crate::gui::widgets::lerp_color(colors.dim, colors.text, hover_t);
+    draw_icon_sized(
+        ui.painter(),
+        c,
+        if dark { Icon::Sun } else { Icon::Moon },
+        icon_color,
+        15.0,
     );
-    if dark {
-        ui.painter().circle(c, 3.5, Color32::TRANSPARENT, stroke);
-        for i in 0..8 {
-            let angle = i as f32 * std::f32::consts::TAU / 8.0;
-            let direction = egui::vec2(angle.cos(), angle.sin());
-            ui.painter()
-                .line_segment([c + direction * 5.5, c + direction * 7.0], stroke);
-        }
-    } else {
-        ui.painter().circle_filled(c, 5.5, stroke.color);
-        ui.painter()
-            .circle_filled(c + egui::vec2(2.5, -2.0), 5.0, colors.fill);
-    }
     ui.painter().text(
-        egui::pos2(rect.left() + 25.0, rect.center().y),
+        egui::pos2(draw_rect.left() + 25.0, draw_rect.center().y),
         egui::Align2::LEFT_CENTER,
         if dark { "浅色" } else { "深色" },
         egui::FontId::proportional(12.0),
-        colors.text,
+        crate::gui::widgets::lerp_color(colors.dim, colors.text, hover_t * 0.7 + 0.3),
     );
-    response
+    response.on_hover_text(if dark {
+        "切换至浅色主题"
+    } else {
+        "切换至深色主题"
+    })
 }
 
 #[cfg(target_os = "windows")]
 fn window_button(ui: &mut Ui, colors: ChromeColors, kind: u8, maximized: bool) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(46.0, titlebar_height()), Sense::click());
-    let fill = if response.hovered() {
-        if kind == 2 {
-            Color32::from_rgb(0xc4, 0x2b, 0x1c)
-        } else {
-            colors.hover
-        }
+    let (hover_t, active_t) = crate::gui::widgets::animate_interaction(ui, response.id, &response);
+    let fill = if kind == 2 {
+        crate::gui::widgets::lerp_color(
+            Color32::TRANSPARENT,
+            Color32::from_rgb(0xc4, 0x2b, 0x1c),
+            hover_t,
+        )
     } else {
-        Color32::TRANSPARENT
+        colors.translucent_hover(hover_t)
     };
     ui.painter().rect_filled(rect, 0.0, fill);
-    let color = if response.hovered() && kind == 2 {
-        Color32::WHITE
+    let color = if kind == 2 {
+        crate::gui::widgets::lerp_color(colors.text, Color32::WHITE, hover_t)
     } else {
-        colors.text
+        crate::gui::widgets::lerp_color(colors.dim, colors.text, hover_t)
     };
-    let stroke = Stroke::new(1.15_f32, color);
-    let c = rect.center();
-    match kind {
-        0 => {
-            ui.painter().line_segment(
-                [c + egui::vec2(-5.0, 3.0), c + egui::vec2(5.0, 3.0)],
-                stroke,
-            );
-        }
-        1 if maximized => {
-            let back =
-                egui::Rect::from_center_size(c + egui::vec2(2.0, -2.0), egui::vec2(8.0, 7.0));
-            let front =
-                egui::Rect::from_center_size(c + egui::vec2(-1.0, 1.0), egui::vec2(8.0, 7.0));
-            ui.painter().rect_stroke(back, 0.0, stroke);
-            ui.painter().rect_filled(front.expand(1.0), 0.0, fill);
-            ui.painter().rect_stroke(front, 0.0, stroke);
-        }
-        1 => {
-            let square = egui::Rect::from_center_size(c, egui::vec2(9.0, 8.0));
-            ui.painter().rect_stroke(square, 0.0, stroke);
-        }
-        _ => {
-            ui.painter().line_segment(
-                [c + egui::vec2(-4.5, -4.5), c + egui::vec2(4.5, 4.5)],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [c + egui::vec2(-4.5, 4.5), c + egui::vec2(4.5, -4.5)],
-                stroke,
-            );
-        }
-    }
+    let c = rect.center() + egui::vec2(0.0, 0.5 * active_t);
+    let icon = match kind {
+        0 => Icon::WindowMinimize,
+        1 if maximized => Icon::WindowRestore,
+        1 => Icon::WindowMaximize,
+        _ => Icon::X,
+    };
+    draw_icon_sized(ui.painter(), c, icon, color, 13.0);
     response
 }
 
@@ -155,71 +146,128 @@ pub struct ChromeActions {
 /// 主导航最左侧的侧栏开关，仅绘制图标，文字通过悬停提示呈现。
 fn sidebar_button(ui: &mut Ui, colors: ChromeColors, expanded: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), Sense::click());
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 6.0, colors.border.gamma_multiply(0.35));
-    }
-    let stroke = Stroke::new(
-        1.35_f32,
-        if response.hovered() {
-            colors.text
-        } else {
-            colors.dim
-        },
+    let (hover_t, active_t) = crate::gui::widgets::animate_interaction(ui, response.id, &response);
+    let draw_rect = rect.shrink(0.5 * active_t);
+    let fill = colors.translucent_hover(hover_t);
+    let border = if hover_t > 0.01 {
+        Stroke::new(
+            1.0_f32,
+            crate::gui::widgets::lerp_color(Color32::TRANSPARENT, colors.border, hover_t),
+        )
+    } else {
+        Stroke::NONE
+    };
+    ui.painter().rect(draw_rect, 6.0, fill, border);
+
+    let base_color = if expanded { colors.accent } else { colors.dim };
+    let target_color = if expanded { colors.accent } else { colors.text };
+    let icon_color = crate::gui::widgets::lerp_color(base_color, target_color, hover_t);
+    draw_icon_sized(
+        ui.painter(),
+        draw_rect.center(),
+        Icon::Sidebar,
+        icon_color,
+        15.0,
     );
-    let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 13.0));
-    ui.painter().rect_stroke(icon, 2.0, stroke);
-    ui.painter()
-        .vline(icon.left() + 4.5, icon.y_range(), stroke);
-    response.on_hover_text(if expanded { "收起" } else { "展开" })
+    response.on_hover_text(if expanded {
+        "收起侧栏"
+    } else {
+        "展开侧栏"
+    })
 }
 
 /// 文件树开关按钮（矢量树形图标，激活态用 accent 色）。
 fn tree_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
-    let border = if response.hovered() {
-        Stroke::new(1.0_f32, colors.border)
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), Sense::click());
+    let (hover_t, active_t) = crate::gui::widgets::animate_interaction(ui, response.id, &response);
+    let draw_rect = rect.shrink(0.5 * active_t);
+
+    let fill = if open {
+        crate::gui::widgets::lerp_color(
+            colors.translucent_hover(0.7),
+            colors.translucent_hover(1.0),
+            hover_t,
+        )
+    } else {
+        colors.translucent_hover(hover_t)
+    };
+    let border = if open || hover_t > 0.01 {
+        let alpha_t = if open {
+            (0.6 + 0.4 * hover_t).min(1.0)
+        } else {
+            hover_t
+        };
+        Stroke::new(
+            1.0_f32,
+            crate::gui::widgets::lerp_color(Color32::TRANSPARENT, colors.border, alpha_t),
+        )
     } else {
         Stroke::NONE
     };
-    ui.painter().rect(rect, 6.0, Color32::TRANSPARENT, border);
-    let c = rect.center();
-    let color = if open { colors.accent } else { colors.dim };
-    let s = Stroke::new(1.25_f32, color);
-    // 树形：根节点 + 子节点 + 连接线。
-    ui.painter().rect_stroke(
-        egui::Rect::from_center_size(c + egui::vec2(-4.0, -4.0), egui::vec2(6.0, 4.5)),
-        1.0,
-        s,
+    ui.painter().rect(draw_rect, 6.0, fill, border);
+
+    let base_color = if open { colors.accent } else { colors.dim };
+    let target_color = if open { colors.accent } else { colors.text };
+    let icon_color = crate::gui::widgets::lerp_color(base_color, target_color, hover_t);
+
+    crate::gui::icons::draw_icon(
+        ui.painter(),
+        draw_rect.center(),
+        crate::gui::icons::Icon::ListTree,
+        icon_color,
     );
-    ui.painter().rect_stroke(
-        egui::Rect::from_center_size(c + egui::vec2(3.5, 3.5), egui::vec2(6.0, 4.5)),
-        1.0,
-        s,
-    );
-    ui.painter()
-        .line_segment([c + egui::vec2(-4.0, -1.8), c + egui::vec2(-4.0, 3.5)], s);
-    ui.painter()
-        .line_segment([c + egui::vec2(-4.0, 3.5), c + egui::vec2(0.5, 3.5)], s);
-    response.on_hover_text("项目文件树")
+    response.on_hover_text(if open {
+        "收起项目文件树"
+    } else {
+        "打开项目文件树"
+    })
 }
 
 /// 协同检查器开关按钮（矢量图标，左右分栏样式）。
 fn inspector_button(ui: &mut Ui, colors: ChromeColors, open: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
-    let border = if response.hovered() {
-        Stroke::new(1.0_f32, colors.border)
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), Sense::click());
+    let (hover_t, active_t) = crate::gui::widgets::animate_interaction(ui, response.id, &response);
+    let draw_rect = rect.shrink(0.5 * active_t);
+
+    let fill = if open {
+        crate::gui::widgets::lerp_color(
+            colors.translucent_hover(0.7),
+            colors.translucent_hover(1.0),
+            hover_t,
+        )
+    } else {
+        colors.translucent_hover(hover_t)
+    };
+    let border = if open || hover_t > 0.01 {
+        let alpha_t = if open {
+            (0.6 + 0.4 * hover_t).min(1.0)
+        } else {
+            hover_t
+        };
+        Stroke::new(
+            1.0_f32,
+            crate::gui::widgets::lerp_color(Color32::TRANSPARENT, colors.border, alpha_t),
+        )
     } else {
         Stroke::NONE
     };
-    ui.painter().rect(rect, 6.0, Color32::TRANSPARENT, border);
-    let c = rect.center();
-    let color = if open { colors.accent } else { colors.dim };
-    let s = Stroke::new(1.25_f32, color);
-    let body = egui::Rect::from_center_size(c, egui::vec2(14.0, 12.0));
-    ui.painter().rect_stroke(body, 2.0, s);
-    ui.painter().vline(body.right() - 4.5, body.y_range(), s);
-    response.on_hover_text(if open { "收起协同检查器" } else { "打开协同检查器 (预览/Diff/遥测)" })
+    ui.painter().rect(draw_rect, 6.0, fill, border);
+
+    let base_color = if open { colors.accent } else { colors.dim };
+    let target_color = if open { colors.accent } else { colors.text };
+    let icon_color = crate::gui::widgets::lerp_color(base_color, target_color, hover_t);
+    draw_icon_sized(
+        ui.painter(),
+        draw_rect.center(),
+        Icon::Inspector,
+        icon_color,
+        15.0,
+    );
+    response.on_hover_text(if open {
+        "收起协同检查器"
+    } else {
+        "打开协同检查器 (预览/Diff/遥测)"
+    })
 }
 
 /// 绘制全宽标题栏，返回标题栏触发的动作。
@@ -268,19 +316,25 @@ pub fn show(
                 }
 
                 // ── Codex 式面包屑与当前上下文 ──
-                ui.add_space(10.0);
-                // 项目名
-                let proj_name = if wb.project_name.is_empty() { "默认工作区" } else { wb.project_name };
-                ui.label(
-                    egui::RichText::new(format!("📁 {proj_name}"))
-                        .size(12.0)
-                        .color(colors.dim),
+                ui.add_space(8.0);
+                // 项目名（矢量文件夹图标 + 项目名）
+                let proj_name = if wb.project_name.is_empty() {
+                    "默认工作区"
+                } else {
+                    wb.project_name
+                };
+                let (f_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+                crate::gui::icons::draw_icon(
+                    ui.painter(),
+                    f_rect.center(),
+                    crate::gui::icons::Icon::Folder,
+                    colors.dim,
                 );
-                ui.label(
-                    egui::RichText::new("/")
-                        .size(11.0)
-                        .color(colors.border),
-                );
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(proj_name).size(12.0).color(colors.dim));
+                ui.add_space(3.0);
+                ui.label(egui::RichText::new("/").size(11.0).color(colors.border));
+                ui.add_space(3.0);
                 // 会话名（截断）
                 let session_display: String = if wb.session_title.is_empty() {
                     "新会话".to_string()
@@ -326,23 +380,28 @@ pub fn show(
                     }
                     ui.add_space(6.0);
 
-                    // 模型胶囊
+                    // 模型胶囊（矢量机器人图标 + 模型名）
                     if !wb.model_name.is_empty() {
-                        let m_text = format!("🤖 {}", wb.model_name);
-                        let (m_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(m_text.len() as f32 * 6.5 + 16.0, 22.0),
-                            egui::Sense::hover(),
-                        );
+                        let pill_w = wb.model_name.len() as f32 * 6.5 + 30.0;
+                        let (m_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(pill_w, 22.0), egui::Sense::hover());
                         ui.painter().rect(
                             m_rect,
                             egui::Rounding::same(11.0),
                             colors.card,
                             egui::Stroke::new(1.0_f32, colors.border),
                         );
+                        let bot_c = egui::pos2(m_rect.left() + 11.0, m_rect.center().y);
+                        crate::gui::icons::draw_icon(
+                            ui.painter(),
+                            bot_c,
+                            crate::gui::icons::Icon::Bot,
+                            colors.accent,
+                        );
                         ui.painter().text(
-                            m_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            &m_text,
+                            egui::pos2(m_rect.left() + 22.0, m_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            wb.model_name,
                             egui::FontId::proportional(11.0),
                             colors.dim,
                         );
@@ -350,33 +409,67 @@ pub fn show(
                     }
 
                     // Agent 运行状态胶囊
-                    let (status_text, dot_color) = if wb.busy {
-                        let secs = ui.input(|i| i.time);
-                        let glyph = ["◐", "◓", "◑", "◒"][((secs as u64) % 4) as usize];
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                        (format!("{glyph} Agent 执行中"), colors.accent)
-                    } else if wb.status.contains("错误") || wb.status.contains("失败") {
-                        (format!("! {}", wb.status), colors.warn)
+                    if wb.busy {
+                        let time = ui.input(|i| i.time);
+                        ui.ctx().request_repaint(); // 60FPS 顺滑旋转
+                        let status_label = "Agent 执行中";
+                        let pill_w = status_label.len() as f32 * 6.8 + 26.0;
+                        let (pill_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(pill_w, 22.0), egui::Sense::hover());
+                        ui.painter().rect(
+                            pill_rect,
+                            egui::Rounding::same(11.0),
+                            colors.card,
+                            egui::Stroke::new(1.0_f32, colors.border),
+                        );
+                        let sp_c = egui::pos2(pill_rect.left() + 12.0, pill_rect.center().y);
+                        crate::gui::icons::draw_smooth_spinner(
+                            ui.painter(),
+                            sp_c,
+                            5.0,
+                            colors.accent,
+                            time,
+                        );
+                        ui.painter().text(
+                            egui::pos2(pill_rect.left() + 21.0, pill_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            status_label,
+                            egui::FontId::proportional(11.0),
+                            colors.accent,
+                        );
                     } else {
-                        ("● 就绪".to_string(), colors.success)
-                    };
-                    let (pill_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(status_text.len() as f32 * 6.8 + 18.0, 22.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect(
-                        pill_rect,
-                        egui::Rounding::same(11.0),
-                        colors.card,
-                        egui::Stroke::new(1.0_f32, colors.border),
-                    );
-                    ui.painter().text(
-                        pill_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        &status_text,
-                        egui::FontId::proportional(11.0),
-                        dot_color,
-                    );
+                        let is_err = wb.status.contains("错误") || wb.status.contains("失败");
+                        let (dot_color, status_label) = if is_err {
+                            (
+                                colors.warn,
+                                if wb.status.is_empty() {
+                                    "异常"
+                                } else {
+                                    wb.status
+                                },
+                            )
+                        } else {
+                            (colors.success, "就绪")
+                        };
+                        let pill_w = status_label.len() as f32 * 6.8 + 24.0;
+                        let (pill_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(pill_w, 22.0), egui::Sense::hover());
+                        ui.painter().rect(
+                            pill_rect,
+                            egui::Rounding::same(11.0),
+                            colors.card,
+                            egui::Stroke::new(1.0_f32, colors.border),
+                        );
+                        let dot_c = egui::pos2(pill_rect.left() + 11.0, pill_rect.center().y);
+                        draw_icon_sized(ui.painter(), dot_c, Icon::CircleDot, dot_color, 10.0);
+                        ui.painter().text(
+                            egui::pos2(pill_rect.left() + 19.0, pill_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            status_label,
+                            egui::FontId::proportional(11.0),
+                            colors.text,
+                        );
+                    }
                 });
             });
             ui.painter().hline(

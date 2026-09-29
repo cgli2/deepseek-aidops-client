@@ -1,5 +1,6 @@
 //! Long-horizon task status, submission, and durable HITL decisions.
 
+use super::widgets::compact_button;
 use super::*;
 use harness_runtime::{CheckpointState, TaskStatus};
 
@@ -119,10 +120,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                 .color(pal.dim),
                             );
                             ui.horizontal(|ui| {
-                                if ui.button("批准").clicked() {
+                                if compact_button(ui, &pal, "批准") {
                                     decision = Some((true, checkpoint.checkpoint_id.clone()));
                                 }
-                                if ui.button("拒绝").clicked() {
+                                if compact_button(ui, &pal, "拒绝") {
                                     decision = Some((false, checkpoint.checkpoint_id.clone()));
                                 }
                             });

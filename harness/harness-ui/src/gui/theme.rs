@@ -54,6 +54,31 @@ pub(super) struct Palette {
     /// 状态徽标胶囊底色
     #[allow(dead_code)]
     pub(super) badge_bg: egui::Color32,
+    /// 是否为深色模式
+    pub(crate) is_dark: bool,
+}
+
+impl Palette {
+    /// 工业级半透明悬停叠加色（微阻尼柔光，根据 hover_t 0.0..1.0 渐进呈现，避免同色套娃）
+    pub(crate) fn translucent_hover(&self, hover_t: f32) -> egui::Color32 {
+        if hover_t <= 0.001 {
+            return egui::Color32::TRANSPARENT;
+        }
+        if self.is_dark {
+            egui::Color32::from_white_alpha((24.0 * hover_t).min(255.0) as u8)
+        } else {
+            egui::Color32::from_black_alpha((18.0 * hover_t).min(255.0) as u8)
+        }
+    }
+
+    /// 工业级半透明按下叠加色（清脆深度反馈）
+    pub(crate) fn translucent_active(&self) -> egui::Color32 {
+        if self.is_dark {
+            egui::Color32::from_white_alpha(38)
+        } else {
+            egui::Color32::from_black_alpha(28)
+        }
+    }
 }
 
 pub(super) fn palette(dark: bool) -> Palette {
@@ -101,6 +126,7 @@ pub(super) fn palette(dark: bool) -> Palette {
             info: C::from_rgb(0x60, 0xa5, 0xfa),
             purple: C::from_rgb(0xa7, 0x8b, 0xfa),
             badge_bg: C::from_rgb(0x18, 0x23, 0x34),
+            is_dark: true,
         }
     } else {
         Palette {
@@ -144,6 +170,7 @@ pub(super) fn palette(dark: bool) -> Palette {
             info: C::from_rgb(0x25, 0x63, 0xeb),
             purple: C::from_rgb(0x7c, 0x3a, 0xed),
             badge_bg: C::from_rgb(0xe2, 0xe8, 0xf0),
+            is_dark: false,
         }
     }
 }

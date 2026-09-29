@@ -1,5 +1,7 @@
 //! Workspace tree, preview side panel, and conversation message stream.
 
+use super::icons::{Icon, draw_icon, draw_icon_sized, draw_smooth_spinner};
+use super::widgets::{animate_interaction, lerp_color, subtle_text_action};
 use super::*;
 
 /// 先创建右侧分栏，使后续底部输入区自动只占中央剩余区域。
@@ -89,24 +91,50 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                             .fill(pal.field)
                             .rounding(egui::Rounding::same(8.0))
                             .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                            .inner_margin(egui::Margin::symmetric(10.0, if expanded { 6.0 } else { 3.0 }))
+                            .inner_margin(egui::Margin::symmetric(
+                                10.0,
+                                if expanded { 6.0 } else { 3.0 },
+                            ))
                             .show(ui, |ui| {
                                 // 始终渲染的单行摘要：阶段 + 核心计数 + 展开切换，
                                 // 折叠态只占约一行高度，把垂直空间让给消息流。
-                                let projection = state.execution_projection.as_ref().expect("checked above");
+                                let projection =
+                                    state.execution_projection.as_ref().expect("checked above");
                                 ui.horizontal_wrapped(|ui| {
-                                    let chevron = if expanded { "▼" } else { "▶" };
-                                    if ui
-                                        .add(egui::Button::new(
-                                            egui::RichText::new(chevron).size(11.0).color(pal.accent),
-                                        ).frame(false).min_size(egui::vec2(14.0, 14.0)))
-                                        .on_hover_text("展开/收起运行时详情")
-                                        .clicked()
+                                    let (c_rect, c_resp) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 16.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let (c_hov, c_act) =
+                                        animate_interaction(ui, c_resp.id, &c_resp);
+                                    let c_draw = c_rect.shrink(0.4 * c_act);
+                                    if c_hov > 0.001 {
+                                        ui.painter().rect_filled(
+                                            c_draw,
+                                            egui::Rounding::same(3.0),
+                                            pal.translucent_hover(c_hov),
+                                        );
+                                    }
+                                    let ic = if expanded {
+                                        Icon::ChevronDown
+                                    } else {
+                                        Icon::ChevronRight
+                                    };
+                                    draw_icon(
+                                        ui.painter(),
+                                        c_draw.center(),
+                                        ic,
+                                        lerp_color(pal.accent, pal.text, c_hov * 0.3),
+                                    );
+                                    if c_resp.on_hover_text("展开/收起运行时详情").clicked()
                                     {
                                         state.runtime_expanded = !state.runtime_expanded;
                                     }
                                     ui.label(
-                                        egui::RichText::new("运行时").strong().color(pal.accent).size(12.0),
+                                        egui::RichText::new("运行时")
+                                            .strong()
+                                            .color(pal.accent)
+                                            .size(12.0),
                                     );
                                     ui.label(
                                         egui::RichText::new(format!(
@@ -121,7 +149,8 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                     );
                                 });
                                 if expanded {
-                                    let projection = state.execution_projection.as_ref().expect("checked above");
+                                    let projection =
+                                        state.execution_projection.as_ref().expect("checked above");
                                     ui.add_space(2.0);
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label(
@@ -150,9 +179,12 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                     });
                                     if !projection.goal.is_empty() {
                                         ui.label(
-                                            egui::RichText::new(format!("目标：{}", projection.goal))
-                                                .size(10.5)
-                                                .color(pal.dim),
+                                            egui::RichText::new(format!(
+                                                "目标：{}",
+                                                projection.goal
+                                            ))
+                                            .size(10.5)
+                                            .color(pal.dim),
                                         );
                                     }
                                     ui.label(
@@ -174,7 +206,9 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                     .map(|item| {
                                                         format!(
                                                             "{}={}（证据 {}）",
-                                                            item.id, item.state, item.evidence_count
+                                                            item.id,
+                                                            item.state,
+                                                            item.evidence_count
                                                         )
                                                     })
                                                     .collect::<Vec<_>>()
@@ -284,21 +318,35 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         let hit_rect = icon_rect.expand(3.0);
 
                                         let role_tag = match msg.kind.as_str() {
-                                            "user" => Some(("👤 你", pal.dim)),
-                                            "assistant" => Some(("🤖 Agent", pal.accent)),
-                                            "error" => Some(("⚠ 系统异常", pal.err_text)),
+                                            "user" => Some((Icon::User, "你", pal.dim)),
+                                            "assistant" => Some((Icon::Bot, "Agent", pal.accent)),
+                                            "error" => Some((
+                                                Icon::AlertTriangle,
+                                                "系统异常",
+                                                pal.err_text,
+                                            )),
                                             _ => None,
                                         };
-                                        if let Some((role_name, role_color)) = role_tag {
+                                        if let Some((role_icon, role_name, role_color)) = role_tag {
                                             ui.horizontal(|ui| {
+                                                let (icon_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(13.0, 13.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                draw_icon(
+                                                    ui.painter(),
+                                                    icon_rect.center(),
+                                                    role_icon,
+                                                    role_color,
+                                                );
                                                 ui.label(
                                                     egui::RichText::new(role_name)
-                                                        .size(10.5)
+                                                        .size(11.0)
                                                         .strong()
                                                         .color(role_color),
                                                 );
                                             });
-                                            ui.add_space(2.0);
+                                            ui.add_space(3.0);
                                         }
 
                                         // 交付状态只接受 Runtime 的 Delivery 事件；TurnEnd 或模型
@@ -416,7 +464,11 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                             egui::Rounding::same(6.0),
                                             fill,
                                             egui::Stroke::new(
-                                                if copy_resp.hovered() { 1.4_f32 } else { 1.0_f32 },
+                                                if copy_resp.hovered() {
+                                                    1.4_f32
+                                                } else {
+                                                    1.0_f32
+                                                },
                                                 if copy_resp.hovered() {
                                                     pal.dim
                                                 } else {
@@ -424,11 +476,11 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                                 },
                                             ),
                                         );
-                                        super::icons::draw_copy_icon(
+                                        draw_icon(
                                             ui.painter(),
                                             icon_rect.center(),
+                                            Icon::Copy,
                                             icon_color,
-                                            fill,
                                         );
                                         if copy_resp.clicked() {
                                             state.pending_copy = Some(msg.text.clone());
@@ -442,19 +494,17 @@ pub(super) fn show_main(state: &mut AppState, ctx: &egui::Context, pal: Palette)
                                         // Label 仍有选区。改为点击菜单时直接复制当前这条消息
                                         // 的完整文本，不再依赖易失的 selection 状态。
                                         resp.context_menu(|ui| {
-                                            if ui.button("📋 复制选中内容").clicked() {
+                                            if ui.button("复制选中内容").clicked() {
                                                 state.pending_copy = Some(msg.text.clone());
                                                 ui.ctx().copy_text(msg.text.clone());
                                                 ui.close_menu();
                                             }
-                                            if ui.button("📋 复制本条全部内容").clicked() {
+                                            if ui.button("复制本条全部内容").clicked() {
                                                 state.pending_copy = Some(msg.text.clone());
                                                 ui.ctx().copy_text(msg.text.clone());
                                                 ui.close_menu();
                                             }
-                                            if ui
-                                                .button("📋 复制整轮对话（含过程与回复）")
-                                                .clicked()
+                                            if ui.button("复制整轮对话（含过程与回复）").clicked()
                                             {
                                                 let t = format_turn_text(&messages, turn_start);
                                                 state.pending_copy = Some(t.clone());
@@ -583,15 +633,20 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                         );
                         ui.add_space(4.0);
                         for task in council.tasks.values() {
-                            let (mark, color) = match task.state {
-                                CouncilTaskState::Done => ("✓", pal.accent),
-                                CouncilTaskState::Running => ("◐", pal.warn),
-                                CouncilTaskState::Failed | CouncilTaskState::Blocked => {
-                                    ("×", pal.err_text)
+                            let (state_label, state_icon, color) = match task.state {
+                                CouncilTaskState::Done => ("已完成", Some(Icon::Check), pal.accent),
+                                CouncilTaskState::Running => ("执行中", None, pal.warn),
+                                CouncilTaskState::Failed => ("失败", Some(Icon::X), pal.err_text),
+                                CouncilTaskState::Blocked => {
+                                    ("受阻", Some(Icon::AlertTriangle), pal.err_text)
                                 }
-                                CouncilTaskState::Cancelled => ("—", pal.dim),
-                                CouncilTaskState::Ready => ("○", pal.text),
-                                CouncilTaskState::Pending => ("·", pal.dim),
+                                CouncilTaskState::Cancelled => {
+                                    ("已取消", Some(Icon::Stop), pal.dim)
+                                }
+                                CouncilTaskState::Ready => {
+                                    ("就绪", Some(Icon::CircleDot), pal.text)
+                                }
+                                CouncilTaskState::Pending => ("等待中", Some(Icon::Clock), pal.dim),
                             };
                             let retry = if task.attempt > 1 {
                                 format!(" · 第 {} 次", task.attempt)
@@ -599,10 +654,13 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                                 String::new()
                             };
                             let title = one_line_summary(
-                                &format!("{mark} {} · {}{retry}", task.spec.title, task.spec.role),
+                                &format!(
+                                    "    {state_label} · {} · {}{retry}",
+                                    task.spec.title, task.spec.role
+                                ),
                                 ((content_w / 8.0) as usize).max(20),
                             );
-                            egui::CollapsingHeader::new(
+                            let response = egui::CollapsingHeader::new(
                                 egui::RichText::new(title).size(11.5).color(color),
                             )
                             .id_salt(("council-task", &council.id, &task.spec.id))
@@ -631,6 +689,22 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                                     .wrap(),
                                 );
                             });
+                            let icon_center = egui::pos2(
+                                response.header_response.rect.left() + 25.0,
+                                response.header_response.rect.center().y,
+                            );
+                            if let Some(state_icon) = state_icon {
+                                draw_icon_sized(ui.painter(), icon_center, state_icon, color, 12.0);
+                            } else {
+                                draw_smooth_spinner(
+                                    ui.painter(),
+                                    icon_center,
+                                    4.2,
+                                    color,
+                                    ui.input(|input| input.time),
+                                );
+                                ui.ctx().request_repaint();
+                            }
                         }
                         if !council.gates.is_empty() {
                             ui.separator();
@@ -641,25 +715,35 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                                     .color(pal.text),
                             );
                             for gate in &council.gates {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!(
-                                            "{} {} · {}",
-                                            if gate.passed { "✓" } else { "×" },
-                                            gate.name,
-                                            gate.evidence
-                                        ))
-                                        .size(10.5)
-                                        .color(
-                                            if gate.passed {
-                                                pal.accent
-                                            } else {
-                                                pal.err_text
-                                            },
-                                        ),
-                                    )
-                                    .wrap(),
-                                );
+                                let color = if gate.passed {
+                                    pal.accent
+                                } else {
+                                    pal.err_text
+                                };
+                                ui.horizontal_wrapped(|ui| {
+                                    let (icon_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    draw_icon_sized(
+                                        ui.painter(),
+                                        icon_rect.center(),
+                                        if gate.passed { Icon::Check } else { Icon::X },
+                                        color,
+                                        12.0,
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "{} · {}",
+                                                gate.name, gate.evidence
+                                            ))
+                                            .size(10.5)
+                                            .color(color),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
                             }
                         }
                         if !council.detail.is_empty() {
@@ -899,8 +983,11 @@ fn render_plan_card(
         .show(ui, |ui| {
             ui.set_max_width(max_w * 0.96);
             ui.horizontal(|ui| {
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                draw_icon(ui.painter(), icon_rect.center(), Icon::ListTree, pal.accent);
                 ui.label(
-                    egui::RichText::new("📋 任务执行计划 (Plan Checklist)")
+                    egui::RichText::new("任务执行计划 (Plan Checklist)")
                         .size(12.0)
                         .strong()
                         .color(pal.text),
@@ -923,12 +1010,12 @@ fn render_plan_card(
             ui.add_space(6.0);
 
             for (mark, item) in plan_items {
-                let (sym, badge_bg, sym_color) = match mark {
-                    '✓' => ("✓", pal.success.gamma_multiply(0.15), pal.success),
-                    '!' => ("!", pal.warn.gamma_multiply(0.15), pal.warn),
-                    '×' | 'x' | 'X' => ("×", pal.err_text.gamma_multiply(0.15), pal.err_text),
-                    '…' => ("…", pal.accent.gamma_multiply(0.15), pal.accent),
-                    _ => ("·", pal.hover, pal.dim),
+                let (icon, badge_bg, sym_color) = match mark {
+                    '✓' => (Icon::Check, pal.success.gamma_multiply(0.15), pal.success),
+                    '!' => (Icon::AlertTriangle, pal.warn.gamma_multiply(0.15), pal.warn),
+                    '×' | 'x' | 'X' => (Icon::X, pal.err_text.gamma_multiply(0.15), pal.err_text),
+                    '…' => (Icon::CircleDot, pal.accent.gamma_multiply(0.15), pal.accent),
+                    _ => (Icon::Circle, pal.hover, pal.dim),
                 };
 
                 ui.horizontal(|ui| {
@@ -936,18 +1023,14 @@ fn render_plan_card(
                         ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
                     ui.painter()
                         .rect_filled(icon_rect, egui::Rounding::same(4.0), badge_bg);
-                    ui.painter().text(
-                        icon_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        sym,
-                        egui::FontId::proportional(11.5),
-                        sym_color,
-                    );
+                    draw_icon(ui.painter(), icon_rect.center(), icon, sym_color);
                     ui.add_space(4.0);
 
-                    let mut text = egui::RichText::new(item)
-                        .size(12.0)
-                        .color(if *mark == '✓' { pal.dim } else { pal.text });
+                    let mut text = egui::RichText::new(item).size(12.0).color(if *mark == '✓' {
+                        pal.dim
+                    } else {
+                        pal.text
+                    });
                     if *mark == '✓' {
                         text = text.strikethrough();
                     }
@@ -969,12 +1052,10 @@ fn render_thought_card(
 ) {
     let char_count = text.chars().count();
     let header_text = if live {
-        let secs = ui.input(|i| i.time);
-        let glyph = ["◐", "◓", "◑", "◒"][((secs as u64) % 4) as usize];
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-        format!("{glyph} 深度思考链路 · 正在推理...")
+        ui.ctx().request_repaint();
+        "    深度思考链路 · 正在推理...".to_string()
     } else {
-        format!("💭 深度思考过程 · {char_count} 字符")
+        format!("    深度思考过程 · {char_count} 字符")
     };
 
     egui::Frame::default()
@@ -1001,45 +1082,60 @@ fn render_thought_card(
                     .inner_margin(8.0)
                     .show(ui, |ui| {
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .size(11.5)
-                                    .color(pal.text),
-                            )
-                            .selectable(true)
-                            .wrap(),
+                            egui::Label::new(egui::RichText::new(text).size(11.5).color(pal.text))
+                                .selectable(true)
+                                .wrap(),
                         );
                         if live {
-                            let secs = ui.input(|i| i.time);
-                            let cursor = if ((secs * 2.0) as u64) % 2 == 0 { "▌" } else { " " };
-                            ui.label(
-                                egui::RichText::new(cursor)
-                                    .monospace()
-                                    .size(11.5)
-                                    .color(pal.accent),
+                            let (spinner_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            draw_smooth_spinner(
+                                ui.painter(),
+                                spinner_rect.center(),
+                                4.5,
+                                pal.accent,
+                                ui.input(|input| input.time),
                             );
+                            ui.ctx().request_repaint();
                         }
                     });
                 ui.add_space(2.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(egui::RichText::new("复制思考文本").size(10.5).color(pal.dim))
-                        .clicked()
+                    if subtle_text_action(ui, pal, "复制思考文本", "复制完整的思考推理内容")
                     {
                         ui.ctx().copy_text(text.to_string());
                     }
                 });
             });
 
+            let header_icon_center = egui::pos2(
+                res.header_response.rect.left() + 25.0,
+                res.header_response.rect.center().y,
+            );
+            draw_icon_sized(
+                ui.painter(),
+                header_icon_center,
+                Icon::Brain,
+                if live { pal.purple } else { pal.dim },
+                12.0,
+            );
+
             if live && res.body_returned.is_none() {
                 let preview = one_line_summary(text, 68);
-                let secs = ui.input(|i| i.time);
-                let cursor = if ((secs * 2.0) as u64) % 2 == 0 { "▌" } else { " " };
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(cursor).size(10.5).color(pal.purple));
+                    let (spinner_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    draw_smooth_spinner(
+                        ui.painter(),
+                        spinner_rect.center(),
+                        3.8,
+                        pal.purple,
+                        ui.input(|input| input.time),
+                    );
                     ui.label(egui::RichText::new(preview).size(10.5).color(pal.dim));
                 });
+                ui.ctx().request_repaint();
             }
         });
 }
@@ -1092,17 +1188,11 @@ fn render_tool_action_block(
 ) {
     let (badge_label, badge_color, icon) = tool_meta(&action.name, pal);
 
-    let (status_str, status_color) = match &action.result {
-        Some((true, _)) => ("✓ 成功", pal.success),
-        Some((false, _)) => ("× 失败", pal.err_text),
-        None => {
-            if live {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                ("◐ 正在执行", pal.accent)
-            } else {
-                ("◌ 已调用", pal.dim)
-            }
-        }
+    let (status_label, status_color, status_icon) = match &action.result {
+        Some((true, _)) => ("成功", pal.success, Some(Icon::Check)),
+        Some((false, _)) => ("失败", pal.err_text, Some(Icon::X)),
+        None if live => ("正在执行", pal.accent, None),
+        None => ("已调用", pal.dim, Some(Icon::Circle)),
     };
 
     let title_param = if !action.args.is_empty() {
@@ -1154,14 +1244,37 @@ fn render_tool_action_block(
                                 .color(pal.text),
                         );
 
-                        // 状态指示
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(status_str)
-                                    .size(11.0)
-                                    .strong()
-                                    .color(status_color),
-                            );
+                            ui.horizontal(|ui| {
+                                let (status_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(14.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
+                                if let Some(status_icon) = status_icon {
+                                    draw_icon_sized(
+                                        ui.painter(),
+                                        status_rect.center(),
+                                        status_icon,
+                                        status_color,
+                                        12.0,
+                                    );
+                                } else {
+                                    draw_smooth_spinner(
+                                        ui.painter(),
+                                        status_rect.center(),
+                                        4.2,
+                                        status_color,
+                                        ui.input(|input| input.time),
+                                    );
+                                    ui.ctx().request_repaint();
+                                }
+                                ui.label(
+                                    egui::RichText::new(status_label)
+                                        .size(11.0)
+                                        .strong()
+                                        .color(status_color),
+                                );
+                            });
                         });
                     });
                 });
@@ -1169,30 +1282,83 @@ fn render_tool_action_block(
             // 展开输出抽屉
             let has_content = !action.args.is_empty() || action.result.is_some();
             if has_content {
-                let id = ui.id().with(("tool_action_drawer", start_index, step_index));
+                let id = ui
+                    .id()
+                    .with(("tool_action_drawer", start_index, step_index));
                 let mut is_open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
 
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    let toggle_text = if is_open { "▲ 收起" } else { "▼ 展开输出 / 详情" };
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new(toggle_text).size(10.5).color(pal.dim),
-                        ).frame(false))
-                        .clicked()
-                    {
+                    let toggle_label = if is_open {
+                        "收起"
+                    } else {
+                        "展开输出 / 详情"
+                    };
+                    let toggle_icon = if is_open {
+                        Icon::ChevronUp
+                    } else {
+                        Icon::ChevronDown
+                    };
+                    let (t_rect, t_resp) = ui.allocate_exact_size(
+                        egui::vec2(if is_open { 48.0 } else { 108.0 }, 18.0),
+                        egui::Sense::click(),
+                    );
+                    let (t_hov, t_act) = animate_interaction(ui, t_resp.id, &t_resp);
+                    let t_draw = t_rect.shrink(0.3 * t_act);
+                    if t_hov > 0.001 {
+                        ui.painter().rect_filled(
+                            t_draw,
+                            egui::Rounding::same(4.0),
+                            pal.translucent_hover(t_hov),
+                        );
+                    }
+                    let t_ic_c = egui::pos2(t_draw.left() + 7.0, t_draw.center().y);
+                    draw_icon(
+                        ui.painter(),
+                        t_ic_c,
+                        toggle_icon,
+                        lerp_color(pal.dim, pal.text, t_hov),
+                    );
+                    ui.painter().text(
+                        egui::pos2(t_draw.left() + 16.0, t_draw.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        toggle_label,
+                        egui::FontId::proportional(10.5),
+                        lerp_color(pal.dim, pal.text, t_hov),
+                    );
+                    if t_resp.clicked() {
                         is_open = !is_open;
                         ui.data_mut(|d| d.insert_temp(id, is_open));
                     }
                     if let Some((_, content)) = &action.result {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(8.0);
-                            if ui
-                                .add(egui::Button::new(
-                                    egui::RichText::new("复制输出").size(10.5).color(pal.dim),
-                                ).frame(false))
-                                .clicked()
-                            {
+                            let (c_rect, c_resp) = ui
+                                .allocate_exact_size(egui::vec2(66.0, 18.0), egui::Sense::click());
+                            let (c_hov, c_act) = animate_interaction(ui, c_resp.id, &c_resp);
+                            let c_draw = c_rect.shrink(0.3 * c_act);
+                            if c_hov > 0.001 {
+                                ui.painter().rect_filled(
+                                    c_draw,
+                                    egui::Rounding::same(4.0),
+                                    pal.translucent_hover(c_hov),
+                                );
+                            }
+                            let c_ic_c = egui::pos2(c_draw.left() + 7.0, c_draw.center().y);
+                            draw_icon(
+                                ui.painter(),
+                                c_ic_c,
+                                Icon::Copy,
+                                lerp_color(pal.dim, pal.text, c_hov),
+                            );
+                            ui.painter().text(
+                                egui::pos2(c_draw.left() + 17.0, c_draw.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                "复制输出",
+                                egui::FontId::proportional(10.5),
+                                lerp_color(pal.dim, pal.text, c_hov),
+                            );
+                            if c_resp.clicked() {
                                 ui.ctx().copy_text(content.clone());
                             }
                         });
@@ -1233,7 +1399,11 @@ fn render_tool_action_block(
                                         "错误输出:"
                                     })
                                     .size(10.5)
-                                    .color(if *ok { pal.dim } else { pal.err_text }),
+                                    .color(if *ok {
+                                        pal.dim
+                                    } else {
+                                        pal.err_text
+                                    }),
                                 );
                                 ui.add_space(2.0);
 
@@ -1257,15 +1427,25 @@ fn render_tool_action_block(
                                                 );
 
                                                 if is_diff {
-                                                    let (line_color, line_fill) = if line.starts_with('+') {
-                                                        (pal.success, pal.success.gamma_multiply(0.12))
-                                                    } else if line.starts_with('-') {
-                                                        (pal.err_text, pal.err_text.gamma_multiply(0.12))
-                                                    } else if line.starts_with('@') {
-                                                        (pal.accent, pal.accent.gamma_multiply(0.08))
-                                                    } else {
-                                                        (pal.text, egui::Color32::TRANSPARENT)
-                                                    };
+                                                    let (line_color, line_fill) =
+                                                        if line.starts_with('+') {
+                                                            (
+                                                                pal.success,
+                                                                pal.success.gamma_multiply(0.12),
+                                                            )
+                                                        } else if line.starts_with('-') {
+                                                            (
+                                                                pal.err_text,
+                                                                pal.err_text.gamma_multiply(0.12),
+                                                            )
+                                                        } else if line.starts_with('@') {
+                                                            (
+                                                                pal.accent,
+                                                                pal.accent.gamma_multiply(0.08),
+                                                            )
+                                                        } else {
+                                                            (pal.text, egui::Color32::TRANSPARENT)
+                                                        };
 
                                                     let (rect, _) = ui.allocate_exact_size(
                                                         egui::vec2(ui.available_width(), 16.0),
@@ -1312,65 +1492,68 @@ fn render_tool_action_block(
 }
 
 /// Codex 风格任务交付验收卡片 (Delivery Acceptance Card)
-fn render_delivery_banner(
-    ui: &mut egui::Ui,
-    delivery: &DeliveryUi,
-    pal: &Palette,
-) {
-    let (fill, border_color, title, desc, is_verified) = match delivery.outcome {
+fn render_delivery_banner(ui: &mut egui::Ui, delivery: &DeliveryUi, pal: &Palette) {
+    let (fill, border_color, title, desc, icon, is_verified) = match delivery.outcome {
         harness_session::DeliveryOutcome::Verified => (
             pal.success.gamma_multiply(0.12),
             pal.success,
             format!(
-                "✓ 任务交付验收通过 · {} 项验证全部符合标准",
+                "任务交付验收通过 · {} 项验证全部符合标准",
                 delivery.verification_count
             ),
             "Agent 已完成目标并经由 Runtime 验证门禁检验通过。",
+            Icon::CheckCircle,
             true,
         ),
         harness_session::DeliveryOutcome::NeedsUserInput => (
             pal.warn.gamma_multiply(0.12),
             pal.warn,
             format!(
-                "? 需要人工确认 · 剩余 {} 项验收标准待核准",
+                "需要人工确认 · 剩余 {} 项验收标准待核准",
                 delivery.remaining
             ),
             "请审查上述步骤和执行结果，并在输入框提供指令以继续或核准交付。",
+            Icon::AlertTriangle,
             false,
         ),
         harness_session::DeliveryOutcome::PartialDelivery => (
             pal.warn.gamma_multiply(0.12),
             pal.warn,
-            format!("◐ 部分交付完成 · 剩余 {} 项标准待处理", delivery.remaining),
+            format!("部分交付完成 · 剩余 {} 项标准待处理", delivery.remaining),
             "部分子任务已完成，需继续执行以达成最终目标。",
+            Icon::CircleDot,
             false,
         ),
         harness_session::DeliveryOutcome::SystemFailure => (
             pal.err_text.gamma_multiply(0.12),
             pal.err_text,
-            "× 系统执行遇到异常 · 交付未达成".to_string(),
+            "系统执行遇到异常 · 交付未达成".to_string(),
             "执行过程中发生不可恢复异常，请查看日志排障。",
+            Icon::X,
             false,
         ),
         harness_session::DeliveryOutcome::Blocked => (
             pal.warn.gamma_multiply(0.12),
             pal.warn,
-            "! 任务处于阻塞状态 · 需要调整条件".to_string(),
+            "任务处于阻塞状态 · 需要调整条件".to_string(),
             "前置依赖或外部资源不可用，请根据上述提示提供必要输入。",
+            Icon::AlertTriangle,
             false,
         ),
         harness_session::DeliveryOutcome::Interrupted => (
             pal.warn.gamma_multiply(0.12),
             pal.warn,
-            "! 任务已手动或超时中断".to_string(),
+            "任务已手动或超时中断".to_string(),
             "本次执行流程已终止。",
+            Icon::Stop,
             false,
         ),
         harness_session::DeliveryOutcome::Cancelled => (
             pal.hover,
             pal.dim,
-            "◌ 任务已取消".to_string(),
+            "任务已取消".to_string(),
             "用户取消了当前任务。",
+            Icon::Circle,
             false,
         ),
     };
@@ -1385,11 +1568,7 @@ fn render_delivery_banner(
             ui.horizontal(|ui| {
                 let (icon_rect, _) =
                     ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                if is_verified {
-                    draw_icon(ui.painter(), icon_rect.center(), Icon::CheckCircle, pal.success);
-                } else {
-                    draw_icon(ui.painter(), icon_rect.center(), Icon::Sparkles, border_color);
-                }
+                draw_icon_sized(ui.painter(), icon_rect.center(), icon, border_color, 18.0);
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
                     ui.label(

@@ -7,6 +7,7 @@
 //! - 点击符号或关系 chip 可在图谱内跳转（选中详情面板展示 调用方/被调方 导航）；
 //! - 渲染函数是纯 UI：不持有数据服务，只消费传入的 `&[CodeSymbol]` 与选中项。
 
+use super::icons::{Icon, draw_icon_sized};
 use super::theme::Palette;
 use super::widgets::close_button;
 use harness_capability::assets::CodeSymbol;
@@ -84,32 +85,23 @@ pub(super) fn render(
         let is_open = expanded.contains(file);
         let mut toggle = false;
         let header = ui.horizontal(|ui| {
-            // 折叠三角（矢量，不依赖字体字形）。
             let (tri, tri_resp) =
                 ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-            let c = tri.center();
-            let s = egui::Stroke::new(
-                1.4_f32,
+            draw_icon_sized(
+                ui.painter(),
+                tri.center(),
+                if is_open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
                 if tri_resp.hovered() {
                     pal.text
                 } else {
                     pal.dim
                 },
+                12.0,
             );
-            let pts: [egui::Pos2; 3] = if is_open {
-                [
-                    egui::pos2(c.x - 3.2, c.y - 2.0),
-                    egui::pos2(c.x + 3.2, c.y - 2.0),
-                    egui::pos2(c.x, c.y + 2.6),
-                ]
-            } else {
-                [
-                    egui::pos2(c.x - 1.8, c.y - 3.2),
-                    egui::pos2(c.x - 1.8, c.y + 3.2),
-                    egui::pos2(c.x + 2.8, c.y),
-                ]
-            };
-            ui.painter().add(egui::Shape::closed_line(pts.to_vec(), s));
             if tri_resp.clicked() {
                 toggle = true;
             }

@@ -1,10 +1,36 @@
-//! Stateless reusable GUI controls.
+//! Stateless reusable GUI controls with industrial-grade micro-animations.
 
 use super::icons::{Icon, draw_icon};
 use super::model::{PluginKind, PluginUiRow};
 use super::theme::Palette;
 
-/// 侧栏扁平导航项：透明底、悬停微亮、矢量图标。返回是否点击。
+/// 线性插值颜色（含 Alpha 通道，平滑过渡）。
+pub(crate) fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    egui::Color32::from_rgba_premultiplied(
+        (a.r() as f32 * (1.0 - t) + b.r() as f32 * t).round() as u8,
+        (a.g() as f32 * (1.0 - t) + b.g() as f32 * t).round() as u8,
+        (a.b() as f32 * (1.0 - t) + b.b() as f32 * t).round() as u8,
+        (a.a() as f32 * (1.0 - t) + b.a() as f32 * t).round() as u8,
+    )
+}
+
+/// 统一交互动效管道：返回 (hover_t 0.0..1.0 约120ms阻尼, active_t 0.0..1.0 约70ms按下阻尼)。
+pub(crate) fn animate_interaction(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    response: &egui::Response,
+) -> (f32, f32) {
+    let hover_t = ui
+        .ctx()
+        .animate_bool_responsive(id.with("hov"), response.hovered());
+    let active_t = ui
+        .ctx()
+        .animate_bool_responsive(id.with("act"), response.is_pointer_button_down_on());
+    (hover_t, active_t)
+}
+
+/// 侧栏扁平导航项：半透明微光悬停、矢量图标渐亮、按下微形变。返回是否点击。
 pub(super) fn nav_item(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -22,21 +48,48 @@ pub(super) fn nav_item(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click(),
     );
-    let hovered = enabled && response.hovered();
-    if hovered {
+    let (hover_t, active_t) = if enabled {
+        animate_interaction(ui, response.id, &response)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // 绘制半透明悬停层
+    let bg_color = if active_t > 0.05 {
+        pal.translucent_active()
+    } else {
+        pal.translucent_hover(hover_t)
+    };
+    if bg_color != egui::Color32::TRANSPARENT {
+        let draw_rect = rect.shrink(2.0 + 0.4 * active_t);
         ui.painter()
-            .rect_filled(rect.shrink(2.0), egui::Rounding::same(8.0), pal.hover);
+            .rect_filled(draw_rect, egui::Rounding::same(8.0), bg_color);
     }
-    let icon_color = if accent { pal.accent } else { pal.dim };
-    let text_color = if !enabled { pal.dim } else { pal.text };
+
+    // 图标与文字随悬停微提亮
+    let base_icon_color = if accent { pal.accent } else { pal.dim };
+    let target_icon_color = if accent { pal.accent } else { pal.text };
+    let icon_color = if !enabled {
+        pal.dim
+    } else {
+        lerp_color(base_icon_color, target_icon_color, hover_t)
+    };
+
+    let text_color = if !enabled {
+        pal.dim
+    } else {
+        lerp_color(pal.dim, pal.text, hover_t * 0.85 + 0.15)
+    };
+
     let icon_center = egui::pos2(
         rect.min.x + if expanded { 20.0 } else { rect.width() / 2.0 },
-        rect.center().y,
+        rect.center().y + 0.3 * active_t,
     );
     draw_icon(ui.painter(), icon_center, icon, icon_color);
+
     if expanded {
         ui.painter().text(
-            egui::pos2(rect.min.x + 40.0, rect.center().y),
+            egui::pos2(rect.min.x + 40.0, rect.center().y + 0.3 * active_t),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(if cfg!(target_os = "macos") {
@@ -50,69 +103,87 @@ pub(super) fn nav_item(
     response.clicked() && enabled
 }
 
-/// 模态面板右上角关闭按钮（矢量 ✕，悬停微亮）。
+/// 模态面板右上角关闭按钮（矢量关闭图标，平滑半透明光晕与微阻尼）。
 pub(super) fn close_button(ui: &mut egui::Ui, pal: &Palette) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
-    if resp.hovered() {
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+
+    let bg_color = if active_t > 0.05 {
+        pal.translucent_active()
+    } else {
+        pal.translucent_hover(hover_t)
+    };
+    if bg_color != egui::Color32::TRANSPARENT {
+        let draw_rect = rect.shrink(0.5 * active_t);
         ui.painter()
-            .rect_filled(rect, egui::Rounding::same(6.0), pal.hover);
+            .rect_filled(draw_rect, egui::Rounding::same(6.0), bg_color);
     }
-    let c = rect.center();
-    let d = 4.5;
-    let stroke = egui::Stroke::new(1.6_f32, if resp.hovered() { pal.text } else { pal.dim });
-    ui.painter().line_segment(
-        [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [egui::pos2(c.x - d, c.y + d), egui::pos2(c.x + d, c.y - d)],
-        stroke,
-    );
+
+    let c = rect.center() + egui::vec2(0.0, 0.4 * active_t);
+    let cross_color = lerp_color(pal.dim, pal.text, hover_t);
+    draw_icon(ui.painter(), c, Icon::X, cross_color);
     resp.clicked()
 }
 
-/// 主操作按钮（柔和青底、内容自适应宽度，不再占满整行）。
+/// 主操作按钮（自适应宽度、微阻尼悬停、按下物理微下沉）。
 pub(super) fn accent_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
     accent_button_ex(ui, pal, label, true)
 }
 
-/// 主操作按钮（可禁用）：禁用时尺寸与位置完全不变，只换成低对比配色。
-/// 用于「条件未满足但也必须让用户看见按钮」的场景（如新建项目的「确定」）：
-/// 按钮提前消失会让用户以为弹窗没有确认入口。
+/// 主操作按钮（支持禁用态，尺寸位置严格不变）。
 pub(super) fn accent_button_ex(
     ui: &mut egui::Ui,
     pal: &Palette,
     label: &str,
     enabled: bool,
 ) -> bool {
-    // 宽度按文字估算：CJK 约 13.5px、ASCII 约 7.5px，再加左右内边距。
     let text_w: f32 = label
         .chars()
         .map(|c| if c.is_ascii() { 7.5 } else { 13.5 })
         .sum();
     let w = (text_w + 44.0).max(130.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
+    let (hover_t, active_t) = if enabled {
+        animate_interaction(ui, resp.id, &resp)
+    } else {
+        (0.0, 0.0)
+    };
+
     let fill = if !enabled {
         pal.field
-    } else if resp.hovered() {
-        pal.btn_hover
     } else {
-        pal.btn_fill
+        lerp_color(pal.btn_fill, pal.btn_hover, hover_t)
     };
+
+    let border_color = if !enabled {
+        pal.border
+    } else {
+        lerp_color(pal.btn_border, pal.accent, hover_t * 0.7)
+    };
+
+    // 按下时发生微量形变，呈现机械按压反馈
+    let draw_rect = rect.shrink(0.6 * active_t);
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(8.0), fill);
+        .rect_filled(draw_rect, egui::Rounding::same(8.0), fill);
     ui.painter().rect(
-        rect,
+        draw_rect,
         egui::Rounding::same(8.0),
         egui::Color32::TRANSPARENT,
-        egui::Stroke::new(1.0_f32, pal.btn_border),
+        egui::Stroke::new(1.0_f32, border_color),
     );
+
+    let text_color = if !enabled {
+        pal.dim
+    } else {
+        lerp_color(pal.btn_text, pal.text, hover_t * 0.5)
+    };
+
     ui.painter().text(
-        rect.center(),
+        draw_rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(13.0),
-        if enabled { pal.btn_text } else { pal.dim },
+        text_color,
     );
     enabled && resp.clicked()
 }
@@ -125,13 +196,11 @@ pub(super) fn plugin_row_ui(
 ) -> (bool, bool) {
     let mut removed = false;
     let was_enabled = row.enabled;
-    // 统一行宽：内容区撑满外层可用宽度（扣除左右内边距），
-    // 卡片边框左右对齐且不超出面板。
     let margin = egui::Margin::symmetric(12.0, 9.0);
     let row_w = (ui.available_width() - margin.sum().x).max(200.0);
     egui::Frame::default()
         .fill(pal.field)
-        .rounding(egui::Rounding::same(9.0))
+        .rounding(egui::Rounding::same(8.0))
         .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .inner_margin(margin)
         .show(ui, |ui| {
@@ -139,7 +208,6 @@ pub(super) fn plugin_row_ui(
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
                 if row.kind == PluginKind::Core {
-                    // 核心插件恒启用：禁用态控件直观传达「不可取消勾选」。
                     let mut on = true;
                     ui.add_enabled(false, egui::Checkbox::new(&mut on, ""));
                 } else {
@@ -173,7 +241,6 @@ pub(super) fn plugin_row_ui(
                     });
                     ui.add(
                         egui::Label::new(egui::RichText::new(&row.desc).size(11.0).color(pal.dim))
-                            // 描述单行展示不换行，超长截断省略。
                             .wrap_mode(egui::TextWrapMode::Truncate),
                     );
                 });
@@ -190,27 +257,37 @@ pub(super) fn plugin_row_ui(
     (removed, was_enabled != row.enabled)
 }
 
-/// 次级按钮（描边幽灵风格）。
+/// 次级幽灵按钮（细描边、平滑半透明底色过渡）。
 pub(super) fn ghost_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
-    // 高度与主操作按钮 accent_button 保持一致（34px）。
     let size = egui::vec2(label.chars().count() as f32 * 13.0 + 20.0, 34.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    if resp.hovered() {
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+
+    let bg_color = if active_t > 0.05 {
+        pal.translucent_active()
+    } else {
+        pal.translucent_hover(hover_t)
+    };
+    let draw_rect = rect.shrink(0.5 * active_t);
+    if bg_color != egui::Color32::TRANSPARENT {
         ui.painter()
-            .rect_filled(rect, egui::Rounding::same(6.0), pal.hover);
+            .rect_filled(draw_rect, egui::Rounding::same(6.0), bg_color);
     }
+    let border_color = lerp_color(pal.border, pal.accent.gamma_multiply(0.6), hover_t);
     ui.painter().rect(
-        rect,
+        draw_rect,
         egui::Rounding::same(6.0),
         egui::Color32::TRANSPARENT,
-        egui::Stroke::new(1.0_f32, pal.border),
+        egui::Stroke::new(1.0_f32, border_color),
     );
+
+    let text_color = lerp_color(pal.dim, pal.text, hover_t);
     ui.painter().text(
-        rect.center(),
+        draw_rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(12.0),
-        if resp.hovered() { pal.text } else { pal.dim },
+        text_color,
     );
     resp.clicked()
 }
@@ -229,7 +306,7 @@ pub(super) fn sidebar_control_height() -> f32 {
     }
 }
 
-/// 侧栏紧凑图标按钮：固定尺寸和矢量图形，避免平台字体造成基线偏移。
+/// 侧栏紧凑图标按钮：常态透明、悬停平滑半透明浮出、点击微下沉。
 pub(super) fn sidebar_icon_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -238,100 +315,33 @@ pub(super) fn sidebar_icon_button(
 ) -> bool {
     let height = sidebar_control_height();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(height, height), egui::Sense::click());
-    let fill = if response.hovered() {
-        pal.hover
-    } else {
-        pal.field
-    };
-    ui.painter().rect(
-        rect,
-        egui::Rounding::same(6.0),
-        fill,
-        egui::Stroke::new(1.0_f32, pal.border),
-    );
-    let color = if response.hovered() {
-        pal.text
-    } else {
-        pal.dim
-    };
-    let stroke = egui::Stroke::new(1.4_f32, color);
-    let c = rect.center();
-    match icon {
-        SidebarActionIcon::Add => {
-            ui.painter().line_segment(
-                [c + egui::vec2(-4.0, 0.0), c + egui::vec2(4.0, 0.0)],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [c + egui::vec2(0.0, -4.0), c + egui::vec2(0.0, 4.0)],
-                stroke,
-            );
-        }
-        SidebarActionIcon::Archive => {
-            let body =
-                egui::Rect::from_center_size(c + egui::vec2(0.0, 1.5), egui::vec2(10.0, 7.0));
-            ui.painter().rect(
-                body,
-                egui::Rounding::same(1.5),
-                egui::Color32::TRANSPARENT,
-                stroke,
-            );
-            ui.painter().line_segment(
-                [c + egui::vec2(-5.5, -3.0), c + egui::vec2(5.5, -3.0)],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [c + egui::vec2(0.0, -6.0), c + egui::vec2(0.0, -1.0)],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [c + egui::vec2(-2.0, -3.0), c + egui::vec2(0.0, -1.0)],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [c + egui::vec2(2.0, -3.0), c + egui::vec2(0.0, -1.0)],
-                stroke,
-            );
-        }
-    }
-    response.on_hover_text(tooltip).clicked()
-}
+    let (hover_t, active_t) = animate_interaction(ui, response.id, &response);
 
-/// 侧栏文字按钮：macOS/Windows 各自使用合适高度，文字始终按按钮中心绘制。
-pub(super) fn sidebar_text_button(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    label: &str,
-    tooltip: &str,
-) -> bool {
-    let height = sidebar_control_height();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, height), egui::Sense::click());
-    let fill = if response.hovered() {
-        pal.hover
+    let bg = if active_t > 0.05 {
+        pal.translucent_active()
     } else {
-        pal.field
+        pal.translucent_hover(hover_t)
     };
-    ui.painter().rect(
-        rect,
-        egui::Rounding::same(6.0),
-        fill,
-        egui::Stroke::new(1.0_f32, pal.border),
-    );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::proportional(if cfg!(target_os = "macos") {
-            11.5
-        } else {
-            11.0
-        }),
-        if response.hovered() {
-            pal.text
-        } else {
-            pal.dim
-        },
-    );
+
+    let draw_rect = rect.shrink(0.4 * active_t);
+    if bg != egui::Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(draw_rect, egui::Rounding::same(6.0), bg);
+        let border = lerp_color(egui::Color32::TRANSPARENT, pal.border, hover_t);
+        ui.painter().rect(
+            draw_rect,
+            egui::Rounding::same(6.0),
+            egui::Color32::TRANSPARENT,
+            egui::Stroke::new(1.0_f32, border),
+        );
+    }
+
+    let color = lerp_color(pal.dim, pal.text, hover_t);
+    let semantic_icon = match icon {
+        SidebarActionIcon::Add => Icon::Plus,
+        SidebarActionIcon::Archive => Icon::ArchiveBox,
+    };
+    draw_icon(ui.painter(), draw_rect.center(), semantic_icon, color);
     response.on_hover_text(tooltip).clicked()
 }
 
@@ -347,43 +357,38 @@ pub(super) fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut
         .stroke(egui::Stroke::new(1.0_f32, stroke_color))
         .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
-            ui.set_min_height(sidebar_control_height() - 8.0);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let (icon_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                let center = icon_rect.center() + egui::vec2(-1.0, -1.0);
-                let stroke = egui::Stroke::new(1.25_f32, pal.dim);
-                ui.painter().circle_stroke(center, 4.0, stroke);
-                ui.painter().line_segment(
-                    [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
-                    stroke,
+                let icon_c = ui.cursor().min + egui::vec2(6.0, 9.0);
+                draw_icon(
+                    ui.painter(),
+                    icon_c,
+                    Icon::Search,
+                    if focused { pal.accent } else { pal.dim },
                 );
-                ui.add(
-                    egui::TextEdit::singleline(value)
-                        .id_source(id)
-                        .desired_width(f32::INFINITY)
-                        .frame(false)
-                        .margin(egui::Margin::same(0.0))
-                        .hint_text(egui::RichText::new("搜索历史…").color(pal.dim)),
-                );
+                ui.add_space(14.0);
+
+                let text_edit = egui::TextEdit::singleline(value)
+                    .id(id)
+                    .hint_text("搜索会话历史...")
+                    .text_color(pal.text)
+                    .margin(egui::Margin::symmetric(0.0, 0.0))
+                    .frame(false)
+                    .desired_width(ui.available_width() - 22.0);
+                ui.add(text_edit);
+
                 if !value.is_empty() {
                     let (clear_rect, response) =
                         ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                    if response.hovered() {
-                        ui.painter()
-                            .circle_filled(clear_rect.center(), 7.0, pal.hover);
+                    let (hov, _) = animate_interaction(ui, response.id, &response);
+                    if hov > 0.01 {
+                        ui.painter().circle_filled(
+                            clear_rect.center(),
+                            7.0,
+                            pal.translucent_hover(hov),
+                        );
                     }
-                    let c = clear_rect.center();
-                    let stroke = egui::Stroke::new(1.15_f32, pal.dim);
-                    ui.painter().line_segment(
-                        [c + egui::vec2(-2.5, -2.5), c + egui::vec2(2.5, 2.5)],
-                        stroke,
-                    );
-                    ui.painter().line_segment(
-                        [c + egui::vec2(-2.5, 2.5), c + egui::vec2(2.5, -2.5)],
-                        stroke,
-                    );
+                    let cross_color = lerp_color(pal.dim, pal.text, hov);
+                    draw_icon(ui.painter(), clear_rect.center(), Icon::X, cross_color);
                     clear = response.on_hover_text("清除搜索").clicked();
                 }
             });
@@ -400,7 +405,7 @@ pub(super) fn field_label(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     ui.add_space(3.0);
 }
 
-/// 状态徽标胶囊（如 [● Running]、[+12 -4]、[fs.write]）：圆角药丸造型、自适应文本。
+/// 状态徽标胶囊（如 [Running]、[+12 -4]、[fs.write]）：圆角药丸造型、自适应文本。
 pub(super) fn badge_pill(
     ui: &mut egui::Ui,
     text: &str,
@@ -409,12 +414,22 @@ pub(super) fn badge_pill(
     border_color: egui::Color32,
 ) -> egui::Response {
     let font_id = egui::FontId::proportional(11.0);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id, text_color);
     let padding = egui::vec2(12.0, 5.0);
     let size = galley.size() + padding;
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (hov, _) = animate_interaction(ui, resp.id, &resp);
+
+    let actual_bg = if hov > 0.01 {
+        lerp_color(bg_color, bg_color.gamma_multiply(1.3), hov)
+    } else {
+        bg_color
+    };
+
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(rect.height() / 2.0), bg_color);
+        .rect_filled(rect, egui::Rounding::same(rect.height() / 2.0), actual_bg);
     if border_color != egui::Color32::TRANSPARENT {
         ui.painter().rect_stroke(
             rect,
@@ -427,16 +442,36 @@ pub(super) fn badge_pill(
     resp
 }
 
-/// 分段式选项卡切换器（Segmented Tabs，如 [ 代码预览 | Git 变更 | 运行时遥测 ]）：
-/// 类似 macOS / Codex 风格的内嵌滑块选项卡。
-pub(super) fn segmented_tabs(
+/// 单个分段选项卡定义：可选矢量 Icon + 文本标签。
+#[derive(Clone, Copy)]
+pub(super) struct TabOption<'a> {
+    pub(super) icon: Option<Icon>,
+    pub(super) label: &'a str,
+}
+
+impl<'a> TabOption<'a> {
+    #[allow(dead_code)]
+    pub(crate) const fn new(icon: Option<Icon>, label: &'a str) -> Self {
+        Self { icon, label }
+    }
+    #[allow(dead_code)]
+    pub(super) const fn text_only(label: &'a str) -> Self {
+        Self { icon: None, label }
+    }
+}
+
+/// 分段式选项卡切换器（Segmented Tabs，如 [文件预览 | 代码变更 | 运行时遥测]）：
+/// 具备 macOS Sonoma 级别的弹性滑动胶囊（Sliding Pill Animation）与矢量图标居中对齐。
+pub(super) fn segmented_icon_tabs(
     ui: &mut egui::Ui,
     pal: &Palette,
-    options: &[&str],
+    options: &[TabOption<'_>],
     selected: usize,
 ) -> Option<usize> {
     let mut clicked = None;
+    let tabs_id = ui.make_persistent_id("segmented_icon_tabs_bar");
     let frame_margin = egui::Margin::same(2.0);
+
     egui::Frame::default()
         .fill(pal.field)
         .rounding(egui::Rounding::same(7.0))
@@ -445,40 +480,119 @@ pub(super) fn segmented_tabs(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                for (idx, &label) in options.iter().enumerate() {
+
+                // 预先计算各 Tab 矩形
+                let mut tab_rects = Vec::with_capacity(options.len());
+                let mut responses = Vec::with_capacity(options.len());
+
+                for (idx, opt) in options.iter().enumerate() {
                     let is_sel = idx == selected;
-                    let (fill, stroke, text_color) = if is_sel {
-                        (pal.card_bg, egui::Stroke::new(1.0_f32, pal.card_border), pal.text)
-                    } else {
-                        (egui::Color32::TRANSPARENT, egui::Stroke::NONE, pal.dim)
-                    };
-                    let text_w: f32 = label
+                    let text_w: f32 = opt
+                        .label
                         .chars()
                         .map(|c| if c.is_ascii() { 7.0 } else { 12.0 })
                         .sum();
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(text_w + 16.0, 24.0),
-                        egui::Sense::click(),
-                    );
-                    let actual_fill = if resp.hovered() && !is_sel {
-                        pal.hover
-                    } else {
-                        fill
-                    };
-                    ui.painter()
-                        .rect_filled(rect, egui::Rounding::same(5.0), actual_fill);
-                    if stroke != egui::Stroke::NONE {
-                        ui.painter().rect(rect, egui::Rounding::same(5.0), egui::Color32::TRANSPARENT, stroke);
-                    }
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(11.5),
-                        if is_sel { pal.text } else if resp.hovered() { pal.text } else { text_color },
-                    );
+                    let icon_w = if opt.icon.is_some() { 18.0 } else { 0.0 };
+                    let total_w = text_w + icon_w + 16.0;
+
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(total_w, 24.0), egui::Sense::click());
+
                     if resp.clicked() && !is_sel {
                         clicked = Some(idx);
+                    }
+                    tab_rects.push(rect);
+                    responses.push(resp);
+                }
+
+                // 弹性滑动胶囊动画（Spring / Ease 插值滑动）
+                let target_rect = tab_rects
+                    .get(selected)
+                    .copied()
+                    .unwrap_or(egui::Rect::NOTHING);
+                let pill_min_x = ui.ctx().animate_value_with_time(
+                    tabs_id.with("pill_x"),
+                    target_rect.min.x,
+                    0.13,
+                );
+                let pill_w = ui.ctx().animate_value_with_time(
+                    tabs_id.with("pill_w"),
+                    target_rect.width(),
+                    0.13,
+                );
+                let animated_pill = egui::Rect::from_min_size(
+                    egui::pos2(pill_min_x, target_rect.min.y),
+                    egui::vec2(pill_w, target_rect.height()),
+                );
+
+                // 绘制活动滑块胶囊卡片（带高亮底色与微边框）
+                if animated_pill.is_positive() {
+                    ui.painter()
+                        .rect_filled(animated_pill, egui::Rounding::same(5.0), pal.card_bg);
+                    ui.painter().rect(
+                        animated_pill,
+                        egui::Rounding::same(5.0),
+                        egui::Color32::TRANSPARENT,
+                        egui::Stroke::new(1.0_f32, pal.card_border),
+                    );
+                }
+
+                // 绘制各 Tab 图标与文字内容
+                for (idx, (opt, (rect, resp))) in options
+                    .iter()
+                    .zip(tab_rects.iter().zip(responses.iter()))
+                    .enumerate()
+                {
+                    let is_sel = idx == selected;
+                    let (hov, _) = animate_interaction(ui, resp.id, resp);
+
+                    // 未选中项悬停时微底色
+                    if !is_sel && hov > 0.01 {
+                        ui.painter().rect_filled(
+                            *rect,
+                            egui::Rounding::same(5.0),
+                            pal.translucent_hover(hov),
+                        );
+                    }
+
+                    let text_color = if is_sel {
+                        pal.text
+                    } else {
+                        lerp_color(pal.dim, pal.text, hov)
+                    };
+
+                    let icon_color = if is_sel {
+                        pal.accent
+                    } else {
+                        lerp_color(pal.dim, pal.text, hov)
+                    };
+
+                    let c = rect.center();
+                    if let Some(icon) = opt.icon {
+                        let text_w: f32 = opt
+                            .label
+                            .chars()
+                            .map(|c| if c.is_ascii() { 7.0 } else { 12.0 })
+                            .sum();
+                        let icon_c = egui::pos2(c.x - text_w / 2.0 - 2.0, c.y);
+                        draw_icon(ui.painter(), icon_c, icon, icon_color);
+
+                        let text_pos = egui::pos2(icon_c.x + 10.0, c.y);
+                        ui.painter().text(
+                            text_pos,
+                            egui::Align2::LEFT_CENTER,
+                            opt.label,
+                            egui::FontId::proportional(11.5),
+                            text_color,
+                        );
+                    } else {
+                        ui.painter().text(
+                            c,
+                            egui::Align2::CENTER_CENTER,
+                            opt.label,
+                            egui::FontId::proportional(11.5),
+                            text_color,
+                        );
                     }
                 }
             });
@@ -486,6 +600,286 @@ pub(super) fn segmented_tabs(
     clicked
 }
 
-// ── 记忆面板：浏览本地原生记忆资产（与 harness-provider-memory 落盘结构一致）──
-// 注意：本面板读取 `<cwd>/.harness-memory` 下的本地文件，反映 dsh「不接入后端时的
-// 原生记忆」。若已配置并连接 aidops 后端，后端的记忆以远端为准，此处仅展示本地副本。
+/// 兼容传统纯字符串签名的分段选项卡。
+#[allow(dead_code)]
+pub(super) fn segmented_tabs(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    options: &[&str],
+    selected: usize,
+) -> Option<usize> {
+    let opts: Vec<TabOption<'_>> = options.iter().map(|&s| TabOption::text_only(s)).collect();
+    segmented_icon_tabs(ui, pal, &opts, selected)
+}
+
+/// 极简线性设置导航项：2.5px 左侧高亮指示条、半透明柔和微底色、纯矢量图标、左对齐排版。
+pub(super) fn settings_nav_item(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+    let draw_rect = rect.shrink(0.4 * active_t);
+
+    if selected {
+        let sel_bg = if pal.is_dark {
+            egui::Color32::from_white_alpha(18)
+        } else {
+            egui::Color32::from_black_alpha(12)
+        };
+        ui.painter()
+            .rect_filled(draw_rect, egui::Rounding::same(6.0), sel_bg);
+        let bar_h = (draw_rect.height() - 14.0).max(12.0);
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(draw_rect.min.x + 2.0, draw_rect.center().y - bar_h / 2.0),
+            egui::vec2(2.5, bar_h),
+        );
+        ui.painter()
+            .rect_filled(bar, egui::Rounding::same(1.5), pal.accent);
+    } else if hover_t > 0.001 {
+        ui.painter().rect_filled(
+            draw_rect,
+            egui::Rounding::same(6.0),
+            pal.translucent_hover(hover_t),
+        );
+    }
+
+    let icon_color = if selected {
+        pal.accent
+    } else {
+        lerp_color(pal.dim, pal.text, hover_t)
+    };
+    draw_icon(
+        ui.painter(),
+        egui::pos2(draw_rect.min.x + 16.0, draw_rect.center().y),
+        icon,
+        icon_color,
+    );
+
+    let text_color = if selected {
+        pal.text
+    } else {
+        lerp_color(pal.dim, pal.text, hover_t * 0.8 + 0.2)
+    };
+    ui.painter().text(
+        egui::pos2(draw_rect.min.x + 32.0, draw_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.5),
+        text_color,
+    );
+
+    resp.clicked()
+}
+
+/// 分组设置卡片容器：工业级微圆角、微底色、细边框。
+pub(super) fn settings_card<R>(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::default()
+        .fill(pal.card_bg)
+        .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .show(ui, add_contents)
+        .inner
+}
+
+/// 分组卡片内发丝级行分割线（0.5px，极低对比度）。
+pub(super) fn settings_hairline(ui: &mut egui::Ui, pal: &Palette) {
+    ui.add_space(5.0);
+    let sep = ui
+        .allocate_exact_size(egui::vec2(ui.available_width(), 0.5), egui::Sense::hover())
+        .0;
+    ui.painter()
+        .rect_filled(sep, 0.0, pal.border.gamma_multiply(0.35));
+    ui.add_space(5.0);
+}
+
+/// 分组卡片双列设置行：左侧强标题 + 弱提示；右侧对齐交互控件。
+pub(super) fn settings_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    title: &str,
+    hint: Option<&str>,
+    add_control: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .size(12.5)
+                    .strong()
+                    .color(pal.text),
+            );
+            if let Some(h) = hint {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(h).size(11.0).color(pal.dim))
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            add_control(ui);
+        });
+    });
+}
+
+/// 22×22px 微型图标动作按钮：平时无边框、无底色，hover 浮出柔和半透明背景，点击微形变。
+pub(super) fn micro_icon_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    tooltip: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+    let draw_rect = rect.shrink(0.4 * active_t);
+
+    if active_t > 0.05 {
+        ui.painter().rect_filled(
+            draw_rect,
+            egui::Rounding::same(4.0),
+            pal.translucent_active(),
+        );
+    } else if hover_t > 0.001 {
+        ui.painter().rect_filled(
+            draw_rect,
+            egui::Rounding::same(4.0),
+            pal.translucent_hover(hover_t),
+        );
+    }
+
+    let color = lerp_color(pal.dim, pal.text, hover_t);
+    draw_icon(ui.painter(), draw_rect.center(), icon, color);
+    resp.on_hover_text(tooltip).clicked()
+}
+
+/// 弱化文字交互动作（非按钮必要，不要时按钮风格）：常态无边框、无底色，仅文字淡亮过渡。
+pub(super) fn subtle_text_action(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    tooltip: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(label.chars().count() as f32 * 12.0 + 8.0, 22.0),
+        egui::Sense::click(),
+    );
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+    let draw_rect = rect.shrink(0.3 * active_t);
+
+    if hover_t > 0.001 {
+        ui.painter().rect_filled(
+            draw_rect,
+            egui::Rounding::same(4.0),
+            pal.translucent_hover(hover_t * 0.7),
+        );
+    }
+
+    let text_color = lerp_color(pal.dim, pal.accent, hover_t);
+    ui.painter().text(
+        draw_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.0),
+        text_color,
+    );
+
+    resp.on_hover_text(tooltip).clicked()
+}
+
+/// 紧凑按钮（高度 26px，用于表单内次要动作，替代臃肿的 34px 大按钮）。
+pub(super) fn compact_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
+    let size = egui::vec2(label.chars().count() as f32 * 12.0 + 16.0, 26.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+
+    let bg_color = if active_t > 0.05 {
+        pal.translucent_active()
+    } else {
+        pal.translucent_hover(hover_t)
+    };
+    let draw_rect = rect.shrink(0.4 * active_t);
+    if bg_color != egui::Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(draw_rect, egui::Rounding::same(5.0), bg_color);
+    }
+    let border_color = lerp_color(pal.border, pal.accent.gamma_multiply(0.5), hover_t);
+    ui.painter().rect(
+        draw_rect,
+        egui::Rounding::same(5.0),
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(1.0_f32, border_color),
+    );
+
+    let text_color = lerp_color(pal.dim, pal.text, hover_t);
+    ui.painter().text(
+        draw_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.5),
+        text_color,
+    );
+    resp.clicked()
+}
+
+/// 下拉菜单/弹层无边框选择行（带左侧勾选对齐，支持柔和渐变 hover，无粗暴灰块）
+pub(super) fn menu_check_item(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    selected: bool,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+    let draw_rect = rect.shrink(0.3 * active_t);
+
+    if selected {
+        let sel_bg = if pal.is_dark {
+            egui::Color32::from_white_alpha(15)
+        } else {
+            egui::Color32::from_black_alpha(10)
+        };
+        ui.painter()
+            .rect_filled(draw_rect, egui::Rounding::same(5.0), sel_bg);
+    } else if hover_t > 0.001 {
+        ui.painter().rect_filled(
+            draw_rect,
+            egui::Rounding::same(5.0),
+            pal.translucent_hover(hover_t),
+        );
+    }
+
+    if selected {
+        draw_icon(
+            ui.painter(),
+            egui::pos2(draw_rect.left() + 10.0, draw_rect.center().y),
+            Icon::Check,
+            pal.accent,
+        );
+    }
+
+    let text_x = draw_rect.left() + 22.0;
+    let text_color = if selected {
+        pal.text
+    } else {
+        lerp_color(pal.dim, pal.text, hover_t)
+    };
+    ui.painter().text(
+        egui::pos2(text_x, draw_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        text_color,
+    );
+
+    resp.clicked()
+}

@@ -289,7 +289,11 @@ impl AppState {
         // 目标执行框架开关：同样持久化 + 即时写入进程级开关（每个 turn 读取）。
         let _ = settings.set(
             "runtime.goal_executor_enabled",
-            if self.f_goal_executor { "true" } else { "false" },
+            if self.f_goal_executor {
+                "true"
+            } else {
+                "false"
+            },
         );
         harness_core::tuning::set_goal_executor_enabled(Some(self.f_goal_executor));
         self.host.sink.set_permission(self.permission.clone());

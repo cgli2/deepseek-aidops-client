@@ -23,17 +23,19 @@ mod app_state;
 mod code_graph;
 mod composer;
 mod fonts;
-mod icons;
+pub(crate) mod icons;
 mod long_horizon_panel;
-mod self_monitor_panel;
 mod memory_panel;
 mod model;
 mod preview_panel;
+mod self_monitor_panel;
 mod settings_panel;
 mod settings_view;
+#[cfg(target_os = "macos")]
+pub(crate) mod sf_symbols;
 mod sidebar;
-mod theme;
-mod widgets;
+pub(crate) mod theme;
+pub(crate) mod widgets;
 mod workspace;
 
 use app_state::AppState;
@@ -42,18 +44,15 @@ use fonts::available_cjk_font;
 use fonts::install_cjk_fonts;
 #[cfg(target_os = "macos")]
 use fonts::install_macos_ui_style;
-use icons::{
-    Icon, draw_brand_logo, draw_icon, draw_paperclip_icon, draw_pencil_icon, draw_trash_icon,
-};
+use icons::{Icon, draw_brand_logo, draw_icon};
 use model::{
     ChatMsg, CouncilTaskUi, CouncilUi, DeliveryUi, ExecutionProjectionUi, MemItem, MemRefresh,
     PluginUiRow,
 };
 use theme::{Palette, palette};
 use widgets::{
-    SidebarActionIcon, accent_button, accent_button_ex, badge_pill, close_button, field_label,
-    ghost_button, nav_item, plugin_row_ui, sidebar_control_height,
-    sidebar_icon_button, sidebar_search_field, sidebar_text_button,
+    SidebarActionIcon, badge_pill, nav_item, plugin_row_ui, sidebar_control_height,
+    sidebar_icon_button, sidebar_search_field,
 };
 
 // 窗口 / 任务栏图标 RGBA（自动生成，见 scripts/make_icon.py）。eframe 不会自动读 exe 资源，

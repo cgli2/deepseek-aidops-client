@@ -59,6 +59,7 @@ impl eframe::App for AppState {
             warn: pal.warn,
             #[cfg(target_os = "windows")]
             hover: pal.hover,
+            is_dark: pal.is_dark,
         };
         let integrated_titlebar_setting = self.host.settings.get("ui.integrated_titlebar");
         let integrated_titlebar = crate::window_chrome::integrated_titlebar_enabled(

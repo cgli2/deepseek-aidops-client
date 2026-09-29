@@ -1431,7 +1431,24 @@ impl GoalExecution {
         {
             return None;
         }
-        let (purpose, expected_signal) = if proposal.signature.starts_with("search:") {
+        let is_write_call = proposal.signature.starts_with("edit:")
+            || proposal.signature.contains("\"op\":\"write\"");
+        // 文档类交付面（“输出 md 报告”）：本回合的产物是磁盘上的一份报告，而不是一次业务
+        // 代码修改。逐调用动作契约若仍按工具前缀说“定位实现入口/检查数据流”，模型会无限
+        // 探索代码而永不落盘报告（真实事故：预算烧尽、零写入、验收 0/1）。这里改为撰写契约：
+        // 写调用=撰写并写入报告，读/搜=收集最小证据后立即转为撰写。
+        let document_authoring = self.document_artifact_pending() && item.id == "document-artifact";
+        let (purpose, expected_signal) = if document_authoring && is_write_call {
+            (
+                "撰写并写入交付报告文档",
+                "磁盘上生成含根因分析、结论与解决方案的 .md 报告",
+            )
+        } else if document_authoring {
+            (
+                "为报告收集最小必要证据",
+                "读到与根因/方案直接相关的片段即停止检索，转为撰写报告",
+            )
+        } else if proposal.signature.starts_with("search:") {
             (
                 "定位当前交付面的实现入口",
                 "命中字段、路由、组件或其直接引用",
@@ -1473,19 +1490,31 @@ impl GoalExecution {
             target_path,
             purpose: purpose.into(),
             expected_signal: expected_signal.into(),
-            on_hit: match phase {
-                SolvePhase::Locate => "锁定候选文件并进入 inspect",
-                SolvePhase::Inspect => "确认最短数据流并进入 change/verify",
-                SolvePhase::Change => "记录 diff 并进入 verify",
-                SolvePhase::Verify => "所有关联工作项进入 verified",
-                SolvePhase::Conclude => "生成证据化结论",
+            on_hit: if document_authoring && is_write_call {
+                "报告落盘即交付面完成"
+            } else if document_authoring {
+                "证据足够→立即用 fs write 撰写并写入报告"
+            } else {
+                match phase {
+                    SolvePhase::Locate => "锁定候选文件并进入 inspect",
+                    SolvePhase::Inspect => "确认最短数据流并进入 change/verify",
+                    SolvePhase::Change => "记录 diff 并进入 verify",
+                    SolvePhase::Verify => "所有关联工作项进入 verified",
+                    SolvePhase::Conclude => "生成证据化结论",
+                }
             }
             .into(),
-            on_miss: match phase {
-                SolvePhase::Locate | SolvePhase::Inspect => "拒绝当前假设，切换有限候选",
-                SolvePhase::Change => "保持目标不变，修正最小修改",
-                SolvePhase::Verify => "把失败映射回相关工作项",
-                SolvePhase::Conclude => "报告明确阻塞",
+            on_miss: if document_authoring && is_write_call {
+                "补全缺失章节后重新写入报告"
+            } else if document_authoring {
+                "收紧检索词，不要扩大目录遍历"
+            } else {
+                match phase {
+                    SolvePhase::Locate | SolvePhase::Inspect => "拒绝当前假设，切换有限候选",
+                    SolvePhase::Change => "保持目标不变，修正最小修改",
+                    SolvePhase::Verify => "把失败映射回相关工作项",
+                    SolvePhase::Conclude => "报告明确阻塞",
+                }
             }
             .into(),
             max_cost: 1,
@@ -1577,6 +1606,15 @@ impl GoalExecution {
         match item.state {
             WorkItemState::Pending | WorkItemState::Locating => {
                 "执行一个与目标实体直接相关的高信号 search；不要列目录或运行 git status。".into()
+            }
+            // 文档类交付面在定位/检查阶段读到证据后，下一步不是继续读代码，而是撰写报告。
+            // 否则续跑提示会一直说“读取候选文件”，与逐调用撰写契约相互抵消。
+            WorkItemState::Located | WorkItemState::Inspecting
+                if self.document_artifact_pending()
+                    && item.id == "document-artifact"
+                    && item.read_evidence > 0 =>
+            {
+                "证据已足够：本交付面是一份报告文档，用单次 fs write 新建 .md 写入根因分析、结论与解决方案；评审通过前不要修改任何业务代码。".into()
             }
             WorkItemState::Located | WorkItemState::Inspecting => format!(
                 "直接读取候选文件 [{}] 中与当前验收项相关的最小区间。",
@@ -1722,7 +1760,10 @@ impl GoalExecution {
                 "当前任务为只读，写入不被允许；请基于已有证据给出定位结论。".into(),
             ));
         }
-        if is_write && !self.allowed_tools().iter().any(|tool| tool == "edit") {
+        if is_write
+            && !self.document_artifact_pending()
+            && !self.allowed_tools().iter().any(|tool| tool == "edit")
+        {
             return Err(GateDecision::Advise(
                 "当前阶段尚未开放写入工具；先读取具体目标文件确认实现。".into(),
             ));
@@ -1780,6 +1821,21 @@ impl GoalExecution {
                 "目录枚举不新增证据；{}",
                 self.next_action_hint()
             )));
+        }
+        // 文档类交付面：产物是磁盘上的一份报告，没有“已确认代码目标”可编辑。一旦读到
+        // 证据就停止检索去撰写报告；否则模型会在“定位实现入口”的契约下无限探索代码，
+        // 与用户“评审前不改业务代码”的约束冲突，最终零写入烧尽预算。
+        if call.name == "search"
+            && self.document_artifact_pending()
+            && self.active_item().is_some_and(|item| {
+                item.id == "document-artifact"
+                    && item.state == WorkItemState::ReadyToChange
+                    && item.read_evidence >= 1
+            })
+        {
+            return Err(GateDecision::Deny(
+                "证据已足够：本交付面是一份报告文档，停止检索，直接用 fs write 新建并写入 .md 报告（评审前不改业务代码）。".into(),
+            ));
         }
         // 已有两个具体读取与可编辑目标后，继续搜索不能推进当前交付面：这时
         // `search` 只会让模型绕开已明确的 edit/verify 闭环，最终耗尽预算而未产生
@@ -4997,5 +5053,137 @@ mod tests {
             "报告落盘后应提示收尾：{hint}"
         );
         assert!(plan.allowed_tools().is_empty(), "收敛后不再开放工具");
+    }
+
+    #[test]
+    fn document_artifact_action_contract_steers_to_authoring_not_code_location() {
+        // 取证：真实 Codeloop 事故里，文档交付面被引导去无限探索代码，永不落盘报告
+        // （预算烧尽、零写入、验收 0/1）。两个模型可见信号必须按交付面类型改写：
+        //  (1) 逐调用“动作契约”（action_spec）——进 trace 日志，保证可观测性与门禁记账
+        //      口径一致，不再对报告任务说“定位实现入口/检查数据流”；
+        //  (2) 读到证据后继续 search 的门禁拒绝语——以 [constraint denied] 进入对话，
+        //      必须指向“撰写报告”而非“编辑已确认代码文件”（与“评审前不改代码”冲突）。
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input(
+            "目前系统Agent工作台Codeloop工作机制存在严重问题，梳理分析找出根因，输出md报告，评审后再动手改造",
+        ));
+        assert!(plan.document_artifact_pending());
+        let item = plan.items.get_mut("document-artifact").unwrap();
+        item.state = WorkItemState::ReadyToChange;
+        item.read_evidence = 1;
+
+        // search 契约不得再说“定位实现入口”，而应指向收集证据后撰写报告。
+        let search = ToolCall {
+            id: "s".into(),
+            name: "search".into(),
+            args: serde_json::json!({"pattern":"codeloop","dir":"aidops-hub-server/app"}),
+        };
+        let search_proposal = ActionProposal {
+            signature: format!("search:{}", search.args),
+            question: "locate".into(),
+            supports: vec!["document-artifact".into()],
+            estimated_cost: 1,
+        };
+        let spec = plan.action_spec(&search, &search_proposal).expect("search spec");
+        assert!(
+            !spec.purpose.contains("定位当前交付面的实现入口"),
+            "文档面不得再引导定位代码：{}",
+            spec.purpose
+        );
+        assert!(
+            spec.purpose.contains("报告") || spec.on_hit.contains("报告"),
+            "读/搜契约应指向撰写报告：{} / {}",
+            spec.purpose,
+            spec.on_hit
+        );
+
+        // fs write 契约必须是“撰写并写入报告”，命中说明指向报告落盘。
+        let write = ToolCall {
+            id: "w".into(),
+            name: "fs".into(),
+            args: serde_json::json!({"op":"write","path":"docs/reports/codeloop.md","content":"# 根因"}),
+        };
+        let write_proposal = ActionProposal {
+            signature: format!("fs:{}", write.args),
+            question: "author".into(),
+            supports: vec!["document-artifact".into()],
+            estimated_cost: 1,
+        };
+        let spec = plan.action_spec(&write, &write_proposal).expect("write spec");
+        assert!(
+            spec.purpose.contains("撰写并写入交付报告文档"),
+            "写契约应引导撰写报告：{}",
+            spec.purpose
+        );
+        assert!(
+            spec.on_hit.contains("报告落盘"),
+            "命中说明应指向报告落盘：{}",
+            spec.on_hit
+        );
+
+        // 已读到证据后继续 search 必须被拒，且拒绝语指向撰写报告而非编辑业务代码。
+        let GateDecision::Deny(reason) = plan.allows_tool_call(&search, &search_proposal).unwrap_err()
+        else {
+            panic!("文档面读到证据后继续检索应被拒绝");
+        };
+        assert!(reason.contains("报告"), "拒绝语应指向撰写报告：{reason}");
+        assert!(
+            !reason.contains("编辑已确认文件"),
+            "不得催促编辑业务代码：{reason}"
+        );
+    }
+
+    #[test]
+    fn document_artifact_read_contract_is_not_code_inspection() {
+        // 定位/检查阶段读到证据后，逐调用契约与续跑提示都应转向撰写报告，而不是继续
+        // “检查最短数据流 / 读取候选文件”，否则两套信号相互抵消，模型继续空转探索。
+        let mut plan =
+            GoalExecution::from_contract(&TaskContract::from_input("分析根因并输出md报告"));
+        assert!(plan.document_artifact_pending());
+        let item = plan.items.get_mut("document-artifact").unwrap();
+        item.state = WorkItemState::Inspecting;
+        item.read_evidence = 1;
+        let read = ToolCall {
+            id: "r".into(),
+            name: "fs".into(),
+            args: serde_json::json!({"op":"read","path":"aidops-hub-server/app/api/v1/codeloop.py"}),
+        };
+        let proposal = ActionProposal {
+            signature: format!("fs:{}", read.args),
+            question: "inspect".into(),
+            supports: vec!["document-artifact".into()],
+            estimated_cost: 1,
+        };
+        let spec = plan.action_spec(&read, &proposal).expect("read spec");
+        assert!(
+            !spec.purpose.contains("检查最短数据流"),
+            "文档面读契约不得是代码检查：{}",
+            spec.purpose
+        );
+        let hint = plan.next_action_hint();
+        assert!(
+            hint.contains("报告文档") && hint.contains("fs write"),
+            "续跑提示应指向撰写报告：{hint}"
+        );
+    }
+
+    #[test]
+    fn document_artifact_prompt_tells_the_model_to_write_the_report() {
+        // 最高保真证明：真正进入每回合系统提示（render_for_model）的是“下一动作”
+        // （next_action_hint），而不是只进 trace 日志的 action_spec 动作契约。文档交付面
+        // 读到证据后，prompt 的“下一动作”必须是撰写报告，否则模型在真实回合里收不到写盘指令。
+        let mut plan = GoalExecution::from_contract(&TaskContract::from_input(
+            "梳理分析找出根因，输出md报告，评审后再动手改造",
+        ));
+        assert!(plan.document_artifact_pending());
+        let item = plan.items.get_mut("document-artifact").unwrap();
+        item.state = WorkItemState::ReadyToChange;
+        item.read_evidence = 2;
+        let prompt = plan.render_for_model();
+        assert!(prompt.contains("报告文档"), "prompt 应含撰写报告指令：{prompt}");
+        assert!(prompt.contains("fs write"), "prompt 应指向单次写盘：{prompt}");
+        assert!(
+            !prompt.contains("对已确认文件执行一次最小编辑"),
+            "不得催促修改业务代码：{prompt}"
+        );
     }
 }

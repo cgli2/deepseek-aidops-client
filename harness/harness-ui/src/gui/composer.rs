@@ -1,5 +1,9 @@
 //! Bottom message composer and model/permission controls.
 
+use egui::Color32;
+
+use super::icons::{Icon, draw_icon, draw_icon_sized, draw_smooth_spinner};
+use super::widgets::{animate_interaction, lerp_color, menu_check_item};
 use super::*;
 
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> bool {
@@ -36,10 +40,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
             let is_focused = ctx.memory(|m| m.has_focus(composer_id));
             let card_frame = egui::Frame::default()
                 .fill(pal.card_bg)
-                .rounding(egui::Rounding::same(12.0))
+                .rounding(egui::Rounding::same(8.0))
                 .stroke(egui::Stroke::new(
-                    if is_focused { 1.3_f32 } else { 1.0_f32 },
-                    if is_focused { pal.accent } else { pal.card_border },
+                    1.0_f32,
+                    if is_focused { pal.accent } else { pal.border },
                 ))
                 .inner_margin(egui::Margin {
                     left: 12.0,
@@ -64,18 +68,48 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("附件");
-                            let response = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(format!("📎 {name}  ×"))
-                                        .size(11.5)
-                                        .color(pal.text),
-                                )
-                                .fill(pal.field),
+                            let id = ui.id().with(("att_chip", index));
+                            let text_w = name.len() as f32 * 6.8;
+                            let chip_w = text_w + 44.0;
+                            let (chip_rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(chip_w, 22.0),
+                                egui::Sense::click(),
                             );
-                            if response.clicked() {
+                            let (hover_t, _) = animate_interaction(ui, id, &resp);
+                            let bg_color = lerp_color(pal.field, pal.translucent_hover(1.0), hover_t);
+                            ui.painter().rect(
+                                chip_rect,
+                                egui::Rounding::same(5.0),
+                                bg_color,
+                                egui::Stroke::new(
+                                    1.0,
+                                    lerp_color(pal.border, pal.accent, hover_t * 0.5),
+                                ),
+                            );
+                            let clip_c = egui::pos2(chip_rect.left() + 11.0, chip_rect.center().y);
+                            draw_icon(
+                                ui.painter(),
+                                clip_c,
+                                Icon::Paperclip,
+                                lerp_color(pal.dim, pal.text, hover_t),
+                            );
+                            ui.painter().text(
+                                egui::pos2(chip_rect.left() + 20.0, chip_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                name,
+                                egui::FontId::proportional(11.5),
+                                pal.text,
+                            );
+                            let x_c = egui::pos2(chip_rect.right() - 10.0, chip_rect.center().y);
+                            draw_icon(
+                                ui.painter(),
+                                x_c,
+                                Icon::X,
+                                lerp_color(pal.dim, pal.warn, hover_t),
+                            );
+                            if resp.on_hover_text("点击删除此附件").clicked() {
                                 remove = Some(index);
                             }
-                            response.on_hover_text("点击删除此附件");
                         }
                     });
                     if let Some(index) = remove {
@@ -99,7 +133,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                 .id(composer_id)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(2)
-                                .font(egui::FontId::proportional(13.5))
+                                .font(egui::FontId::proportional(13.0))
                                 .frame(false)
                                 .margin(egui::Margin::same(0.0))
                                 .hint_text(
@@ -194,46 +228,58 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     } else {
                         "标准"
                     };
-                    // 模式 chip：与模型/权限控件共用同一套 28px chrome，
+                    // 模式 chip：与模型/权限控件共用同一套 26px chrome，
                     // 仅以状态圆点和强调色描边表达启用，避免标准 Button 的突兀块感。
                     let mode_w = 64.0_f32;
                     let (mode_rect, mode_resp) =
-                        ui.allocate_exact_size(egui::vec2(mode_w, 28.0), egui::Sense::click());
-                    let mode_fill = if mode_resp.hovered() {
-                        pal.hover
+                        ui.allocate_exact_size(egui::vec2(mode_w, 26.0), egui::Sense::click());
+                    let (mode_hov, mode_act) = animate_interaction(ui, mode_resp.id, &mode_resp);
+                    let mode_draw = mode_rect.shrink(0.4 * mode_act);
+                    let mode_fill = if mode_hov > 0.001 {
+                        pal.translucent_hover(mode_hov)
                     } else {
                         pal.field
                     };
+                    let mode_border = if state.multi_agent {
+                        pal.accent
+                    } else {
+                        lerp_color(pal.border, pal.text, mode_hov * 0.4)
+                    };
                     ui.painter()
-                        .rect_filled(mode_rect, egui::Rounding::same(8.0), mode_fill);
+                        .rect_filled(mode_draw, egui::Rounding::same(5.0), mode_fill);
                     ui.painter().rect(
-                        mode_rect,
-                        egui::Rounding::same(8.0),
+                        mode_draw,
+                        egui::Rounding::same(5.0),
                         egui::Color32::TRANSPARENT,
-                        egui::Stroke::new(
-                            1.0_f32,
-                            if state.multi_agent {
-                                pal.accent
-                            } else {
-                                pal.border
-                            },
-                        ),
+                        egui::Stroke::new(1.0_f32, mode_border),
                     );
-                    ui.painter().circle_filled(
-                        mode_rect.left_center() + egui::vec2(11.0, 0.0),
-                        3.0,
+                    let dot_c = mode_draw.left_center() + egui::vec2(11.0, 0.0);
+                    let dot_col = if state.multi_agent {
+                        pal.accent
+                    } else {
+                        lerp_color(pal.dim, pal.text, mode_hov * 0.5)
+                    };
+                    draw_icon_sized(
+                        ui.painter(),
+                        dot_c,
                         if state.multi_agent {
-                            pal.accent
+                            Icon::CircleDot
                         } else {
-                            pal.dim
+                            Icon::Circle
                         },
+                        dot_col,
+                        10.0,
                     );
                     ui.painter().text(
-                        mode_rect.left_center() + egui::vec2(20.0, 0.0),
+                        mode_draw.left_center() + egui::vec2(20.0, 0.0),
                         egui::Align2::LEFT_CENTER,
                         mode_text,
                         egui::FontId::proportional(12.0),
-                        pal.text,
+                        if state.multi_agent {
+                            pal.text
+                        } else {
+                            lerp_color(pal.dim, pal.text, mode_hov * 0.6)
+                        },
                     );
                     if mode_resp.clicked() {
                         state.multi_agent = !state.multi_agent;
@@ -273,39 +319,46 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         used_w += char_w;
                     }
                     let (mrect, mresp) =
-                        ui.allocate_exact_size(egui::vec2(chip_w, 28.0), egui::Sense::click());
-                    let mfill = if mresp.hovered() || state.model_menu_open {
-                        pal.hover
+                        ui.allocate_exact_size(egui::vec2(chip_w, 26.0), egui::Sense::click());
+                    let (m_hov, m_act) = animate_interaction(ui, mresp.id, &mresp);
+                    let m_draw = mrect.shrink(0.4 * m_act);
+                    let mfill = if state.model_menu_open || m_hov > 0.001 {
+                        pal.translucent_hover(if state.model_menu_open { 0.9 } else { m_hov })
                     } else {
                         pal.field
                     };
+                    let m_border = if state.model_menu_open {
+                        pal.accent
+                    } else {
+                        lerp_color(pal.border, pal.text, m_hov * 0.4)
+                    };
                     ui.painter()
-                        .rect_filled(mrect, egui::Rounding::same(8.0), mfill);
+                        .rect_filled(m_draw, egui::Rounding::same(5.0), mfill);
                     ui.painter().rect(
-                        mrect,
-                        egui::Rounding::same(8.0),
+                        m_draw,
+                        egui::Rounding::same(5.0),
                         egui::Color32::TRANSPARENT,
-                        egui::Stroke::new(1.0_f32, pal.border),
+                        egui::Stroke::new(1.0_f32, m_border),
                     );
                     ui.painter().text(
-                        mrect.left_center() + egui::vec2(10.0, 0.0),
+                        m_draw.left_center() + egui::vec2(10.0, 0.0),
                         egui::Align2::LEFT_CENTER,
                         &model_display,
                         egui::FontId::proportional(12.0),
                         pal.text,
                     );
-                    // 右侧 chevron
-                    let cx = mrect.right() - 11.0;
-                    let cy = mrect.center().y;
-                    ui.painter().add(egui::Shape::convex_polygon(
-                        vec![
-                            egui::pos2(cx - 3.5, cy - 1.6),
-                            egui::pos2(cx + 3.5, cy - 1.6),
-                            egui::pos2(cx, cy + 1.8),
-                        ],
-                        pal.dim,
-                        egui::Stroke::NONE,
-                    ));
+                    // 右侧矢量 chevron 图标
+                    let chevron_c = egui::pos2(m_draw.right() - 11.0, m_draw.center().y);
+                    draw_icon(
+                        ui.painter(),
+                        chevron_c,
+                        if state.model_menu_open {
+                            Icon::ChevronUp
+                        } else {
+                            Icon::ChevronDown
+                        },
+                        lerp_color(pal.dim, pal.text, m_hov),
+                    );
                     if mresp.clicked() {
                         // 直接下拉切换模型，不再跳转设置页；与权限菜单互斥。
                         state.perm_menu_open = false;
@@ -327,51 +380,45 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         .fold(0.0_f32, f32::max);
                     let perm_w = (label_max_w + 40.0).max(96.0).min(160.0);
                     let (prect, presp) =
-                        ui.allocate_exact_size(egui::vec2(perm_w, 28.0), egui::Sense::click());
-                    let pfill = if presp.hovered() || state.perm_menu_open {
-                        pal.hover
+                        ui.allocate_exact_size(egui::vec2(perm_w, 26.0), egui::Sense::click());
+                    let (p_hov, p_act) = animate_interaction(ui, presp.id, &presp);
+                    let p_draw = prect.shrink(0.4 * p_act);
+                    let pfill = if state.perm_menu_open || p_hov > 0.001 {
+                        pal.translucent_hover(if state.perm_menu_open { 0.9 } else { p_hov })
                     } else {
                         pal.field
                     };
+                    let p_border = if state.perm_menu_open {
+                        pal.accent
+                    } else {
+                        lerp_color(pal.border, pal.text, p_hov * 0.4)
+                    };
                     ui.painter()
-                        .rect_filled(prect, egui::Rounding::same(8.0), pfill);
+                        .rect_filled(p_draw, egui::Rounding::same(5.0), pfill);
                     ui.painter().rect(
-                        prect,
-                        egui::Rounding::same(8.0),
+                        p_draw,
+                        egui::Rounding::same(5.0),
                         egui::Color32::TRANSPARENT,
-                        egui::Stroke::new(1.0_f32, pal.border),
+                        egui::Stroke::new(1.0_f32, p_border),
                     );
                     ui.painter().text(
-                        prect.left_center() + egui::vec2(10.0, 0.0),
+                        p_draw.left_center() + egui::vec2(10.0, 0.0),
                         egui::Align2::LEFT_CENTER,
                         &state.permission,
                         egui::FontId::proportional(12.0),
                         pal.text,
                     );
-                    // 右侧 chevron：关闭 ▼，打开 ▲（与模型 chip 关闭态一致；打开态翻转）
-                    let pcx = prect.right() - 11.0;
-                    let pcy = prect.center().y;
-                    if state.perm_menu_open {
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            vec![
-                                egui::pos2(pcx - 3.5, pcy + 1.6),
-                                egui::pos2(pcx + 3.5, pcy + 1.6),
-                                egui::pos2(pcx, pcy - 1.8),
-                            ],
-                            pal.dim,
-                            egui::Stroke::NONE,
-                        ));
-                    } else {
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            vec![
-                                egui::pos2(pcx - 3.5, pcy - 1.6),
-                                egui::pos2(pcx + 3.5, pcy - 1.6),
-                                egui::pos2(pcx, pcy + 1.8),
-                            ],
-                            pal.dim,
-                            egui::Stroke::NONE,
-                        ));
-                    }
+                    let p_chevron_c = egui::pos2(p_draw.right() - 11.0, p_draw.center().y);
+                    draw_icon(
+                        ui.painter(),
+                        p_chevron_c,
+                        if state.perm_menu_open {
+                            Icon::ChevronUp
+                        } else {
+                            Icon::ChevronDown
+                        },
+                        lerp_color(pal.dim, pal.text, p_hov),
+                    );
                     if presp.clicked() {
                         state.model_menu_open = false;
                         state.perm_menu_open = !state.perm_menu_open;
@@ -415,7 +462,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             .show(ctx, |ui| {
                                 egui::Frame::none()
                                     .fill(pal.panel)
-                                    .rounding(egui::Rounding::same(8.0))
+                                    .rounding(egui::Rounding::same(6.0))
                                     .inner_margin(egui::Margin::same(4.0))
                                     .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                     .shadow(egui::epaint::Shadow {
@@ -433,13 +480,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                         ui.spacing_mut().item_spacing.y = 2.0;
                                         for mode in ["只读", "工作区写入", "完全访问"] {
                                             let selected = state.permission == mode;
-                                            let r = ui.selectable_label(
-                                                selected,
-                                                egui::RichText::new(mode)
-                                                    .size(12.0)
-                                                    .color(pal.text),
-                                            );
-                                            if r.clicked() {
+                                            if menu_check_item(ui, &pal, mode, selected) {
                                                 state.permission = mode.to_string();
                                                 state.perm_menu_open = false;
                                                 // 展示值必须与运行时 AccessPolicy 立即同步。
@@ -476,7 +517,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             .show(ctx, |ui| {
                                 egui::Frame::none()
                                     .fill(pal.panel)
-                                    .rounding(egui::Rounding::same(8.0))
+                                    .rounding(egui::Rounding::same(6.0))
                                     .inner_margin(egui::Margin::same(4.0))
                                     .stroke(egui::Stroke::new(1.0_f32, pal.border))
                                     .shadow(egui::epaint::Shadow {
@@ -514,7 +555,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                                     ui.add_space(2.0);
                                                     ui.label(
                                                         egui::RichText::new("保存的配置")
-                                                            .size(10.5)
+                                                            .size(11.0)
                                                             .color(pal.dim),
                                                     );
                                                     for profile in profiles {
@@ -522,13 +563,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                                             == state.f_model
                                                             && profile.provider == state.f_provider;
                                                         let name = profile.name.clone();
-                                                        let resp = ui.selectable_label(
-                                                            selected,
-                                                            egui::RichText::new(&name)
-                                                                .size(12.0)
-                                                                .color(pal.text),
-                                                        );
-                                                        if resp.clicked() {
+                                                        if menu_check_item(ui, &pal, &name, selected) {
                                                             state.load_profile(&name);
                                                             state.model_menu_open = false;
                                                         }
@@ -540,19 +575,13 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                                     ui.add_space(2.0);
                                                     ui.label(
                                                         egui::RichText::new("上游模型")
-                                                            .size(10.5)
+                                                            .size(11.0)
                                                             .color(pal.dim),
                                                     );
                                                     let models = state.f_models.clone();
                                                     for model in models {
                                                         let selected = model == state.f_model;
-                                                        let resp = ui.selectable_label(
-                                                            selected,
-                                                            egui::RichText::new(&model)
-                                                                .size(12.0)
-                                                                .color(pal.text),
-                                                        );
-                                                        if resp.clicked() {
+                                                        if menu_check_item(ui, &pal, &model, selected) {
                                                             // 优先匹配启用的配置；均停用时回退任意同名条目。
                                                             let all = state
                                                                 .host
@@ -589,13 +618,34 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                                             }); // ── ScrollArea 列表区结束 ──
                                         ui.add_space(2.0);
                                         ui.separator();
-                                        let manage = ui.selectable_label(
-                                            false,
-                                            egui::RichText::new("⚙ 管理模型配置")
-                                                .size(12.0)
-                                                .color(pal.accent),
+                                        let manage_id = ui.id().with("manage_model_cfg");
+                                        let (manage_rect, manage_resp) = ui.allocate_exact_size(
+                                            egui::vec2(ui.available_width(), 26.0),
+                                            egui::Sense::click(),
                                         );
-                                        if manage.clicked() {
+                                        let (m_hov, m_act) = animate_interaction(ui, manage_id, &manage_resp);
+                                        if m_hov > 0.001 {
+                                            ui.painter().rect_filled(
+                                                manage_rect.shrink(0.4 * m_act),
+                                                egui::Rounding::same(5.0),
+                                                pal.translucent_hover(m_hov),
+                                            );
+                                        }
+                                        let gear_c = egui::pos2(manage_rect.left() + 12.0, manage_rect.center().y);
+                                        draw_icon(
+                                            ui.painter(),
+                                            gear_c,
+                                            Icon::Gear,
+                                            lerp_color(pal.accent, pal.text, m_hov * 0.3),
+                                        );
+                                        ui.painter().text(
+                                            egui::pos2(manage_rect.left() + 26.0, manage_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            "管理模型配置",
+                                            egui::FontId::proportional(12.0),
+                                            lerp_color(pal.accent, pal.text, m_hov * 0.3),
+                                        );
+                                        if manage_resp.clicked() {
                                             state.settings_open = true;
                                             state.settings_page = "模型配置".into();
                                             state.model_menu_open = false;
@@ -614,44 +664,52 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         }
                     }
 
-                    // ── 附件按钮：与左侧权限 chip 同高(28)/同 chrome，图标更醒目 ──
+                    // ── 附件按钮：与左侧权限 chip 同高(26)/同 chrome，图标更醒目 ──
                     let att_count = state.attachments.len();
                     let (arect, aresp) = if att_count > 0 {
-                        ui.allocate_exact_size(egui::vec2(48.0, 28.0), egui::Sense::click())
+                        ui.allocate_exact_size(egui::vec2(44.0, 26.0), egui::Sense::click())
                     } else {
-                        ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click())
+                        ui.allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::click())
                     };
+                    let (a_hov, a_act) = animate_interaction(ui, aresp.id, &aresp);
+                    let a_draw = arect.shrink(0.4 * a_act);
                     let has_att = att_count > 0;
-                    let afill = if aresp.hovered() {
-                        pal.hover
+                    let afill = if a_hov > 0.001 {
+                        pal.translucent_hover(a_hov)
                     } else {
                         pal.field
                     };
+                    let aborder = if has_att {
+                        pal.accent
+                    } else {
+                        lerp_color(pal.border, pal.text, a_hov * 0.4)
+                    };
                     ui.painter()
-                        .rect_filled(arect, egui::Rounding::same(8.0), afill);
+                        .rect_filled(a_draw, egui::Rounding::same(5.0), afill);
                     ui.painter().rect(
-                        arect,
-                        egui::Rounding::same(8.0),
+                        a_draw,
+                        egui::Rounding::same(5.0),
                         egui::Color32::TRANSPARENT,
-                        egui::Stroke::new(1.0_f32, if has_att { pal.accent } else { pal.border }),
+                        egui::Stroke::new(1.0_f32, aborder),
                     );
                     if has_att {
                         let acolor = pal.accent;
-                        draw_paperclip_icon(
+                        draw_icon(
                             ui.painter(),
-                            arect.left_center() + egui::vec2(12.0, 0.0),
+                            a_draw.left_center() + egui::vec2(12.0, 0.0),
+                            Icon::Paperclip,
                             acolor,
                         );
                         ui.painter().text(
-                            arect.left_center() + egui::vec2(24.0, 0.0),
+                            a_draw.left_center() + egui::vec2(24.0, 0.0),
                             egui::Align2::LEFT_CENTER,
                             format!("{att_count}"),
                             egui::FontId::proportional(11.5),
                             acolor,
                         );
                     } else {
-                        let acolor = if aresp.hovered() { pal.text } else { pal.dim };
-                        draw_paperclip_icon(ui.painter(), arect.center(), acolor);
+                        let acolor = lerp_color(pal.dim, pal.text, a_hov);
+                        draw_icon(ui.painter(), a_draw.center(), Icon::Paperclip, acolor);
                     }
                     let tip = if has_att {
                         format!("已添加 {att_count} 个附件（点击可继续添加）")
@@ -672,38 +730,37 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     // ── 优化按钮：在发送按钮左侧，点击后异步调用 LLM 重写输入 ──
                     let can_optimize = !state.input.trim().is_empty() && !state.optimizing;
                     let (orect, oresp) =
-                        ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click());
-                    let ofill = if oresp.hovered() {
-                        pal.hover
+                        ui.allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::click());
+                    let (o_hov, o_act) = animate_interaction(ui, oresp.id, &oresp);
+                    let o_draw = orect.shrink(0.4 * o_act);
+                    let ofill = if o_hov > 0.001 {
+                        pal.translucent_hover(o_hov)
                     } else {
                         pal.field
                     };
+                    let oborder = if state.optimizing {
+                        pal.accent
+                    } else {
+                        lerp_color(pal.border, pal.text, o_hov * 0.4)
+                    };
                     ui.painter()
-                        .rect_filled(orect, egui::Rounding::same(8.0), ofill);
+                        .rect_filled(o_draw, egui::Rounding::same(5.0), ofill);
                     ui.painter().rect(
-                        orect,
-                        egui::Rounding::same(8.0),
+                        o_draw,
+                        egui::Rounding::same(5.0),
                         egui::Color32::TRANSPARENT,
-                        egui::Stroke::new(
-                            1.0_f32,
-                            if state.optimizing {
-                                pal.accent
-                            } else {
-                                pal.border
-                            },
-                        ),
+                        egui::Stroke::new(1.0_f32, oborder),
                     );
-                    // 魔法棒图标 ✨
+                    // 魔法棒矢量图标（Icon::Sparkles），消除 Emoji
                     let ocolor = if state.optimizing {
                         pal.accent
                     } else {
-                        pal.text
+                        lerp_color(pal.dim, pal.text, o_hov)
                     };
-                    ui.painter().text(
-                        orect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "✨",
-                        egui::FontId::proportional(14.0),
+                    draw_icon(
+                        ui.painter(),
+                        o_draw.center(),
+                        Icon::Sparkles,
                         ocolor,
                     );
                     if oresp.clicked() && can_optimize {
@@ -720,55 +777,52 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
 
                     // 弹性空间 → 圆形发送/停止按钮
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let btn_size = 32.0;
+                        let btn_size = 28.0;
                         let (brect, bresp) = ui.allocate_exact_size(
                             egui::vec2(btn_size, btn_size),
                             egui::Sense::click(),
                         );
+                        let (b_hov, b_act) = animate_interaction(ui, bresp.id, &bresp);
                         let center = brect.center();
-                        let bfill = if can_send {
+                        let radius = (btn_size / 2.0) - 0.5 * b_act;
+                        let base_fill = if can_send {
                             pal.btn_fill
                         } else if state.busy {
                             pal.warn
                         } else {
                             pal.field
                         };
-                        ui.painter().circle_filled(center, btn_size / 2.0, bfill);
-                        if state.busy && !can_send {
-                            // 停止：实心方块
-                            ui.painter().rect_filled(
-                                egui::Rect::from_center_size(center, egui::vec2(8.0, 8.0)),
-                                egui::Rounding::same(1.5),
-                                egui::Color32::WHITE,
-                            );
+                        let bfill = if can_send {
+                            lerp_color(base_fill, pal.accent, b_hov * 0.25)
+                        } else if state.busy {
+                            lerp_color(base_fill, Color32::from_rgb(0xef, 0x44, 0x44), b_hov * 0.25)
                         } else {
-                            let icon_color = if can_send { pal.btn_text } else { pal.dim };
-                            // 实心三角箭头
-                            ui.painter().add(egui::Shape::convex_polygon(
-                                vec![
-                                    egui::pos2(center.x, center.y - 4.6),
-                                    egui::pos2(center.x + 4.2, center.y - 0.9),
-                                    egui::pos2(center.x - 4.2, center.y - 0.9),
-                                ],
-                                icon_color,
-                                egui::Stroke::NONE,
-                            ));
-                            // 箭头柄
-                            ui.painter().line_segment(
-                                [
-                                    egui::pos2(center.x, center.y - 0.9),
-                                    egui::pos2(center.x, center.y + 4.6),
-                                ],
-                                egui::Stroke::new(2.0_f32, icon_color),
-                            );
-                        }
-                        if bresp.hovered() {
+                            base_fill
+                        };
+                        ui.painter().circle_filled(center, radius, bfill);
+
+                        // 仅当按钮处于可激活状态时（可以发送或可以停止），悬停才绘制扩散外环光晕；
+                        // 彻底修复禁用状态下误绘制蓝色高亮圆环的 bug
+                        if (can_send || state.busy) && b_hov > 0.01 {
+                            let halo_color = if state.busy && !can_send {
+                                pal.warn
+                            } else {
+                                pal.accent
+                            };
                             ui.painter().circle_stroke(
                                 center,
-                                btn_size / 2.0,
-                                egui::Stroke::new(1.5_f32, pal.accent),
+                                radius + 1.2 * b_hov,
+                                egui::Stroke::new(1.3_f32, halo_color.gamma_multiply(b_hov * 0.7)),
                             );
                         }
+
+                        let (action_icon, icon_color) = if state.busy && !can_send {
+                            (Icon::Stop, egui::Color32::WHITE)
+                        } else {
+                            (Icon::Send, if can_send { pal.btn_text } else { pal.dim })
+                        };
+                        draw_icon_sized(ui.painter(), center, action_icon, icon_color, 14.0);
+
                         if bresp.clicked() {
                             if can_send {
                                 send_now = true;
@@ -810,7 +864,8 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let usage = state.log.usage_total();
                     let queued = state.host.sink.queued_count();
-                    let (dot, text): (egui::Color32, String) = if state.busy {
+                    if state.busy {
+                        ctx.request_repaint(); // 60FPS 顺滑旋转
                         let secs = state
                             .turn_started
                             .map(|t| t.elapsed().as_secs())
@@ -819,7 +874,6 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                             .last_activity
                             .map(|t| t.elapsed().as_secs())
                             .unwrap_or(0);
-                        let spinner = ["◐", "◓", "◑", "◒"][(secs % 4) as usize];
                         let activity = if state.activity.is_empty() {
                             "正在启动任务"
                         } else {
@@ -830,31 +884,83 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                         } else {
                             String::new()
                         };
-                        (
-                            if quiet_secs >= 10 {
-                                egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
-                            } else {
-                                egui::Color32::from_rgb(0x81, 0x8d, 0xf8)
-                            },
-                            format!(
-                                "{spinner} {activity} · 已用时 {secs} 秒{freshness}{} · 可随时停止",
-                                if queued > 0 {
-                                    format!(" · 队列中 {queued} 条")
-                                } else {
-                                    String::new()
-                                },
-                            ),
-                        )
+                        let queue_text = if queued > 0 {
+                            format!(" · 队列中 {queued} 条")
+                        } else {
+                            String::new()
+                        };
+                        let status_color = if quiet_secs >= 10 {
+                            egui::Color32::from_rgb(0xfb, 0xbf, 0x24)
+                        } else {
+                            pal.accent
+                        };
+                        let status_text = format!(
+                            "{activity} · 已用时 {secs} 秒{freshness}{queue_text} · 可随时停止"
+                        );
+                        let text_w = status_text.len() as f32 * 6.5 + 24.0;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(text_w, 16.0),
+                            egui::Sense::hover(),
+                        );
+                        let sp_c = egui::pos2(rect.left() + 6.0, rect.center().y);
+                        let time = ui.input(|i| i.time);
+                        draw_smooth_spinner(
+                            ui.painter(),
+                            sp_c,
+                            4.5,
+                            status_color,
+                            time,
+                        );
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 16.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            status_text,
+                            egui::FontId::proportional(11.0),
+                            status_color,
+                        );
                     } else {
-                        (
-                            pal.accent,
+                        let is_err = state.note.contains("错误") || state.note.contains("失败");
+                        let dot_col = if is_err {
+                            pal.warn
+                        } else {
+                            pal.success
+                        };
+                        let status_text = if state.note.is_empty() {
                             format!(
-                                "● 就绪  ·  Tokens {}/{}",
+                                "就绪  ·  Tokens {}/{}",
                                 usage.prompt_tokens, usage.completion_tokens
-                            ),
-                        )
-                    };
-                    ui.label(egui::RichText::new(text).size(11.0).color(dot));
+                            )
+                        } else {
+                            format!(
+                                "{}  ·  Tokens {}/{}",
+                                state.note, usage.prompt_tokens, usage.completion_tokens
+                            )
+                        };
+                        let text_w = status_text.len() as f32 * 6.5 + 22.0;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(text_w, 16.0),
+                            egui::Sense::hover(),
+                        );
+                        let dot_c = egui::pos2(rect.left() + 5.0, rect.center().y);
+                        draw_icon_sized(
+                            ui.painter(),
+                            dot_c,
+                            if is_err {
+                                Icon::AlertTriangle
+                            } else {
+                                Icon::CircleDot
+                            },
+                            dot_col,
+                            10.0,
+                        );
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 14.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            status_text,
+                            egui::FontId::proportional(11.0),
+                            pal.dim,
+                        );
+                    }
                 });
             });
         });
@@ -1170,7 +1276,9 @@ mod tests {
         let mut edit_state = egui::text_edit::TextEditState::load(&ctx, id).unwrap_or_default();
         edit_state
             .cursor
-            .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(3))));
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(3),
+            )));
         edit_state.store(&ctx, id);
 
         // 第三帧：带裸 Enter；先消费再渲染编辑器。

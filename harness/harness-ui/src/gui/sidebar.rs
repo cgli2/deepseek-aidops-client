@@ -1,5 +1,8 @@
 //! Left navigation, project list, and session history.
 
+use egui::Color32;
+
+use super::widgets::{animate_interaction, lerp_color, subtle_text_action};
 use super::*;
 
 fn time_group_label(t: &std::time::SystemTime) -> &'static str {
@@ -33,66 +36,59 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
             draw_brand_logo(ui, logo_rect, state.sidebar_expanded, &pal);
             ui.add_space(8.0);
 
-            // ── Codex 式醒目主操作：➕ 新建会话 ──
+            // ── Codex 式醒目主操作：新建会话 ──
             if state.sidebar_expanded {
                 let (btn_rect, btn_resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 32.0),
+                    egui::vec2(ui.available_width(), 30.0),
                     egui::Sense::click(),
                 );
-                let btn_fill = if btn_resp.hovered() {
-                    pal.btn_hover
-                } else {
-                    pal.btn_fill
-                };
+                let (hover_t, active_t) = animate_interaction(ui, btn_resp.id, &btn_resp);
+                let draw_rect = btn_rect.shrink(0.6 * active_t);
+                let btn_fill = lerp_color(pal.btn_fill, pal.btn_hover, hover_t);
+                let btn_border = lerp_color(pal.btn_border, pal.accent, hover_t * 0.6);
                 ui.painter().rect(
-                    btn_rect,
-                    egui::Rounding::same(8.0),
+                    draw_rect,
+                    egui::Rounding::same(5.0),
                     btn_fill,
-                    egui::Stroke::new(1.0_f32, pal.btn_border),
+                    egui::Stroke::new(1.0_f32, btn_border),
                 );
-                // + 图标
-                let ic = btn_rect.left_center() + egui::vec2(16.0, 0.0);
-                let is = egui::Stroke::new(1.6_f32, pal.btn_text);
-                ui.painter().line_segment([ic + egui::vec2(-4.5, 0.0), ic + egui::vec2(4.5, 0.0)], is);
-                ui.painter().line_segment([ic + egui::vec2(0.0, -4.5), ic + egui::vec2(0.0, 4.5)], is);
+                // + 矢量图标
+                let ic = draw_rect.left_center() + egui::vec2(16.0, 0.0);
+                draw_icon(ui.painter(), ic, Icon::Plus, pal.btn_text);
 
                 ui.painter().text(
-                    btn_rect.left_center() + egui::vec2(28.0, 0.0),
+                    draw_rect.left_center() + egui::vec2(28.0, 0.0),
                     egui::Align2::LEFT_CENTER,
                     "新建对话",
-                    egui::FontId::proportional(12.5),
+                    egui::FontId::proportional(12.0),
                     pal.btn_text,
                 );
                 ui.painter().text(
-                    btn_rect.right_center() + egui::vec2(-10.0, 0.0),
+                    draw_rect.right_center() + egui::vec2(-10.0, 0.0),
                     egui::Align2::RIGHT_CENTER,
                     "⌘N",
-                    egui::FontId::proportional(10.5),
-                    pal.dim,
+                    egui::FontId::proportional(10.0),
+                    lerp_color(pal.dim, pal.btn_text, hover_t * 0.5),
                 );
                 if btn_resp.clicked() {
                     state.new_session();
                 }
             } else {
                 let (btn_rect, btn_resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 32.0),
+                    egui::vec2(ui.available_width(), 30.0),
                     egui::Sense::click(),
                 );
-                let btn_fill = if btn_resp.hovered() {
-                    pal.btn_hover
-                } else {
-                    pal.btn_fill
-                };
+                let (hover_t, active_t) = animate_interaction(ui, btn_resp.id, &btn_resp);
+                let draw_rect = btn_rect.shrink(0.6 * active_t);
+                let btn_fill = lerp_color(pal.btn_fill, pal.btn_hover, hover_t);
+                let btn_border = lerp_color(pal.btn_border, pal.accent, hover_t * 0.6);
                 ui.painter().rect(
-                    btn_rect,
-                    egui::Rounding::same(8.0),
+                    draw_rect,
+                    egui::Rounding::same(5.0),
                     btn_fill,
-                    egui::Stroke::new(1.0_f32, pal.btn_border),
+                    egui::Stroke::new(1.0_f32, btn_border),
                 );
-                let ic = btn_rect.center();
-                let is = egui::Stroke::new(1.6_f32, pal.btn_text);
-                ui.painter().line_segment([ic + egui::vec2(-4.5, 0.0), ic + egui::vec2(4.5, 0.0)], is);
-                ui.painter().line_segment([ic + egui::vec2(0.0, -4.5), ic + egui::vec2(0.0, 4.5)], is);
+                draw_icon(ui.painter(), draw_rect.center(), Icon::Plus, pal.btn_text);
                 if btn_resp.on_hover_text("新建对话 (⌘N)").clicked() {
                     state.new_session();
                 }
@@ -187,7 +183,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                             }
                             let is_active = proj.path == state.active_project;
                             let (rect, resp) = ui.allocate_at_least(
-                                egui::vec2(ui.available_width(), 26.0),
+                                egui::vec2(ui.available_width(), 28.0),
                                 egui::Sense::click(),
                             );
                             let hovered = resp.hovered()
@@ -196,17 +192,40 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                                         ctx.input(|i| i.pointer.hover_pos())
                                             .unwrap_or(egui::pos2(-1.0, -1.0)),
                                     ));
-                            if is_active || hovered {
+                            let proj_id = ui.id().with(("proj_row", &proj.path));
+                            let hover_t = ui
+                                .ctx()
+                                .animate_bool_responsive(proj_id.with("hov"), hovered);
+                            let active_t = ui.ctx().animate_bool_responsive(
+                                proj_id.with("act"),
+                                resp.is_pointer_button_down_on(),
+                            );
+                            let draw_rect = rect.shrink(0.4 * active_t);
+
+                            // 背景四态：激活底色与半透明悬停自然叠层
+                            if is_active {
+                                let sel_bg = if pal.is_dark {
+                                    Color32::from_white_alpha(18)
+                                } else {
+                                    Color32::from_black_alpha(12)
+                                };
+                                ui.painter().rect_filled(draw_rect, 5.0, sel_bg);
+                            }
+                            if hover_t > 0.001 {
                                 ui.painter().rect_filled(
-                                    rect.shrink(1.0),
-                                    egui::Rounding::same(6.0),
-                                    pal.hover,
+                                    draw_rect,
+                                    5.0,
+                                    pal.translucent_hover(hover_t),
                                 );
                             }
                             if is_active {
+                                let bar_h = (draw_rect.height() - 12.0).max(12.0);
                                 let bar = egui::Rect::from_min_size(
-                                    egui::pos2(rect.min.x + 2.0, rect.min.y + 5.0),
-                                    egui::vec2(2.5, rect.height() - 10.0),
+                                    egui::pos2(
+                                        draw_rect.min.x + 2.0,
+                                        draw_rect.center().y - bar_h / 2.0,
+                                    ),
+                                    egui::vec2(2.5, bar_h),
                                 );
                                 ui.painter().rect_filled(
                                     bar,
@@ -216,23 +235,31 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                             }
                             draw_icon(
                                 ui.painter(),
-                                egui::pos2(rect.min.x + 14.0, rect.center().y),
+                                egui::pos2(draw_rect.min.x + 14.0, draw_rect.center().y),
                                 Icon::Folder,
-                                if is_active { pal.accent } else { pal.dim },
+                                if is_active {
+                                    pal.accent
+                                } else {
+                                    lerp_color(pal.dim, pal.text, hover_t * 0.7)
+                                },
                             );
                             ui.painter().text(
-                                egui::pos2(rect.min.x + 26.0, rect.center().y),
+                                egui::pos2(draw_rect.min.x + 26.0, draw_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 &proj.name,
                                 egui::FontId::proportional(12.0),
-                                if is_active { pal.text } else { pal.dim },
+                                if is_active {
+                                    pal.text
+                                } else {
+                                    lerp_color(pal.dim, pal.text, hover_t * 0.8 + 0.2)
+                                },
                             );
-                            if hovered {
+                            if hover_t > 0.05 {
                                 let control_h = sidebar_control_height();
                                 let arch_rect = egui::Rect::from_min_size(
                                     egui::pos2(
-                                        rect.max.x - control_h - 2.0,
-                                        rect.center().y - control_h / 2.0,
+                                        draw_rect.max.x - control_h - 2.0,
+                                        draw_rect.center().y - control_h / 2.0,
                                     ),
                                     egui::vec2(control_h, control_h),
                                 );
@@ -274,11 +301,11 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                             .color(pal.dim),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if sidebar_text_button(ui, &pal, "清空", "删除全部历史会话（保留当前对话）")
+                        if subtle_text_action(ui, &pal, "清空", "删除全部历史会话（保留当前对话）")
                         {
                             state.clear_history();
                         }
-                        if sidebar_text_button(
+                        if subtle_text_action(
                             ui,
                             &pal,
                             "精简",
@@ -292,7 +319,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                     if at.elapsed() < std::time::Duration::from_secs(5) {
                         ui.label(
                             egui::RichText::new(&state.history_note)
-                                .size(10.5)
+                                .size(11.0)
                                 .color(pal.accent),
                         );
                     } else {
@@ -347,7 +374,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                                 ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new(group)
-                                        .size(10.5)
+                                        .size(11.0)
                                         .strong()
                                         .color(pal.dim),
                                 );
@@ -387,7 +414,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette, side
                     };
                     ui.label(
                         egui::RichText::new(format!("工作区: {ws_display}"))
-                            .size(10.5)
+                            .size(11.0)
                             .color(pal.dim),
                     );
                 }
@@ -406,106 +433,126 @@ fn render_history_row(
     delete_now: &mut Option<String>,
     open_now: &mut Option<String>,
 ) {
-    let (rect, resp) = ui.allocate_at_least(
-        egui::vec2(ui.available_width(), 34.0),
-        egui::Sense::click(),
-    );
-    let hovered = resp.hovered()
+    let (rect, resp) =
+        ui.allocate_at_least(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+    let is_hovered = resp.hovered()
         || (ctx.input(|i| i.pointer.has_pointer())
             && rect.contains(
                 ctx.input(|i| i.pointer.hover_pos())
                     .unwrap_or(egui::pos2(-1.0, -1.0)),
             ));
-    if is_active || hovered {
-        ui.painter().rect_filled(
-            rect.shrink(1.0),
-            egui::Rounding::same(6.0),
-            pal.hover,
-        );
+    let row_id = ui.id().with(("hist_row", &meta.file));
+    let hover_t = ui
+        .ctx()
+        .animate_bool_responsive(row_id.with("hov"), is_hovered);
+    let active_t = ui
+        .ctx()
+        .animate_bool_responsive(row_id.with("act"), resp.is_pointer_button_down_on());
+    let draw_rect = rect.shrink(0.4 * active_t);
+
+    // 四态半透明无缝叠加（彻底消除同色套娃）
+    if is_active {
+        let sel_bg = if pal.is_dark {
+            Color32::from_white_alpha(18)
+        } else {
+            Color32::from_black_alpha(12)
+        };
+        ui.painter().rect_filled(draw_rect, 5.0, sel_bg);
+    }
+    if hover_t > 0.001 {
+        ui.painter()
+            .rect_filled(draw_rect, 5.0, pal.translucent_hover(hover_t));
     }
     if is_active {
+        let bar_h = (draw_rect.height() - 14.0).max(12.0);
         let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x + 2.0, rect.min.y + 6.0),
-            egui::vec2(2.5, rect.height() - 12.0),
+            egui::pos2(draw_rect.min.x + 2.0, draw_rect.center().y - bar_h / 2.0),
+            egui::vec2(2.5, bar_h),
         );
-        ui.painter().rect_filled(
-            bar,
-            egui::Rounding::same(2.0),
-            pal.accent,
-        );
+        ui.painter()
+            .rect_filled(bar, egui::Rounding::same(2.0), pal.accent);
     }
+
     // 标题截断
     let mut title: String = meta.title.chars().take(16).collect();
     if meta.title.chars().count() > 16 {
         title.push('…');
     }
+    let title_color = if is_active {
+        pal.text
+    } else {
+        lerp_color(pal.dim, pal.text, hover_t * 0.8 + 0.2)
+    };
     ui.painter().text(
-        egui::pos2(rect.min.x + 10.0, rect.min.y + 11.0),
+        egui::pos2(draw_rect.min.x + 10.0, draw_rect.min.y + 11.0),
         egui::Align2::LEFT_CENTER,
         &title,
         egui::FontId::proportional(12.0),
-        if is_active { pal.text } else { pal.dim },
+        title_color,
     );
     ui.painter().text(
-        egui::pos2(rect.min.x + 10.0, rect.max.y - 9.0),
+        egui::pos2(draw_rect.min.x + 10.0, draw_rect.max.y - 10.0),
         egui::Align2::LEFT_CENTER,
         relative_time(&meta.mtime),
-        egui::FontId::proportional(9.5),
+        egui::FontId::proportional(10.0),
         pal.dim,
     );
-    if hovered {
+
+    // 快捷按钮跟随 hover_t 平滑透明度与微滑入
+    if hover_t > 0.05 {
+        let slide = (1.0 - hover_t) * 4.0;
         let rename_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.max.x - 40.0, rect.center().y - 8.0),
-            egui::vec2(16.0, 16.0),
+            egui::pos2(draw_rect.max.x - 42.0 + slide, draw_rect.center().y - 9.0),
+            egui::vec2(18.0, 18.0),
         );
-        let rb = ui.interact(
-            rename_rect,
-            egui::Id::new(("hist_rename", &meta.file)),
-            egui::Sense::click(),
-        );
-        if rb.hovered() {
+        let rb_id = row_id.with("rename");
+        let rb = ui.interact(rename_rect, rb_id, egui::Sense::click());
+        let (rb_hov, rb_act) = animate_interaction(ui, rb_id, &rb);
+        if rb_hov > 0.01 {
             ui.painter().rect_filled(
-                rename_rect.shrink(1.0),
+                rename_rect.shrink(0.5 * rb_act),
                 egui::Rounding::same(4.0),
-                pal.hover,
+                pal.translucent_hover(rb_hov * 1.5),
             );
         }
-        draw_pencil_icon(
+        draw_icon(
             ui.painter(),
             rename_rect.center(),
-            if rb.hovered() { pal.text } else { pal.dim },
+            Icon::Pencil,
+            lerp_color(pal.dim, pal.text, rb_hov),
         );
-        let rb = rb.on_hover_text("重命名此会话");
-        if rb.clicked() {
+        if rb.on_hover_text("重命名此会话").clicked() {
             *renaming = Some(meta.file.clone());
             *rename_buf = meta.title.clone();
         }
+
         let del_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.max.x - 22.0, rect.center().y - 8.0),
-            egui::vec2(16.0, 16.0),
+            egui::pos2(draw_rect.max.x - 22.0 + slide, draw_rect.center().y - 9.0),
+            egui::vec2(18.0, 18.0),
         );
-        let b = ui.interact(
-            del_rect,
-            egui::Id::new(("hist_delete", &meta.file)),
-            egui::Sense::click(),
-        );
-        if b.hovered() {
+        let db_id = row_id.with("delete");
+        let db = ui.interact(del_rect, db_id, egui::Sense::click());
+        let (db_hov, db_act) = animate_interaction(ui, db_id, &db);
+        if db_hov > 0.01 {
+            let warn_tint = Color32::from_rgb(0xdc, 0x26, 0x26).gamma_multiply(0.25);
+            let hover_bg = lerp_color(pal.translucent_hover(db_hov), warn_tint, db_hov);
             ui.painter().rect_filled(
-                del_rect.shrink(1.0),
+                del_rect.shrink(0.5 * db_act),
                 egui::Rounding::same(4.0),
-                pal.hover,
+                hover_bg,
             );
         }
-        draw_trash_icon(
-            ui.painter(),
-            del_rect.center(),
-            if b.hovered() { pal.text } else { pal.dim },
-        );
-        let b = b.on_hover_text("删除此会话");
-        if b.clicked() {
+        let del_icon_color = if db.hovered() {
+            Color32::from_rgb(0xf8, 0x71, 0x71)
+        } else {
+            lerp_color(pal.dim, pal.text, db_hov)
+        };
+        draw_icon(ui.painter(), del_rect.center(), Icon::Trash, del_icon_color);
+        if db.on_hover_text("删除此会话").clicked() {
             *delete_now = Some(meta.file.clone());
         }
     }
+
     if resp.clicked() && !is_active {
         *open_now = Some(meta.file.clone());
     }

@@ -32,16 +32,16 @@ fn render(e: &SessionEvent) {
             }
         }
         SessionEvent::ToolCall { call, .. } => {
-            println!("\n\x1b[33m→ calling {}\x1b[0m", call.name);
+            println!("\n\x1b[33m[工具调用] {}\x1b[0m", call.name);
         }
         SessionEvent::ToolResult { result, .. } => {
             let tag = if result.ok {
-                "\x1b[32mok\x1b[0m"
+                "\x1b[32m成功\x1b[0m"
             } else {
-                "\x1b[31mERR\x1b[0m"
+                "\x1b[31m失败\x1b[0m"
             };
             let preview: String = result.content.chars().take(200).collect();
-            println!("\n\x1b[34m← tool {tag}\x1b[0m: {preview}");
+            println!("\n\x1b[34m[工具结果：{tag}]\x1b[0m {preview}");
         }
         SessionEvent::TurnEnd { .. } => {
             println!("\n\x1b[36m--- turn end ---\x1b[0m");

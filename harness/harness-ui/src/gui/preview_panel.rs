@@ -3,9 +3,112 @@
 use std::sync::Arc;
 
 use super::AppState;
-use super::icons::{Icon, draw_icon};
+use super::icons::{Icon, draw_icon, draw_icon_sized, draw_smooth_spinner};
 use super::theme::{Palette, palette};
-use super::widgets::{badge_pill, close_button, segmented_tabs};
+use super::widgets::{
+    TabOption, animate_interaction, badge_pill, close_button, lerp_color, segmented_icon_tabs,
+};
+
+fn loading_line(ui: &mut egui::Ui, pal: &Palette, label: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        draw_smooth_spinner(
+            ui.painter(),
+            rect.center(),
+            6.0,
+            pal.accent,
+            ui.input(|i| i.time),
+        );
+        ui.label(egui::RichText::new(label).size(12.0).color(pal.accent));
+    });
+    ui.ctx().request_repaint();
+}
+
+fn telemetry_status_badge(ui: &mut egui::Ui, pal: &Palette, busy: bool) {
+    let (label, color) = if busy {
+        ("正在执行", pal.accent)
+    } else {
+        ("就绪空闲", pal.success)
+    };
+    let width = label.chars().count() as f32 * 7.0 + 29.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
+    ui.painter().rect(
+        rect,
+        egui::Rounding::same(10.0),
+        color.gamma_multiply(0.15),
+        egui::Stroke::new(1.0, color.gamma_multiply(0.7)),
+    );
+    let icon_center = egui::pos2(rect.left() + 10.0, rect.center().y);
+    if busy {
+        draw_smooth_spinner(
+            ui.painter(),
+            icon_center,
+            4.5,
+            color,
+            ui.input(|input| input.time),
+        );
+        ui.ctx().request_repaint();
+    } else {
+        draw_icon_sized(ui.painter(), icon_center, Icon::CircleDot, color, 10.0);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 19.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(10.5),
+        color,
+    );
+}
+
+fn panel_tool_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    tip: &str,
+) -> bool {
+    let char_w = label
+        .chars()
+        .map(|c| if c.is_ascii() { 6.8 } else { 11.5 })
+        .sum::<f32>();
+    let icon_w = if icon.is_some() { 16.0 } else { 0.0 };
+    let w = char_w + icon_w + 14.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
+    let (hov, act) = animate_interaction(ui, resp.id, &resp);
+    let draw_rect = rect.shrink(0.4 * act);
+    if hov > 0.001 {
+        ui.painter().rect_filled(
+            draw_rect,
+            egui::Rounding::same(5.0),
+            pal.translucent_hover(hov),
+        );
+    }
+    let border_color = if hov > 0.05 {
+        lerp_color(pal.border, pal.accent, hov * 0.4)
+    } else {
+        pal.border
+    };
+    ui.painter().rect(
+        draw_rect,
+        egui::Rounding::same(5.0),
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(1.0, border_color),
+    );
+    let mut text_x = draw_rect.left() + 7.0;
+    if let Some(ic) = icon {
+        let ic_c = egui::pos2(draw_rect.left() + 11.0, draw_rect.center().y);
+        draw_icon(ui.painter(), ic_c, ic, lerp_color(pal.dim, pal.text, hov));
+        text_x += 16.0;
+    }
+    ui.painter().text(
+        egui::pos2(text_x, draw_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(11.5),
+        lerp_color(pal.dim, pal.text, hov * 0.8),
+    );
+    resp.on_hover_text(tip).clicked()
+}
 
 impl AppState {
     /// 打开文件预览窗并加载指定文件。
@@ -232,8 +335,12 @@ impl AppState {
             .show(ui, |ui| {
                 ui.set_min_height(head_h - 10.0);
                 ui.horizontal(|ui| {
-                    let tabs = ["📄 文件预览", "🌿 代码变更", "📊 运行时遥测"];
-                    if let Some(new_tab) = segmented_tabs(ui, pal, &tabs, self.inspector_tab) {
+                    let tabs = [
+                        TabOption::new(Some(Icon::FileText), "文件预览"),
+                        TabOption::new(Some(Icon::GitBranch), "代码变更"),
+                        TabOption::new(Some(Icon::Activity), "运行时遥测"),
+                    ];
+                    if let Some(new_tab) = segmented_icon_tabs(ui, pal, &tabs, self.inspector_tab) {
                         self.inspector_tab = new_tab;
                         if new_tab == 1 && !self.git_loaded {
                             self.refresh_git_changes();
@@ -299,35 +406,44 @@ impl AppState {
                         } else {
                             name_trunc
                         };
-                        ui.label(egui::RichText::new(&name_disp).size(12.0).strong().color(pal.text));
+                        ui.label(
+                            egui::RichText::new(&name_disp)
+                                .size(12.0)
+                                .strong()
+                                .color(pal.text),
+                        );
 
                         if let Some(content) = &cur_content {
                             let line_count = content.lines().count();
                             let kb = content.len() as f32 / 1024.0;
                             ui.label(
                                 egui::RichText::new(format!("{line_count} 行 · {kb:.1} KB"))
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(pal.dim),
                             );
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let abs = tree_attachment_path(&ws_root, path);
-                            if ui
-                                .button(egui::RichText::new("↗ 打开").size(11.0))
-                                .on_hover_text("在操作系统默认编辑器中打开该文件")
-                                .clicked()
-                            {
+                            if panel_tool_button(
+                                ui,
+                                pal,
+                                Some(Icon::ExternalLink),
+                                "打开",
+                                "在操作系统默认编辑器中打开该文件",
+                            ) {
                                 open_in_system_editor(&abs);
                                 self.note = format!("已在系统编辑器中打开 {name}");
                             }
 
                             if let Some(content) = &cur_content {
-                                if ui
-                                    .button(egui::RichText::new("📋 复制全部").size(11.0))
-                                    .on_hover_text("复制当前文件全部源码到剪贴板")
-                                    .clicked()
-                                {
+                                if panel_tool_button(
+                                    ui,
+                                    pal,
+                                    Some(Icon::Copy),
+                                    "复制全部",
+                                    "复制当前文件全部源码到剪贴板",
+                                ) {
                                     ui.ctx().copy_text(content.clone());
                                     self.note = "已复制文件全部内容到剪贴板".into();
                                 }
@@ -376,7 +492,7 @@ impl AppState {
                     ui.vertical_centered(|ui| {
                         ui.add_space(50.0);
                         let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                        draw_icon(&ui.painter(), icon_rect.center(), Icon::Code, pal.dim);
+                        draw_icon_sized(ui.painter(), icon_rect.center(), Icon::Code, pal.dim, 22.0);
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("暂无打开的文件预览").size(13.0).strong().color(pal.text));
                         ui.add_space(6.0);
@@ -394,23 +510,28 @@ impl AppState {
                     && self.preview_rx.is_some()
                 {
                     ui.add_space(30.0);
-                    let secs = ui.input(|i| i.time);
-                    let spinner = ["◐", "◓", "◑", "◒"][((secs * 4.0) as usize) % 4];
-                    ui.label(
-                        egui::RichText::new(format!("{spinner} 正在加载文件内容..."))
-                            .size(12.0)
-                            .color(pal.accent),
-                    );
+                    loading_line(ui, pal, "正在加载文件内容...");
                     return;
                 }
 
                 if let Some(err) = &self.preview_error {
                     ui.add_space(20.0);
-                    ui.label(
-                        egui::RichText::new(format!("! {err}"))
-                            .size(12.0)
-                            .color(pal.err_text),
-                    );
+                    ui.horizontal(|ui| {
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        draw_icon_sized(
+                            ui.painter(),
+                            icon_rect.center(),
+                            Icon::AlertTriangle,
+                            pal.err_text,
+                            14.0,
+                        );
+                        ui.label(
+                            egui::RichText::new(err)
+                                .size(12.0)
+                                .color(pal.err_text),
+                        );
+                    });
                     return;
                 }
 
@@ -420,7 +541,7 @@ impl AppState {
                             if self.preview_truncated {
                                 ui.label(
                                     egui::RichText::new("文件过大，仅显示前 512KB")
-                                        .size(10.5)
+                                        .size(11.0)
                                         .color(pal.warn),
                                 );
                                 ui.add_space(4.0);
@@ -449,7 +570,7 @@ impl AppState {
                             if self.preview_truncated {
                                 ui.label(
                                     egui::RichText::new("文件过大，仅显示前 512KB")
-                                        .size(10.5)
+                                        .size(11.0)
                                         .color(pal.warn),
                                 );
                                 ui.add_space(4.0);
@@ -473,13 +594,28 @@ impl AppState {
             .inner_margin(egui::Margin::symmetric(10.0, 5.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let branch = if self.git_branch.is_empty() { "HEAD" } else { &self.git_branch };
-                    badge_pill(
-                        ui,
-                        &format!("🌿 {branch}"),
-                        pal.warn,
+                    let branch = if self.git_branch.is_empty() {
+                        "HEAD"
+                    } else {
+                        &self.git_branch
+                    };
+                    let branch_w = branch.len() as f32 * 6.8 + 30.0;
+                    let (b_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(branch_w, 20.0), egui::Sense::hover());
+                    ui.painter().rect(
+                        b_rect,
+                        egui::Rounding::same(4.0),
                         pal.warn.gamma_multiply(0.12),
-                        pal.warn.gamma_multiply(0.35),
+                        egui::Stroke::new(1.0, pal.warn.gamma_multiply(0.35)),
+                    );
+                    let ic_c = egui::pos2(b_rect.left() + 10.0, b_rect.center().y);
+                    draw_icon(ui.painter(), ic_c, Icon::GitBranch, pal.warn);
+                    ui.painter().text(
+                        egui::pos2(b_rect.left() + 20.0, b_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        branch,
+                        egui::FontId::proportional(11.0),
+                        pal.warn,
                     );
                     badge_pill(
                         ui,
@@ -489,11 +625,13 @@ impl AppState {
                         pal.border,
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(egui::RichText::new("🔄 刷新").size(11.0))
-                            .on_hover_text("重新读取 Git 工作区与未暂存变更")
-                            .clicked()
-                        {
+                        if panel_tool_button(
+                            ui,
+                            pal,
+                            Some(Icon::RefreshCw),
+                            "刷新",
+                            "重新读取 Git 工作区与未暂存变更",
+                        ) {
                             self.refresh_git_changes();
                         }
                     });
@@ -513,14 +651,7 @@ impl AppState {
             .show(ui, |ui| {
                 if !self.git_loaded {
                     ui.add_space(30.0);
-                    let secs = ui.input(|i| i.time);
-                    let spinner = ["◐", "◓", "◑", "◒"][((secs * 4.0) as usize) % 4];
-                    ui.label(
-                        egui::RichText::new(format!("{spinner} 正在查询 Git 状态..."))
-                            .size(12.0)
-                            .color(pal.accent),
-                    );
-                    ui.ctx().request_repaint();
+                    loading_line(ui, pal, "正在查询 Git 状态...");
                     return;
                 }
 
@@ -545,8 +676,14 @@ impl AppState {
                 if self.git_changes.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(50.0);
-                        let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                        draw_icon(&ui.painter(), icon_rect.center(), Icon::CheckCircle, pal.success);
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                        draw_icon(
+                            &ui.painter(),
+                            icon_rect.center(),
+                            Icon::CheckCircle,
+                            pal.success,
+                        );
                         ui.add_space(12.0);
                         ui.label(
                             egui::RichText::new("工作区代码整洁")
@@ -590,8 +727,11 @@ impl AppState {
                         egui::Sense::click(),
                     );
                     if resp.hovered() || is_active {
-                        ui.painter()
-                            .rect_filled(rect.shrink(1.0), egui::Rounding::same(4.0), pal.hover);
+                        ui.painter().rect_filled(
+                            rect.shrink(1.0),
+                            egui::Rounding::same(4.0),
+                            pal.hover,
+                        );
                     }
                     if is_active {
                         let bar = egui::Rect::from_min_size(
@@ -643,7 +783,10 @@ impl AppState {
                 // Diff 详情区
                 ui.add_space(10.0);
                 let sep2 = ui
-                    .allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover())
+                    .allocate_exact_size(
+                        egui::vec2(ui.available_width(), 1.0),
+                        egui::Sense::hover(),
+                    )
                     .0;
                 ui.painter().rect_filled(sep2, 0.0, pal.border);
                 ui.add_space(6.0);
@@ -658,11 +801,13 @@ impl AppState {
                                 .color(pal.text),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button(egui::RichText::new("📋 复制 Diff").size(11.0))
-                                .on_hover_text("复制当前文件的 Unified Diff 补丁内容")
-                                .clicked()
-                            {
+                            if panel_tool_button(
+                                ui,
+                                pal,
+                                Some(Icon::Copy),
+                                "复制 Diff",
+                                "复制当前文件的 Unified Diff 补丁内容",
+                            ) {
                                 ui.ctx().copy_text(diff.clone());
                                 self.note = "已复制 Diff 内容到剪贴板".into();
                             }
@@ -673,7 +818,11 @@ impl AppState {
                     render_diff_viewer(ui, pal, diff);
                 } else if self.preview_rx.is_some() {
                     ui.add_space(16.0);
-                    ui.label(egui::RichText::new("正在加载 Diff 对比...").size(11.5).color(pal.dim));
+                    ui.label(
+                        egui::RichText::new("正在加载 Diff 对比...")
+                            .size(11.5)
+                            .color(pal.dim),
+                    );
                 } else {
                     ui.add_space(16.0);
                     ui.label(
@@ -701,23 +850,7 @@ impl AppState {
                         pal.accent.gamma_multiply(0.35),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.busy {
-                            badge_pill(
-                                ui,
-                                "● 正在执行",
-                                pal.accent,
-                                pal.accent.gamma_multiply(0.15),
-                                pal.accent,
-                            );
-                        } else {
-                            badge_pill(
-                                ui,
-                                "○ 就绪空闲",
-                                pal.success,
-                                pal.success.gamma_multiply(0.15),
-                                pal.success,
-                            );
-                        }
+                        telemetry_status_badge(ui, pal, self.busy);
                     });
                 });
             });
@@ -743,12 +876,16 @@ impl AppState {
                         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("🎯 执行意图与阶段目标")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(pal.text),
-                            );
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::Target, pal.accent);
+                                ui.label(
+                                    egui::RichText::new("执行意图与阶段目标")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(pal.text),
+                                );
+                            });
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 badge_pill(
@@ -786,38 +923,42 @@ impl AppState {
                         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("🛡️ 门禁与验证指标")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(pal.text),
-                            );
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::ShieldCheck, pal.accent);
+                                ui.label(
+                                    egui::RichText::new("门禁与验证指标")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(pal.text),
+                                );
+                            });
                             ui.add_space(6.0);
                             ui.horizontal_wrapped(|ui| {
                                 badge_pill(
                                     ui,
-                                    &format!("✓ 已验证: {}", projection.verified_count),
+                                    &format!("已验证: {}", projection.verified_count),
                                     pal.success,
                                     pal.success.gamma_multiply(0.12),
                                     pal.success.gamma_multiply(0.35),
                                 );
                                 badge_pill(
                                     ui,
-                                    &format!("! 阻塞中: {}", projection.blocked_count),
+                                    &format!("阻塞中: {}", projection.blocked_count),
                                     pal.warn,
                                     pal.warn.gamma_multiply(0.12),
                                     pal.warn.gamma_multiply(0.35),
                                 );
                                 badge_pill(
                                     ui,
-                                    &format!("? 无信息: {}", projection.no_information_count),
+                                    &format!("无信息: {}", projection.no_information_count),
                                     pal.dim,
                                     pal.hover,
                                     pal.border,
                                 );
                                 badge_pill(
                                     ui,
-                                    &format!("↺ 校正中: {}", projection.correction_count),
+                                    &format!("校正中: {}", projection.correction_count),
                                     pal.purple,
                                     pal.purple.gamma_multiply(0.12),
                                     pal.purple.gamma_multiply(0.35),
@@ -846,24 +987,36 @@ impl AppState {
                         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("💡 当前工作项与假设")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(pal.text),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(format!("🔨 当前工作: {}", projection.active_work_item))
-                                    .size(11.5)
-                                    .color(pal.text),
-                            );
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::Sparkles, pal.accent);
+                                ui.label(
+                                    egui::RichText::new("当前工作项与假设")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(pal.text),
+                                );
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::Wrench, pal.text);
+                                ui.label(
+                                    egui::RichText::new(format!("当前工作: {}", projection.active_work_item))
+                                        .size(11.5)
+                                        .color(pal.text),
+                                );
+                            });
                             ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(format!("💡 待验假设: {}", projection.active_hypothesis))
-                                    .size(11.0)
-                                    .color(pal.dim),
-                            );
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::Brain, pal.dim);
+                                ui.label(
+                                    egui::RichText::new(format!("待验假设: {}", projection.active_hypothesis))
+                                        .size(11.0)
+                                        .color(pal.dim),
+                                );
+                            });
                         });
 
                     ui.add_space(8.0);
@@ -876,12 +1029,16 @@ impl AppState {
                             .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                             .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("📋 DAG 工作项分解")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(pal.text),
-                                );
+                                ui.horizontal(|ui| {
+                                    let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                    draw_icon(ui.painter(), icon_rect.center(), Icon::ListTree, pal.accent);
+                                    ui.label(
+                                        egui::RichText::new("DAG 工作项分解")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(pal.text),
+                                    );
+                                });
                                 ui.add_space(4.0);
                                 for item in &projection.work_items {
                                     ui.horizontal(|ui| {
@@ -900,7 +1057,7 @@ impl AppState {
                                         );
                                         ui.label(
                                             egui::RichText::new(format!("(证据 {})", item.evidence_count))
-                                                .size(10.5)
+                                                .size(11.0)
                                                 .color(pal.dim),
                                         );
                                     });
@@ -917,12 +1074,16 @@ impl AppState {
                         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("🔑 门禁允许工具")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(pal.text),
-                            );
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::Key, pal.accent);
+                                ui.label(
+                                    egui::RichText::new("门禁允许工具")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(pal.text),
+                                );
+                            });
                             ui.add_space(4.0);
                             if projection.allowed_tools.is_empty() {
                                 ui.label(egui::RichText::new("无（任务进入收尾验收阶段）").size(11.0).color(pal.dim));
@@ -949,12 +1110,16 @@ impl AppState {
                         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                         .inner_margin(egui::Margin::symmetric(12.0, 12.0))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("📊 会话资源消耗统计")
-                                    .size(12.5)
-                                    .strong()
-                                    .color(pal.text),
-                            );
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::BarChart, pal.accent);
+                                ui.label(
+                                    egui::RichText::new("会话资源消耗统计")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(pal.text),
+                                );
+                            });
                             ui.add_space(8.0);
                             ui.horizontal_wrapped(|ui| {
                                 badge_pill(
@@ -981,12 +1146,16 @@ impl AppState {
                             });
 
                             ui.add_space(14.0);
-                            ui.label(
-                                egui::RichText::new("💡 智能体遥测提示")
-                                    .size(11.5)
-                                    .strong()
-                                    .color(pal.dim),
-                            );
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                draw_icon(ui.painter(), icon_rect.center(), Icon::Sparkles, pal.dim);
+                                ui.label(
+                                    egui::RichText::new("智能体遥测提示")
+                                        .size(11.5)
+                                        .strong()
+                                        .color(pal.dim),
+                                );
+                            });
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new(
@@ -1183,7 +1352,7 @@ impl AppState {
                     } else {
                         "文件树".to_string()
                     };
-                    ui.label(egui::RichText::new(title).size(12.5).color(pal.text));
+                    ui.label(egui::RichText::new(title).size(12.0).color(pal.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if close_button(ui, pal) {
                             self.tree_open = false;
@@ -1322,20 +1491,25 @@ impl AppState {
                 }
                 ui.label(
                     egui::RichText::new(format!("查询工作区：{}", self.git_workspace))
-                        .size(10.5)
+                        .size(11.0)
                         .color(pal.dim),
                 );
                 return;
             }
             ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "✨ 工作区干净，无未提交变更 · {}",
-                    self.git_workspace
-                ))
-                .size(12.0)
-                .color(pal.accent),
-            );
+            ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                draw_icon(ui.painter(), rect.center(), Icon::Sparkles, pal.accent);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "工作区干净，无未提交变更 · {}",
+                        self.git_workspace
+                    ))
+                    .size(12.0)
+                    .color(pal.accent),
+                );
+            });
             return;
         }
         let mut open_diff: Option<String> = None;
@@ -1462,35 +1636,21 @@ impl AppState {
         let text_x = icon_x + 16.0;
 
         if node.is_dir {
-            // 矢量三角箭头（不用 Unicode 字符）
-            let arrow_size = 3.5;
-            let arrow_x = icon_x;
-            let arrow_color = if hovered || expanded {
-                pal.text
-            } else {
-                pal.dim
-            };
-            if expanded {
-                let pts = vec![
-                    egui::pos2(arrow_x, center_y - arrow_size),
-                    egui::pos2(arrow_x + arrow_size * 2.0, center_y - arrow_size),
-                    egui::pos2(arrow_x + arrow_size, center_y + arrow_size),
-                ];
-                ui.painter().add(egui::Shape::closed_line(
-                    pts,
-                    egui::Stroke::new(1.0_f32, arrow_color),
-                ));
-            } else {
-                let pts = vec![
-                    egui::pos2(arrow_x, center_y - arrow_size),
-                    egui::pos2(arrow_x, center_y + arrow_size),
-                    egui::pos2(arrow_x + arrow_size, center_y),
-                ];
-                ui.painter().add(egui::Shape::closed_line(
-                    pts,
-                    egui::Stroke::new(1.0_f32, arrow_color),
-                ));
-            }
+            draw_icon_sized(
+                ui.painter(),
+                egui::pos2(icon_x + 4.0, center_y),
+                if expanded {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                if hovered || expanded {
+                    pal.text
+                } else {
+                    pal.dim
+                },
+                10.0,
+            );
 
             // 目录名
             ui.painter().text(
@@ -1528,10 +1688,14 @@ impl AppState {
                 }
             }
         } else {
-            // git 有未提交变化的文件：文件名左侧画橙色小圆点色块。
             if node.dirty {
-                ui.painter()
-                    .circle_filled(egui::pos2(text_x - 7.0, center_y), 3.2, pal.warn);
+                draw_icon_sized(
+                    ui.painter(),
+                    egui::pos2(text_x - 7.0, center_y),
+                    Icon::CircleDot,
+                    pal.warn,
+                    8.0,
+                );
             }
             ui.painter().text(
                 egui::pos2(text_x, center_y),
@@ -1544,7 +1708,7 @@ impl AppState {
                 *clicked_path = Some(node.path.clone());
             }
             resp.context_menu(|ui| {
-                if ui.button("📎 添加到对话框附件").clicked() {
+                if ui.button("添加到对话框附件").clicked() {
                     *attachment_path = Some(node.path.clone());
                     ui.close_menu();
                 }
@@ -1681,9 +1845,7 @@ fn render_diff_viewer(ui: &mut egui::Ui, pal: &Palette, diff: &str) {
             crate::preview::DiffLineKind::Del => {
                 (pal.diff_del_bg, pal.text, "-", pal.diff_sign_del)
             }
-            crate::preview::DiffLineKind::Hunk => {
-                (pal.diff_hunk_bg, pal.accent, "@", pal.accent)
-            }
+            crate::preview::DiffLineKind::Hunk => (pal.diff_hunk_bg, pal.accent, "@", pal.accent),
             crate::preview::DiffLineKind::Meta => {
                 (egui::Color32::TRANSPARENT, pal.dim, "", pal.dim)
             }

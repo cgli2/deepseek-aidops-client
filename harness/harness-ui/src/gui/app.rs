@@ -22,11 +22,20 @@ impl eframe::App for AppState {
         visuals.window_fill = pal.panel;
         visuals.extreme_bg_color = pal.field;
         visuals.widgets.noninteractive.bg_fill = pal.panel;
+        // 关键：非交互分割线（ui.separator() 等）强制统一为主题 pal.line 发丝线，
+        // 根治默认退化为纯灰色 #3c3c3c 的暗黑生硬边框问题。
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, pal.line);
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, pal.border);
+        visuals.window_rounding = egui::Rounding::same(8.0);
         visuals.widgets.inactive.bg_fill = pal.field;
         visuals.selection.bg_fill = pal.user_bubble;
         // 下拉 / 选择控件统一主题化：按钮底色、描边、悬停、弹出菜单背景与圆角全部跟主题走，
-        // 不再使用 egui 默认灰块风格。
-        visuals.menu_rounding = egui::Rounding::same(8.0);
+        // 不再使用 egui 默认灰块风格，严格对齐 macOS 规范。
+        visuals.menu_rounding = egui::Rounding::same(6.0);
+        visuals.widgets.inactive.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.active.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.open.rounding = egui::Rounding::same(5.0);
         visuals.popup_shadow = egui::epaint::Shadow {
             offset: egui::vec2(0.0, 6.0),
             blur: 16.0,
@@ -51,6 +60,7 @@ impl eframe::App for AppState {
         let chrome_colors = crate::window_chrome::ChromeColors {
             fill: pal.head_fill,
             border: pal.head_border,
+            line: pal.line,
             text: pal.text,
             dim: pal.dim,
             accent: pal.accent,
@@ -59,6 +69,7 @@ impl eframe::App for AppState {
             warn: pal.warn,
             #[cfg(target_os = "windows")]
             hover: pal.hover,
+            is_dark: pal.is_dark,
         };
         let integrated_titlebar_setting = self.host.settings.get("ui.integrated_titlebar");
         let integrated_titlebar = crate::window_chrome::integrated_titlebar_enabled(
@@ -151,14 +162,14 @@ impl eframe::App for AppState {
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("确定").clicked() {
+                        if widgets::accent_button(ui, &pal, "确定") {
                             if let Some(dir) = self.history_dirs.get(&file).cloned() {
                                 harness_session::rename_session(&dir, &file, &self.rename_buf);
                                 self.refresh_history();
                             }
                             self.renaming = None;
                         }
-                        if ui.button("取消").clicked() {
+                        if widgets::ghost_button(ui, &pal, "取消") {
                             self.renaming = None;
                         }
                     });

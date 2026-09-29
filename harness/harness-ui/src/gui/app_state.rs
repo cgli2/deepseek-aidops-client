@@ -804,7 +804,7 @@ impl AppState {
             .into_iter()
             .rev()
             .collect();
-        let text = format!("💭 {preview}…");
+        let text = format!("{preview}…");
         if let Some(last) = self.messages.last_mut() {
             if last.kind == "thinking" {
                 last.text = text;

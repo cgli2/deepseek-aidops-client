@@ -55,13 +55,13 @@ impl AppState {
             UpdateStatus::ReadyToRestart { version, .. } => {
                 egui::Frame::default()
                     .fill(pal.banner_ok)
-                    .rounding(egui::Rounding::same(12.0))
+                    .rounding(egui::Rounding::same(6.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("已下载 v{version}，重启后生效"))
-                                    .size(12.5)
+                                    .size(12.0)
                                     .strong()
                                     .color(pal.text),
                             );
@@ -289,7 +289,11 @@ impl AppState {
         // 目标执行框架开关：同样持久化 + 即时写入进程级开关（每个 turn 读取）。
         let _ = settings.set(
             "runtime.goal_executor_enabled",
-            if self.f_goal_executor { "true" } else { "false" },
+            if self.f_goal_executor {
+                "true"
+            } else {
+                "false"
+            },
         );
         harness_core::tuning::set_goal_executor_enabled(Some(self.f_goal_executor));
         self.host.sink.set_permission(self.permission.clone());

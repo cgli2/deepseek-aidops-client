@@ -37,13 +37,14 @@ fn push_line(lines: &mut Vec<String>, e: &SessionEvent) {
                 lines.push(format!("[tool_call {}]", tc.name));
             }
         }
-        SessionEvent::ToolCall { call, .. } => lines.push(format!("→ calling {}", call.name)),
+        SessionEvent::ToolCall { call, .. } => {
+            lines.push(format!("[工具调用] {}", call.name));
+        }
         SessionEvent::ToolResult { result, .. } => {
             let preview: String = result.content.chars().take(200).collect();
             lines.push(format!(
-                "← tool {}: {}",
-                if result.ok { "ok" } else { "ERR" },
-                preview
+                "[工具结果：{}] {preview}",
+                if result.ok { "成功" } else { "失败" },
             ));
         }
         SessionEvent::TurnEnd { .. } => lines.push("--- turn end ---".into()),
@@ -132,9 +133,9 @@ impl Ui for TuiUi {
                     f.render_widget(editor, chunks[1]);
 
                     let status = if busy {
-                        "● 正在处理，按 Esc 可随时停止"
+                        "正在处理，按 Esc 可随时停止"
                     } else {
-                        "● 就绪 · Enter 发送 · Esc 停止 · q 退出"
+                        "就绪 | Enter 发送 | Esc 停止 | q 退出"
                     };
                     let bar = Paragraph::new(status).style(
                         Style::default()

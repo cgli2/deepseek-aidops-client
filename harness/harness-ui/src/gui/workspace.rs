@@ -591,7 +591,7 @@ fn render_council_card(ui: &mut egui::Ui, council: &CouncilUi, max_w: f32, pal: 
                 ui.set_width(card_w);
                 egui::Frame::default()
                     .fill(pal.panel)
-                    .rounding(egui::Rounding::same(12.0))
+                    .rounding(egui::Rounding::same(8.0))
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         if failed > 0 { pal.warn } else { pal.accent },
@@ -786,7 +786,7 @@ pub(super) fn render_pending_queue(ui: &mut egui::Ui, state: &mut AppState, pal:
         .gamma_multiply(if state.dark { 0.16 } else { 0.10 });
     egui::Frame::default()
         .fill(queue_fill)
-        .rounding(egui::Rounding::same(9.0))
+        .rounding(egui::Rounding::same(8.0))
         .stroke(egui::Stroke::new(1.0_f32, pal.warn))
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
@@ -1331,7 +1331,7 @@ fn render_tool_action_block(
                         egui::pos2(t_draw.left() + 16.0, t_draw.center().y),
                         egui::Align2::LEFT_CENTER,
                         toggle_label,
-                        egui::FontId::proportional(10.5),
+                        egui::FontId::proportional(fonts::FONT_CAPTION),
                         lerp_color(pal.dim, pal.text, t_hov),
                     );
                     if t_resp.clicked() {
@@ -1569,7 +1569,7 @@ fn render_delivery_banner(ui: &mut egui::Ui, delivery: &DeliveryUi, pal: &Palett
     ui.add_space(4.0);
     egui::Frame::default()
         .fill(fill)
-        .rounding(egui::Rounding::same(5.0))
+        .rounding(egui::Rounding::same(8.0))
         .stroke(egui::Stroke::new(1.0_f32, border_color))
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {

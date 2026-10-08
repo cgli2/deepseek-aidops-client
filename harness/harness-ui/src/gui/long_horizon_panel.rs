@@ -1,8 +1,45 @@
 //! Long-horizon task status, submission, and durable HITL decisions.
 
-use super::widgets::compact_button;
+use super::fonts::{FONT_CAPTION, FONT_SECONDARY, FONT_TITLE, FONT_UI};
+use super::theme::Palette;
+use super::widgets::{accent_button_ex, compact_button};
 use super::*;
 use harness_runtime::{CheckpointState, TaskStatus};
+
+fn render_capsule_progress(ui: &mut egui::Ui, pal: &Palette, pct: f32) {
+    let height = 6.0;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width() - 50.0, height),
+            egui::Sense::hover(),
+        );
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(3.0), pal.field);
+        ui.painter().rect(
+            rect,
+            egui::Rounding::same(3.0),
+            egui::Color32::TRANSPARENT,
+            egui::Stroke::new(1.0, pal.card_border),
+        );
+        let clamped = pct.clamp(0.0, 1.0);
+        if clamped > 0.005 {
+            let fill_w = (rect.width() * clamped).max(6.0);
+            let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, height));
+            let fill_col = if clamped >= 0.999 {
+                pal.success
+            } else {
+                pal.accent
+            };
+            ui.painter()
+                .rect_filled(fill_rect, egui::Rounding::same(3.0), fill_col);
+        }
+        ui.label(
+            egui::RichText::new(format!("{:.0}%", clamped * 100.0))
+                .size(FONT_CAPTION)
+                .color(pal.dim),
+        );
+    });
+}
 
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
     if !state.lha_open {
@@ -42,25 +79,24 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
         .min_width(560.0)
         .resizable(true)
         .show(ctx, |ui| {
-            super::self_monitor_panel::show(ui, &state.active_project);
+            super::self_monitor_panel::show(ui, &state.active_project, &pal);
+            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("持久化执行、恢复状态与人工决策")
-                    .size(12.0)
+                    .size(FONT_SECONDARY)
                     .color(pal.dim),
             );
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.add(
                 egui::TextEdit::multiline(&mut state.lha_prompt)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY)
                     .hint_text("输入需要长时间自主执行的目标…"),
             );
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let enabled = runtime.is_some() && !state.lha_prompt.trim().is_empty();
-                if ui
-                    .add_enabled(enabled, egui::Button::new("提交长任务"))
-                    .clicked()
-                {
+                if accent_button_ex(ui, &pal, "提交长任务", enabled) {
                     submit_requested = true;
                 }
                 if state.host.sink.any_busy() {
@@ -74,22 +110,32 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(&state.lha_note)
-                        .size(11.0)
+                        .size(FONT_CAPTION)
                         .color(pal.dim),
                 );
             }
 
-            ui.separator();
+            ui.add_space(8.0);
+            let sep_rect = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover()).0;
+            ui.painter().rect_filled(sep_rect, 0.0, pal.line);
+            ui.add_space(8.0);
+
             let pending: Vec<_> = decisions
                 .iter()
                 .filter(|item| item.state == CheckpointState::Pending)
                 .collect();
-            ui.heading(format!("待人工确认 ({})", pending.len()));
+            ui.label(
+                egui::RichText::new(format!("待人工确认 ({})", pending.len()))
+                    .size(FONT_TITLE)
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.add_space(4.0);
             if pending.is_empty() {
-                ui.label(egui::RichText::new("当前没有待确认检查点").color(pal.dim));
+                ui.label(egui::RichText::new("当前没有待确认检查点").size(FONT_SECONDARY).color(pal.dim));
             } else {
                 ui.horizontal(|ui| {
-                    ui.label("操作人");
+                    ui.label(egui::RichText::new("操作人:").size(FONT_UI).color(pal.dim));
                     ui.text_edit_singleline(&mut state.lha_actor);
                 });
                 ui.add(
@@ -97,16 +143,18 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                         .desired_width(f32::INFINITY)
                         .hint_text("审批说明（建议填写）"),
                 );
+                ui.add_space(4.0);
                 for checkpoint in pending {
                     egui::Frame::default()
                         .fill(pal.field)
                         .rounding(egui::Rounding::same(8.0))
-                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                        .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                         .inner_margin(egui::Margin::same(10.0))
                         .show(ui, |ui| {
                             ui.label(
                                 egui::RichText::new(&checkpoint.subject)
                                     .strong()
+                                    .size(FONT_UI)
                                     .color(pal.text),
                             );
                             ui.label(
@@ -116,9 +164,10 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                     checkpoint.kind,
                                     checkpoint.shadow_artifact
                                 ))
-                                .size(11.0)
+                                .size(FONT_CAPTION)
                                 .color(pal.dim),
                             );
+                            ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 if compact_button(ui, &pal, "批准") {
                                     decision = Some((true, checkpoint.checkpoint_id.clone()));
@@ -132,26 +181,37 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                 }
             }
 
-            ui.separator();
-            ui.heading(format!("任务状态 ({})", tasks.len()));
+            ui.add_space(8.0);
+            let sep_rect2 = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover()).0;
+            ui.painter().rect_filled(sep_rect2, 0.0, pal.line);
+            ui.add_space(8.0);
+
+            ui.label(
+                egui::RichText::new(format!("任务状态 ({})", tasks.len()))
+                    .size(FONT_TITLE)
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.add_space(4.0);
             egui::ScrollArea::vertical()
                 .id_salt("long_horizon_tasks")
                 .max_height(300.0)
                 .show(ui, |ui| {
                     if tasks.is_empty() {
-                        ui.label(egui::RichText::new("当前项目尚无长时程任务").color(pal.dim));
+                        ui.label(egui::RichText::new("当前项目尚无长时程任务").size(FONT_SECONDARY).color(pal.dim));
                     }
                     for task in tasks.iter().take(100) {
                         egui::Frame::default()
                             .fill(pal.field)
                             .rounding(egui::Rounding::same(8.0))
-                            .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                            .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
                             .inner_margin(egui::Margin::same(10.0))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(&task.spec.task_id)
                                             .strong()
+                                            .size(FONT_UI)
                                             .color(pal.text),
                                     );
                                     ui.with_layout(
@@ -159,28 +219,30 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         |ui| {
                                             ui.label(
                                                 egui::RichText::new(status_text(&task.status))
+                                                    .size(FONT_CAPTION)
                                                     .color(status_color(&task.status, pal)),
                                             );
                                         },
                                     );
                                 });
-                                ui.add(
-                                    egui::ProgressBar::new(
-                                        (task.progress_pct / 100.0).clamp(0.0, 1.0),
-                                    )
-                                    .show_percentage(),
+                                ui.add_space(4.0);
+                                render_capsule_progress(
+                                    ui,
+                                    &pal,
+                                    (task.progress_pct / 100.0).clamp(0.0, 1.0),
                                 );
+                                ui.add_space(2.0);
                                 let note = task.last_note.as_deref().unwrap_or("暂无进度说明");
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "重试 {} / {} · {note}",
                                         task.retry_count, task.spec.max_retries
                                     ))
-                                    .size(11.0)
+                                    .size(FONT_CAPTION)
                                     .color(pal.dim),
                                 );
                                 if let Some(detail) = status_detail(&task.status) {
-                                    ui.label(egui::RichText::new(detail).size(11.0).color(pal.dim));
+                                    ui.label(egui::RichText::new(detail).size(FONT_CAPTION).color(pal.dim));
                                 }
                             });
                         ui.add_space(6.0);

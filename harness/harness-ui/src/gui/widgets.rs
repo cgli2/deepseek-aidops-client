@@ -36,6 +36,66 @@ pub(crate) fn animate_interaction(
     (hover_t, active_t)
 }
 
+/// 绘制 Apple 风格顶边 1.0px Specular Highlight 天光内发丝高光（增强视窗与卡片的立体物理景深）
+pub(crate) fn draw_specular_highlight(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    rounding: egui::Rounding,
+    highlight_color: egui::Color32,
+) {
+    if highlight_color == egui::Color32::TRANSPARENT || !rect.is_positive() {
+        return;
+    }
+    let inset_x = (rounding.nw.max(rounding.ne) * 0.75).clamp(1.0, 8.0);
+    let y = rect.min.y + 0.5;
+    let p1 = egui::pos2(rect.min.x + inset_x, y);
+    let p2 = egui::pos2(rect.max.x - inset_x, y);
+    if p2.x > p1.x {
+        painter.line_segment([p1, p2], egui::Stroke::new(1.0, highlight_color));
+    }
+}
+
+/// 绘制 macOS Aqua 外发光双层焦点环（2.0px 外扩柔光光晕，清晰提示键盘与交互聚焦）
+pub(crate) fn draw_focus_ring(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    rounding: egui::Rounding,
+    ring_color: egui::Color32,
+    halo_color: egui::Color32,
+) {
+    if ring_color == egui::Color32::TRANSPARENT || !rect.is_positive() {
+        return;
+    }
+    // 外层柔光光晕 (halo)
+    let halo_rect = rect.expand(2.5);
+    let halo_rounding = egui::Rounding {
+        nw: rounding.nw + 2.5,
+        ne: rounding.ne + 2.5,
+        sw: rounding.sw + 2.5,
+        se: rounding.se + 2.5,
+    };
+    painter.rect(
+        halo_rect,
+        halo_rounding,
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(1.5, halo_color),
+    );
+    // 内层主焦点环 (ring)
+    let ring_rect = rect.expand(1.2);
+    let ring_rounding = egui::Rounding {
+        nw: rounding.nw + 1.2,
+        ne: rounding.ne + 1.2,
+        sw: rounding.sw + 1.2,
+        se: rounding.se + 1.2,
+    };
+    painter.rect(
+        ring_rect,
+        ring_rounding,
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(1.2, ring_color),
+    );
+}
+
 /// 侧栏扁平导航项：半透明微光悬停、矢量图标渐亮、按下微形变。返回是否点击。
 pub(super) fn nav_item(
     ui: &mut egui::Ui,
@@ -99,6 +159,9 @@ pub(super) fn nav_item(
             text_color,
         );
     }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
+    });
     response.clicked() && enabled
 }
 
@@ -121,6 +184,37 @@ pub(super) fn close_button(ui: &mut egui::Ui, pal: &Palette) -> bool {
     let c = rect.center() + egui::vec2(0.0, 0.3 * active_t);
     let cross_color = lerp_color(pal.dim, pal.text, hover_t);
     draw_icon(ui.painter(), c, Icon::X, cross_color);
+    resp.clicked()
+}
+
+/// 通用紧凑图标按钮（24x24，对标 macOS 工具栏图标按钮，微阻尼悬停与按下物理微缩）。
+pub(super) fn icon_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    tooltip: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    let (hover_t, active_t) = animate_interaction(ui, resp.id, &resp);
+
+    let bg_color = if active_t > 0.05 {
+        pal.translucent_active()
+    } else {
+        pal.translucent_hover(hover_t)
+    };
+    let draw_rect = rect.shrink(0.35 * active_t);
+    if bg_color != egui::Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(draw_rect, egui::Rounding::same(4.5), bg_color);
+    }
+    let icon_color = lerp_color(pal.dim, pal.text, hover_t);
+    draw_icon(ui.painter(), draw_rect.center(), icon, icon_color);
+    if !tooltip.is_empty() {
+        resp.clone().on_hover_text(tooltip);
+    }
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip)
+    });
     resp.clicked()
 }
 
@@ -185,6 +279,9 @@ pub(super) fn accent_button_ex(
         egui::FontId::proportional(FONT_UI),
         text_color,
     );
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
+    });
     enabled && resp.clicked()
 }
 
@@ -297,6 +394,9 @@ pub(super) fn ghost_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> boo
         egui::FontId::proportional(FONT_UI),
         text_color,
     );
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label)
+    });
     resp.clicked()
 }
 
@@ -351,13 +451,13 @@ pub(super) fn sidebar_icon_button(
 
 /// 带搜索图标和清除动作的侧栏搜索框。
 pub(super) fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut String) {
-    let id = ui.make_persistent_id("history_search_input");
+    let id = egui::Id::new("history_search_input");
     let focused = ui.memory(|memory| memory.has_focus(id));
     let stroke_color = if focused { pal.accent } else { pal.border };
     let mut clear = false;
-    egui::Frame::default()
+    let frame_resp = egui::Frame::default()
         .fill(pal.field)
-        .rounding(egui::Rounding::same(7.0))
+        .rounding(egui::Rounding::same(BTN_ROUNDING))
         .stroke(egui::Stroke::new(1.0_f32, stroke_color))
         .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
@@ -397,6 +497,15 @@ pub(super) fn sidebar_search_field(ui: &mut egui::Ui, pal: &Palette, value: &mut
                 }
             });
         });
+    if focused {
+        draw_focus_ring(
+            ui.painter(),
+            frame_resp.response.rect,
+            egui::Rounding::same(BTN_ROUNDING),
+            pal.focus_ring,
+            pal.focus_ring_halo,
+        );
+    }
     if clear {
         value.clear();
     }
@@ -529,8 +638,14 @@ pub(super) fn segmented_icon_tabs(
                     egui::vec2(pill_w, target_rect.height()),
                 );
 
-                // 绘制活动滑块胶囊卡片（带高亮底色与微边框）
+                // 绘制活动滑块胶囊卡片（带立体柔光投影、高亮底色与天光高光发丝）
                 if animated_pill.is_positive() {
+                    let shadow_rect = animated_pill.translate(egui::vec2(0.0, 1.0));
+                    ui.painter().rect_filled(
+                        shadow_rect,
+                        egui::Rounding::same(5.0),
+                        egui::Color32::from_black_alpha(if pal.is_dark { 50 } else { 20 }),
+                    );
                     ui.painter()
                         .rect_filled(animated_pill, egui::Rounding::same(5.0), pal.card_bg);
                     ui.painter().rect(
@@ -538,6 +653,12 @@ pub(super) fn segmented_icon_tabs(
                         egui::Rounding::same(5.0),
                         egui::Color32::TRANSPARENT,
                         egui::Stroke::new(1.0_f32, pal.card_border),
+                    );
+                    draw_specular_highlight(
+                        ui.painter(),
+                        animated_pill,
+                        egui::Rounding::same(5.0),
+                        pal.specular_highlight,
                     );
                 }
 
@@ -586,7 +707,7 @@ pub(super) fn segmented_icon_tabs(
                             text_pos,
                             egui::Align2::LEFT_CENTER,
                             opt.label,
-                            egui::FontId::proportional(11.5),
+                            egui::FontId::proportional(FONT_SECONDARY),
                             text_color,
                         );
                     } else {
@@ -594,10 +715,18 @@ pub(super) fn segmented_icon_tabs(
                             c,
                             egui::Align2::CENTER_CENTER,
                             opt.label,
-                            egui::FontId::proportional(11.5),
+                            egui::FontId::proportional(FONT_SECONDARY),
                             text_color,
                         );
                     }
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::RadioButton,
+                            true,
+                            is_sel,
+                            opt.label,
+                        )
+                    });
                 }
             });
         });
@@ -676,23 +805,36 @@ pub(super) fn settings_nav_item(
         egui::FontId::proportional(FONT_UI),
         text_color,
     );
-
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            true,
+            selected,
+            label,
+        )
+    });
     resp.clicked()
 }
 
-/// 分组设置卡片容器：工业级微圆角、微底色、细边框。
+/// 分组设置卡片容器：工业级微圆角、微底色、细边框与天光发丝高光。
 pub(super) fn settings_card<R>(
     ui: &mut egui::Ui,
     pal: &Palette,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    egui::Frame::default()
+    let frame_res = egui::Frame::default()
         .fill(pal.card_bg)
         .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
         .rounding(egui::Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-        .show(ui, add_contents)
-        .inner
+        .show(ui, add_contents);
+    draw_specular_highlight(
+        ui.painter(),
+        frame_res.response.rect,
+        egui::Rounding::same(6.0),
+        pal.specular_highlight,
+    );
+    frame_res.inner
 }
 
 /// 分组卡片内发丝级行分割线（1.0px 发丝线，macOS 层叠体系）。
@@ -756,6 +898,9 @@ pub(super) fn micro_icon_button(
 
     let color = lerp_color(pal.dim, pal.text, hover_t);
     draw_icon(ui.painter(), draw_rect.center(), icon, color);
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip)
+    });
     resp.on_hover_text(tooltip).clicked()
 }
 
@@ -829,6 +974,9 @@ pub(super) fn compact_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> b
         egui::FontId::proportional(FONT_SECONDARY),
         text_color,
     );
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label)
+    });
     resp.clicked()
 }
 

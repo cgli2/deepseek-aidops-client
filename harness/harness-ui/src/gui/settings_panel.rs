@@ -81,7 +81,7 @@ impl AppState {
                 let mandatory = rel.mandatory.unwrap_or(false);
                 egui::Frame::default()
                     .fill(pal.banner_warn)
-                    .rounding(egui::Rounding::same(12.0))
+                    .rounding(egui::Rounding::same(6.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
                         ui.vertical(|ui| {

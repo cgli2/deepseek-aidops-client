@@ -56,6 +56,12 @@ pub(super) struct Palette {
     /// 状态徽标胶囊底色
     #[allow(dead_code)]
     pub(super) badge_bg: egui::Color32,
+    /// 顶部 1.0px 发丝高光（Apple Specular Highlight 天光反射深度质感）
+    pub(crate) specular_highlight: egui::Color32,
+    /// 焦点外环主色（Aqua Focus Ring）
+    pub(crate) focus_ring: egui::Color32,
+    /// 焦点外环柔光光晕（Aqua Halo）
+    pub(crate) focus_ring_halo: egui::Color32,
     /// 是否为深色模式
     pub(crate) is_dark: bool,
 }
@@ -129,6 +135,9 @@ pub(super) fn palette(dark: bool) -> Palette {
             info: C::from_rgb(0x60, 0xa5, 0xfa),
             purple: C::from_rgb(0xa7, 0x8b, 0xfa),
             badge_bg: C::from_rgb(0x18, 0x23, 0x34),
+            specular_highlight: C::from_white_alpha(32),
+            focus_ring: C::from_rgba_premultiplied(0x38, 0xbd, 0xf8, 180),
+            focus_ring_halo: C::from_rgba_premultiplied(0x38, 0xbd, 0xf8, 60),
             is_dark: true,
         }
     } else {
@@ -174,6 +183,9 @@ pub(super) fn palette(dark: bool) -> Palette {
             info: C::from_rgb(0x25, 0x63, 0xeb),
             purple: C::from_rgb(0x7c, 0x3a, 0xed),
             badge_bg: C::from_rgb(0xe2, 0xe8, 0xf0),
+            specular_highlight: C::from_white_alpha(70),
+            focus_ring: C::from_rgba_premultiplied(0x02, 0x84, 0xc7, 160),
+            focus_ring_halo: C::from_rgba_premultiplied(0x02, 0x84, 0xc7, 45),
             is_dark: false,
         }
     }

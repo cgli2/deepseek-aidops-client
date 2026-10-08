@@ -1063,7 +1063,7 @@ pub(super) fn draw_brand_logo(ui: &egui::Ui, rect: egui::Rect, expanded: bool, p
             egui::pos2(origin.x + 39.0, origin.y + 23.0),
             egui::Align2::LEFT_CENTER,
             "DESKTOP",
-            egui::FontId::proportional(8.5),
+            egui::FontId::proportional(super::fonts::FONT_MICRO),
             pal.dim,
         );
     }

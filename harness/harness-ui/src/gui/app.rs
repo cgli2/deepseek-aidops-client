@@ -31,16 +31,22 @@ impl eframe::App for AppState {
         visuals.selection.bg_fill = pal.user_bubble;
         // 下拉 / 选择控件统一主题化：按钮底色、描边、悬停、弹出菜单背景与圆角全部跟主题走，
         // 不再使用 egui 默认灰块风格，严格对齐 macOS 规范。
-        visuals.menu_rounding = egui::Rounding::same(6.0);
+        visuals.menu_rounding = egui::Rounding::same(5.0);
         visuals.widgets.inactive.rounding = egui::Rounding::same(5.0);
         visuals.widgets.hovered.rounding = egui::Rounding::same(5.0);
         visuals.widgets.active.rounding = egui::Rounding::same(5.0);
         visuals.widgets.open.rounding = egui::Rounding::same(5.0);
         visuals.popup_shadow = egui::epaint::Shadow {
-            offset: egui::vec2(0.0, 6.0),
+            offset: egui::vec2(0.0, 4.0),
             blur: 16.0,
             spread: 0.0,
-            color: egui::Color32::from_black_alpha(90),
+            color: egui::Color32::from_black_alpha(if pal.is_dark { 100 } else { 35 }),
+        };
+        visuals.window_shadow = egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 10.0),
+            blur: 28.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(if pal.is_dark { 120 } else { 45 }),
         };
         let w_stroke = egui::Stroke::new(1.0_f32, pal.border);
         let w_text = egui::Stroke::new(1.0_f32, pal.text);
@@ -56,6 +62,10 @@ impl eframe::App for AppState {
         visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, pal.accent);
         visuals.widgets.open.fg_stroke = w_text;
         ctx.set_visuals(visuals);
+        ctx.style_mut(|s| {
+            s.spacing.scroll = egui::style::ScrollStyle::floating();
+            s.spacing.menu_margin = egui::Margin::symmetric(8.0, 5.0);
+        });
 
         let chrome_colors = crate::window_chrome::ChromeColors {
             fill: pal.head_fill,
@@ -75,7 +85,108 @@ impl eframe::App for AppState {
         let integrated_titlebar = crate::window_chrome::integrated_titlebar_enabled(
             integrated_titlebar_setting.as_deref(),
         );
-        let sidebar_width = if self.sidebar_expanded { 230.0 } else { 56.0 };
+
+        // ── 跟随系统外观动态自适应 ───────────────────────────────
+        if let Some(sys_theme) = ctx.system_theme() {
+            let theme_pref = self.host.settings.get("ui.theme");
+            if theme_pref.as_deref() == Some("system") || theme_pref.is_none() {
+                let sys_dark = sys_theme == egui::Theme::Dark;
+                if self.dark != sys_dark {
+                    self.dark = sys_dark;
+                    self.rehighlight_preview();
+                }
+            }
+        }
+
+        // ── macOS 工业级全域快捷键网络 ──────────────────────────
+        let (cmd_n, cmd_comma, cmd_b, cmd_w, cmd_f, cmd_1, cmd_2, cmd_3) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::N),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)
+                    || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Backslash),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num2),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num3),
+            )
+        });
+
+        if cmd_n {
+            self.new_session();
+        }
+        if cmd_comma {
+            self.settings_open = !self.settings_open;
+        }
+        if cmd_b {
+            self.sidebar_expanded = !self.sidebar_expanded;
+        }
+        if cmd_w {
+            if self.settings_open {
+                self.settings_open = false;
+            } else if self.renaming.is_some() {
+                self.renaming = None;
+            } else if self.lha_open {
+                self.lha_open = false;
+            } else if self.preview_open {
+                self.preview_open = false;
+                self.preview_animating = true;
+            } else if self.tree_open {
+                self.tree_open = false;
+            }
+        }
+        if cmd_f {
+            if !self.sidebar_expanded {
+                self.sidebar_expanded = true;
+            }
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("history_search_input")));
+        }
+        if cmd_1 {
+            self.inspector_tab = 0;
+            if !self.preview_open {
+                self.preview_open = true;
+            }
+        }
+        if cmd_2 {
+            self.inspector_tab = 1;
+            if !self.preview_open {
+                self.preview_open = true;
+            }
+        }
+        if cmd_3 {
+            self.inspector_tab = 2;
+            if !self.preview_open {
+                self.preview_open = true;
+            }
+        }
+
+        // ── 原生文件拖拽添加附件支持 (Finder Drag & Drop) ───────
+        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped_files.is_empty() {
+            let mut added_names = Vec::new();
+            for file in dropped_files {
+                if let Some(path) = file.path {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("文件")
+                        .to_string();
+                    composer::add_attachment(self, path);
+                    added_names.push(name);
+                }
+            }
+            if !added_names.is_empty() {
+                self.note = format!("已添加拖拽附件：{}", added_names.join(", "));
+            }
+        }
+
+        let target_sidebar_width = if self.sidebar_expanded { 230.0 } else { 56.0 };
+        let sidebar_width = ctx.animate_value_with_time(
+            egui::Id::new("sidebar_width_anim"),
+            target_sidebar_width,
+            0.16,
+        );
 
         let active_project_name = self
             .projects

@@ -3,10 +3,12 @@
 use std::sync::Arc;
 
 use super::AppState;
+use super::fonts;
 use super::icons::{Icon, draw_icon, draw_icon_sized, draw_smooth_spinner};
 use super::theme::{Palette, palette};
 use super::widgets::{
-    TabOption, animate_interaction, badge_pill, close_button, lerp_color, segmented_icon_tabs,
+    TabOption, animate_interaction, badge_pill, close_button, icon_button, lerp_color,
+    segmented_icon_tabs,
 };
 
 fn loading_line(ui: &mut egui::Ui, pal: &Palette, label: &str) {
@@ -55,7 +57,7 @@ fn telemetry_status_badge(ui: &mut egui::Ui, pal: &Palette, busy: bool) {
         egui::pos2(rect.left() + 19.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(fonts::FONT_CAPTION),
         color,
     );
 }
@@ -360,7 +362,7 @@ impl AppState {
         let sep = ui
             .allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover())
             .0;
-        ui.painter().rect_filled(sep, 0.0, pal.border);
+        ui.painter().rect_filled(sep, 0.0, pal.line);
 
         // 内容区按激活 Tab 分发
         match self.inspector_tab {
@@ -1357,15 +1359,13 @@ impl AppState {
                         if close_button(ui, pal) {
                             self.tree_open = false;
                         }
-                        // R 按钮：Git 变更视图 = 切回文件树；文件树视图 = 刷新文件树。
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new("R").size(12.0)))
-                            .on_hover_text(if self.tree_show_git {
-                                "切回文件树"
-                            } else {
-                                "刷新文件树"
-                            })
-                            .clicked()
+                        // 刷新/切回按钮：Git 变更视图 = 切回文件树；文件树视图 = 刷新文件树。
+                        let (refresh_icon, refresh_tip) = if self.tree_show_git {
+                            (Icon::Folder, "切回文件树")
+                        } else {
+                            (Icon::RefreshCw, "刷新文件树")
+                        };
+                        if icon_button(ui, pal, refresh_icon, refresh_tip)
                         {
                             if self.tree_show_git {
                                 self.tree_show_git = false;
@@ -1555,7 +1555,7 @@ impl AppState {
                 badge.center(),
                 egui::Align2::CENTER_CENTER,
                 mark,
-                egui::FontId::monospace(10.5),
+                egui::FontId::monospace(fonts::FONT_CAPTION),
                 mcolor,
             );
             // 路径
@@ -1657,7 +1657,7 @@ impl AppState {
                 egui::pos2(text_x, center_y),
                 egui::Align2::LEFT_CENTER,
                 &node.name,
-                egui::FontId::proportional(12.5),
+                egui::FontId::proportional(fonts::FONT_UI),
                 pal.text,
             );
             // 子节点数量提示
@@ -1701,7 +1701,7 @@ impl AppState {
                 egui::pos2(text_x, center_y),
                 egui::Align2::LEFT_CENTER,
                 &node.name,
-                egui::FontId::proportional(12.5),
+                egui::FontId::proportional(fonts::FONT_UI),
                 if is_active { pal.text } else { pal.dim },
             );
             if resp.clicked() {
@@ -1866,7 +1866,7 @@ fn render_diff_viewer(ui: &mut egui::Ui, pal: &Palette, diff: &str) {
                 egui::pos2(row_rect.min.x + 8.0, cy),
                 egui::Align2::LEFT_CENTER,
                 sign,
-                egui::FontId::monospace(11.5),
+                egui::FontId::monospace(fonts::FONT_CODE),
                 sign_color,
             );
         }
@@ -1875,7 +1875,7 @@ fn render_diff_viewer(ui: &mut egui::Ui, pal: &Palette, diff: &str) {
             egui::pos2(row_rect.min.x + 22.0, cy),
             egui::Align2::LEFT_CENTER,
             text_content,
-            egui::FontId::monospace(11.5),
+            egui::FontId::monospace(fonts::FONT_CODE),
             fg,
         );
     }

@@ -7,9 +7,10 @@
 //! - 点击符号或关系 chip 可在图谱内跳转（选中详情面板展示 调用方/被调方 导航）；
 //! - 渲染函数是纯 UI：不持有数据服务，只消费传入的 `&[CodeSymbol]` 与选中项。
 
+use super::fonts;
 use super::icons::{Icon, draw_icon_sized};
 use super::theme::Palette;
-use super::widgets::close_button;
+use super::widgets::{BTN_HEIGHT_REGULAR, close_button};
 use harness_capability::assets::CodeSymbol;
 
 /// 类型 → (标签, 主题色)。未知类型归为「符号」，保证每个符号都有颜色可读的徽标。
@@ -188,25 +189,25 @@ fn render_stats(ui: &mut egui::Ui, pal: &Palette, symbols: &[CodeSymbol]) {
             let w = 92.0;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 46.0), egui::Sense::hover());
             ui.painter()
-                .rect_filled(rect, egui::Rounding::same(9.0), pal.field);
+                .rect_filled(rect, egui::Rounding::same(6.0), pal.field);
             ui.painter().rect(
                 rect,
-                egui::Rounding::same(9.0),
+                egui::Rounding::same(6.0),
                 egui::Color32::TRANSPARENT,
-                egui::Stroke::new(1.0_f32, pal.border),
+                egui::Stroke::new(1.0_f32, pal.card_border),
             );
             ui.painter().text(
                 egui::pos2(rect.min.x + 12.0, rect.center().y - 6.0),
                 egui::Align2::LEFT_CENTER,
                 format!("{n}"),
-                egui::FontId::proportional(18.0),
+                egui::FontId::proportional(fonts::FONT_DISPLAY),
                 pal.text,
             );
             ui.painter().text(
                 egui::pos2(rect.min.x + 12.0, rect.center().y + 11.0),
                 egui::Align2::LEFT_CENTER,
                 label,
-                egui::FontId::proportional(10.5),
+                egui::FontId::proportional(fonts::FONT_CAPTION),
                 pal.dim,
             );
             ui.add_space(6.0);
@@ -232,12 +233,12 @@ fn count_badge(ui: &mut egui::Ui, pal: &Palette, n: usize) {
     let w = 14.0 + text.chars().count() as f32 * 8.5;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::hover());
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(9.0), pal.hover);
+        .rect_filled(rect, egui::Rounding::same(4.0), pal.hover);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         &text,
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(fonts::FONT_CAPTION),
         pal.dim,
     );
 }
@@ -254,10 +255,10 @@ fn symbol_row(
     let (kind_label, kind_color) = kind_style(&sym.kind);
     let is_sel = sel.as_ref().is_some_and(|id| id == &sym.id);
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), BTN_HEIGHT_REGULAR), egui::Sense::click());
     if is_sel || resp.hovered() {
         ui.painter()
-            .rect_filled(rect.shrink(1.0), egui::Rounding::same(7.0), pal.hover);
+            .rect_filled(rect.shrink(1.0), egui::Rounding::same(5.0), pal.hover);
     }
     if is_sel {
         // 左侧 accent 竖条标识选中。
@@ -318,7 +319,7 @@ fn symbol_row(
         egui::pos2(rect.max.x - 12.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
         &rel,
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(fonts::FONT_CAPTION),
         pal.dim,
     );
     if resp.hovered() {
@@ -378,8 +379,8 @@ fn detail_panel(
     let mut out_rect = ui.min_rect();
     egui::Frame::default()
         .fill(pal.field)
-        .rounding(egui::Rounding::same(10.0))
-        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .rounding(egui::Rounding::same(8.0))
+        .stroke(egui::Stroke::new(1.0_f32, pal.card_border))
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             out_rect = ui.min_rect();
@@ -485,7 +486,7 @@ fn chip_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
     };
     ui.painter().rect(
         rect,
-        egui::Rounding::same(10.0),
+        egui::Rounding::same(4.0),
         fill,
         egui::Stroke::new(1.0_f32, stroke_color),
     );
@@ -493,7 +494,7 @@ fn chip_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> bool {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(fonts::FONT_CAPTION),
         if resp.hovered() { pal.accent } else { pal.text },
     );
     if resp.hovered() {
@@ -507,12 +508,12 @@ fn chip_text(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     let text_w = label.chars().count() as f32 * 7.2 + 16.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(text_w, 20.0), egui::Sense::hover());
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(10.0), pal.field);
+        .rect_filled(rect, egui::Rounding::same(4.0), pal.field);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(fonts::FONT_CAPTION),
         pal.dim,
     );
 }

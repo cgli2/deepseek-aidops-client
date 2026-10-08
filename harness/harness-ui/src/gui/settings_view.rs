@@ -3,9 +3,9 @@
 use super::icons::{Icon, draw_icon_sized, draw_smooth_spinner};
 use super::model::PluginKind;
 use super::widgets::{
-    accent_button, accent_button_ex, close_button, compact_button, field_label, ghost_button,
-    menu_check_item, micro_icon_button, segmented_tabs, settings_card, settings_hairline,
-    settings_nav_item, settings_row,
+    accent_button, accent_button_ex, close_button, compact_button, draw_specular_highlight,
+    field_label, ghost_button, menu_check_item, micro_icon_button, segmented_tabs, settings_card,
+    settings_hairline, settings_nav_item, settings_row,
 };
 use super::*;
 
@@ -143,6 +143,12 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
             screen.top() + ((screen.height() - panel_h) * 0.5).max(20.0),
         );
 
+        // macOS Sheet 弹性微动效：淡入蒙层与下落 12px 展开定位
+        let sheet_t = ctx.animate_bool_responsive(egui::Id::new("settings_sheet_anim"), true);
+        let dim_alpha = (130.0 * sheet_t).round() as u8;
+        let y_offset = (1.0 - sheet_t) * 12.0;
+        let animated_panel_pos = egui::pos2(panel_pos.x, panel_pos.y - y_offset);
+
         // 蒙层：纯装饰压暗（直接画到 Background 层，不注册任何交互控件）。
         // 不能用带 Sense 的 Area 做蒙层：egui 0.30 会给 interactable Area 自动注册
         // 覆盖整个区域的“置顶点击”控件（area.rs move_response），抢占面板交互并自动
@@ -151,7 +157,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
             egui::Order::Middle,
             egui::Id::new("modal_dim"),
         ))
-        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(130));
+        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(dim_alpha));
 
         // 点面板外关闭：原始输入判定（本帧不注册任何全屏交互控件，不与面板抢事件）。
         // modal_open_last_frame 守卫：打开当帧的 press 是侧栏触发点击，不得误关。
@@ -173,7 +179,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
         // 切勿用 Tooltip：下拉菜单开在 Foreground 层，面板若更高会把菜单整个盖住。
         egui::Area::new("settings_panel".into())
                 .order(egui::Order::Foreground)
-                .fixed_pos(panel_pos)
+                .fixed_pos(animated_panel_pos)
                 .show(ctx, |ui| {
                     egui::Frame::default()
                         .fill(pal.panel)
@@ -193,7 +199,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(display_title)
-                                        .size(14.0)
+                                        .size(fonts::FONT_TITLE)
                                         .strong()
                                         .color(pal.text),
                                 );
@@ -207,7 +213,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) {
                                         .show(ui, |ui| {
                                             ui.label(
                                                 egui::RichText::new(&state.note)
-                                                    .size(11.5)
+                                                    .size(fonts::FONT_SECONDARY)
                                                     .color(pal.accent),
                                             );
                                         });
@@ -1614,12 +1620,20 @@ if state.mem_tab == "code" {
                                     },
                                 );
                             }
-                            // 记录面板矩形：供下一帧“点外部关闭”守卫判定。
-                            state.modal_panel_rect = Some(ui.min_rect());
+                            // 记录面板矩形：供下一帧“点外部关闭”守卫判定，并绘制顶边 Specular 天光发丝高光
+                            let min_rect = ui.min_rect();
+                            state.modal_panel_rect = Some(min_rect);
+                            draw_specular_highlight(
+                                ui.painter(),
+                                min_rect,
+                                egui::Rounding::same(8.0),
+                                pal.specular_highlight,
+                            );
                         });
                 });
         state.modal_open_last_frame = true;
     } else {
+        ctx.animate_bool_responsive(egui::Id::new("settings_sheet_anim"), false);
         state.modal_open_last_frame = false;
     }
 }

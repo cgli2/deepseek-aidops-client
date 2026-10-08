@@ -3,7 +3,9 @@
 use egui::Color32;
 
 use super::icons::{Icon, draw_icon, draw_icon_sized, draw_smooth_spinner};
-use super::widgets::{animate_interaction, lerp_color, menu_check_item};
+use super::widgets::{
+    animate_interaction, draw_focus_ring, draw_specular_highlight, lerp_color, menu_check_item,
+};
 use super::*;
 
 pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> bool {
@@ -38,12 +40,18 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
             // ── 输入卡片：圆角 + 细边框 + 阴影浮起，聚焦时光晕高亮 ──
             let composer_id = egui::Id::new("composer-input");
             let is_focused = ctx.memory(|m| m.has_focus(composer_id));
+            let is_hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
+            let card_stroke_color = if is_hovering_files || is_focused {
+                pal.accent
+            } else {
+                pal.border
+            };
             let card_frame = egui::Frame::default()
                 .fill(pal.card_bg)
                 .rounding(egui::Rounding::same(8.0))
                 .stroke(egui::Stroke::new(
                     1.0_f32,
-                    if is_focused { pal.accent } else { pal.border },
+                    card_stroke_color,
                 ))
                 .inner_margin(egui::Margin {
                     left: 12.0,
@@ -57,7 +65,39 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                     spread: 0.0,
                     color: egui::Color32::from_black_alpha(if state.dark { 0x48 } else { 0x16 }),
                 });
-            card_frame.show(ui, |ui| {
+            let card_resp = card_frame.show(ui, |ui| {
+                if is_hovering_files {
+                    let (h_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 24.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(
+                        h_rect,
+                        egui::Rounding::same(5.0),
+                        pal.accent.gamma_multiply(0.12),
+                    );
+                    ui.painter().rect(
+                        h_rect,
+                        egui::Rounding::same(5.0),
+                        egui::Color32::TRANSPARENT,
+                        egui::Stroke::new(1.0, pal.accent),
+                    );
+                    draw_icon(
+                        ui.painter(),
+                        h_rect.left_center() + egui::vec2(14.0, 0.0),
+                        Icon::Paperclip,
+                        pal.accent,
+                    );
+                    ui.painter().text(
+                        h_rect.left_center() + egui::vec2(28.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "释放以添加为附件",
+                        egui::FontId::proportional(fonts::FONT_UI),
+                        pal.accent,
+                    );
+                    ui.add_space(4.0);
+                }
+
                 // 附件占输入框左上方独立一行，文件名与删除入口始终可见。
                 if !state.attachments.is_empty() {
                     let mut remove = None;
@@ -844,6 +884,24 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
                 });
             });
 
+            // 绘制 Apple 风格顶边 1.0px Specular Highlight 与聚焦时 Aqua 焦点光环
+            let card_rect = card_resp.response.rect;
+            draw_specular_highlight(
+                ui.painter(),
+                card_rect,
+                egui::Rounding::same(8.0),
+                pal.specular_highlight,
+            );
+            if is_focused {
+                draw_focus_ring(
+                    ui.painter(),
+                    card_rect,
+                    egui::Rounding::same(8.0),
+                    pal.focus_ring,
+                    pal.focus_ring_halo,
+                );
+            }
+
             // 忙碌时每秒心跳重绘：egui 无输入事件不自动刷新，已用时计数需心跳驱动。
             if state.busy {
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -858,7 +916,7 @@ pub(super) fn show(state: &mut AppState, ctx: &egui::Context, pal: Palette) -> b
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Enter 发送 · Shift+Enter 换行")
-                        .size(11.0)
+                        .size(fonts::FONT_CAPTION)
                         .color(pal.dim),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

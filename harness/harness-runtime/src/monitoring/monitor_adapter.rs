@@ -78,8 +78,12 @@ impl MonitorTurn {
         state.tap = Some(tap);
         state
     }
-    pub fn observe(&mut self, conclusion: &str, evidence_count: usize) -> bool {
-        let delta = u8::from(evidence_count > self.evidence);
+    // step_had_tools：本步模型确实发起了工具调用。工具调用即便没有新增 evidence
+    // 条目（重复读同一资产、写入已记录文件、跑验证命令），也说明模型在推进多步任务，
+    // 不能算空转；否则同一句过渡说明在第 3 步出现就会把仍在干活的回合直接判死，
+    // 表现为任务跑到一半被强行中断。
+    pub fn observe(&mut self, conclusion: &str, evidence_count: usize, step_had_tools: bool) -> bool {
+        let delta = u8::from(step_had_tools || evidence_count > self.evidence);
         self.evidence = evidence_count;
         let verdict = self.guard.observe(conclusion, delta);
         if let Some(tap) = &self.tap {

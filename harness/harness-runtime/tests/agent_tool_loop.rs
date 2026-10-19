@@ -796,8 +796,8 @@ async fn unverified_text_only_step_stops_after_one_state_correction() {
     let requests = llm.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        2,
-        "同一受控状态下的纯文本空转只允许一次校正，第二次必须终止"
+        3,
+        "纯文本空转先给一次状态校正、再给一次明确的行动要求，之后必须终止"
     );
     assert!(
         requests[1]

@@ -1447,6 +1447,9 @@ impl AgentLoop {
         // 硬预算耗尽。这里比较 Runtime 状态而不是文本字节，因此能识别同义改写。
         let mut text_only_state: Option<String> = None;
         let mut text_only_no_progress_streak = 0u8;
+        // 空转裁决前必须先向模型发过一次“直接执行下一步”的行动要求；只解释状态、
+        // 不要求动作的校正不能作为硬停依据，否则任务会在仍有进展空间时被截断。
+        let mut text_only_action_demanded = false;
         let mut stalled_without_action = false;
         let mut baseline_verification_observed = false;
         /// 单个用户请求内的 prompt 窗口续期上限；每次续期仍受 300k 窗口边界约束。
@@ -2323,7 +2326,11 @@ impl AgentLoop {
                 empty_response_reason.is_some() && assistant_tools.is_empty();
             let assistant_returned_text_without_tools =
                 assistant_tools.is_empty() && !assistant_text.trim().is_empty();
-            let monitor_stop = monitor.observe(&assistant_text, execution.evidence.len());
+            let monitor_stop = monitor.observe(
+                &assistant_text,
+                execution.evidence.len(),
+                !assistant_tools.is_empty(),
+            );
             if !assistant_text.trim().is_empty() {
                 last_assistant = assistant_text.clone();
             }
@@ -2439,7 +2446,19 @@ impl AgentLoop {
                 // 纠正一轮。没有任何工具证据时仍保留一次纠错机会，容忍模型先说明
                 // 再行动的常见模式。
                 let stop_after = if baseline_verification_observed && !implementation_workflow { 1 } else { 2 };
-                if text_only_no_progress_streak >= stop_after {
+                if text_only_no_progress_streak >= stop_after
+                    && !text_only_action_demanded
+                    && !baseline_verification_observed
+                {
+                    // 状态键相同也可能只是上一步的校正只解释了状态、没有要求动作；
+                    // 先给一次明确的行动要求，才允许把下一次复读判成空转。
+                    text_only_action_demanded = true;
+                    messages.push(Message::user(format!(
+                        "[运行时行动要求] 任务尚未完成，但上一步没有执行任何允许的工具。不要重复结论，直接执行下一步：{}",
+                        next_action(&execution, &goal_execution).hint
+                    )));
+                    debt += 1;
+                } else if text_only_no_progress_streak >= stop_after {
                     stalled_without_action = true;
                     hard_stop = true;
                     debt = 0;
@@ -2448,7 +2467,7 @@ impl AgentLoop {
                         text: if baseline_verification_observed {
                             "基线验证后模型以正文收尾但没有产生代码修改；已停止继续空转。".into()
                         } else {
-                            "连续两次纯文本回复未推动任务状态；已停止自动复读并保留现有证据。"
+                            "已明确要求执行下一步后，模型仍以纯文本回复且未推动任务状态；已停止自动复读并保留现有证据。"
                                 .into()
                         },
                     });
@@ -2456,9 +2475,15 @@ impl AgentLoop {
             } else if step_had_tools || completion_ready {
                 text_only_state = None;
                 text_only_no_progress_streak = 0;
+                text_only_action_demanded = false;
             }
 
-            if stalled_without_action {
+            if text_only_action_demanded
+                && !stalled_without_action
+                && text_only_no_progress_streak >= 2
+            {
+                // 刚发出行动要求：本步正文不参与完成裁决，避免同一回合叠加两套校正。
+            } else if stalled_without_action {
                 // 上面的活性守卫已经形成确定终态；不得再由事实校正或目标校正复活。
             } else if should_recover_empty {
                 // 恢复重试已经重新记账，不能再被“本步没有工具”误判为完成。
@@ -2922,7 +2947,7 @@ fn concise_incomplete_status(
             .into();
     }
     if reason.is_some_and(|text| text.contains("stalled_without_action")) {
-        return "已停止空转：模型连续两次没有执行任何允许动作，任务状态和证据没有变化。\n结论：本轮未形成可验证交付；已保留现有分析与证据，可从当前断点继续。"
+        return "已停止空转：模型在任务未完成时没有执行能推进状态的动作，也没有产生新证据（重复输出同一结论）。\n结论：本轮未形成可验证交付；已保留现有分析与证据，可从当前断点继续。"
             .into();
     }
     let acceptance = acceptance_progress(execution);

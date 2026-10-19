@@ -75,18 +75,14 @@ impl DeepSeek {
     }
 }
 
-fn thinking_mode_enabled(effort: Option<&str>, model: &str) -> bool {
-    match effort {
-        Some("none") => false,
-        Some(_) => true,
-        // `deepseek-reasoner` enables thinking even when a gateway does not
-        // expose a reasoning_effort control. Chat models without an explicit
-        // thinking setting retain their ordinary tool transcript unchanged.
-        None => {
-            let model = model.to_ascii_lowercase();
-            model.contains("reasoner") || model.contains("deepseek-v4")
-        }
-    }
+/// 只有**显式关闭**（`off`/`none`）才能证明上游不会思考。`auto`、未配置以及
+/// 模型别名（网关侧另有默认值，如 `deepseek-chat` 在 V4 上默认开启思考）都
+/// 无法在本地证明是普通转录，若按「非思考」放过，缺 reasoning_content 的
+/// assistant/tool 回合会直接被上游判 400:
+/// `The reasoning_content in the thinking mode must be passed back to the API.`
+/// 因此除显式关闭外一律按「可能思考」保守处理。
+fn thinking_mode_enabled(effort: Option<&str>, _model: &str) -> bool {
+    effort != Some("none")
 }
 
 /// Rewrites only legacy assistant tool-call turns which have no recoverable
@@ -183,6 +179,18 @@ impl LlmProvider for DeepSeek {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_mode_assumed_unless_explicitly_disabled() {
+        // 只有显式 "none"（由 normalize_reasoning_effort 归一 "off"）才能证明
+        // 上游不思考；其余情况（含未配置 / auto / 普通 chat 别名）必须保守地
+        // 清理缺 reasoning_content 的历史工具回合，否则上游直接 400。
+        assert!(!thinking_mode_enabled(Some("none"), "deepseek-chat"));
+        assert!(!thinking_mode_enabled(Some("none"), "deepseek-reasoner"));
+        assert!(thinking_mode_enabled(None, "deepseek-chat"));
+        assert!(thinking_mode_enabled(None, "deepseek-reasoner"));
+        assert!(thinking_mode_enabled(Some("high"), "deepseek-chat"));
+    }
 
     #[test]
     fn request_options_override_persisted_reasoning_and_output_budget() {

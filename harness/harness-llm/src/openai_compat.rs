@@ -118,9 +118,9 @@ fn inner_stream_chat(
         let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
-                yield Err(Error::Llm(format!(
-                    "{provider_label} 请求失败: {}",
-                    friendly_error(&e)
+                yield Err(Error::Llm(send_failure_text(
+                    provider_label,
+                    &friendly_error(&e),
                 )));
                 return;
             }
@@ -766,7 +766,7 @@ pub fn fetch_models(base_url: String, api_key: String) -> Result<Vec<String>, St
         } else if e.is_connect() {
             "无法连接模型服务，请检查网络、代理、防火墙和 API 地址".to_string()
         } else {
-            e.to_string()
+            format!("{}{}", e, send_failure_hint(&e.to_string()))
         }
     })?;
 
@@ -811,19 +811,91 @@ pub fn parse_models_json(text: &str) -> std::result::Result<Vec<String>, String>
     Ok(ids)
 }
 
+/// 统一 `发送失败` 的用户可见文案：保留 provider 前缀，附上可诊断的原因链。
+///
+/// 旧实现只输出 `{provider_label} 请求失败: {reqwest Display}`，而 reqwest 顶层
+/// Display 仅为 `error sending request for url (...)`，真实原因被丢弃。
+fn send_failure_text(provider_label: &str, message: &str) -> String {
+    format!("{provider_label} 请求失败: {message}")
+}
+
+/// 把 reqwest 发送失败翻译成可诊断文案。
+///
+/// reqwest 顶层 Display 只有一句 `error sending request for url (...)`，
+/// 真实原因（DNS 解析失败 / TLS 握手失败 / 代理不可用 / 连接被重置）藏在
+/// source 链里，此前被直接丢弃，用户只能看到无信息量的报错。这里展开 source
+/// 链（最多 4 层，避免超长）并按关键词给出排查方向。
 fn friendly_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
-        "请求超时，请检查网络、代理和 API 地址".to_string()
-    } else if e.is_connect() {
-        "无法连接模型服务，请检查网络、代理、防火墙和 API 地址".to_string()
+        return "请求超时，请检查网络、代理和 API 地址".to_string();
+    }
+    let chain = error_chain_text(e);
+    if e.is_connect() {
+        return format!(
+            "无法连接模型服务，请检查网络、代理、防火墙和 API 地址（{chain}）{}"
+                ,
+            send_failure_hint(&chain)
+        );
+    }
+    format!("{chain}{}", send_failure_hint(&chain))
+}
+
+/// 展开 reqwest 错误的 source 链，用 ` <- ` 连接（最多 4 层）。
+fn error_chain_text(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        parts.push(err.to_string());
+        if parts.len() >= 4 {
+            break;
+        }
+        source = err.source();
+    }
+    parts.join(" <- ")
+}
+
+/// 依据错误链关键词给出排查方向；无法归类时返回空串，保持原样输出。
+fn send_failure_hint(chain: &str) -> &'static str {
+    let lower = chain.to_ascii_lowercase();
+    if lower.contains("dns") || lower.contains("getaddrinfo") || lower.contains("name resolution")
+    {
+        "；疑似 DNS 解析失败：确认能 ping 通该域名、或改用可解析的 API 地址"
+    } else if lower.contains("ssl")
+        || lower.contains("tls")
+        || lower.contains("certificate")
+        || lower.contains("handshake")
+    {
+        "；疑似 TLS 握手/证书失败：检查系统时间是否准确、是否被中间人代理拦截、证书链是否完整"
+    } else if lower.contains("proxy") {
+        "；疑似代理问题：检查 HTTP_PROXY/HTTPS_PROXY 或系统代理是否可用"
+    } else if lower.contains("reset")
+        || lower.contains("broken pipe")
+        || lower.contains("closed")
+        || lower.contains("eof")
+    {
+        "；连接在发送/读取途中被对端重置：常见于请求体过大（超长会话历史）、上游限流或中间设备断连，可新开会话或缩短历史后重试"
     } else {
-        e.to_string()
+        ""
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_failure_hint_classifies_common_network_causes() {
+        // reqwest 顶层只给 "error sending request for url (...)"，归类信息来自 source 链。
+        assert!(send_failure_hint("error sending request for url (https://api.deepseek.com/chat/completions)").is_empty());
+        assert!(send_failure_hint("error sending request <- dns error: no such host")
+            .contains("DNS"));
+        assert!(send_failure_hint("error sending request <- error:0A000086:SSL routines::certificate verify failed")
+            .contains("TLS"));
+        assert!(send_failure_hint("error sending request <- error sending request through proxy")
+            .contains("代理"));
+        assert!(send_failure_hint("error sending request <- connection closed before message completed")
+            .contains("重置"));
+    }
 
     #[test]
     fn messages_json_maps_roles_and_tool_fields() {
